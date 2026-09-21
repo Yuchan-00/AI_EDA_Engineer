@@ -1,0 +1,12 @@
+# Keep line endings LF everywhere (Windows core.autocrlf would otherwise rewrite
+# the working copy to CRLF). Compiler output is byte-compared in tests, so the
+# sources that build it should not vary by checkout platform.
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.kicad_sch text eol=lf
+*.kicad_pcb text eol=lf
+*.kicad_sym text eol=lf
+*.kicad_mod text eol=lf
