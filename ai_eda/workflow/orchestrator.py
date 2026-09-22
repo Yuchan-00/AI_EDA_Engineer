@@ -47,7 +47,8 @@ from ai_eda.compilers import (
     SpiceNetlistCompiler,
 )
 from ai_eda.errors import CompileError, NothingToCompileError, ToolUnavailableError
-from ai_eda.ir import ArtifactKind, CircuitIR, MissingInformation, ValidationStatus, worst_status
+from ai_eda.ir import ArtifactKind, CircuitIR, MissingInformation, ValidationResult, ValidationStatus, worst_status
+from ai_eda.tools.calc import recompute_parameters
 from ai_eda.tools.kicad.cli import KicadCli, run_drc_for, run_erc_for
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.manufacturing.outputs import check_output_artifact
@@ -109,7 +110,7 @@ class Orchestrator:
             Stage.ARCHITECTURE: self._agent_stage(CircuitDesignAgent()),
             Stage.COMPONENT_SELECTION: self._agent_stage(ComponentAgent()),
             Stage.IR_BUILD: self._ir_validate,
-            Stage.CALCULATION: self._not_implemented("calculation stage"),
+            Stage.CALCULATION: self._calculation,
             Stage.SPICE: self._agent_stage(SimulationAgent()),
             Stage.SCHEMATIC: self._compile_stage(ArtifactKind.SCHEMATIC),
             Stage.ERC: self._kicad_check("kicad.erc"),
@@ -182,8 +183,30 @@ class Orchestrator:
                 status = ValidationStatus.NOT_VERIFIED
                 if result.proposals:
                     notes.insert(0, f"{len(result.proposals)} proposal(s) applied, nothing verified")
+            revalidated = self._revalidate(ir, ctx, {r.check_id for r in result.validation})
+            if revalidated:
+                notes.append("re-validated: " + ", ".join(f"{r.check_id} {r.status}" for r in revalidated))
             return StageOutcome(stage=Stage(self._stage_of(agent)), status=status, message="; ".join(notes), questions=result.questions)
         return fn
+
+    @staticmethod
+    def _revalidate(ir: CircuitIR, ctx: AgentContext, produced: set[str]) -> list[ValidationResult]:
+        """Re-run the registered validators that consume a check id this stage just produced.
+
+        A validator such as ``domain.analog.bias`` reads the ``spice`` result;
+        at IR_BUILD time that result does not exist yet, so it is evaluated
+        again right after the stage that produces it. The stage's own status
+        stays the agent's verdict; the re-validation is reported in the message.
+        """
+        if not produced:
+            return []
+        out: list[ValidationResult] = []
+        vctx = ValidationContext(workdir=ctx.workdir, tools=ctx.tools)
+        for v in default_registry.select(ir):
+            if v.consumes & produced:
+                out.extend(v.validate(ir, vctx))
+        ir.validation.extend(out)
+        return out
 
     def _stage_of(self, agent) -> str:
         return {
@@ -287,10 +310,19 @@ class Orchestrator:
             notes.append(f"{res.check_id} {res.status}: {res.message}")
         return StageOutcome(stage=stage, status=worst_status(statuses), message="; ".join(notes))
 
-    def _not_implemented(self, what: str) -> StageFn:
-        def fn(ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
-            return StageOutcome(stage=Stage.CALCULATION, status=ValidationStatus.NOT_VERIFIED, message=f"{what} not implemented")
-        return fn
+    def _calculation(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
+        """Recompute every derived parameter with its registered calculator (``calc.recompute``).
+
+        PASS when all recomputed values match the stored ones, FAIL (human)
+        on a mismatch, NOT_VERIFIED when a parameter's tool is not a
+        registered calculator or nothing is derived - the stage never
+        changes a parameter, it only checks that the IR's numbers are the
+        calculators' numbers.
+        """
+        res = recompute_parameters(ir)
+        res.ir_hash = ir.content_hash()
+        ir.validation.add(res)
+        return StageOutcome(stage=Stage.CALCULATION, status=res.status, message=res.message)
 
     def _release(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         overall = ir.validation.overall()

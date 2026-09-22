@@ -11,6 +11,7 @@ from ai_eda.errors import CompileError, NotRepairableError, ToolExecutionError, 
 from ai_eda.ir import ArtifactKind, CircuitIR, ValidationResult
 from ai_eda.tools.kicad.cli import KicadCli, fresh_artifact, run_drc_for, run_erc_for
 from ai_eda.tools.manufacturing.outputs import OUTPUT_CHECKS, check_output_artifact
+from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK_ID, run_spice_for
 
 #: Finding categories that must never be auto-fixed (spec section 18).
 NON_REPAIRABLE = frozenset(
@@ -103,13 +104,15 @@ class RegenerateArtifact(RepairStrategy):
 
 
 class RerunTool(RepairStrategy):
-    """Re-run an external check (ERC/DRC, gerber/drill format check) whose report is stale.
+    """Re-run an external check (ERC/DRC, SPICE, gerber/drill format check) whose report is stale.
 
     The check only runs on an artifact that is fresh with respect to the IR
     and unchanged on disk (:func:`~ai_eda.tools.kicad.cli.fresh_artifact`);
     otherwise the action fails and the loop has to regenerate first - a
     check of stale or hand-edited files must never become evidence about the
-    current design.
+    current design. ``spice`` re-runs every analysis and expectation through
+    :func:`~ai_eda.tools.spice.stage.run_spice_for`, exactly as the SPICE
+    stage did.
     """
 
     id = "repair.rerun_tool"
@@ -126,7 +129,7 @@ class RerunTool(RepairStrategy):
         errors: list[str] = []
         for check in checks:
             try:
-                ir.validation.add(self._rerun(ir, check, workdir, tools))
+                ir.validation.extend(self._rerun(ir, check, workdir, tools))
             except (KeyError, ToolUnavailableError, ToolExecutionError, ValueError) as e:
                 errors.append(f"{check}: {e!r}")
         action.succeeded = not errors
@@ -135,25 +138,28 @@ class RerunTool(RepairStrategy):
         return action
 
     @staticmethod
-    def _rerun(ir: CircuitIR, check: str, workdir: Path, tools: dict[str, Any]) -> ValidationResult:
+    def _rerun(ir: CircuitIR, check: str, workdir: Path, tools: dict[str, Any]) -> list[ValidationResult]:
         output_kinds = {check_id: kind for kind, check_id in OUTPUT_CHECKS.items()}
-        if check not in output_kinds and check not in ("kicad.erc", "kicad.drc"):
+        if check not in output_kinds and check not in ("kicad.erc", "kicad.drc", SPICE_CHECK_ID):
             raise ValueError(f"unknown tool check {check}")
         if check in output_kinds:
             art = fresh_artifact(ir, output_kinds[check])
             res = check_output_artifact(art, ir)
             res.ir_hash = ir.content_hash()
-            return res
+            return [res]
+        if check == SPICE_CHECK_ID:
+            # ToolUnavailableError without an engine, ToolExecutionError when the netlist is stale
+            return run_spice_for(ir, tools, workdir)
         kicad = tools.get("kicad_cli")
         if not isinstance(kicad, KicadCli) or not kicad.available():
             raise ToolUnavailableError("kicad-cli not available")
         if check == "kicad.erc":
             if ArtifactKind.SCHEMATIC not in ir.artifacts:
                 raise ToolExecutionError("no schematic artifact to check")
-            return run_erc_for(ir, kicad, workdir)
+            return [run_erc_for(ir, kicad, workdir)]
         if ArtifactKind.PCB not in ir.artifacts:
             raise ToolExecutionError("no PCB artifact to check")
-        return run_drc_for(ir, kicad, workdir)
+        return [run_drc_for(ir, kicad, workdir)]
 
 
 DEFAULT_STRATEGIES: list[RepairStrategy] = [RegenerateArtifact(), RerunTool()]

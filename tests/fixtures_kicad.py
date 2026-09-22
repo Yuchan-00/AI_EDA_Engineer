@@ -13,7 +13,19 @@ Every pin carries authoritative provenance and every :class:`LibraryRef` is
 resolved through :class:`KicadLibrary` so ``verified`` reflects what is really
 on disk (``False`` when the KiCad libraries are not installed - tests that need
 them skip). This module is deliberately self-contained: it depends only on
-``ai_eda.ir`` and ``ai_eda.tools.kicad.library``.
+``ai_eda.ir``, ``ai_eda.tools.calc`` and ``ai_eda.tools.kicad.library``.
+
+SPICE: the resistors are bound as ``R`` elements with their authoritative
+resistance, the header is excluded (no electrical model), and
+:func:`divider_simulation` describes the 12 V DC stimulus on ``VIN``, an
+``op`` and a ``dc`` sweep (0..12 V in 1 V steps) with two expectations whose
+nominals are calculator outputs stored in ``ir.parameters``: ``v(VOUT)`` at
+the operating point = ``v_out`` (6 V, verifying ``req.v_out`` = 6 V) and
+``v(VOUT)`` at ``VIN = v_in_mid`` (6 V) on the sweep = ``v_out_mid`` (3 V,
+verifying ``req.v_out_half`` = 3 V - the "half the input" clause at a second
+input), both within 1 %. Each expectation's nominal is the value of the
+requirement it is traced to: the reviewer compares the two. The netlist the
+compiler writes for it is ``divider_conn\\nR1 VIN VOUT 10k\\nR2 VOUT 0 10k\\nVVIN VIN 0 DC 12\\n.end\\n``.
 """
 
 from __future__ import annotations
@@ -21,11 +33,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from ai_eda.ir import (
+    AnalysisSpec,
     BoardOutline,
     BoardSide,
     CircuitDomain,
     CircuitIR,
     Component,
+    Expectation,
     LibraryRef,
     Net,
     NetKind,
@@ -37,13 +51,22 @@ from ai_eda.ir import (
     ProjectMeta,
     Provenance,
     ProvenanceKind,
+    Reduce,
+    Requirement,
+    RequirementKind,
+    SimulationSetup,
     SourceRef,
+    SpiceBinding,
+    SpiceDevice,
+    Stimulus,
+    StimulusKind,
     Topology,
     authoritative,
-    derived,
     user_requirement,
 )
+from ai_eda.tools.calc import voltage_divider_output
 from ai_eda.tools.kicad.library import KicadLibrary
+from ai_eda.tools.spice import SpiceAnalysis
 
 __all__ = [
     "PROJECT_ID",
@@ -53,14 +76,20 @@ __all__ = [
     "SHORTING_PLACEMENTS",
     "RESISTOR_DS",
     "HEADER_DS",
+    "USER",
     "divider_with_connector_ir",
+    "divider_simulation",
     "ir_net_map",
     "resistor",
+    "pin_header",
     "pin_header_1x03",
 ]
 
 #: file stem of every artifact the compilers write for this fixture
 PROJECT_ID = "divider_conn"
+
+#: provenance of the simulation setup: the person who wrote the fixture decided what to simulate
+USER = Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="fixture simulation setup")
 
 RESISTOR_DS = SourceRef(
     title="Generic thick film chip resistor datasheet",
@@ -116,8 +145,12 @@ def _pin(number: str, name: str, source: SourceRef) -> Pin:
     return Pin(number=number, name=name, electrical_type=PinElectricalType.PASSIVE, provenance=_auth(source))
 
 
-def resistor(ref: str, value: str, ohms: float, library: KicadLibrary) -> Component:
-    """A verified 0603 chip resistor. Pin names are the library's (``Device:R`` pins are unnamed)."""
+def resistor(ref: str, value: str, ohms: float, library: KicadLibrary, serves: tuple[str, ...] = ("req.v_out",)) -> Component:
+    """A verified 0603 chip resistor, bound in SPICE as an ideal ``R`` with its authoritative resistance.
+
+    Pin names are the library's (``Device:R`` pins are unnamed).
+    """
+    resistance = authoritative(ohms, RESISTOR_DS, "ohm")
     return Component(
         ref=ref,
         value=value,
@@ -127,31 +160,80 @@ def resistor(ref: str, value: str, ohms: float, library: KicadLibrary) -> Compon
         datasheet=RESISTOR_DS,
         package=authoritative("0603", RESISTOR_DS),
         pins=[_pin("1", "", RESISTOR_DS), _pin("2", "", RESISTOR_DS)],
-        electrical={"resistance": authoritative(ohms, RESISTOR_DS, "ohm")},
+        electrical={"resistance": resistance},
         symbol=library.resolve_symbol(LibraryRef(library="Device", name="R")),
         footprint=library.resolve_footprint(LibraryRef(library="Resistor_SMD", name="R_0603_1608Metric")),
         provenance=Provenance(kind=ProvenanceKind.DERIVED, tool="fixture", note="divider element"),
-        serves_requirements=["req.v_out"],
+        serves_requirements=list(serves),
+        spice=SpiceBinding(
+            device=SpiceDevice.R,
+            value=resistance,
+            provenance=Provenance(kind=ProvenanceKind.AUTHORITATIVE, source=RESISTOR_DS, note="ideal resistor at the datasheet nominal value"),
+        ),
+    )
+
+
+def pin_header(ref: str, n_pins: int, library: KicadLibrary, serves: tuple[str, ...] = ("req.interface",)) -> Component:
+    """A verified 1xN 2.54 mm vertical pin header (``Connector_Generic:Conn_01x0N``), excluded from SPICE."""
+    return Component(
+        ref=ref,
+        value=f"Conn_01x{n_pins:02d}",
+        description=f"Generic connector, single row, 01x{n_pins:02d}",
+        manufacturer=authoritative("Generic", HEADER_DS),
+        mpn=authoritative(f"PH1-{n_pins:02d}-UA", HEADER_DS),
+        datasheet=HEADER_DS,
+        package=authoritative(f"PinHeader_1x{n_pins:02d}_P2.54mm_Vertical", HEADER_DS),
+        pins=[_pin(str(i), f"Pin_{i}", HEADER_DS) for i in range(1, n_pins + 1)],
+        symbol=library.resolve_symbol(LibraryRef(library="Connector_Generic", name=f"Conn_01x{n_pins:02d}")),
+        footprint=library.resolve_footprint(
+            LibraryRef(library="Connector_PinHeader_2.54mm", name=f"PinHeader_1x{n_pins:02d}_P2.54mm_Vertical")
+        ),
+        provenance=Provenance(kind=ProvenanceKind.DERIVED, tool="fixture", note="board header"),
+        serves_requirements=list(serves),
+        spice=SpiceBinding(exclude=True, exclude_reason="connector, no electrical model", provenance=USER),
     )
 
 
 def pin_header_1x03(ref: str, library: KicadLibrary) -> Component:
     """A verified 1x03 2.54 mm vertical pin header (``Connector_Generic:Conn_01x03``)."""
-    return Component(
-        ref=ref,
-        value="Conn_01x03",
-        description="Generic connector, single row, 01x03",
-        manufacturer=authoritative("Generic", HEADER_DS),
-        mpn=authoritative("PH1-03-UA", HEADER_DS),
-        datasheet=HEADER_DS,
-        package=authoritative("PinHeader_1x03_P2.54mm_Vertical", HEADER_DS),
-        pins=[_pin("1", "Pin_1", HEADER_DS), _pin("2", "Pin_2", HEADER_DS), _pin("3", "Pin_3", HEADER_DS)],
-        symbol=library.resolve_symbol(LibraryRef(library="Connector_Generic", name="Conn_01x03")),
-        footprint=library.resolve_footprint(
-            LibraryRef(library="Connector_PinHeader_2.54mm", name="PinHeader_1x03_P2.54mm_Vertical")
-        ),
-        provenance=Provenance(kind=ProvenanceKind.DERIVED, tool="fixture", note="VIN / VOUT / GND header"),
-        serves_requirements=["req.interface"],
+    c = pin_header(ref, 3, library)
+    c.provenance = Provenance(kind=ProvenanceKind.DERIVED, tool="fixture", note="VIN / VOUT / GND header")
+    return c
+
+
+def divider_simulation(ir: CircuitIR) -> SimulationSetup:
+    """The simulation setup of the divider: stimulus, ``op`` + ``dc`` analyses, expectations against ``ir.parameters``.
+
+    ``ir.parameters`` must already hold ``v_out`` (op nominal), ``v_in_mid``
+    (the sweep point) and ``v_out_mid`` (the nominal there): the expectations
+    reference those traced values, so the CALCULATION stage recomputes the
+    very numbers ngspice is checked against.
+    """
+    return SimulationSetup(
+        stimuli=[
+            Stimulus(
+                id="VIN", source="voltage", net="VIN", reference_net="GND", kind=StimulusKind.DC,
+                value=user_requirement(12.0, "V", note="input supply of the requirement"), provenance=USER, serves_requirements=["req.v_in"],
+            )
+        ],
+        analyses=[
+            AnalysisSpec(id="op", kind=SpiceAnalysis.OP, provenance=USER),
+            AnalysisSpec(
+                id="dc_vin", kind=SpiceAnalysis.DC,
+                params={"source": user_requirement("VIN"), "start": user_requirement(0.0, "V"), "stop": user_requirement(12.0, "V"), "step": user_requirement(1.0, "V")},
+                provenance=USER,
+            ),
+        ],
+        expectations=[
+            Expectation(
+                id="v_out", analysis_id="op", vector="v(VOUT)", reduce=Reduce.VALUE, nominal=ir.parameters["v_out"],
+                tol_rel=user_requirement(0.01, note="1 % output accuracy"), requirement_id="req.v_out", provenance=USER,
+            ),
+            Expectation(
+                id="v_out_mid", analysis_id="dc_vin", vector="v(VOUT)", reduce=Reduce.AT, at=ir.parameters["v_in_mid"], nominal=ir.parameters["v_out_mid"],
+                tol_rel=user_requirement(0.01, note="1 % output accuracy"), requirement_id="req.v_out_half", provenance=USER,
+            ),
+        ],
     )
 
 
@@ -176,6 +258,15 @@ def divider_with_connector_ir(tmp_path: Path, library: KicadLibrary | None = Non
         domains=[CircuitDomain.ANALOG],
         provenance=Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="fixture"),
     )
+    ir.requirements.requirements = [
+        Requirement(id="req.v_in", key="v_in", text="12 V DC input on the header", kind=RequirementKind.EXPLICIT, value=user_requirement(12.0, "V")),
+        Requirement(id="req.v_out", key="v_out", text="6 V output (half the input) within 1 %", kind=RequirementKind.EXPLICIT, value=user_requirement(6.0, "V")),
+        Requirement(
+            id="req.v_out_half", key="v_out_half", text="the output stays half the input: 3 V at a 6 V input, within 1 %",
+            kind=RequirementKind.EXPLICIT, value=user_requirement(3.0, "V"),
+        ),
+        Requirement(id="req.interface", key="interface", text="VIN / VOUT / GND on a 3-pin 2.54 mm header", kind=RequirementKind.EXPLICIT, category="mechanical"),
+    ]
     ir.components = [
         resistor("R1", "10k", 10_000.0, lib),
         resistor("R2", "10k", 10_000.0, lib),
@@ -188,6 +279,7 @@ def divider_with_connector_ir(tmp_path: Path, library: KicadLibrary | None = Non
             kind=NetKind.POWER,
             pins=[PinRef(component_ref="J1", pin_number="1"), PinRef(component_ref="R1", pin_number="1")],
             provenance=net_p,
+            serves_requirements=["req.v_in"],
         ),
         Net(
             name="VOUT",
@@ -197,6 +289,7 @@ def divider_with_connector_ir(tmp_path: Path, library: KicadLibrary | None = Non
                 PinRef(component_ref="R2", pin_number="1"),
             ],
             provenance=net_p,
+            serves_requirements=["req.v_out", "req.v_out_half"],
         ),
         Net(
             name="GND",
@@ -205,10 +298,14 @@ def divider_with_connector_ir(tmp_path: Path, library: KicadLibrary | None = Non
             provenance=net_p,
         ),
     ]
-    ir.parameters["v_in"] = user_requirement(12.0, "V")
-    ir.parameters["r1"] = authoritative(10_000.0, RESISTOR_DS, "ohm")
-    ir.parameters["r2"] = authoritative(10_000.0, RESISTOR_DS, "ohm")
-    ir.parameters["v_out"] = derived(6.0, tool="calc.divider.v_out", derived_from=["v_in", "r1", "r2"], unit="V")
+    params = ir.parameters
+    params["v_in"] = user_requirement(12.0, "V")
+    params["r1"] = ir.component("R1").electrical["resistance"]
+    params["r2"] = ir.component("R2").electrical["resistance"]
+    params["v_out"] = voltage_divider_output(params["v_in"], params["r1"], params["r2"], ("v_in", "r1", "r2"))  # 6 V by calc.divider.v_out
+    params["v_in_mid"] = user_requirement(6.0, "V", note="dc sweep point checked against the calculator")
+    params["v_out_mid"] = voltage_divider_output(params["v_in_mid"], params["r1"], params["r2"], ("v_in_mid", "r1", "r2"))  # 3 V
+    ir.simulation = divider_simulation(ir)
     # copies: tests mutate placements in place, the module-level fixture list must stay pristine
     ir.pcb = PCBDesign(outline=BoardOutline(width_mm=30.0, height_mm=20.0), placements=[p.model_copy() for p in ROUTABLE_PLACEMENTS])
     return ir

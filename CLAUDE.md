@@ -13,7 +13,8 @@ Verification-first AI circuit design system. **The LLM never decides design trut
 ## Environment
 - Windows 11, Korean locale. Python venv: `B:\Claude\.venv\Scripts\python.exe`. Run tests: `cd /b/Claude && .venv/Scripts/python -m pytest -q`.
 - KiCad 10.0.6: `C:\Users\yc012\AppData\Local\Programs\KiCad\10.0\bin\kicad-cli.exe`; libraries at `C:\Users\yc012\AppData\Local\Programs\KiCad\10.0\share\kicad\symbols\*.kicad_sym`, `...\footprints\*.pretty\*.kicad_mod`, demos at `...\share\kicad\demos`.
-- ngspice is NOT installed. No LLM key is set. Never rely on either in tests.
+- There is no `ngspice.exe`; SPICE runs through KiCad's bundled `bin\ngspice.dll` (ngspice-46) via `ai_eda.tools.spice.NgspiceShared` (ctypes, in-process singleton). Tests that need it use `pytest.mark.skipif(not NgspiceShared().available(), ...)` and otherwise run against the real DLL. Measured facts the code depends on: analysis commands must be lowercase device names (`dc vvin 0 12 1`), decks carry no analysis cards, node names are limited to `NODE_RE`, `ngGet_Vec_Info` returns one static struct (copy before the next call), rawfiles carry a `Date` line (evidence, not deterministic artifacts), and ngspice's number parser is not correctly rounded (`10u` reads as 9.999999999999999e-06 - `ai_eda.tools.calc.si` models it).
+- No LLM key is set. Never rely on one in tests.
 - Always pass `encoding="utf-8", errors="replace"` to `subprocess.run(text=True)`; the console code page is cp949.
 - Bash-tool heredocs (`cat > f <<'EOF'`) are unreliable here — write files with the Write/Edit tools.
 - Scratch/experiment files go in `C:\Users\yc012\AppData\Local\Temp\claude\B--Claude\abcacf4d-e090-437c-84fc-e48862689e37\scratchpad`, never in the repo. Do not touch `projects/`.

@@ -29,6 +29,10 @@ class Validator(ABC):
     domains: frozenset[CircuitDomain] = frozenset()
     #: human description shown in the GUI
     description: str = ""
+    #: check ids of tool results this validator reads (e.g. ``{"spice"}``); the orchestrator runs the
+    #: validator again right after the stage that produced such a result, because at IR_BUILD time it
+    #: can only say NOT_VERIFIED
+    consumes: frozenset[str] = frozenset()
 
     def applies_to(self, ir: CircuitIR) -> bool:
         if not self.domains:

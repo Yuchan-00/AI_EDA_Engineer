@@ -40,6 +40,16 @@ from ai_eda.ir.components import (
     Component,
 )
 from ai_eda.ir.nets import NetKind, PinRef, Net
+from ai_eda.ir.simulation import (
+    SpiceDevice,
+    SpiceBinding,
+    StimulusKind,
+    Stimulus,
+    AnalysisSpec,
+    Reduce,
+    Expectation,
+    SimulationSetup,
+)
 from ai_eda.ir.topology import CircuitDomain, Block, Topology
 from ai_eda.ir.constraints import ConstraintKind, Constraint
 from ai_eda.ir.pcb import (
@@ -71,6 +81,8 @@ __all__ = [
     "RequirementConflict", "RequirementSet",
     "PinElectricalType", "Pin", "LibraryRef", "SourcingInfo", "Component",
     "NetKind", "PinRef", "Net",
+    "SpiceDevice", "SpiceBinding", "StimulusKind", "Stimulus", "AnalysisSpec", "Reduce",
+    "Expectation", "SimulationSetup",
     "CircuitDomain", "Block", "Topology",
     "ConstraintKind", "Constraint",
     "BoardSide", "Layer", "BoardOutline", "Placement", "Track", "Via", "Zone",

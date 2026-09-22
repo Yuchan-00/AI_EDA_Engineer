@@ -18,10 +18,26 @@ from ai_eda.ir.pcb import PCBDesign
 from ai_eda.ir.provenance import Traced
 from ai_eda.ir.regulatory import RegulatoryState
 from ai_eda.ir.requirements import RequirementSet
+from ai_eda.ir.simulation import SimulationSetup
 from ai_eda.ir.topology import Topology
 from ai_eda.ir.validation import ValidationState
 
 IR_SCHEMA_VERSION = "0.1"
+
+#: project bookkeeping that says where / when the IR was built, not what it designs (not hashed)
+NON_DESIGN_PROJECT_FIELDS: tuple[str, ...] = ("workdir", "created_at")
+#: wall-clock keys stripped from every nested object before hashing (``Provenance.created_at`` defaults to
+#: *now*, so two identical designs built a millisecond apart would otherwise never share a hash)
+WALL_CLOCK_KEYS: frozenset[str] = frozenset({"created_at"})
+
+
+def strip_wall_clock(obj):
+    """``obj`` (JSON-able data) without any :data:`WALL_CLOCK_KEYS` entry at any depth."""
+    if isinstance(obj, dict):
+        return {k: strip_wall_clock(v) for k, v in obj.items() if k not in WALL_CLOCK_KEYS}
+    if isinstance(obj, list):
+        return [strip_wall_clock(v) for v in obj]
+    return obj
 
 
 class ArtifactKind(StrEnum):
@@ -116,6 +132,8 @@ class CircuitIR(BaseModel):
     #: design parameters: "v_in", "i_out", "r1", "p_diss" ... all traced
     parameters: dict[str, Traced] = Field(default_factory=dict)
     pcb: PCBDesign | None = None
+    #: stimuli / analyses / expectations for the SPICE stage (part of the design hash)
+    simulation: SimulationSetup | None = None
     regulatory: RegulatoryState = Field(default_factory=RegulatoryState)
     validation: ValidationState = Field(default_factory=ValidationState)
     artifacts: dict[ArtifactKind, ArtifactRef] = Field(default_factory=dict)
@@ -147,10 +165,23 @@ class CircuitIR(BaseModel):
     _NON_DESIGN_FIELDS = ("validation", "artifacts")
 
     def design_dict(self) -> dict:
-        return self.model_dump(mode="json", exclude=set(self._NON_DESIGN_FIELDS))
+        """The design content as JSON-able data: what :meth:`content_hash` hashes.
+
+        Excludes ``validation`` / ``artifacts`` (state about the design),
+        ``project.workdir`` / ``project.created_at`` (where and when it was
+        built) and every ``created_at`` timestamp, so the same design built
+        twice - in another folder, at another time, or loaded from disk -
+        hashes the same. ``SourceRef.retrieved_at`` stays: which retrieval
+        of a datasheet was used is design provenance, and it is never filled
+        in by a clock default.
+        """
+        data = self.model_dump(mode="json", exclude=set(self._NON_DESIGN_FIELDS))
+        for key in NON_DESIGN_PROJECT_FIELDS:
+            data["project"].pop(key, None)
+        return strip_wall_clock(data)
 
     def content_hash(self) -> str:
-        """Stable hash of the design content (excluding validation/artifact bookkeeping)."""
+        """Stable hash of the design content (see :meth:`design_dict` for what is excluded)."""
         payload = json.dumps(self.design_dict(), sort_keys=True, separators=(",", ":"), default=str)
         return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

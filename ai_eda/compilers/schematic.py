@@ -145,7 +145,7 @@ def _no_connect(at: Vec, uuid: str) -> Node:
 
 class SchematicCompiler(Compiler):
     id = "compiler.kicad_sch"
-    version = "0.2"
+    version = "0.3"
     kind = ArtifactKind.SCHEMATIC
 
     def compile(self, ir: CircuitIR, ctx: CompileContext) -> ArtifactRef:
@@ -356,13 +356,18 @@ class SchematicCompiler(Compiler):
         x, y = ps.x, ps.y
         datasheet = (c.datasheet.url if c.datasheet and c.datasheet.url else "") or ""
         description = c.description or ps.symbol.properties.get("Description", "")
+        # A part with no SPICE binding (or one excluded from it) has no SPICE meaning in the IR; without
+        # this flag kicad-cli's SPICE export writes a placeholder line (`J1 __J1`, exit 0, empty stderr)
+        # that makes ngspice refuse the whole circuit - measured with kicad-cli 10.0.6. `dnp` does not
+        # remove it; `exclude_from_sim` does.
+        exclude_from_sim = c.spice is None or c.spice.exclude
         return S(
             "symbol",
             S("lib_id", Q(ps.symbol.lib_id)),
             S("at", x, y, ps.rotation),
             S("mirror", ps.mirror) if ps.mirror else None,
             S("unit", 1),
-            S("exclude_from_sim", False),
+            S("exclude_from_sim", exclude_from_sim),
             S("in_bom", True),
             S("on_board", True),
             S("dnp", False),

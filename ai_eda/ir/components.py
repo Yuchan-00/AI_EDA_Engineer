@@ -13,6 +13,7 @@ from enum import StrEnum
 from pydantic import BaseModel, Field
 
 from ai_eda.ir.provenance import Provenance, ProvenanceKind, SourceRef, Traced
+from ai_eda.ir.simulation import SpiceBinding
 
 
 class PinElectricalType(StrEnum):
@@ -81,6 +82,9 @@ class Component(BaseModel):
     provenance: Provenance
     #: requirement ids this component satisfies - used for Requirements <-> IR review
     serves_requirements: list[str] = Field(default_factory=list)
+    #: how the part appears in SPICE; ``None`` makes the SPICE compiler refuse (it never guesses a
+    #: model), a part without SPICE meaning is bound with ``exclude=True`` and a reason
+    spice: SpiceBinding | None = None
 
     def pin(self, number: str) -> Pin | None:
         for p in self.pins:

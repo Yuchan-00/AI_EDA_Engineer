@@ -68,9 +68,59 @@ class ComponentProvenanceValidator(Validator):
         return [ValidationResult(check_id=self.id, status=ValidationStatus.PASS, tool=self.id)]
 
 
+def simulation_assumptions(ir: CircuitIR) -> list[str]:
+    """Every ``assumption``-provenance value or decision that would reach ngspice, as ``path: rationale``.
+
+    Walks each component's SPICE binding (the binding itself, ``value``,
+    ``params``, ``model_card``), the stimuli (themselves, ``value``,
+    ``params``), the analyses (themselves, ``params``), the expectations
+    (themselves, ``nominal``, ``tol_abs``, ``tol_rel``, ``at``) and
+    ``temperature_c`` - the same items the netlist compiler lists under
+    ``report["assumptions"]``.
+    """
+    out: list[str] = []
+
+    def note(path: str, prov) -> None:
+        if prov.kind == ProvenanceKind.ASSUMPTION:
+            out.append(f"{path}: {prov.note or '(no rationale)'}")
+
+    for c in ir.components:
+        b = c.spice
+        if b is None:
+            continue
+        note(f"components[{c.ref}].spice", b.provenance)
+        if b.value is not None:
+            note(f"components[{c.ref}].spice.value", b.value.provenance)
+        if b.model_card is not None:
+            note(f"components[{c.ref}].spice.model_card", b.model_card.provenance)
+        for k, t in b.params.items():
+            note(f"components[{c.ref}].spice.params[{k}]", t.provenance)
+    setup = ir.simulation
+    if setup is None:
+        return out
+    for s in setup.stimuli:
+        note(f"simulation.stimuli[{s.id}]", s.provenance)
+        if s.value is not None:
+            note(f"simulation.stimuli[{s.id}].value", s.value.provenance)
+        for k, t in s.params.items():
+            note(f"simulation.stimuli[{s.id}].params[{k}]", t.provenance)
+    for a in setup.analyses:
+        note(f"simulation.analyses[{a.id}]", a.provenance)
+        for k, t in a.params.items():
+            note(f"simulation.analyses[{a.id}].params[{k}]", t.provenance)
+    for e in setup.expectations:
+        note(f"simulation.expectations[{e.id}]", e.provenance)
+        for label, t in (("nominal", e.nominal), ("tol_abs", e.tol_abs), ("tol_rel", e.tol_rel), ("at", e.at)):
+            if t is not None:
+                note(f"simulation.expectations[{e.id}].{label}", t.provenance)
+    if setup.temperature_c is not None:
+        note("simulation.temperature_c", setup.temperature_c.provenance)
+    return out
+
+
 class AssumptionsSurfacedValidator(Validator):
     id = "ir.assumptions"
-    description = "Every assumption in requirements/parameters is listed for user confirmation"
+    description = "Every assumption in requirements / parameters / the simulation setup is listed for user confirmation"
 
     def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
         assumptions: list[str] = []
@@ -80,6 +130,7 @@ class AssumptionsSurfacedValidator(Validator):
         for r in ir.requirements.requirements:
             if r.value is not None and r.value.provenance.kind == ProvenanceKind.ASSUMPTION:
                 assumptions.append(f"{r.key}: {r.value.provenance.note or '(no rationale)'}")
+        assumptions += simulation_assumptions(ir)
         if assumptions:
             return [
                 ValidationResult(

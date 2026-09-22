@@ -62,5 +62,5 @@ def divider_ir(tmp_path: Path) -> CircuitIR:
     ir.parameters["v_in"] = user_requirement(12.0, "V")
     ir.parameters["r1"] = authoritative(10_000.0, DS, "ohm")
     ir.parameters["r2"] = authoritative(10_000.0, DS, "ohm")
-    ir.parameters["v_out"] = derived(6.0, tool="calc.divider.v_out", derived_from=["v_in", "r1", "r2"], unit="V")
+    ir.parameters["v_out"] = derived(6.0, tool="calc.divider.v_out", inputs={"v_in": "v_in", "r1": "r1", "r2": "r2"}, unit="V")
     return ir

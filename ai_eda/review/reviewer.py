@@ -15,6 +15,32 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
 * ``review.erc`` / ``review.drc``: the latest tool result must have run on
   the current artifact; its status is passed through (any KiCad violation,
   warning included, is FAIL - ``ai_eda.tools.kicad.cli``).
+* ``review.spice_vs_requirements``: NOT_VERIFIED without a simulation setup,
+  netlist or result; FAIL ``regenerate`` (SPICE_NETLIST) when the netlist is
+  stale or changed on disk; FAIL ``rerun_tool`` (``spice``) when the results
+  artifact is stale, changed, or was produced for a different netlist than
+  the current one (``results.json`` and the ``spice`` result both name the
+  netlist hash); FAIL ``human`` when an expectation failed, has no result
+  from this run, names a requirement that does not exist, or **claims to
+  verify a requirement whose numeric value it does not agree with** (a 6 V
+  requirement is not verified by an expectation whose nominal is 4 V: the
+  nominal must match the requirement's value, same unit, within the
+  expectation's tolerance); NOT_VERIFIED when an expectation is traced to a
+  requirement without a comparable numeric value ("traced but not
+  compared"), or when the netlist rests on an assumption; PASS only when
+  every expectation of the current run passed and agrees with its
+  requirement, with the rawfiles and ``results.json`` as evidence
+  (expectations without a ``requirement_id`` are listed under
+  ``details["untraced"]``). Every verdict says it holds at nominal component
+  values and one temperature only (``details["conditions"]``).
+* ``review.calculations_vs_design``: the reviewer recomputes every derived
+  value itself (:func:`ai_eda.tools.calc.recompute_parameters`, the same
+  deterministic calculators) and passes that verdict through - FAIL
+  ``human`` with the mismatches, NOT_VERIFIED with what could not be
+  recomputed - after the provenance-shape checks (a derived value must name
+  a tool and inputs that exist). The CALCULATION stage's stored
+  ``calc.recompute`` is reported next to it and a disagreement between the
+  two is a FAIL of its own.
 """
 
 from __future__ import annotations
@@ -37,9 +63,11 @@ from ai_eda.ir import (
     worst_status,
 )
 from ai_eda.review.areas import ReviewArea
+from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters
 from ai_eda.tools.kicad.board import BoardFootprint, read_board_footprints
 from ai_eda.tools.kicad.geometry import normalize_angle
 from ai_eda.tools.manufacturing.outputs import OUTPUT_CHECKS
+from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK_ID, read_results
 
 Check = Callable[[CircuitIR, Path], ValidationResult]
 
@@ -88,7 +116,7 @@ class IndependentReviewer:
             ReviewArea.PCB_VS_CPL: self.check_pcb_vs_cpl,
             ReviewArea.MANUFACTURING_OUTPUTS: self.check_manufacturing_outputs,
             ReviewArea.CALCULATIONS_VS_DESIGN: self.check_calculations_vs_design,
-            ReviewArea.SPICE_VS_REQUIREMENTS: self._tool_result_present("spice", ArtifactKind.SPICE_RESULT),
+            ReviewArea.SPICE_VS_REQUIREMENTS: self.check_spice_vs_requirements,
             ReviewArea.ERC: self._tool_result_fresh("kicad.erc", ArtifactKind.SCHEMATIC),
             ReviewArea.DRC: self._tool_result_fresh("kicad.drc", ArtifactKind.PCB),
             ReviewArea.REGULATORY_PROVENANCE: self.check_regulatory_provenance,
@@ -388,8 +416,139 @@ class IndependentReviewer:
             return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="CPL and board disagree", details={"mismatches": mismatches, "repair": "human"}, evidence=evidence)
         return ValidationResult(check_id="", status=ValidationStatus.PASS, message=f"{len(rows)} CPL rows match the board's footprints (position, rotation, side)", evidence=evidence)
 
+    def check_spice_vs_requirements(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
+        """Every expectation of the simulation setup must have passed in a run of the *current* netlist (see the module docstring)."""
+        setup = ir.simulation
+        if setup is None:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no simulation setup in the IR")
+        netlist = ir.artifacts.get(ArtifactKind.SPICE_NETLIST)
+        if netlist is None:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no SPICE netlist artifact (the SPICE stage has not compiled one)")
+        problem = self._stale_or_changed(ir, ArtifactKind.SPICE_NETLIST, netlist)
+        if problem is not None:
+            return problem
+        spice = ir.validation.latest(SPICE_CHECK_ID)
+        results = ir.artifacts.get(ArtifactKind.SPICE_RESULT)
+        if spice is None or not spice.is_tool_backed or results is None:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="spice has not been run on this netlist")
+        rerun = {"tool_check": SPICE_CHECK_ID, "repair": "rerun_tool"}
+        evidence = [self._evidence("spice_netlist", netlist), self._evidence("spice results.json", results)]
+        if results.is_stale(ir.content_hash()):
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="spice results were produced for a different IR version", details=rerun, evidence=evidence)
+        if not results.matches_disk():
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="spice results.json on disk does not match its recorded hash", details=rerun, evidence=evidence)
+        if spice.artifact_hash != netlist.content_hash:
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="the latest spice result ran on a different netlist than the current artifact", details=rerun, evidence=evidence)
+        try:
+            data = read_results(results.path)
+        except ValueError as e:
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"spice results.json is not in the current layout ({e}); re-run", details=rerun, evidence=evidence)
+        if data.get("netlist_hash") != netlist.content_hash:
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="results.json names a different netlist hash than the current artifact", details=rerun, evidence=evidence)
+        evidence += [e for e in spice.evidence if e.path not in {x.path for x in evidence}]
+        requirements = {r.id: r for r in ir.requirements.requirements}
+        failed: list[str] = []
+        missing: list[str] = []
+        not_passed: list[tuple[ValidationStatus, str]] = []
+        unknown_req: list[str] = []
+        untraced: list[str] = []
+        not_compared: list[str] = []
+        disagree: list[str] = []
+        verified: dict[str, str | None] = {}
+        for exp in setup.expectations:
+            r = ir.validation.latest(f"{SPICE_CHECK_ID}.{exp.id}")
+            if r is None or r.artifact_hash != netlist.content_hash:
+                missing.append(exp.id)
+            elif r.status is ValidationStatus.FAIL:
+                failed.append(f"{exp.id}: {r.message}")
+            elif r.status is not ValidationStatus.PASS:
+                not_passed.append((r.status, f"{exp.id}: {r.status} ({r.message})"))
+            else:
+                verified[exp.id] = exp.requirement_id
+            if exp.requirement_id is None:
+                untraced.append(exp.id)
+            elif exp.requirement_id not in requirements:
+                unknown_req.append(f"{exp.id} -> {exp.requirement_id}")
+            else:
+                problem, comparable = self._nominal_vs_requirement(exp, requirements[exp.requirement_id])
+                if problem is not None and comparable:
+                    disagree.append(f"{exp.id}: {problem}")
+                elif problem is not None:
+                    not_compared.append(f"{exp.id}: {problem}")
+        assumptions = list(spice.details.get("assumptions") or [])
+        details: dict = {
+            "verified": verified, "untraced": untraced, "not_compared": not_compared, "assumptions": assumptions,
+            "conditions": spice.details.get("conditions"), "engine": data.get("engine"), "engine_version": data.get("engine_version"),
+            "netlist_hash": netlist.content_hash,
+        }
+        if spice.status is ValidationStatus.FAIL and not failed:
+            failed.append(f"spice: {spice.message}")
+        if failed or missing or unknown_req or disagree:
+            details.update({"repair": "human", "failed": failed, "no_result": missing, "unknown_requirements": unknown_req, "nominal_vs_requirement": disagree})
+            parts = []
+            if failed:
+                parts.append(f"{len(failed)} expectation(s) failed")
+            if missing:
+                parts.append(f"no result from this run for {missing}")
+            if unknown_req:
+                parts.append(f"expectation(s) name unknown requirements {unknown_req}")
+            if disagree:
+                parts.append(f"{len(disagree)} expectation nominal(s) are not the requirement they claim to verify: {disagree}")
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="; ".join(parts), details=details, evidence=evidence)
+        if not_passed:
+            details["not_passed"] = [m for _, m in not_passed]
+            return ValidationResult(check_id="", status=worst_status(s for s, _ in not_passed), message="; ".join(m for _, m in not_passed), details=details, evidence=evidence)
+        if not setup.expectations or spice.status is not ValidationStatus.PASS:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"spice ran but verified nothing: {spice.message}", details=details, evidence=evidence)
+        if assumptions:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"the simulated netlist rests on unconfirmed assumption(s) {assumptions}: not evidence", details=details, evidence=evidence)
+        if not_compared:
+            return ValidationResult(
+                check_id="", status=ValidationStatus.NOT_VERIFIED,
+                message=f"{len(verified)} expectation(s) passed, but {len(not_compared)} are traced to requirements without a comparable value: {not_compared}",
+                details=details, evidence=evidence,
+            )
+        traced = sum(1 for v in verified.values() if v is not None)
+        return ValidationResult(
+            check_id="",
+            status=ValidationStatus.PASS,
+            message=(
+                f"{len(verified)} expectation(s) verified by {data.get('engine')} {data.get('engine_version')} on the current netlist "
+                f"({traced} traced to requirements, nominals agree with the requirement values) - at nominal component values and one temperature only"
+            ),
+            details=details,
+            evidence=evidence,
+        )
+
+    @staticmethod
+    def _nominal_vs_requirement(exp, req) -> tuple[str | None, bool]:
+        """``(problem, comparable)``: whether ``exp.nominal`` is the value ``req`` asks for.
+
+        ``(None, True)`` when they agree within the expectation's tolerance;
+        ``(why, True)`` when both are numbers in the same unit and disagree;
+        ``(why, False)`` when the requirement has no numeric value or another
+        unit, so nothing can be compared.
+        """
+        value = req.value
+        if value is None:
+            return f"requirement {req.id} has no value to compare the nominal with", False
+        if isinstance(value.value, bool) or not isinstance(value.value, (int, float)):
+            return f"requirement {req.id} value {value.value!r} is not a number", False
+        unit_e, unit_r = (exp.nominal.unit or "").strip().lower(), (value.unit or "").strip().lower()
+        if unit_e and unit_r and unit_e != unit_r:
+            return f"nominal unit {exp.nominal.unit!r} is not the requirement's {value.unit!r}", False
+        nominal, target = float(exp.nominal.value), float(value.value)
+        limits = [abs(float(exp.tol_abs.value))] if exp.tol_abs is not None else []
+        if exp.tol_rel is not None and target != 0.0:
+            limits.append(abs(float(exp.tol_rel.value)) * abs(target))
+        limit = max(limits) if limits else 1e-9 * max(1.0, abs(target))
+        if abs(nominal - target) <= limit:
+            return None, True
+        unit = f" {value.unit}" if value.unit else ""
+        return f"nominal {nominal:.6g}{unit} is not requirement {req.id}'s {target:.6g}{unit} (+/- {limit:.3g}{unit})", True
+
     def check_calculations_vs_design(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
-        """Every derived parameter must name a tool and inputs that exist in the IR."""
+        """Every derived value must name a tool and inputs that exist, and the reviewer's own recompute must agree with it."""
         broken: list[str] = []
         for key, t in ir.parameters.items():
             p = t.provenance
@@ -401,9 +560,25 @@ class IndependentReviewer:
                         broken.append(f"{key}: input '{src}' not found in IR")
         if broken:
             return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="calculation provenance broken", details={"broken": broken, "repair": "human"})
-        if not any(t.provenance.kind == ProvenanceKind.DERIVED for t in ir.parameters.values()):
-            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no derived parameters to check")
-        return ValidationResult(check_id="", status=ValidationStatus.PASS)
+        live = recompute_parameters(ir)  # the reviewer's own second opinion, from the same deterministic calculators
+        stored = ir.validation.latest(CALC_CHECK_ID)
+        details: dict = {
+            "recompute": {"status": live.status.value, "mismatches": live.details.get("mismatches", []), "unverified": live.details.get("unverified", []), "parameters": live.details.get("parameters", {})},
+            "stage_result": None if stored is None else {"status": stored.status.value, "ir_hash": stored.ir_hash, "current": stored.ir_hash == ir.content_hash(), "tool": stored.tool},
+        }
+        if live.status is ValidationStatus.FAIL:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"recompute: {live.message}", details=details)
+        if stored is not None and stored.is_tool_backed and stored.ir_hash == ir.content_hash() and stored.status is not live.status:
+            details["repair"] = "human"
+            return ValidationResult(
+                check_id="", status=ValidationStatus.FAIL,
+                message=f"the stored {CALC_CHECK_ID} result says {stored.status.value} for this IR, the reviewer's recompute says {live.status.value}: {live.message}",
+                details=details,
+            )
+        if live.status is not ValidationStatus.PASS:
+            return ValidationResult(check_id="", status=live.status, message=f"recompute: {live.message}", details=details)
+        return ValidationResult(check_id="", status=ValidationStatus.PASS, message=f"recompute: {live.message} (agrees with the stored values)", details=details)
 
     def check_regulatory_provenance(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
         reg = ir.regulatory

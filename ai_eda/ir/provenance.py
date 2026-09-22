@@ -55,13 +55,18 @@ class SourceRef(BaseModel):
 class Provenance(BaseModel):
     kind: ProvenanceKind
     source: SourceRef | None = None
-    #: ids / keys of the traced values this one was derived from
+    #: ids / keys of the traced values this one was derived from (in the calculator's parameter order)
     derived_from: list[str] = Field(default_factory=list)
+    #: calculator role -> id, written by the calculator itself (``{"v_in": "v_in", "r1": "r1", "r2": "r2"}``);
+    #: :func:`ai_eda.tools.calc.recompute_parameters` rebuilds the call from these roles instead of trusting
+    #: the positional order of ``derived_from``. Empty for a value nobody recorded roles for.
+    inputs: dict[str, str] = Field(default_factory=dict)
     #: deterministic tool that produced a derived value (e.g. "calc.voltage_divider", "ngspice")
     tool: str | None = None
     tool_version: str | None = None
     #: free-form rationale; for assumptions this is what the user must confirm
     note: str | None = None
+    #: wall-clock bookkeeping; excluded from :meth:`ai_eda.ir.CircuitIR.content_hash` (it is not design content)
     created_at: datetime = Field(default_factory=_now)
 
     @property
@@ -114,11 +119,25 @@ def assumption(value: T, note: str, unit: str | None = None) -> Traced[T]:
 def derived(
     value: T,
     tool: str,
-    derived_from: list[str],
+    derived_from: list[str] | None = None,
     unit: str | None = None,
     tool_version: str | None = None,
     note: str | None = None,
+    inputs: dict[str, str] | None = None,
 ) -> Traced[T]:
+    """A value computed by ``tool``.
+
+    ``inputs`` maps the tool's input roles to the ids that filled them
+    (``{"v_in": "v_in", "r1": "r1", "r2": "r2"}``); ``derived_from`` then
+    defaults to those ids in role order. Giving both is allowed only when
+    they agree (``ValueError`` otherwise), so a provenance can never name one
+    input list and another role mapping.
+    """
+    inputs = dict(inputs or {})
+    if derived_from is None:
+        derived_from = list(inputs.values())
+    elif inputs and list(inputs.values()) != list(derived_from):
+        raise ValueError(f"derived_from {list(derived_from)} and inputs {inputs} name different ids")
     return Traced(
         value=value,
         unit=unit,
@@ -126,7 +145,8 @@ def derived(
             kind=ProvenanceKind.DERIVED,
             tool=tool,
             tool_version=tool_version,
-            derived_from=derived_from,
+            derived_from=list(derived_from),
+            inputs=inputs,
             note=note,
         ),
     )
