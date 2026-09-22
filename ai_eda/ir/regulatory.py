@@ -22,7 +22,8 @@ from ai_eda.ir.validation import ValidationStatus
 class Jurisdiction(BaseModel):
     code: str  # "EU", "US", "KR", "JP", ...
     name: str
-    #: how we know this applies: always user supplied
+    #: how we know this applies: the user typed it, or confirmed an extraction that quoted it. ``False`` only
+    #: for a grounded LLM extraction the user has not confirmed yet - such an entry is not "known"
     provided_by_user: bool = True
 
 
@@ -57,4 +58,5 @@ class RegulatoryState(BaseModel):
 
     @property
     def jurisdiction_known(self) -> bool:
-        return bool(self.jurisdictions)
+        """At least one jurisdiction the user supplied or confirmed; an unconfirmed extraction does not count."""
+        return any(j.provided_by_user for j in self.jurisdictions)

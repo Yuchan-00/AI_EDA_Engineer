@@ -26,6 +26,9 @@ IR_SCHEMA_VERSION = "0.1"
 
 #: project bookkeeping that says where / when the IR was built, not what it designs (not hashed)
 NON_DESIGN_PROJECT_FIELDS: tuple[str, ...] = ("workdir", "created_at")
+#: requirement bookkeeping that memoises what a model *said* (``RequirementSet.extraction_cache``), not what
+#: the user asked for or what entered ``requirements`` (not hashed; ``corrections`` are the user's words and stay)
+NON_DESIGN_REQUIREMENT_FIELDS: tuple[str, ...] = ("extraction_cache",)
 #: wall-clock keys stripped from every nested object before hashing (``Provenance.created_at`` defaults to
 #: *now*, so two identical designs built a millisecond apart would otherwise never share a hash)
 WALL_CLOCK_KEYS: frozenset[str] = frozenset({"created_at"})
@@ -169,15 +172,18 @@ class CircuitIR(BaseModel):
 
         Excludes ``validation`` / ``artifacts`` (state about the design),
         ``project.workdir`` / ``project.created_at`` (where and when it was
-        built) and every ``created_at`` timestamp, so the same design built
-        twice - in another folder, at another time, or loaded from disk -
-        hashes the same. ``SourceRef.retrieved_at`` stays: which retrieval
-        of a datasheet was used is design provenance, and it is never filled
-        in by a clock default.
+        built), ``requirements.extraction_cache`` (what a model said, not
+        what the design is) and every ``created_at`` timestamp, so the same
+        design built twice - in another folder, at another time, or loaded
+        from disk - hashes the same. ``SourceRef.retrieved_at`` stays: which
+        retrieval of a datasheet was used is design provenance, and it is
+        never filled in by a clock default.
         """
         data = self.model_dump(mode="json", exclude=set(self._NON_DESIGN_FIELDS))
         for key in NON_DESIGN_PROJECT_FIELDS:
             data["project"].pop(key, None)
+        for key in NON_DESIGN_REQUIREMENT_FIELDS:
+            data["requirements"].pop(key, None)
         return strip_wall_clock(data)
 
     def content_hash(self) -> str:

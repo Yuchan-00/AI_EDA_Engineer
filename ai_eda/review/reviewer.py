@@ -214,6 +214,15 @@ class IndependentReviewer:
     # --- specific checks ----------------------------------------------------------
 
     def check_requirements_vs_ir(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
+        """Every *authoritative* design requirement is served by a component or net.
+
+        A requirement whose value still needs verification (``llm_generated``
+        - a model's implicit inference the user has not accepted - or an
+        ``assumption``) is neither enforced nor satisfiable here: it does not
+        FAIL the design when unserved, and a component that lists it in
+        ``serves_requirements`` does not make anything PASS. While any such
+        requirement exists the verdict is NOT_VERIFIED, naming them.
+        """
         reqs = ir.requirements
         if not reqs.can_proceed:
             return ValidationResult(check_id="", status=ValidationStatus.USER_INPUT_REQUIRED, message=f"{len(reqs.blocking_questions)} open question(s), {len(reqs.conflicts)} conflict(s)")
@@ -224,9 +233,20 @@ class IndependentReviewer:
         # Only design-level requirements must map to components / nets; application / regulatory
         # requirements are covered by the regulatory and manufacturing checks.
         design_categories = {"electrical", "thermal", "mechanical", "signal_integrity", "power_integrity", "rf"}
-        unserved = [r.id for r in reqs.requirements if r.category in design_categories and r.id not in served]
+        unverified = [r.id for r in reqs.requirements if r.value is not None and r.value.provenance.needs_verification]
+        authoritative = [r for r in reqs.requirements if r.id not in set(unverified)]
+        unserved = [r.id for r in authoritative if r.category in design_categories and r.id not in served]
         if unserved:
-            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="requirements not traced to any component", details={"unserved": unserved, "repair": "human"})
+            return ValidationResult(
+                check_id="", status=ValidationStatus.FAIL, message="requirements not traced to any component",
+                details={"unserved": unserved, "unverified": unverified, "repair": "human"},
+            )
+        if unverified:
+            return ValidationResult(
+                check_id="", status=ValidationStatus.NOT_VERIFIED,
+                message=f"{len(unverified)} model-inferred / assumed requirement(s) not yet accepted by the user; they are neither enforced nor counted as served",
+                details={"unverified": unverified, "served_but_unverified": sorted(set(unverified) & served)},
+            )
         return ValidationResult(check_id="", status=ValidationStatus.PASS)
 
     def check_schematic_vs_pcb(self, ir: CircuitIR, workdir: Path) -> ValidationResult:

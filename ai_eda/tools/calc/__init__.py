@@ -10,6 +10,8 @@ it writes) to the callable and the order of its inputs, so
 
 :mod:`ai_eda.tools.calc.si` parses and formats SPICE numbers with ngspice's
 scale-factor semantics (``m`` = milli, ``meg`` = mega).
+:mod:`ai_eda.tools.calc.quantity` reads engineering quantities from
+requirement text (``M`` = mega, units required, never guessed).
 """
 
 from ai_eda.tools.calc.basic import (
@@ -26,6 +28,18 @@ from ai_eda.tools.calc.basic import (
     rc_time_constant,
     voltage_divider_output,
     voltage_divider_ratio,
+)
+from ai_eda.tools.calc.quantity import (
+    PREFIX_EXPONENTS,
+    PREFIXABLE_UNITS,
+    QUANTITY_VERSION,
+    UNITS,
+    Quantity,
+    QuantityRange,
+    find_quantities,
+    format_quantity,
+    parse_quantity,
+    parse_unit,
 )
 from ai_eda.tools.calc.recompute import CALCULATORS, derived_values, recompute_parameters
 from ai_eda.tools.calc.si import (
@@ -46,17 +60,27 @@ __all__ = [
     "MIL_FACTOR",
     "NGSPICE_EXACT_MANTISSA",
     "NGSPICE_EXPONENT_RANGE",
+    "PREFIXABLE_UNITS",
+    "PREFIX_EXPONENTS",
+    "QUANTITY_VERSION",
+    "Quantity",
+    "QuantityRange",
     "ROLES",
     "ROLE_UNITS",
     "SI_VERSION",
     "SPICE_SCALE_EXPONENTS",
+    "UNITS",
     "current_from_voltage_resistance",
     "derived_values",
+    "find_quantities",
+    "format_quantity",
     "format_spice_number",
     "led_series_resistor",
     "ngspice_reads",
     "parallel_resistance",
+    "parse_quantity",
     "parse_spice_number",
+    "parse_unit",
     "power_from_voltage_current",
     "rc_lowpass_magnitude",
     "rc_lowpass_phase_deg",

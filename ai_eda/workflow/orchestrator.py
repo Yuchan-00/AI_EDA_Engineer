@@ -230,7 +230,13 @@ class Orchestrator:
         results = default_registry.run(ir, ValidationContext(workdir=ctx.workdir, tools=ctx.tools))
         ir.validation.extend(results)
         status = worst_status(r.status for r in results)
-        return StageOutcome(stage=Stage.IR_BUILD, status=status, message=f"{len(results)} validator result(s)")
+        # a validator that needs the user (assumptions, undecided model-inferred requirements) is shown as a
+        # question keyed by its check id, so the CLI lists what to answer instead of a bare BLOCKED
+        questions = [
+            MissingInformation(key=r.check_id, question=r.message, rationale=r.check_id)
+            for r in results if r.status == ValidationStatus.USER_INPUT_REQUIRED
+        ]
+        return StageOutcome(stage=Stage.IR_BUILD, status=status, message=f"{len(results)} validator result(s)", questions=questions)
 
     @staticmethod
     def _compile(ir: CircuitIR, ctx: AgentContext, kind: ArtifactKind) -> tuple[ValidationStatus, str]:

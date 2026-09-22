@@ -144,5 +144,33 @@ class AssumptionsSurfacedValidator(Validator):
         return [ValidationResult(check_id=self.id, status=ValidationStatus.PASS, tool=self.id)]
 
 
-for _v in (ConnectivityValidator(), ComponentProvenanceValidator(), AssumptionsSurfacedValidator()):
+class LLMRequirementsValidator(Validator):
+    id = "ir.llm_requirements"
+    description = "Every requirement a model inferred or extracted and the user has not decided on is listed; nothing downstream may rely on it"
+
+    def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
+        from ai_eda.llm.extraction import ACCEPT_KEY, CONFIRM_KEY, REJECT_KEY
+
+        pending: list[dict[str, str]] = []
+        for r in ir.requirements.requirements:
+            if r.value is not None and r.value.provenance.kind == ProvenanceKind.LLM_GENERATED:
+                pending.append({"key": r.key, "id": r.id, "kind": str(r.kind), "note": r.value.provenance.note or "(no rationale)"})
+        if pending:
+            keys = ", ".join(p["key"] for p in pending)
+            return [
+                ValidationResult(
+                    check_id=self.id,
+                    status=ValidationStatus.USER_INPUT_REQUIRED,
+                    message=(
+                        f"{len(pending)} model-inferred requirement(s) not yet accepted ({keys}): decide with "
+                        f"--answer {ACCEPT_KEY}=<keys> / --answer {REJECT_KEY}=<keys>, or correct the extraction via {CONFIRM_KEY}"
+                    ),
+                    tool=self.id,
+                    details={"pending": pending, "accept_key": ACCEPT_KEY, "reject_key": REJECT_KEY},
+                )
+            ]
+        return [ValidationResult(check_id=self.id, status=ValidationStatus.PASS, tool=self.id)]
+
+
+for _v in (ConnectivityValidator(), ComponentProvenanceValidator(), AssumptionsSurfacedValidator(), LLMRequirementsValidator()):
     default_registry.register(_v)

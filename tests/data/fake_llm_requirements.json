@@ -1,0 +1,31 @@
+{
+  "note": "Offline demo script for `ai-eda run IR.json --llm fake:tests/data/fake_llm_requirements.json --llm-budget-usd 0`. It replays one canned RequirementExtraction (what a model would return) for the request below; the pipeline grounds every item deterministically, asks for confirmation, and only `--answer confirm_requirements=yes` makes the explicit items user requirements. The scripted client costs nothing, which is why usage states cost 0.0 (a real provider's cost is reported, never assumed).",
+  "request": "12V 입력을 5V 2A로 변환하는 회로, 효율 90% 이상, EU에서 판매",
+  "responses": [
+    {
+      "model": "scripted/requirements-demo",
+      "usage": {"prompt_tokens": 812, "completion_tokens": 274, "cost_usd": 0.0},
+      "structured": {
+        "requirements": [
+          {"key": "input_voltage", "text": "Input voltage is 12 V", "kind": "explicit", "category": "electrical",
+           "quote": "12V 입력", "value": {"quote": "12V", "number": 12, "unit": "V", "number_high": null}, "rationale": null},
+          {"key": "output_voltage", "text": "Output voltage is 5 V", "kind": "explicit", "category": "electrical",
+           "quote": "5V 2A로 변환", "value": {"quote": "5V", "number": 5, "unit": "V", "number_high": null}, "rationale": null},
+          {"key": "output_current", "text": "Output current is 2 A", "kind": "explicit", "category": "electrical",
+           "quote": "5V 2A로 변환", "value": {"quote": "2A", "number": 2, "unit": "A", "number_high": null}, "rationale": null},
+          {"key": "efficiency", "text": "Efficiency at least 90 %", "kind": "explicit", "category": "electrical",
+           "quote": "효율 90% 이상", "value": {"quote": "90%", "number": 90, "unit": "%", "number_high": null}, "rationale": null},
+          {"key": "input_reverse_polarity_protection", "text": "Reverse-polarity protection on the 12 V input", "kind": "implicit",
+           "category": "safety", "quote": null, "value": null, "rationale": "a 12 V supply input is usually user-connected"}
+        ],
+        "questions": [
+          {"key": "operating_temperature", "question": "What ambient temperature range must it work in?", "required": false, "options": [], "rationale": "affects derating"}
+        ],
+        "conflicts": [],
+        "assumptions": [],
+        "application": {"summary": "12 V to 5 V / 2 A power converter", "quote": "12V 입력을 5V 2A로 변환하는 회로"},
+        "jurisdictions": [{"code": "EU", "quote": "EU에서 판매"}]
+      }
+    }
+  ]
+}

@@ -7,15 +7,18 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ai_eda.ir import CircuitIR, MissingInformation, ValidationResult
-from ai_eda.llm.client import LLMClient
 from ai_eda.llm.router import ModelRouter, TaskKind
+from ai_eda.llm.service import LLMService
 from ai_eda.llm.usage import UsageTracker
 
 
 class AgentContext(BaseModel):
     workdir: Path
-    llm: LLMClient | None = None
+    #: the budgeted, approved model service (``None``: agents use their deterministic behaviour only)
+    llm: LLMService | None = None
+    #: kept for callers that pass a router; the service carries its own (``ctx.llm.router``)
     router: ModelRouter | None = None
+    #: usage accounting for the run; when ``llm`` is set its tracker is the one that counts (``ctx.llm.usage``)
     usage: UsageTracker = Field(default_factory=UsageTracker)
     #: deterministic tool handles: kicad_cli, kicad_library, spice, ...
     tools: dict[str, Any] = Field(default_factory=dict)
