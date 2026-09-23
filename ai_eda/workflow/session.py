@@ -51,7 +51,10 @@ def parse_key_urls(items: Iterable[str] | None, flag: str) -> dict[str, str]:
         key, url = item.split("=", 1)
         if not key.strip() or not url.strip():
             raise SessionError(f"{flag} expects KEY=URL with a non-empty key and URL, got {item!r}")
-        out[key.strip()] = url.strip()
+        key, url = key.strip(), url.strip()
+        if key in out and out[key] != url:
+            raise SessionError(f"{flag} names {key!r} twice with different URLs ({out[key]!r} and {url!r}); an exact URL can only be one")
+        out[key] = url
     return out
 
 

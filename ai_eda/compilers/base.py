@@ -1,12 +1,32 @@
 from __future__ import annotations
 
+import math
+
 import hashlib
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from ai_eda.errors import CompileError
 from pydantic import BaseModel, Field
 
 from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR
+
+
+def check_finite(data, where: str) -> None:
+    """:class:`~ai_eda.errors.CompileError` when any float in ``data`` (JSON-able) is NaN / infinite, naming its path.
+
+    A NaN placement would write ``(at nan 6)`` - a file KiCad cannot load - or
+    ``nanmm`` into a CPL sent to a fab; an infinite angle crashes the angle
+    normalisation. Nothing is guessed: the item is named and refused.
+    """
+    if isinstance(data, dict):
+        for k, v in data.items():
+            check_finite(v, f"{where}.{k}")
+    elif isinstance(data, (list, tuple)):
+        for i, v in enumerate(data):
+            check_finite(v, f"{where}[{i}]")
+    elif isinstance(data, float) and not math.isfinite(data):
+        raise CompileError(f"{where} is {data!r}: not a finite number")
 
 
 class CompileContext(BaseModel):

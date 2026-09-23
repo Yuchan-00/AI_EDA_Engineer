@@ -213,6 +213,9 @@ class IndependentReviewer:
             art = ir.artifacts.get(on_kind)
             if res is None or art is None:
                 return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{check_id} has not been run")
+            if not res.is_tool_backed or not res.artifact_hash or not art.content_hash:
+                # a result nobody's tool produced, or one that does not say which file it ran on, is an opinion
+                return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{check_id} result is not tool-backed evidence about the current {on_kind} (no tool or no artifact hash)")
             if res.artifact_hash != art.content_hash:
                 return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"{check_id} report is stale (ran on a different {on_kind})", details={"tool_check": check_id, "repair": "rerun_tool"})
             details: dict = {}
@@ -231,6 +234,8 @@ class IndependentReviewer:
             res = ir.validation.latest(check_id)
             if res is None:
                 return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"no {check_id} result")
+            if not res.is_tool_backed:
+                return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{check_id} result carries no tool: an opinion, not evidence")
             return ValidationResult(check_id="", status=res.status, message=res.message)
         return check
 
@@ -273,7 +278,12 @@ class IndependentReviewer:
                 message=f"{len(unverified)} model-inferred / assumed requirement(s) not yet accepted by the user; they are neither enforced nor counted as served",
                 details={"unverified": unverified, "served_but_unverified": sorted(set(unverified) & served)},
             )
-        return ValidationResult(check_id="", status=ValidationStatus.PASS)
+        traced = [r.id for r in authoritative if r.category in design_categories]
+        if not traced:
+            # nothing to trace is not a traced design: an IR with no design requirement (or no component / net) proves nothing here
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no design-level requirement to trace to a component or net",
+                                    details={"categories": sorted({r.category for r in authoritative})})
+        return ValidationResult(check_id="", status=ValidationStatus.PASS, message=f"{len(traced)} design requirement(s) traced to components / nets", details={"traced": traced})
 
     def check_schematic_vs_pcb(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
         """Schematic <-> PCB consistency from the real ``kicad-cli pcb drc --schematic-parity`` evidence.
@@ -290,6 +300,8 @@ class IndependentReviewer:
         drc = ir.validation.latest("kicad.drc")
         if drc is None:
             return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="kicad.drc has not been run")
+        if not drc.is_tool_backed or not drc.artifact_hash or not pcb.content_hash:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="kicad.drc result is not tool-backed evidence about the current board (no tool or no artifact hash)")
         if drc.artifact_hash != pcb.content_hash:
             return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="kicad.drc ran on a different board than the current PCB artifact", details={"tool_check": "kicad.drc", "repair": "rerun_tool"})
         if not drc.details.get("schematic_parity_checked"):

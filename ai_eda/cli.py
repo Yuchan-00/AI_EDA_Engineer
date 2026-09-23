@@ -113,7 +113,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_new(args: argparse.Namespace) -> int:
     from ai_eda.ir import CircuitIR, ProjectMeta
 
-    workdir = Path(args.dir or f"projects/{args.name}")
+    # recorded absolute: a relative workdir would be resolved against whatever directory a later `run` / `review`
+    # is started from, and the artifacts, the archive and the parts cache would land away from ir.json
+    workdir = Path(args.dir or f"projects/{args.name}").resolve()
     ir = CircuitIR(project=ProjectMeta(id=args.name, name=args.name, workdir=str(workdir)))
     ir.requirements.raw_input = args.request or ""
     path = ir.save(workdir / "ir.json")

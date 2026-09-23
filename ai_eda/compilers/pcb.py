@@ -79,7 +79,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ai_eda.compilers import ids
-from ai_eda.compilers.base import CompileContext, Compiler
+from ai_eda.compilers.base import CompileContext, Compiler, check_finite
 from ai_eda.compilers.pins import load_verified_symbol, pad_pin_types
 from ai_eda.errors import CompileError, NothingToCompileError
 from ai_eda.ir import ArtifactKind, ArtifactRef, BoardSide, CircuitIR, Component, Placement, Track, Via, Zone
@@ -256,6 +256,8 @@ class PCBCompiler(Compiler):
     kind = ArtifactKind.PCB
 
     def compile(self, ir: CircuitIR, ctx: CompileContext) -> ArtifactRef:
+        if ir.pcb is not None:
+            check_finite(ir.pcb.model_dump(mode="json"), "ir.pcb")
         node = self.build(ir, ctx)
         path = Path(ctx.workdir) / f"{ir.project.id}.kicad_pcb"
         return self._write(ir, path, sexpr.dumps(node))
@@ -596,8 +598,14 @@ class PCBCompiler(Compiler):
             if h in _FP_GRAPHIC_HEADS:
                 node.append(cls._graphic(project_id, comp.ref, gfx_index, child, placement))
                 gfx_index += 1
+        seen_numbers: dict[str, int] = {}
         for child in sexpr.find_all(lib, "pad"):
-            node.append(cls._pad(project_id, comp, placement, child, p.pad_nets, p.pin_types))
+            # a footprint may repeat a pad number (thermal vias on an exposed pad, unnumbered mounting holes): every
+            # pad still gets its own id, the first occurrence keeping the plain key so existing boards do not change
+            number = str(child[1])
+            seen_numbers[number] = seen_numbers.get(number, 0) + 1
+            key = number if seen_numbers[number] == 1 else f"{number}#{seen_numbers[number]}"
+            node.append(cls._pad(project_id, comp, placement, child, p.pad_nets, p.pin_types, uuid_key=key))
         fonts = sexpr.find(lib, "embedded_fonts")
         if fonts is not None:
             node.append(sexpr.deep_copy(fonts))
@@ -667,7 +675,8 @@ class PCBCompiler(Compiler):
 
     @classmethod
     def _pad(
-        cls, project_id: str, comp: Component, placement: Placement, lib_pad: list, pad_nets: dict[str, str], pin_types: dict[str, str]
+        cls, project_id: str, comp: Component, placement: Placement, lib_pad: list, pad_nets: dict[str, str], pin_types: dict[str, str],
+        uuid_key: str | None = None,
     ) -> list:
         node = sexpr.deep_copy(lib_pad)
         number = str(node[1])
@@ -700,7 +709,7 @@ class PCBCompiler(Compiler):
         existing_uuid = sexpr.find(node, "uuid")
         if existing_uuid is not None:
             node.remove(existing_uuid)
-        node.append(S("uuid", Q(ids.pad_uuid(project_id, comp.ref, number))))
+        node.append(S("uuid", Q(ids.pad_uuid(project_id, comp.ref, uuid_key or number))))
         return node
 
     # --- node surgery ----------------------------------------------------------------

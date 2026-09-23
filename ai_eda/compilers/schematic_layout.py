@@ -147,8 +147,13 @@ _REF_SPLIT = re.compile(r"(\d+)")
 
 
 def natural_ref_key(ref: str) -> tuple:
-    """Sort key so that ``R2 < R10`` and ``J1 < R1``: alternating text / integer chunks."""
-    return tuple(int(part) if part.isdigit() else part for part in _REF_SPLIT.split(ref) if part)
+    """Sort key so that ``R2 < R10`` and ``J1 < R1``: alternating text / integer chunks.
+
+    Every chunk is a ``(0, int)`` or ``(1, str)`` pair, so a list that mixes
+    numeric and alphabetic pin numbers (``1``, ``2``, ``CD``, ``SH``, ``A1``)
+    sorts instead of raising ``TypeError``.
+    """
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in _REF_SPLIT.split(ref) if part)
 
 
 def grid_positions(

@@ -38,8 +38,9 @@ import io
 
 from ai_eda.errors import CompileError
 from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, ProvenanceKind, Traced
-from ai_eda.compilers.base import CompileContext, Compiler
+from ai_eda.compilers.base import CompileContext, Compiler, check_finite
 from ai_eda.parts.catalog import unsafe_cell
+from ai_eda.tools.kicad import sexpr
 
 NOT_VERIFIED = "NOT_VERIFIED"
 
@@ -113,5 +114,8 @@ class CPLCompiler(Compiler):
         w.writerow(self.COLUMNS)
         if ir.pcb is not None:
             for p in sorted(ir.pcb.placements, key=lambda p: p.component_ref):
-                w.writerow([_plain(p.component_ref, "Designator"), f"{p.x_mm:.4f}mm", f"{p.y_mm:.4f}mm", f"{p.rotation_deg:g}", p.side.value.capitalize()])
+                check_finite(p.model_dump(mode="json"), f"placement {p.component_ref}")
+                # the rotation is written exactly as the board writer writes it (fixed decimals, no exponent, never -0),
+                # so the reviewer's CPL-vs-board comparison never sees a formatting difference
+                w.writerow([_plain(p.component_ref, "Designator"), f"{p.x_mm:.4f}mm", f"{p.y_mm:.4f}mm", sexpr.fmt_num(float(p.rotation_deg)), p.side.value.capitalize()])
         return self._write(ir, ctx.workdir / "cpl.csv", buf.getvalue())

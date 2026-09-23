@@ -196,6 +196,9 @@ class Orchestrator:
         content) and raises when nothing matched: a removal that silently did
         nothing is worse than one that fails.
         """
+        # two phases: every proposal is resolved and validated first, then all are applied - a set of proposals
+        # is one logical change, and a bad one must not leave the first half applied (and the hash moved)
+        plan: list[Callable[[], None]] = []
         for p in proposals:
             obj: Any = ir
             parts = p.target.split(".")
@@ -216,23 +219,25 @@ class Orchestrator:
             if p.operation == "append":
                 seq = _sequence(obj, leaf, where)
                 item_type = get_args(annotation)[0] if get_origin(annotation) is list and get_args(annotation) else Any
-                seq.append(_validated(item_type, p.payload, where))
+                item = _validated(item_type, p.payload, where)
+                plan.append(lambda seq=seq, item=item: seq.append(item))
             elif p.operation == "set":
                 value = _validated(value_type, p.payload, where)
                 if isinstance(obj, dict):
-                    obj[leaf] = value
+                    plan.append(lambda obj=obj, leaf=leaf, value=value: obj.__setitem__(leaf, value))
                 else:
-                    setattr(obj, leaf, value)
+                    plan.append(lambda obj=obj, leaf=leaf, value=value: setattr(obj, leaf, value))
             elif p.operation == "remove":
                 seq = _sequence(obj, leaf, where)
                 item_type = get_args(annotation)[0] if get_origin(annotation) is list and get_args(annotation) else Any
                 wanted = _design_view(_validated(item_type, p.payload, where))
-                kept = [x for x in seq if _design_view(x) != wanted]
-                if len(kept) == len(seq):
+                if not any(_design_view(x) == wanted for x in seq):
                     raise ValueError(f"{where}: nothing in {p.target} matches the payload; the removal would have been silent")
-                seq[:] = kept
+                plan.append(lambda seq=seq, wanted=wanted: seq.__setitem__(slice(None), [x for x in seq if _design_view(x) != wanted]))
             else:
                 raise ValueError(f"unknown proposal operation {p.operation!r}")
+        for step in plan:
+            step()
 
     def _agent_stage(self, agent) -> StageFn:
         def fn(ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
@@ -314,15 +319,23 @@ class Orchestrator:
         inconsistent); anything else propagates.
         """
         compiler = ctx.tools["compilers"][kind]
+        # the verdict is recorded as a tool-backed ``compile.<kind>`` result, so a refusal (FAIL) reaches
+        # ``ir.validation``, RELEASE, the exit code and ``ai-eda review`` instead of living only in the stage table
+        stamp = dict(check_id=f"compile.{kind}", tool=getattr(compiler, "id", type(compiler).__name__), tool_version=getattr(compiler, "version", None), ir_hash=ir.content_hash())
         try:
             ir.artifacts[kind] = compiler.compile(ir, CompileContext(workdir=ctx.workdir, tools=ctx.tools))
         except (NothingToCompileError, NotImplementedError) as e:
             ir.artifacts.pop(kind, None)  # an older artifact of this kind would be stale evidence
+            ir.validation.add(ValidationResult(status=ValidationStatus.NOT_VERIFIED, message=str(e), **stamp))
             return ValidationStatus.NOT_VERIFIED, str(e)
         except CompileError as e:
             ir.artifacts.pop(kind, None)
-            return ValidationStatus.FAIL, f"{kind} compile refused: {e}"
-        return ValidationStatus.PASS, str(ir.artifacts[kind].path)
+            message = f"{kind} compile refused: {e}"
+            ir.validation.add(ValidationResult(status=ValidationStatus.FAIL, message=message, details={"repair": "human"}, **stamp))
+            return ValidationStatus.FAIL, message
+        art = ir.artifacts[kind]
+        ir.validation.add(ValidationResult(status=ValidationStatus.PASS, message=f"compiled {art.path}", artifact_hash=art.content_hash, **stamp))
+        return ValidationStatus.PASS, str(art.path)
 
     def _compile_stage(self, kind: ArtifactKind) -> StageFn:
         stage = Stage.SCHEMATIC if kind == ArtifactKind.SCHEMATIC else Stage.PCB
@@ -359,14 +372,18 @@ class Orchestrator:
     def _manufacturing_outputs(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         """BOM/CPL from the IR, then gerber + drill from the board via kicad-cli, then the format checks."""
         stage = Stage.MANUFACTURING_OUTPUTS
-        compilers = ctx.tools["compilers"]
-        cctx = CompileContext(workdir=ctx.workdir, tools=ctx.tools)
-        ir.artifacts[ArtifactKind.BOM] = compilers[ArtifactKind.BOM].compile(ir, cctx)
-        ir.artifacts[ArtifactKind.CPL] = compilers[ArtifactKind.CPL].compile(ir, cctx)
-        if ArtifactKind.PCB not in ir.artifacts:
-            return StageOutcome(stage=stage, status=ValidationStatus.NOT_VERIFIED, message="BOM/CPL generated; gerber/drill skipped (no PCB)")
-        notes: list[str] = ["BOM/CPL generated"]
+        notes: list[str] = []
         statuses: list[ValidationStatus] = []
+        for kind in (ArtifactKind.BOM, ArtifactKind.CPL):
+            # a BOM cell the compiler refuses (a formula-shaped identity) is a verdict on the IR, not a defect
+            status, message = self._compile(ir, ctx, kind)
+            if status is not ValidationStatus.PASS:
+                statuses.append(status)
+                notes.append(f"{kind}: {message}")
+        notes.insert(0, "BOM/CPL compiled" if not statuses else "BOM/CPL: see below")
+        if ArtifactKind.PCB not in ir.artifacts:
+            notes.append("gerber/drill skipped (no PCB)")
+            return StageOutcome(stage=stage, status=worst_status(statuses + [ValidationStatus.NOT_VERIFIED]), message="; ".join(notes))
         for kind in MANUFACTURING_EXPORTS:
             try:
                 status, message = self._compile(ir, ctx, kind)

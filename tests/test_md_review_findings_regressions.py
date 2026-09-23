@@ -46,6 +46,29 @@ Round 2 (the LLM and parts/regulatory reviewers):
 29. A ``NaN`` number from the model was accepted into an assumption value.
 30. ``네 맞습니다`` / ``yes, correct`` / ``ok thanks`` were corrections (a billed re-extraction); a repeated correction
     was silently ignored.
+
+Round 3 (the review/repair/orchestrator/CLI and compiler reviewers):
+
+31. A compiler refusal (FAIL) lived only in the stage table: not in ``ir.validation``, RELEASE or the exit code.
+32. A BOM/CPL ``CompileError`` in MANUFACTURING_OUTPUTS crashed the pipeline instead of being a FAIL stage.
+33. The reviewer passed through untooled or hash-less ``kicad.erc`` / ``kicad.drc`` / ``mfg.capability`` results
+    as tool-backed review PASSes.
+34. ``review.requirements_vs_ir`` was a PASS for a design with nothing to trace.
+35. ``apply_proposals`` was not atomic: a later invalid proposal left the earlier ones applied.
+36. ``ai-eda new`` stored a cwd-relative workdir, so a run from another directory wrote artifacts elsewhere.
+37. The repair loop's oscillation fingerprint ignored the repair category: a re-run that turned a stale report into a
+    human finding was reported as an oscillation.
+38. A finding whose action failed once was never retried, even after the regeneration it depended on.
+39. ``RepairOutcome.as_validation_result`` was PASS with a failed action in the log.
+40. Two ``--datasheet-url`` for one REF with different URLs were silently last-wins.
+41. The CPL wrote ``Rotation`` with ``%g`` (6 significant digits, exponents, ``-0``), so the reviewer failed
+    ``pcb_vs_cpl`` as a compiler defect for a rotation with more digits.
+42. ``natural_ref_key`` raised ``TypeError`` for a symbol mixing numeric and alphabetic pin numbers.
+43. NaN / infinite coordinates were written into the board and CPL (``nan``, ``nanmm``) or crashed with ``ValueError``.
+44. Repeated pad numbers in a footprint got duplicate ``(uuid ...)``; repeated pin numbers in a symbol were silently
+    left unwired instead of refused.
+45. ``SchematicCompiler`` silently fell back to the installed libraries when ``tools['kicad_library']`` was not a
+    ``KicadLibrary`` (the PCB compiler refused the same input).
 """
 
 from __future__ import annotations
@@ -61,9 +84,23 @@ from pydantic import ValidationError
 from ai_eda.agents import AgentContext, RequirementAgent
 from ai_eda.agents.base import IRProposal
 from ai_eda.agents.regulatory import ACCEPT_REGS_KEY
-from ai_eda.compilers import BOMCompiler, CompileContext, CPLCompiler
+from ai_eda.cli import main as cli_main, run_exit_code
+from ai_eda.compilers import BOMCompiler, CompileContext, CPLCompiler, PCBCompiler, SchematicCompiler
+from ai_eda.compilers.ids import pad_uuid
+from ai_eda.compilers.pins import pad_pin_types
+from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError, IRSchemaError, ToolUnavailableError
+from ai_eda.repair import RepairAction, RepairLoop, RepairStrategy
+from ai_eda.repair.loop import RepairOutcome
+from ai_eda.review import IndependentReviewer, ReviewArea
+from ai_eda.review.reviewer import ReviewReport
+from ai_eda.tools.kicad import sexpr
+from ai_eda.tools.kicad.library import SymbolDef, SymbolPin
+from ai_eda.tools.kicad.sexpr import SExprError
+from ai_eda.workflow.session import SessionError, parse_key_urls
 from ai_eda.ir import (
+    ArtifactKind,
+    ArtifactRef,
     CircuitDomain,
     SourceRef,
     CircuitIR,
@@ -699,3 +736,240 @@ def test_30_confirmation_words_confirm_and_a_repeated_correction_is_explained(tm
     assert len(client.calls) == 2 and ir.requirements.corrections == ["the output is 3.3V, not 5V"]
     state = _req_run(ir, svc, tmp_path, answers={CONFIRM_KEY: "the output is 3.3V, not 5V"})
     assert len(client.calls) == 2 and "already part of the request" in state.outcome(Stage.REQUIREMENT_ANALYSIS).message
+
+
+# =========================================================================== round 3
+
+
+def _areas(ir: CircuitIR, tmp_path: Path) -> dict[str, ValidationResult]:
+    return {r.check_id: r for r in IndependentReviewer(tools={}).review(ir, tmp_path).results}
+
+
+# --------------------------------------------------------------------------- 31: a compiler refusal is a recorded verdict
+
+
+def test_31_a_compile_refusal_is_recorded_and_reaches_release_and_the_exit_code(divider_ir: CircuitIR, tmp_path: Path):
+    divider_ir.components[0].symbol.verified = False  # the schematic compiler refuses an unverified symbol
+    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS)).run(divider_ir)
+    assert state.outcome(Stage.SCHEMATIC).status is S.FAIL
+    rec = divider_ir.validation.latest("compile.kicad_sch")
+    assert rec is not None and rec.status is S.FAIL and rec.is_tool_backed and rec.ir_hash == divider_ir.content_hash() and rec.details["repair"] == "human"
+    assert state.outcome(Stage.RELEASE).status is S.FAIL and "compile.kicad_sch" in state.outcome(Stage.RELEASE).message
+    assert run_exit_code(state) == 1
+    # a compile that succeeds records a tool-backed PASS on the artifact it wrote
+    ok = divider_ir.validation.latest("compile.bom")
+    assert ok is not None and ok.status is S.PASS and ok.artifact_hash == divider_ir.artifacts[ArtifactKind.BOM].content_hash
+
+
+# --------------------------------------------------------------------------- 32: a BOM refusal is a FAIL stage, not a crash
+
+
+def test_32_a_bom_cell_refusal_is_a_fail_stage_not_an_exception(divider_ir: CircuitIR, tmp_path: Path):
+    divider_ir.components[0].mpn = authoritative("=CMD()", DS)
+    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS)).run(divider_ir)
+    out = state.outcome(Stage.MANUFACTURING_OUTPUTS)
+    assert out.status is S.FAIL and "refusing to write a cell" in out.message and "bom compile refused" in out.message
+    assert divider_ir.validation.latest("compile.bom").status is S.FAIL and ArtifactKind.BOM not in divider_ir.artifacts
+    assert state.outcome(Stage.RELEASE) is not None  # the pipeline ran to the end
+
+
+# --------------------------------------------------------------------------- 33: opinions do not become review PASSes
+
+
+def test_33_untooled_or_hashless_tool_results_are_not_review_evidence(divider_ir: CircuitIR, tmp_path: Path):
+    sch = tmp_path / "t.kicad_sch"
+    sch.write_text("(kicad_sch)", encoding="utf-8")
+    pcb = tmp_path / "t.kicad_pcb"
+    pcb.write_text("(kicad_pcb)", encoding="utf-8")
+    h = divider_ir.content_hash()
+    divider_ir.artifacts[ArtifactKind.SCHEMATIC] = ArtifactRef(kind=ArtifactKind.SCHEMATIC, path=str(sch), content_hash=SourceRef.hash_bytes(sch.read_bytes()), generated_from_ir_hash=h)
+    divider_ir.artifacts[ArtifactKind.PCB] = ArtifactRef(kind=ArtifactKind.PCB, path=str(pcb), content_hash=SourceRef.hash_bytes(pcb.read_bytes()), generated_from_ir_hash=h)
+    sch_hash, pcb_hash = divider_ir.artifacts[ArtifactKind.SCHEMATIC].content_hash, divider_ir.artifacts[ArtifactKind.PCB].content_hash
+    divider_ir.validation.extend([
+        ValidationResult(check_id="kicad.erc", status=S.PASS, message="I say it passes", artifact_hash=sch_hash),  # no tool
+        ValidationResult(check_id="kicad.drc", status=S.PASS, artifact_hash=pcb_hash, details={"schematic_parity_checked": True, "schematic_hash": sch_hash, "schematic_parity": []}),  # no tool
+        ValidationResult(check_id="mfg.capability", status=S.PASS, message="trust me"),  # no tool
+    ])
+    areas = _areas(divider_ir, tmp_path)
+    for area in (ReviewArea.ERC, ReviewArea.DRC, ReviewArea.SCHEMATIC_VS_PCB, ReviewArea.MANUFACTURING_CAPABILITIES):
+        assert areas[area].status is S.NOT_VERIFIED and ("not tool-backed" in areas[area].message or "no tool" in areas[area].message), area
+    # a tool-backed result without an artifact hash is not evidence about any file either
+    divider_ir.validation.add(ValidationResult(check_id="kicad.erc", status=S.PASS, tool="kicad-cli", tool_version="10.0.6"))
+    assert _areas(divider_ir, tmp_path)[ReviewArea.ERC].status is S.NOT_VERIFIED
+    # the real thing still passes through
+    divider_ir.validation.add(ValidationResult(check_id="kicad.erc", status=S.PASS, tool="kicad-cli", tool_version="10.0.6", artifact_hash=sch_hash))
+    assert _areas(divider_ir, tmp_path)[ReviewArea.ERC].status is S.PASS
+
+
+# --------------------------------------------------------------------------- 34: nothing to trace is not a traced design
+
+
+def test_34_requirements_vs_ir_is_not_a_vacuous_pass(tmp_path: Path):
+    ir = CircuitIR(project=ProjectMeta(id="e", name="e", workdir=str(tmp_path)))
+    ir.requirements.requirements.append(Requirement(id="req.application", key="application", text="x", kind=RequirementKind.EXPLICIT, category="application", value=user_requirement("x")))
+    r = _areas(ir, tmp_path)[ReviewArea.REQUIREMENTS_VS_IR]
+    assert r.status is S.NOT_VERIFIED and "no design-level requirement" in r.message
+    ir.requirements.requirements.append(Requirement(id="req.bus", key="bus", text="I2C bus", kind=RequirementKind.EXPLICIT, category="electrical"))
+    ir.nets.append(Net(name="SDA", pins=[], provenance=Provenance(kind=ProvenanceKind.DERIVED, tool="t"), serves_requirements=["req.bus"]))
+    r = _areas(ir, tmp_path)[ReviewArea.REQUIREMENTS_VS_IR]
+    assert r.status is S.PASS and r.details["traced"] == ["req.bus"]
+
+
+# --------------------------------------------------------------------------- 35: proposals apply all or nothing
+
+
+def test_35_an_invalid_proposal_leaves_the_earlier_ones_unapplied(divider_ir: CircuitIR):
+    before, n = divider_ir.content_hash(), len(divider_ir.components)
+    with pytest.raises(ValueError, match="not a valid"):
+        Orchestrator.apply_proposals(divider_ir, [
+            IRProposal(description="ok", target="components", operation="append", payload=make_component("R3", "1k")),
+            IRProposal(description="bad", target="components", operation="append", payload="not a component"),
+        ])
+    assert len(divider_ir.components) == n and divider_ir.content_hash() == before
+
+
+# --------------------------------------------------------------------------- 36: a new project's workdir is absolute
+
+
+def test_36_new_records_an_absolute_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.chdir(tmp_path)
+    assert cli_main(["new", "demo", "--dir", "rel/demo", "--request", "x"]) == 0
+    ir = CircuitIR.load(tmp_path / "rel" / "demo" / "ir.json")
+    assert Path(ir.project.workdir).is_absolute() and Path(ir.project.workdir) == (tmp_path / "rel" / "demo").resolve()
+
+
+# --------------------------------------------------------------------------- 37 / 38 / 39: the repair loop's bookkeeping
+
+
+class _Scripted:
+    """A reviewer that returns the scripted reports in order (the last one repeats)."""
+
+    def __init__(self, ir_hash: str, *reports: list[ValidationResult]) -> None:
+        self.reports = [ReviewReport(ir_hash=ir_hash, results=list(r)) for r in reports]
+        self.calls = 0
+
+    def review(self, ir: CircuitIR, workdir: Path) -> ReviewReport:
+        self.calls += 1
+        return self.reports[min(self.calls - 1, len(self.reports) - 1)]
+
+
+class _Rerun(RepairStrategy):
+    id = "test.rerun"
+
+    def __init__(self, fail_first: bool = False) -> None:
+        self.fail_first = fail_first
+        self.attempts = 0
+
+    def can_repair(self, finding):
+        return finding.details.get("repair") == "rerun_tool"
+
+    def apply(self, ir, finding, workdir, tools):
+        self.attempts += 1
+        failed = self.fail_first and self.attempts == 1
+        return RepairAction(strategy=self.id, finding_check_id=finding.check_id, description="re-run", ir_hash_before=ir.content_hash(),
+                            succeeded=not failed, error="stale" if failed else None)
+
+
+class _Regen(RepairStrategy):
+    id = "test.regen"
+
+    def can_repair(self, finding):
+        return finding.details.get("repair") == "regenerate"
+
+    def apply(self, ir, finding, workdir, tools):
+        return RepairAction(strategy=self.id, finding_check_id=finding.check_id, description="regenerate", ir_hash_before=ir.content_hash(), succeeded=True)
+
+
+def test_37_a_rerun_that_reveals_a_human_finding_is_not_an_oscillation(divider_ir: CircuitIR, tmp_path: Path):
+    h = divider_ir.content_hash()
+    stale = ValidationResult(check_id=ReviewArea.ERC, status=S.FAIL, message="kicad.erc report is stale", details={"repair": "rerun_tool", "tool_check": "kicad.erc"})
+    real = ValidationResult(check_id=ReviewArea.ERC, status=S.FAIL, message="kicad.erc: 1 error(s)", details={"repair": "human", "error_types": ["pin_not_connected"]})
+    outcome = RepairLoop(tools={}, strategies=[_Rerun()], reviewer=_Scripted(h, [stale], [real])).run(divider_ir, tmp_path)
+    assert outcome.iterations == 2 and outcome.stopped_reason == "no repairable failures remain"
+    assert [u.check_id for u in outcome.unresolved] == [ReviewArea.ERC] and "human" in outcome.unresolved[0].message
+    assert outcome.as_validation_result(h, "t").status is S.FAIL
+
+
+def test_38_a_failed_action_is_retried_after_the_loop_made_progress(divider_ir: CircuitIR, tmp_path: Path):
+    h = divider_ir.content_hash()
+    rerun = ValidationResult(check_id=ReviewArea.ERC, status=S.FAIL, message="stale report", details={"repair": "rerun_tool", "tool_check": "kicad.erc"})
+    regen = ValidationResult(check_id=ReviewArea.IR_VS_SCHEMATIC, status=S.FAIL, message="stale artifact", details={"repair": "regenerate", "artifact": "kicad_sch"})
+    strategy = _Rerun(fail_first=True)
+    outcome = RepairLoop(tools={}, strategies=[strategy, _Regen()], reviewer=_Scripted(h, [rerun, regen], [rerun], [])).run(divider_ir, tmp_path)
+    assert strategy.attempts == 2 and outcome.stopped_reason == "all failures resolved" and outcome.unresolved == []
+    assert [a.succeeded for a in outcome.actions] == [False, True, True]
+    assert outcome.as_validation_result(h, "t").status is S.NOT_VERIFIED  # an attempt failed on the way: not a clean PASS
+
+
+def test_39_an_outcome_with_a_failed_action_is_not_pass():
+    report = ReviewReport(ir_hash="sha256:h")
+    failed = RepairAction(strategy="s", finding_check_id="c", description="d", ir_hash_before="sha256:h", ir_hash_after="sha256:h", succeeded=False, error="boom")
+    assert RepairOutcome(actions=[failed], unresolved=[], final_review=report).as_validation_result("sha256:h", "t").status is S.NOT_VERIFIED
+    good = failed.model_copy(update={"succeeded": True, "error": None})
+    assert RepairOutcome(actions=[good], unresolved=[], final_review=report).as_validation_result("sha256:h", "t").status is S.PASS
+
+
+# --------------------------------------------------------------------------- 40: one REF, one URL
+
+
+def test_40_two_different_urls_for_one_key_are_a_usage_error():
+    assert parse_key_urls(["R1=https://a.example/x.pdf", "R1=https://a.example/x.pdf"], "--datasheet-url") == {"R1": "https://a.example/x.pdf"}
+    with pytest.raises(SessionError, match="names 'R1' twice with different URLs"):
+        parse_key_urls(["R1=https://a.example/x.pdf", "R1=https://b.example/y.pdf"], "--datasheet-url")
+
+
+# --------------------------------------------------------------------------- 41: the CPL rotation is written like the board's
+
+
+def test_41_cpl_rotation_is_fixed_format(divider_ir: CircuitIR, tmp_path: Path):
+    divider_ir.pcb = PCBDesign(placements=[
+        Placement(component_ref="R1", x_mm=14.0, y_mm=6.0, rotation_deg=123.4567, provenance=AUTH),
+        Placement(component_ref="R2", x_mm=1.0, y_mm=2.0, rotation_deg=-0.0, provenance=AUTH),
+    ])
+    art = CPLCompiler().compile(divider_ir, CompileContext(workdir=tmp_path, tools={}))
+    rows = Path(art.path).read_text(encoding="utf-8").splitlines()[1:]
+    assert rows[0].split(",")[3] == "123.4567" == sexpr.fmt_num(123.4567) and rows[1].split(",")[3] == "0"
+    assert not any("e" in r.split(",")[3] for r in rows)
+
+
+# --------------------------------------------------------------------------- 42: mixed pin numbers sort
+
+
+def test_42_mixed_numeric_and_alphabetic_pin_numbers_sort():
+    assert sorted(["10", "2", "CD", "A1", "SH", "1"], key=natural_ref_key) == ["1", "2", "10", "A1", "CD", "SH"]
+    assert natural_ref_key("R2") < natural_ref_key("R10") and natural_ref_key("J1") < natural_ref_key("R1")
+
+
+# --------------------------------------------------------------------------- 43: non-finite numbers are refused
+
+
+def test_43_non_finite_coordinates_are_compile_errors_not_files(divider_ir: CircuitIR, tmp_path: Path):
+    with pytest.raises(SExprError, match="not a finite number"):
+        sexpr.fmt_num(float("nan"))
+    divider_ir.pcb = PCBDesign(placements=[Placement(component_ref="R1", x_mm=float("nan"), y_mm=6.0, provenance=AUTH)])
+    with pytest.raises(CompileError, match=r"placement R1\.x_mm is nan"):
+        CPLCompiler().compile(divider_ir, CompileContext(workdir=tmp_path, tools={}))
+    with pytest.raises(CompileError, match=r"ir\.pcb\.placements\[0\]\.x_mm is nan"):
+        PCBCompiler().compile(divider_ir, CompileContext(workdir=tmp_path, tools={}))
+    divider_ir.pcb = PCBDesign(placements=[Placement(component_ref="R1", x_mm=1.0, y_mm=6.0, rotation_deg=float("inf"), provenance=AUTH)])
+    with pytest.raises(CompileError, match="rotation_deg is inf"):
+        PCBCompiler().compile(divider_ir, CompileContext(workdir=tmp_path, tools={}))
+
+
+# --------------------------------------------------------------------------- 44: repeated pad / pin numbers
+
+
+def test_44_repeated_pad_numbers_get_distinct_ids_and_repeated_pin_numbers_are_refused(divider_ir: CircuitIR):
+    assert pad_uuid("p", "J1", "3") != pad_uuid("p", "J1", "3#2") and pad_uuid("p", "J1", "3") == pad_uuid("p", "J1", "3")  # the first keeps its id
+    pin = lambda n: SymbolPin(number=n, name="~", electrical_type="passive", x=0.0, y=0.0, angle=0.0, length=2.54, unit=0, hidden=False)  # noqa: E731
+    symbol = SymbolDef(lib_id="Test:S", name="S", node=[], pins=[pin("1"), pin("2"), pin("1")], units=[1], is_power=False, properties={})
+    with pytest.raises(CompileError, match="repeats pin number"):
+        pad_pin_types(divider_ir.components[0], symbol)
+
+
+# --------------------------------------------------------------------------- 45: a wrong library object is refused, not replaced
+
+
+def test_45_schematic_compiler_refuses_a_wrong_library_object(divider_ir: CircuitIR, tmp_path: Path):
+    with pytest.raises(CompileError, match="not a KicadLibrary"):
+        SchematicCompiler().compile(divider_ir, CompileContext(workdir=tmp_path, tools={"kicad_library": "not a library"}))
