@@ -216,7 +216,8 @@ def test_offline_without_an_archive_fetches_nothing_and_is_not_verified():
     assert lvd.provenance.source_url == LVD_URL and lvd.provenance.content_hash is None and lvd.provenance.source_document is None and lvd.provenance.retrieved_at is None
     assert lvd.applicability is Applicability.NOT_APPLICABLE and lvd.status is ValidationStatus.NOT_APPLICABLE
     assert all(not q.found and q.reason.startswith("offline") for q in lvd.grounded_quotes)
-    assert "evidence: Article 1 (not grounded)" in lvd.provenance.applicability_rationale
+    assert "; evidence: Article 1" in lvd.provenance.applicability_rationale and "grounded" not in lvd.provenance.applicability_rationale
+    assert lvd.provenance.section == "Article 1"  # the cited section is the claim; page / found live on the quote
     # decided on the curated rule, but the sentence it rests on was not grounded: not PASS
     assert applicability.status is ValidationStatus.NOT_VERIFIED and "not grounded" in applicability.message and "reg.EU.LVD.test: not_applicable" in applicability.message
     assert compliance.status is ValidationStatus.NOT_VERIFIED and compliance.message == COMPLIANCE_MESSAGE
@@ -251,10 +252,10 @@ def test_online_archives_grounds_and_fills_the_ten_provenance_fields(fake, tmp_p
     for f in PROVENANCE_FIELDS:
         assert getattr(p, f) not in (None, ""), f
     assert p.jurisdiction == "EU" and p.authority == "EU legislator (test)" and p.source_title.startswith("Low Voltage Directive (test) [L_TEST_LVD.xml]")
-    assert p.source_url == LVD_URL and p.section == "Article 1 (page 1)" and p.verification_status is ValidationStatus.PASS
+    assert p.source_url == LVD_URL and p.section == "Article 1" and lvd.grounded_quotes[0].page == 1 and p.verification_status is ValidationStatus.PASS
     assert p.content_hash.startswith("sha256:") and Path(p.source_document).is_file()
     assert archive.verify(SourceRef(title="x", content_hash=p.content_hash)) == "ok"
-    assert p.applicability_rationale.startswith("rule: ") and "; inputs: " in p.applicability_rationale and "evidence: Article 1 (grounded)" in p.applicability_rationale
+    assert p.applicability_rationale.startswith("rule: ") and "; inputs: " in p.applicability_rationale and "; evidence: Article 1" in p.applicability_rationale
     assert "input_voltage = 12 V DC (requirement req.input_voltage; DC stated with the value)" in p.applicability_rationale and "radio = no (answer)" in p.applicability_rationale
     assert lvd.source_status == "ok" and lvd.applicability is Applicability.NOT_APPLICABLE and lvd.status is ValidationStatus.NOT_APPLICABLE
     assert [q.found for q in lvd.grounded_quotes] == [True, True]
@@ -300,7 +301,7 @@ def test_quote_missing_from_the_official_text_fails_the_candidate(fake, tmp_path
     lvd = _by_id(out)["reg.EU.LVD.test"]
     assert lvd.source_status == "quote_missing" and lvd.status is ValidationStatus.FAIL and lvd.provenance.verification_status is ValidationStatus.FAIL
     assert [q.found for q in lvd.grounded_quotes] == [False, True] and "not found in the archived official text" in lvd.grounded_quotes[0].reason
-    assert lvd.provenance.content_hash and lvd.provenance.section == "Annex II (page 1)"
+    assert lvd.provenance.content_hash and lvd.provenance.section == "Article 1" and lvd.grounded_quotes[1].section == "Annex II" and lvd.grounded_quotes[1].page == 1
     assert _by_id(out)["reg.EU.RED.test"].provenance.verification_status is ValidationStatus.PASS
     assert out.result(RESEARCH_CHECK).status is ValidationStatus.FAIL
     assert out.result(APPLICABILITY_CHECK).status is ValidationStatus.NOT_VERIFIED  # the LVD decision cites the missing quote

@@ -262,7 +262,7 @@ def test_online_run_grounds_parts_and_regulations_against_the_fake(fake, tmp_pat
     assert lvd.applicability_inputs["radio"] == "no (answer)" and lvd.applicability_inputs["input_voltage"].startswith("12 V DC (requirement req.v_in")
     scope = lvd.grounded_quotes[0]
     assert scope.section == "Article 1" and scope.found and scope.page == 1 and "1 000 V" in scope.context and scope.content_hash == lvd.provenance.content_hash
-    assert "evidence: Article 1 (grounded)" in lvd.provenance.applicability_rationale
+    assert "; evidence: Article 1" in lvd.provenance.applicability_rationale and "grounded" not in lvd.provenance.applicability_rationale
     assert by[EMC_ID].applicability is Applicability.APPLICABLE and by[ROHS_ID].applicability is Applicability.APPLICABLE and by[RED_ID].applicability is Applicability.NOT_APPLICABLE
     assert by[EMC_ID].status is S.NOT_VERIFIED and by[ROHS_ID].status is S.NOT_VERIFIED  # they apply; compliance is not verified
     for r in by.values():

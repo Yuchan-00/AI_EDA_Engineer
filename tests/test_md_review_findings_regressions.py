@@ -85,6 +85,12 @@ Round 4 (the SPICE / calculator / portability reviewer):
 53. A non-finite ``tol_abs`` / ``nominal`` was accepted by the compiler and judged (``tol_abs=inf`` passed anything).
 54. The rawfile ``Command:`` line is absent on ngspice-42, not empty (docs and parser note).
 55. On Linux the system ``libngspice.so.0`` was found only through ``NGSPICE_DLL``.
+
+Round 5 (residuals the independent verification pass found in the fixed tree):
+
+56. A regulatory run's outcome still moved the design hash: ``GroundedQuote.reason`` ("offline: ..." vs "missing: HTTP
+    404"), the URL a 404 came from as the quote's ``source_url``, the page in ``RegulatoryProvenance.section`` and the
+    "(grounded)" words in ``applicability_rationale``.
 """
 
 from __future__ import annotations
@@ -167,6 +173,7 @@ from ai_eda.parts.identity import mpn_grounding
 from ai_eda.regulatory.applicability import MAINS_KEY, _current_kind, evaluate
 from ai_eda.security import ApprovalGate
 from ai_eda.tools.sources import DocumentArchive, NetworkPolicy
+from ai_eda.tools.sources.archive import ArchivedDocument
 from ai_eda.tools.sources.policy import host_of, normalise_url, port_of
 from ai_eda.tools.spice.ngspice_shared import find_codemodel_dir, find_ngspice_dll, find_system_ngspice, validate_deck
 from ai_eda.tools.spice import NgspiceRunner, SpiceAnalysis, SpiceResult
@@ -183,7 +190,7 @@ from tests.test_applicability import VOLT, _req as _volt_req, _reqs
 from tests.test_archive import make_archive, online_policy
 from tests.test_parts_existence import make_part
 from tests.test_regulatory_agent import CANNED, GOOD_ID, _ir as _reg_ir, _llm_ctx, _run_agent, _service as _reg_service
-from tests.test_regulatory_research import online_archive, serve_all
+from tests.test_regulatory_research import make_candidates, offline_archive, online_archive, serve_all
 from tests.test_requirement_agent_llm import CANNED as REQ_CANNED, USAGE, _ir as _req_ir, _run as _req_run, _service as _req_service
 
 ANSWERS = {"application": "test", "jurisdiction": "EU"}
@@ -1153,3 +1160,42 @@ def test_55_the_system_ngspice_library_is_found_without_the_env_var(tmp_path: Pa
         assert find_system_ngspice() == lib.resolve() and find_ngspice_dll() == lib.resolve()
     monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
     assert find_system_ngspice() is None
+
+
+# =========================================================================== round 5
+
+
+# --------------------------------------------------------------------------- 56: what a regulatory run found is not the design
+
+
+def test_56_the_outcome_of_a_regulatory_run_does_not_move_the_design_hash(fake, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    answers = {"mains_powered": "no", "radio": "no", "intended_use": "bench"}
+
+    def run(ir: CircuitIR, workdir: Path, archive: DocumentArchive | None):
+        tools = {"regulatory_candidates": make_candidates(), **({"archive": archive} if archive is not None else {})}
+        _run_agent(ir, AgentContext(workdir=workdir, tools=tools, answers=answers))
+        return ir.regulatory.requirements[0]
+
+    # the same design, once offline and once online against a server that has none of the official documents
+    offline = run(_reg_ir(tmp_path / "a", "EU"), tmp_path / "a", offline_archive(tmp_path / "a" / "sources"))
+    missing = run(_reg_ir(tmp_path / "b", "EU"), tmp_path / "b", online_archive(tmp_path / "b" / "sources", fake))
+    assert offline.source_status == "offline" and missing.source_status == "missing"
+    assert offline.grounded_quotes[0].reason.startswith("offline") and missing.grounded_quotes[0].reason.startswith("missing")
+    assert offline.provenance.content_hash is None and missing.provenance.content_hash is None
+    assert offline.provenance.section == "Article 1" == missing.provenance.section
+    a, b = _reg_ir(tmp_path / "a", "EU"), _reg_ir(tmp_path / "b", "EU")
+    a.regulatory.requirements, b.regulatory.requirements = [offline], [missing]
+    assert a.content_hash() == b.content_hash()  # the network's mood is not the design
+    # the same archived documents, once with the quotes found and once (a changed extractor, say) with none re-located
+    serve_all(fake)
+    ir = _reg_ir(tmp_path / "c", "EU")
+    lvd = run(ir, tmp_path / "c", online_archive(tmp_path / "c" / "sources", fake))
+    assert lvd.source_status == "ok" and [q.found for q in lvd.grounded_quotes] == [True, True] and lvd.grounded_quotes[0].page == 1
+    assert lvd.provenance.section == "Article 1" and "; evidence: Article 1" in lvd.provenance.applicability_rationale
+    assert "grounded" not in lvd.provenance.applicability_rationale and "page" not in lvd.provenance.section
+    h = ir.content_hash()
+    monkeypatch.setattr(ArchivedDocument, "find_quote", lambda self, *a, **k: [])
+    lvd = run(ir, tmp_path / "c", None)  # reuses the workdir's copies offline
+    assert lvd.source_status == "quote_missing" and lvd.status is S.FAIL and [q.found for q in lvd.grounded_quotes] == [False, False]
+    assert lvd.provenance.content_hash and lvd.provenance.section == "Article 1"
+    assert ir.content_hash() == h  # same design, same document; only the verdict changed

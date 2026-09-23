@@ -364,7 +364,7 @@ class RegulatoryAgent(Agent):
                 id=p.id, jurisdiction=p.jurisdiction, title=p.title, summary=p.summary, status=ValidationStatus.NOT_VERIFIED,
                 provenance=RegulatoryProvenance(
                     jurisdiction=p.jurisdiction, authority=p.authority, source_title=p.title + (f" [{doc.title}]" if doc.title else ""),
-                    source_url=doc.final_url or doc.url or p.official_url, retrieved_at=doc.retrieved_at, section=f"title quote (page {h.page})",
+                    source_url=doc.final_url or doc.url or p.official_url, retrieved_at=doc.retrieved_at, section="title quote",
                     applicability_rationale=(f"accepted by the user (--answer {ACCEPT_REGS_KEY}={p.id}); proposed by model {p.model}; no declarative rule - "
                                              f"applicability is the user's decision, compliance is not assessed"),
                     verification_status=ValidationStatus.PASS, source_document=str(doc.path), content_hash=doc.sha256,

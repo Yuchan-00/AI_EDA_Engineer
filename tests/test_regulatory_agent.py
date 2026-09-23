@@ -248,7 +248,7 @@ def test_llm_proposals_are_screened_presented_then_accepted_then_grounded(fake, 
     req = next(r for r in ir.regulatory.requirements if r.id == GOOD_ID)
     assert req.basis == "llm_proposed" and req.applicability is Applicability.APPLICABLE and req.status is ValidationStatus.NOT_VERIFIED
     assert req.provenance.verification_status is ValidationStatus.PASS and req.provenance.content_hash and req.provenance.source_url == MACHINERY_URL
-    assert req.provenance.section == "title quote (page 1)" and ACCEPT_REGS_KEY in req.provenance.applicability_rationale and "no declarative rule" in req.provenance.applicability_rationale
+    assert req.provenance.section == "title quote" and req.grounded_quotes[0].page == 1 and ACCEPT_REGS_KEY in req.provenance.applicability_rationale and "no declarative rule" in req.provenance.applicability_rationale
     assert req.grounded_quotes[0].found and req.grounded_quotes[0].quote == "MACHINERY TEST DIRECTIVE TEXT"
     assert _latest(result3, PROPOSALS_CHECK).details["counts"]["grounded"] == 1
     assert {p.id: p.grounded for p in ir.regulatory.proposed_candidates}[GOOD_ID] is True
