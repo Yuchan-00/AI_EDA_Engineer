@@ -28,6 +28,24 @@ model is ``ScriptedLLMClient``.
 17. The design hash included locators (``SourceRef.document_path``, ``LibraryRef.library_path``,
     ``RegulatoryProvenance.source_document``) and regulatory verification outcomes, so the same design in another
     folder or after an online run hashed differently, while a parameter *named* ``created_at`` was stripped by name.
+
+Round 2 (the LLM and parts/regulatory reviewers):
+
+18. A truncated part number (``LM2596S-5``) was grounded on ``LM2596S-5.0/NOPB``: token boundaries let a match stop
+    inside a dot / dash-joined code.
+19. ``DC 60 V`` / ``AC220V`` / ``60 V (DC)`` were not read as a stated current kind, so the mains answer decided.
+20. A typed ``--answer key=value`` was dropped when an extraction-derived requirement of that key existed.
+21. Only the first catalog row of an MPN was consulted: a second row of the right brand was reported as a mismatch.
+22. The recorded page was enforced only for the spelling ``page N``; ``Page 3`` / no section searched everywhere.
+23. Two ``req.application`` entered when the model returned both an application object and an item keyed application.
+24. Cross-kind duplicates with one value merged into whichever the model listed first, dropping the grounded explicit.
+25. A quote without the AC/DC suffix (``12V`` in ``12V DC``) was demoted as "part of a larger quantity".
+26. A cache entry without ``model`` (or with a list for ``decisions``) crashed the agent instead of re-extracting.
+27. The extraction fingerprint hashed only the system prompt, not the prompt as sent nor the quantity parser version.
+28. ``DE`` was grounded on ``DE-9`` (a connector): the code token could be part of an identifier.
+29. A ``NaN`` number from the model was accepted into an assumption value.
+30. ``네 맞습니다`` / ``yes, correct`` / ``ok thanks`` were corrections (a billed re-extraction); a repeated correction
+    was silently ignored.
 """
 
 from __future__ import annotations
@@ -69,10 +87,26 @@ from ai_eda.ir import (
     authoritative,
     user_requirement,
 )
-from ai_eda.ir.regulatory import GroundedQuote, RegulatoryProvenance, RegulatoryRequirement
+from ai_eda.ir.regulatory import Applicability, GroundedQuote, RegulatoryProvenance, RegulatoryRequirement
 from ai_eda.llm.client import LLMError, LLMMessage
-from ai_eda.llm.extraction import CONFIRM_KEY, is_correction
+from ai_eda.llm.extraction import (
+    CONFIRM_KEY,
+    REQUIREMENT_EXTRACTION_SYSTEM,
+    RequirementExtraction,
+    cache_entry_staleness,
+    extraction_fingerprint,
+    find_quote,
+    ground_extraction,
+    is_confirmation,
+    is_correction,
+    is_grounded_explicit,
+    jurisdiction_named_in,
+)
 from ai_eda.llm.openrouter import REDACTED, OpenRouterClient, check_base_url
+from ai_eda.parts import CatalogSource
+from ai_eda.parts.existence import _catalog_check, find_mpn
+from ai_eda.parts.identity import mpn_grounding
+from ai_eda.regulatory.applicability import MAINS_KEY, _current_kind, evaluate
 from ai_eda.security import ApprovalGate
 from ai_eda.tools.sources import DocumentArchive, NetworkPolicy
 from ai_eda.tools.sources.policy import host_of, normalise_url, port_of
@@ -81,7 +115,10 @@ from ai_eda.workflow import Orchestrator, Stage
 from tests.conftest import AUTH, DS, make_component
 from tests.fake_openrouter import FakeOpenRouter
 from tests.fake_sources import FakeSources
+from tests.pdf_fixture import build_pdf
+from tests.test_applicability import VOLT, _req as _volt_req, _reqs
 from tests.test_archive import make_archive, online_policy
+from tests.test_parts_existence import make_part
 from tests.test_regulatory_agent import CANNED, GOOD_ID, _ir as _reg_ir, _llm_ctx, _run_agent, _service as _reg_service
 from tests.test_regulatory_research import online_archive, serve_all
 from tests.test_requirement_agent_llm import CANNED as REQ_CANNED, USAGE, _ir as _req_ir, _run as _req_run, _service as _req_service
@@ -438,3 +475,227 @@ def test_17_locators_and_verification_outcomes_do_not_move_the_design_hash(divid
     assert divider_ir.content_hash() != h  # a parameter that happens to be called created_at is design content
     assert "created_at" not in json.dumps(divider_ir.design_dict()["components"])  # Provenance.created_at is still out
     assert "document_path" not in json.dumps(divider_ir.design_dict()) and "library_path" not in json.dumps(divider_ir.design_dict())
+
+
+# =========================================================================== round 2
+
+
+def _offline_archive(root: Path) -> DocumentArchive:
+    return DocumentArchive(root, NetworkPolicy(approved=False, gate=ApprovalGate()))
+
+
+def _pdf_doc(tmp_path: Path, pages: list[list[str]], name: str = "ds.pdf"):
+    p = tmp_path / name
+    p.write_bytes(build_pdf(pages))
+    archive = _offline_archive(tmp_path / "sources")
+    return archive, archive.add_file(p, title=name, retrieved_at="2026-09-23")
+
+
+# --------------------------------------------------------------------------- 18: a part number is a whole identifier
+
+
+def test_18_a_truncated_part_number_is_not_found_in_the_longer_code(tmp_path: Path):
+    text = "ORDERING INFORMATION  LM2596S-5.0/NOPB  TO-263  LM2596T-ADJ  TO-220"
+    assert find_quote("LM2596S-5", text, identifier=True) is None and find_quote("LM2596S-5", text) is not None  # the request rule is unchanged
+    assert find_quote("LM2596S-5.0", text, identifier=True) == (22, 33)  # a slash separates an option suffix
+    assert find_quote("LM2596S-5.0/NOPB", text, identifier=True) == (22, 38)
+    assert find_quote("2596S-5.0", text, identifier=True) is None  # nor may it start inside the code
+    archive, doc = _pdf_doc(tmp_path, [[text]])
+    assert find_mpn(doc, "lm2596s-5") == [] and [h.page for h in find_mpn(doc, "LM2596S-5.0")] == [1]
+    part = make_part(mpn="LM2596S-5")
+    part.mpn = authoritative("LM2596S-5", doc.source_ref(title="ds", section="page 1"))
+    g = mpn_grounding(part, archive)
+    assert not g.grounded and g.label == "authoritative, not in text"
+
+
+# --------------------------------------------------------------------------- 19: AC/DC before the number
+
+
+def test_19_ac_dc_before_the_number_or_in_parentheses_is_a_stated_kind():
+    assert _current_kind("DC 60 V") == "dc" and _current_kind("AC220V") == "ac" and _current_kind("60 V (DC)") == "dc" and _current_kind("60VDC") == "dc"
+    assert _current_kind("AC adapter, 12 V") is None and _current_kind("12 V") is None  # the bare word in prose is still not a kind
+    ev = evaluate(VOLT, {MAINS_KEY: "yes"}, _reqs(_volt_req(60.0, text="DC 60 V input")))
+    assert ev.applicability is Applicability.UNDECIDED and [m.key for m in ev.missing] == [MAINS_KEY]  # contradiction, not silently AC
+    ev = evaluate(VOLT, {MAINS_KEY: "no"}, _reqs(_volt_req(60.0, text="DC 60 V input")))
+    assert ev.applicability is Applicability.NOT_APPLICABLE
+
+
+# --------------------------------------------------------------------------- 20: a typed answer wins over the extraction
+
+
+def test_20_a_later_typed_answer_replaces_an_extraction_item_of_the_same_key(tmp_path: Path):
+    svc, client = _req_service([{"structured": REQ_CANNED, "usage": USAGE}])
+    ir = _req_ir(tmp_path)
+    _req_run(ir, svc, tmp_path)
+    assert ir.requirements.get("output_voltage").value.provenance.kind is ProvenanceKind.LLM_GENERATED
+    state = _req_run(ir, svc, tmp_path, answers={"output_voltage": "24V"})
+    r = ir.requirements.get("output_voltage")
+    assert r.value.value == "24V" and r.value.provenance.kind is ProvenanceKind.USER_REQUIREMENT
+    assert [x.key for x in ir.requirements.requirements].count("output_voltage") == 1 and len(client.calls) == 1
+    assert "output_voltage: the user's answer takes precedence" in state.outcome(Stage.REQUIREMENT_ANALYSIS).message
+    _req_run(ir, svc, tmp_path, answers={CONFIRM_KEY: "yes"})
+    assert ir.requirements.get("output_voltage").value.value == "24V"  # the confirmation keeps the typed answer
+    # the no-LLM checklist path replaces too
+    RequirementAgent().run(ir, AgentContext(workdir=tmp_path, answers={"efficiency": "95%"}))
+    state = Orchestrator(AgentContext(workdir=tmp_path, answers={"efficiency": "95%"})).run(ir, stop_after=Stage.REQUIREMENT_ANALYSIS)
+    eff = ir.requirements.get("efficiency")
+    assert eff.value.value == "95%" and eff.value.provenance.kind is ProvenanceKind.USER_REQUIREMENT
+    assert [x.key for x in ir.requirements.requirements].count("efficiency") == 1
+    # an answer the user typed earlier is kept (a typed answer is not an extraction)
+    Orchestrator(AgentContext(workdir=tmp_path, answers={"efficiency": "80%"})).run(ir, stop_after=Stage.REQUIREMENT_ANALYSIS)
+    assert ir.requirements.get("efficiency").value.value == "95%"
+
+
+# --------------------------------------------------------------------------- 21: every catalog row of an MPN counts
+
+
+def test_21_the_catalog_row_that_agrees_with_the_ir_backs_the_sourcing(tmp_path: Path):
+    csv = tmp_path / "cat.csv"
+    csv.write_text("mpn,manufacturer,package,supplier_part_number,stock\nLM2596S-5.0/NOPB,Texas Instruments,TO-263,C1,5\nLM2596S-5.0/NOPB,ON Semi,TO-263,C2,9\n", encoding="utf-8")
+    cat = CatalogSource.load(csv, "2026-09-23", "JLCPCB export", supplier="JLCPCB")
+    assert cat.duplicates == {"lm2596s-5.0/nopb": 2} and [r.line for r in cat.rows_for("LM2596S-5.0/NOPB")] == [2, 3]
+    part = make_part(mpn="LM2596S-5.0/NOPB")
+    part.manufacturer = user_requirement("ON Semi")
+    row, check = _catalog_check("LM2596S-5.0/NOPB", cat, part)
+    assert check.status is S.PASS and row.line == 3 and row.supplier_part_number == "C2"
+    part.manufacturer = user_requirement("Nexperia")
+    row, check = _catalog_check("LM2596S-5.0/NOPB", cat, part)
+    assert check.status is S.NOT_VERIFIED and "2 row(s)" in check.message and "row 2:" in check.message and "row 3:" in check.message
+
+
+# --------------------------------------------------------------------------- 22: the recorded page, whatever its spelling
+
+
+def test_22_the_recorded_page_is_enforced_and_a_missing_page_is_not_grounded(tmp_path: Path):
+    archive, doc = _pdf_doc(tmp_path, [["LM317 adjustable regulator"], ["Electrical characteristics"], ["Ordering: see page 1"]])
+    part = make_part(mpn="LM317")
+
+    def grounding(section):
+        part.mpn = authoritative("LM317", doc.source_ref(title="ds", section=section))
+        return mpn_grounding(part, archive)
+
+    assert grounding("page 1").grounded and grounding("Page 1").grounded and grounding("p. 1").grounded
+    assert grounding("Page 3").label == "authoritative, not in text"
+    for section in (None, "", "ordering table"):
+        g = grounding(section)
+        assert not g.grounded and g.label == "authoritative, no page recorded" and "re-run the existence check" in g.reason
+
+
+# --------------------------------------------------------------------------- 23: one req.application
+
+
+def test_23_an_explicit_application_item_and_the_application_object_make_one_requirement(tmp_path: Path):
+    canned = json.loads(json.dumps(REQ_CANNED))
+    canned["requirements"].append({"key": "application", "text": "A converter", "kind": "explicit", "category": "application", "quote": "변환하는 회로", "value": None, "rationale": None})
+    svc, _ = _req_service([{"structured": canned, "usage": USAGE}])
+    ir = _req_ir(tmp_path)
+    _req_run(ir, svc, tmp_path)
+    apps = [r for r in ir.requirements.requirements if r.key == "application"]
+    assert len(apps) == 1 and len({r.id for r in ir.requirements.requirements}) == len(ir.requirements.requirements)
+    assert apps[0].id == "req.application" and apps[0].text == "application: 변환하는 회로"  # the user's words, not the model's summary
+
+
+# --------------------------------------------------------------------------- 24: the grounded explicit item survives a same-value duplicate
+
+
+def test_24_same_value_duplicates_keep_the_grounded_explicit_whatever_the_order():
+    raw = "12V 입력을 5V 2A로 변환"
+    canned = {
+        "requirements": [
+            {"key": "output_voltage", "text": "Output 5 V", "kind": "implicit", "category": "electrical", "quote": None,
+             "value": {"quote": "5V", "number": 5, "unit": "V", "number_high": None}, "rationale": "a 5 V rail is implied"},
+            {"key": "output_voltage", "text": "Output voltage is 5 V", "kind": "explicit", "category": "electrical", "quote": "5V 2A로",
+             "value": {"quote": "5V", "number": 5, "unit": "V", "number_high": None}, "rationale": None},
+        ],
+        "questions": [], "conflicts": [], "assumptions": [], "application": None, "jurisdictions": [],
+    }
+    grounded = ground_extraction(raw, RequirementExtraction.model_validate(canned), "m")
+    survivors = [r for r in grounded.requirements if r.key == "output_voltage"]
+    assert len(survivors) == 1 and survivors[0].kind is RequirementKind.EXPLICIT and is_grounded_explicit(survivors[0]) and survivors[0].id == "req.output_voltage"
+    assert any("merged into the explicit item" in reason for _, reason in grounded.dropped)
+
+
+# --------------------------------------------------------------------------- 25: a quote may leave the AC/DC word out
+
+
+def test_25_a_quote_without_the_ac_dc_suffix_still_grounds():
+    for raw, quote in (("12V DC 입력, 5V 출력", "12V"), ("입력 12 V DC", "12 V"), ("입력 230 V AC 50 Hz", "230 V"), ("입력 230 V (AC)", "230 V")):
+        canned = {"requirements": [{"key": "input_voltage", "text": "x", "kind": "explicit", "category": "electrical", "quote": quote,
+                                    "value": {"quote": quote, "number": float(quote.split()[0].rstrip("V")), "unit": "V", "number_high": None}, "rationale": None}],
+                  "questions": [], "conflicts": [], "assumptions": [], "application": None, "jurisdictions": []}
+        grounded = ground_extraction(raw, RequirementExtraction.model_validate(canned), "m")
+        r = grounded.requirements[0]
+        assert is_grounded_explicit(r) and r.value.provenance.kind is ProvenanceKind.LLM_GENERATED, (raw, quote, grounded.dropped, r.value.provenance.note)
+
+
+# --------------------------------------------------------------------------- 26: a damaged cache entry is a miss, not a crash
+
+
+def test_26_a_cache_entry_without_its_model_or_with_bad_decisions_is_re_extracted(tmp_path: Path):
+    svc, client = _req_service([{"structured": REQ_CANNED, "usage": USAGE}, {"structured": REQ_CANNED, "usage": USAGE}, {"structured": REQ_CANNED, "usage": USAGE}])
+    ir = _req_ir(tmp_path)
+    _req_run(ir, svc, tmp_path)
+    key = next(iter(ir.requirements.extraction_cache))
+    assert cache_entry_staleness({**ir.requirements.extraction_cache[key], "model": None}) and cache_entry_staleness({**ir.requirements.extraction_cache[key], "decisions": ["accept"]})
+    del ir.requirements.extraction_cache[key]["model"]
+    state = _req_run(ir, svc, tmp_path)
+    assert len(client.calls) == 2 and "does not record the model" in state.outcome(Stage.REQUIREMENT_ANALYSIS).message
+    ir.requirements.extraction_cache[key]["decisions"] = ["accept"]
+    state = _req_run(ir, svc, tmp_path)
+    assert len(client.calls) == 3 and "decisions are not an object" in state.outcome(Stage.REQUIREMENT_ANALYSIS).message
+
+
+# --------------------------------------------------------------------------- 27: the fingerprint covers what the model was asked
+
+
+def test_27_the_fingerprint_covers_the_prompt_as_sent_and_the_quantity_rules(monkeypatch: pytest.MonkeyPatch):
+    fp = extraction_fingerprint()
+    assert set(fp) == {"extraction_version", "prompt_hash", "schema_hash", "quantity_version"}
+    assert fp["prompt_hash"] != "sha256:" + hashlib.sha256(REQUIREMENT_EXTRACTION_SYSTEM.encode("utf-8")).hexdigest()
+    import ai_eda.llm.extraction as ext
+    monkeypatch.setattr(ext, "JSON_ONLY_INSTRUCTION", ext.JSON_ONLY_INSTRUCTION + " (changed)")
+    assert extraction_fingerprint()["prompt_hash"] != fp["prompt_hash"]
+    monkeypatch.setattr(ext, "QUANTITY_VERSION", "9.9")
+    assert extraction_fingerprint()["quantity_version"] == "9.9"
+
+
+# --------------------------------------------------------------------------- 28: a jurisdiction code is a whole token
+
+
+def test_28_a_code_inside_an_identifier_does_not_name_a_jurisdiction():
+    assert not jurisdiction_named_in("DE", "DE-9 커넥터 사용") and not jurisdiction_named_in("US", "USB-C") and not jurisdiction_named_in("IN", "IN-1 pin")
+    assert jurisdiction_named_in("DE", "DE에서 판매") and jurisdiction_named_in("EU", "EU에서 판매") and jurisdiction_named_in("DE", "Germany")
+    canned = {"requirements": [], "questions": [], "conflicts": [], "assumptions": [], "application": None, "jurisdictions": [{"code": "DE", "quote": "DE-9"}]}
+    grounded = ground_extraction("DE-9 커넥터로 연결하는 12V 장치", RequirementExtraction.model_validate(canned), "m")
+    assert grounded.jurisdictions == []
+
+
+# --------------------------------------------------------------------------- 29: no NaN
+
+
+def test_29_a_nan_number_is_rejected_by_the_schema():
+    canned = json.loads(json.dumps(REQ_CANNED))
+    canned["requirements"][0]["value"]["number"] = float("nan")
+    with pytest.raises(ValidationError):
+        RequirementExtraction.model_validate(canned)
+    canned["requirements"][0]["value"]["number"] = float("inf")
+    with pytest.raises(ValidationError):
+        RequirementExtraction.model_validate(canned)
+
+
+# --------------------------------------------------------------------------- 30: confirmations made of confirmation words
+
+
+def test_30_confirmation_words_confirm_and_a_repeated_correction_is_explained(tmp_path: Path):
+    assert is_confirmation("네 맞습니다") and is_confirmation("yes, correct") and is_confirmation("ok thanks") and is_confirmation("네, 확인합니다.")
+    assert not is_confirmation("yes, but change X") and not is_confirmation("sure") and not is_confirmation("thanks")
+    assert is_correction("yes, but change the input to 24V") and not is_correction("네 맞습니다")
+    svc, client = _req_service([{"structured": REQ_CANNED, "usage": USAGE}, {"structured": REQ_CANNED, "usage": USAGE}])
+    ir = _req_ir(tmp_path)
+    _req_run(ir, svc, tmp_path)
+    _req_run(ir, svc, tmp_path, answers={CONFIRM_KEY: "네 맞습니다"})
+    assert len(client.calls) == 1 and ir.requirements.get("input_voltage").value.provenance.kind is ProvenanceKind.USER_REQUIREMENT
+    _req_run(ir, svc, tmp_path, answers={CONFIRM_KEY: "the output is 3.3V, not 5V"})
+    assert len(client.calls) == 2 and ir.requirements.corrections == ["the output is 3.3V, not 5V"]
+    state = _req_run(ir, svc, tmp_path, answers={CONFIRM_KEY: "the output is 3.3V, not 5V"})
+    assert len(client.calls) == 2 and "already part of the request" in state.outcome(Stage.REQUIREMENT_ANALYSIS).message

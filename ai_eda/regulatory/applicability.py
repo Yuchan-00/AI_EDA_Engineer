@@ -71,9 +71,10 @@ MAINS_KEY = "mains_powered"
 #: provenance kinds a rule may read a requirement value from
 TRUSTED_KINDS: frozenset[ProvenanceKind] = frozenset({ProvenanceKind.USER_REQUIREMENT, ProvenanceKind.AUTHORITATIVE})
 
-#: ``AC`` / ``DC`` next to a volt unit (``12 V DC``, ``230VAC``, ``48 Vdc``), or the Korean words; never the bare word in prose
-_AC_RE = re.compile(r"(?<![A-Za-z])[Vv]\s*(?:AC|ac|Ac)(?![A-Za-z])|교류")
-_DC_RE = re.compile(r"(?<![A-Za-z])[Vv]\s*(?:DC|dc|Dc)(?![A-Za-z])|직류")
+#: ``AC`` / ``DC`` next to the value: after the volt unit (``12 V DC``, ``230VAC``, ``48 Vdc``, ``60 V (DC)``) or right before
+#: the number (``DC 60 V``, ``AC220V``), or the Korean words; never the bare word in prose (``AC adapter``)
+_AC_RE = re.compile(r"(?<![A-Za-z])[Vv]\s*\(?\s*(?:AC|ac|Ac)\s*\)?(?![A-Za-z])|(?<![A-Za-z])(?:AC|ac|Ac)\s*(?=[0-9])|교류")
+_DC_RE = re.compile(r"(?<![A-Za-z])[Vv]\s*\(?\s*(?:DC|dc|Dc)\s*\)?(?![A-Za-z])|(?<![A-Za-z])(?:DC|dc|Dc)\s*(?=[0-9])|직류")
 _YES_EXTRA = frozenset({"true", "1", "있음", "있어요", "포함"})
 _NO_EXTRA = frozenset({"false", "0", "없음", "없어요", "미포함", "아님"})
 

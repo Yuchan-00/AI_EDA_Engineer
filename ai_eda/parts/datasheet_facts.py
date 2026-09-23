@@ -321,7 +321,7 @@ def ground_facts(
                 if not mpn or not str(mpn).strip():
                     out.rejected.append((key, "package is not tied to the part: the component has no MPN to find in the quoted row"))
                     continue
-                if find_quote(str(mpn).translate(_ASCII_LOWER), hit.matched.translate(_ASCII_LOWER)) is None:
+                if find_quote(str(mpn).translate(_ASCII_LOWER), hit.matched.translate(_ASCII_LOWER), identifier=True) is None:
                     out.rejected.append((key, f"package is not tied to the part: the quote {hit.matched!r} does not contain the MPN {mpn!r} "
                                               "(quote the ordering row that names this part number and its package)"))
                     continue

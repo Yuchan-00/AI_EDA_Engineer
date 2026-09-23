@@ -256,7 +256,7 @@ class ArchivedDocument(BaseModel):
 
     # ------------------------------------------------------------ grounding
 
-    def find_quote(self, quote: str | None, page: int | None = None, *, ignore_case: bool = False) -> list[QuoteHit]:
+    def find_quote(self, quote: str | None, page: int | None = None, *, ignore_case: bool = False, identifier: bool = False) -> list[QuoteHit]:
         """The first hit of ``quote`` on every page (or on ``page`` only), with the requirement stage's normalisation.
 
         Characters must match exactly, whitespace may differ, and the match
@@ -266,6 +266,9 @@ class ArchivedDocument(BaseModel):
         datasheets set in either case; ``m``/``M`` in a quantity still differ
         only when the caller keeps the default. A ``page`` outside the
         document gives no hit; the caller reports the claim as ungrounded.
+        ``identifier=True`` (part numbers) also refuses a match that stops or
+        starts inside a dot / dash-joined code: ``LM2596S-5`` is not in
+        ``LM2596S-5.0/NOPB`` (``LM2596S-5.0`` is; a slash separates an option suffix).
         """
         if not quote or not quote.strip():
             return []
@@ -278,7 +281,7 @@ class ArchivedDocument(BaseModel):
         needle = quote.translate(_ASCII_LOWER) if ignore_case else quote
         hits: list[QuoteHit] = []
         for n, text in candidates:
-            span = _find_quote_span(needle, text.translate(_ASCII_LOWER) if ignore_case else text)
+            span = _find_quote_span(needle, text.translate(_ASCII_LOWER) if ignore_case else text, identifier=identifier)
             if span is None:
                 continue
             hits.append(QuoteHit(page=n, offset=span[0], matched=text[span[0]:span[1]], context=quote_context(text, span, QUOTE_CONTEXT_CHARS)))

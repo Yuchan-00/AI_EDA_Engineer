@@ -209,14 +209,13 @@ class CatalogSource:
         self.columns = columns
         self.notes = notes
         self.encoding = encoding
-        self._by_key: dict[str, CatalogRow] = {}
+        self._by_key: dict[str, list[CatalogRow]] = {}
         self.duplicates: dict[str, int] = {}
         for row in rows:
             key = mpn_key(row.mpn)
             if key in self._by_key:
                 self.duplicates[key] = self.duplicates.get(key, 1) + 1
-                continue
-            self._by_key[key] = row
+            self._by_key.setdefault(key, []).append(row)
 
     # ------------------------------------------------------------ loading
 
@@ -313,10 +312,15 @@ class CatalogSource:
         )
 
     def lookup(self, mpn: str | None) -> CatalogRow | None:
-        """The first row whose MPN equals ``mpn`` ignoring ASCII case and whitespace, else ``None``."""
+        """The first row whose MPN equals ``mpn`` ignoring ASCII case and whitespace, else ``None`` (see :meth:`rows_for`)."""
+        rows = self.rows_for(mpn)
+        return rows[0] if rows else None
+
+    def rows_for(self, mpn: str | None) -> list[CatalogRow]:
+        """Every row whose MPN equals ``mpn`` ignoring ASCII case and whitespace, in file order (community dumps list one MPN under several brands)."""
         if not mpn or not str(mpn).strip():
-            return None
-        return self._by_key.get(mpn_key(mpn))
+            return []
+        return list(self._by_key.get(mpn_key(mpn), ()))
 
     def sourcing_info(self, row: CatalogRow) -> SourcingInfo:
         """``SourcingInfo`` for a row: every value ``authoritative`` with this file as its source (row noted)."""

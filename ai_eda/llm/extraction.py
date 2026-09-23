@@ -100,8 +100,8 @@ from ai_eda.ir.requirements import (
     RequirementStatus,
 )
 from ai_eda.llm.client import LLMMessage
-from ai_eda.llm.prompts import REQUIREMENT_EXTRACTION_SYSTEM, requirement_extraction_messages
-from ai_eda.tools.calc.quantity import Quantity, QuantityRange, find_quantities, format_quantity, parse_quantity
+from ai_eda.llm.prompts import JSON_ONLY_INSTRUCTION, REQUIREMENT_EXTRACTION_SYSTEM, requirement_extraction_messages  # noqa: F401
+from ai_eda.tools.calc.quantity import QUANTITY_VERSION, Quantity, QuantityRange, find_quantities, format_quantity, parse_quantity
 
 #: bumped whenever grounding rules, the prompt or the schema change in a way that makes a cached model reply stale
 EXTRACTION_VERSION = "0.2"
@@ -232,9 +232,9 @@ class _Strict(BaseModel):
 
 class ExtractedValue(_Strict):
     quote: str = Field(description="verbatim phrase of the request that contains this number and its unit")
-    number: float = Field(description="the number as written in the quote (500 for '500mA', or 0.5 with unit 'A')")
+    number: float = Field(allow_inf_nan=False, description="the number as written in the quote (500 for '500mA', or 0.5 with unit 'A')")
     unit: str = Field(description="the unit as written (V, mA, kΩ, uF, MHz, °C, %); SI symbols with SI prefixes")
-    number_high: float | None = Field(description="upper bound when the quote states a range (-20..85 °C); null otherwise")
+    number_high: float | None = Field(allow_inf_nan=False, description="upper bound when the quote states a range (-20..85 °C); null otherwise")
 
 
 class ExtractedRequirement(_Strict):
@@ -264,9 +264,9 @@ class ExtractedAssumption(_Strict):
     key: str = Field(description="ascii lower-case snake_case identifier")
     text: str
     category: Category
-    number: float | None
+    number: float | None = Field(allow_inf_nan=False)
     unit: str | None
-    number_high: float | None = Field(description="upper bound when the assumption is a range; null otherwise")
+    number_high: float | None = Field(allow_inf_nan=False, description="upper bound when the assumption is a range; null otherwise")
     rationale: str = Field(description="why this had to be assumed and why this value")
 
 
@@ -333,7 +333,26 @@ def _boundary_after(ch: str) -> bool:
     return not ch or not (ch.isascii() and (ch.isalnum() or ch == "_"))
 
 
-def find_quote(quote: str | None, raw_input: str) -> tuple[int, int] | None:
+#: characters that continue an orderable code (``LM2596S-5.0``, ``VR1-0603-200V-A``): in identifier mode a match may not
+#: stop or start next to one of them when an ASCII letter / digit continues on the other side. A slash separates an
+#: option suffix (``LM2596S-5.0/NOPB``), so the code before it is a whole identifier.
+_IDENTIFIER_JOINERS = frozenset(".-_")
+
+
+def _identifier_boundary(text: str, s: int, e: int) -> bool:
+    """Whether ``text[s:e]`` is a whole identifier: not cut out of a longer dot / dash / slash-joined code."""
+    after = text[e] if e < len(text) else ""
+    after2 = text[e + 1] if e + 1 < len(text) else ""
+    if after in _IDENTIFIER_JOINERS and after2.isascii() and after2.isalnum():
+        return False
+    before = text[s - 1] if s > 0 else ""
+    before2 = text[s - 2] if s > 1 else ""
+    if before in _IDENTIFIER_JOINERS and before2.isascii() and before2.isalnum():
+        return False
+    return True
+
+
+def find_quote(quote: str | None, raw_input: str, *, identifier: bool = False) -> tuple[int, int] | None:
     """``(start, end)`` of the first place ``quote`` occurs in ``raw_input`` at a token boundary, else ``None``.
 
     Characters must match exactly (case included: ``m`` is milli, ``M`` is
@@ -341,7 +360,10 @@ def find_quote(quote: str | None, raw_input: str) -> tuple[int, int] | None:
     not continue a number or an ASCII word on its left (``5V`` is not in
     ``-5V``, ``0.5A``, ``12V``, ``x5V``) and may not be continued by an ASCII
     letter or digit on its right (``12V`` is not in ``12Vin``); Hangul may
-    follow (``5V로``). Empty -> ``None``.
+    follow (``5V로``). Empty -> ``None``. With ``identifier=True`` (part
+    numbers) the match may not stop or start inside a dot / dash-joined code
+    either: ``LM2596S-5`` is not in ``LM2596S-5.0/NOPB`` (``LM2596S-5.0`` is:
+    a slash separates an option suffix).
     """
     if not quote:
         return None
@@ -355,7 +377,8 @@ def find_quote(quote: str | None, raw_input: str) -> tuple[int, int] | None:
         if m is None:
             return None
         s, e = m.start(), m.end()
-        if _boundary_before(raw_input[s - 1] if s > 0 else "") and _boundary_after(raw_input[e] if e < len(raw_input) else ""):
+        if (_boundary_before(raw_input[s - 1] if s > 0 else "") and _boundary_after(raw_input[e] if e < len(raw_input) else "")
+                and (not identifier or _identifier_boundary(raw_input, s, e))):
             return s, e
         pos = s + 1
     return None
@@ -408,11 +431,20 @@ def _sha256(text: str) -> str:
 
 
 def extraction_fingerprint() -> dict[str, str]:
-    """What a cached model reply depends on besides the request text: extraction version, prompt hash, schema hash."""
+    """What a cached model reply depends on besides the request text.
+
+    The extraction version, the prompt *as sent* (system text with the
+    schema note, the request framing, the JSON-only instruction a
+    non-structured transport adds), the strict schema and the quantity
+    parser's rules (they decide what grounds). The model is not part of it:
+    the cache is keyed by request text and records ``model`` in the entry.
+    """
+    prompt = [m.model_dump(mode="json") for m in requirement_extraction_messages("", None)] + [JSON_ONLY_INSTRUCTION]
     return {
         "extraction_version": EXTRACTION_VERSION,
-        "prompt_hash": _sha256(REQUIREMENT_EXTRACTION_SYSTEM),
+        "prompt_hash": _sha256(json.dumps(prompt, sort_keys=True, ensure_ascii=False)),
         "schema_hash": _sha256(json.dumps(json_schema(), sort_keys=True, ensure_ascii=False)),
+        "quantity_version": QUANTITY_VERSION,
     }
 
 
@@ -436,6 +468,10 @@ def cache_entry_staleness(entry: dict[str, Any] | None) -> str | None:
     except Exception as e:  # pydantic ValidationError, or a non-dict payload
         first = str(e).splitlines()[0][:200]
         return f"cached extraction no longer matches the schema ({first}); re-extracting"
+    if not isinstance(entry.get("model"), str) or not entry["model"].strip():
+        return "cached extraction does not record the model that produced it; re-extracting"
+    if not isinstance(entry.get("decisions", {}), dict):
+        return "cached extraction's decisions are not an object; re-extracting"
     return None
 
 
@@ -449,9 +485,24 @@ def normalise_answer(answer: str | None) -> str:
     return " ".join(answer.split()).casefold().rstrip(_TRAILING_PUNCT).strip()
 
 
+#: words that add nothing to a confirmation (``ok thanks``, ``네 감사합니다``)
+_CONFIRM_FILLER: frozenset[str] = frozenset({"thanks", "thank", "you", "please", "sure", "fine", "good", "감사", "감사합니다", "고마워요", "고맙습니다", "넵", "넹"})
+
+
 def is_confirmation(answer: str | None) -> bool:
-    """Whether a user's answer to :data:`CONFIRM_KEY` confirms (``yes`` / ``y`` / ``ok`` / ``네`` / ``확인`` ..., punctuation ignored)."""
-    return normalise_answer(answer) in CONFIRM_ANSWERS
+    """Whether a user's answer to :data:`CONFIRM_KEY` confirms.
+
+    The listed spellings (``yes`` / ``y`` / ``ok`` / ``네`` / ``확인`` ...,
+    punctuation ignored), or several of them with filler words (``네
+    맞습니다``, ``yes, correct``, ``ok thanks``). A word that says anything
+    else (``yes, but change X``) is not a confirmation.
+    """
+    norm = normalise_answer(answer)
+    if norm in CONFIRM_ANSWERS:
+        return True
+    words = [w.strip(_TRAILING_PUNCT + "'\"()") for w in norm.replace(",", " ").split()]
+    words = [w for w in words if w]
+    return bool(words) and any(w in CONFIRM_ANSWERS for w in words) and all(w in CONFIRM_ANSWERS or w in _CONFIRM_FILLER for w in words)
 
 
 def is_rejection(answer: str | None) -> bool:
@@ -505,6 +556,10 @@ def _same_quantity(a: Quantity | QuantityRange, b: Quantity | QuantityRange) -> 
     return a.value == b.value and a.unit == b.unit and a.plus_minus == b.plus_minus
 
 
+#: the AC/DC words the quantity parser reads with a volt unit (``12 V DC``); a quote may stop before them
+_CURRENT_KIND_WORDS = frozenset({"dc", "ac"})
+
+
 def _request_quantity(raw_input: str, span: tuple[int, int]) -> tuple[Quantity | QuantityRange | None, str | None]:
     """``(parsed, None)`` or ``(None, reason)`` for the quantity the request states at ``span``.
 
@@ -526,8 +581,10 @@ def _request_quantity(raw_input: str, span: tuple[int, int]) -> tuple[Quantity |
     overlapping = [(s, e, q) for (s, e), q in find_quantities(raw_input) if s < end and e > start]
     if len(overlapping) == 1:
         s, e, q = overlapping[0]
-        if start <= s and e <= end and _same_quantity(q, parsed):
-            return parsed, None
+        if start <= s and _same_quantity(q, parsed):
+            # ``12V`` quoted from ``12V DC``: the parser reads the AC/DC word with the unit, the quote may leave it out
+            if e <= end or raw_input[end:e].strip().strip("()").strip().lower() in _CURRENT_KIND_WORDS:
+                return parsed, None
         return None, f"quote {text!r} is part of a larger quantity in the request ({format_quantity(q)})"
     return None, f"quote {text!r} does not read as one quantity in the request ({len(overlapping)} found there)"
 
@@ -842,7 +899,15 @@ def _dedupe(candidates: list[Requirement], dropped: list[tuple[str, str]], notes
             out.append(req)
             continue
         if _same_value(first, req):
-            dropped.append((req.key, f"duplicate of {first.id} with an identical value; merged"))
+            if _rank(req) < _rank(first):
+                # the grounded explicit statement survives whatever order the model listed the two in: it is the
+                # one the user can confirm into user_requirement, the inference is not
+                req.id = first.id
+                out[out.index(first)] = req
+                first_of[req.key] = req
+                dropped.append((first.key, f"duplicate of {req.id} with an identical value; merged into the {req.kind} item"))
+            else:
+                dropped.append((req.key, f"duplicate of {first.id} with an identical value; merged"))
             continue
         if not (_is_numeric(first) and _is_numeric(req)):
             if _same_kind(first, req):
@@ -894,7 +959,7 @@ _JURISDICTION_CODE = re.compile(r"^[A-Z]{2,3}$")
 
 def jurisdiction_named_in(code: str, text: str) -> bool:
     """Whether ``text`` names the jurisdiction ``code``: the code as an upper-case token, or a :data:`JURISDICTION_NAMES` entry."""
-    if re.search(rf"(?<![A-Za-z]){re.escape(code)}(?![A-Za-z])", text):
+    if re.search(rf"(?<![A-Za-z0-9-]){re.escape(code)}(?![A-Za-z0-9-])", text):
         return True
     folded = _collapse(text)
     for name in JURISDICTION_NAMES.get(code, ()):
