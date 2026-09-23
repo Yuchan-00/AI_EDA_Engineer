@@ -19,6 +19,8 @@ class ExternalAction(StrEnum):
     PAID_API_CALL = "paid_api_call"
     MANUFACTURING_ORDER = "manufacturing_order"
     REGULATORY_SUBMISSION = "regulatory_submission"
+    #: opening a network connection to fetch a document (datasheet, official text); granted once per online session
+    NETWORK_FETCH = "network_fetch"
 
 
 class Approval(BaseModel):

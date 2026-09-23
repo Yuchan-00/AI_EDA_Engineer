@@ -27,10 +27,19 @@ from ai_eda.llm.extraction import (
     upgrade_confirmed,
 )
 from ai_eda.llm.fake import ScriptedLLMClient
-from ai_eda.llm.openrouter import OpenRouterClient
 from ai_eda.llm.router import ModelConfig, ModelRouter, TaskKind, default_router
 from ai_eda.llm.service import BudgetExceededError, LLMAttempt, LLMBudget, LLMService, StructuredOutputError
 from ai_eda.llm.usage import UsageTracker
+
+
+def __getattr__(name: str):
+    # The HTTP client (and with it httpx) is imported only when asked for, so the agents, the document archive
+    # (add_file / load / verify) and the offline CLI paths import without the network extras installed.
+    if name == "OpenRouterClient":
+        from ai_eda.llm.openrouter import OpenRouterClient
+
+        return OpenRouterClient
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "LLMClient", "LLMError", "LLMMessage", "LLMResponse", "ToolCall", "ToolSpec", "Usage",

@@ -41,6 +41,25 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   a tool and inputs that exist). The CALCULATION stage's stored
   ``calc.recompute`` is reported next to it and a disagreement between the
   two is a FAIL of its own.
+* ``review.component_provenance``: the same rule as the IR_BUILD validator
+  (:func:`ai_eda.parts.identity.mpn_grounding`) - an MPN is verified only when
+  it is ``authoritative`` *and* its SourceRef names an entry of a document
+  archive (a PDF) that still hashes to its name, whose text re-extracts to
+  what was recorded, **and in which the reviewer re-locates the MPN itself**
+  on the recorded page (a tag alone is NOT_VERIFIED, an altered file is
+  ``tampered``, a tag that the document does not bear is ``not in text``);
+  the latest ``component.existence.<ref>`` result must exist, must have read
+  that very document and found the MPN, and its worst sub-check is passed
+  through (FAIL when a referenced library entry does not exist - a human).
+  Evidence: the archived datasheets.
+* ``review.regulatory_provenance``: every requirement needs the ten
+  :data:`REGULATORY_PROVENANCE_FIELDS` (``verification_status`` PASS), an
+  archived official text that is an archive entry, still hashes and still
+  re-extracts to the recorded text, **every quote the stage reported as
+  found re-located by the reviewer on the recorded page**, and a decided
+  applicability; a quote missing from the official text is FAIL (the
+  curated list is wrong). PASS is source provenance and applicability only -
+  every message says that compliance is not assessed.
 """
 
 from __future__ import annotations
@@ -58,6 +77,7 @@ from ai_eda.ir import (
     CircuitIR,
     Evidence,
     ProvenanceKind,
+    SourceRef,
     ValidationResult,
     ValidationStatus,
     worst_status,
@@ -73,6 +93,12 @@ Check = Callable[[CircuitIR, Path], ValidationResult]
 
 #: position tolerance when comparing CPL rows (4 decimals) with board coordinates (6 decimals)
 POSITION_TOL_MM = 1e-4
+
+#: the ten fields of :class:`~ai_eda.ir.RegulatoryProvenance` every regulatory requirement must carry (``verification_status`` must be PASS)
+REGULATORY_PROVENANCE_FIELDS: tuple[str, ...] = (
+    "jurisdiction", "authority", "source_title", "source_url", "retrieved_at", "section", "applicability_rationale",
+    "verification_status", "source_document", "content_hash",
+)
 
 
 class ReviewReport(BaseModel):
@@ -601,28 +627,198 @@ class IndependentReviewer:
         return ValidationResult(check_id="", status=ValidationStatus.PASS, message=f"recompute: {live.message} (agrees with the stored values)", details=details)
 
     def check_regulatory_provenance(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
+        """Every regulatory requirement must carry the ten provenance fields, an archived official text that still hashes, and a decided applicability.
+
+        PASS means exactly that - source provenance and applicability. It is
+        never a compliance verdict: every message says so, and a requirement's
+        own ``status`` (``NOT_APPLICABLE`` / ``NOT_VERIFIED``) is not read as
+        one. A requirement whose ``verification_status`` is FAIL (a claimed
+        quote is not in the official text: the curated list is wrong) FAILs
+        the review for a human; an incomplete, unarchived, missing, tampered or
+        undecided entry keeps it NOT_VERIFIED.
+        """
+        from ai_eda.ir.regulatory import Applicability
+        from ai_eda.parts.identity import locate_source, open_archive
+
+        suffix = "; compliance not assessed (an engineer / notified body must assess the design against each applicable regulation)"
         reg = ir.regulatory
         if not reg.jurisdiction_known:
-            return ValidationResult(check_id="", status=ValidationStatus.USER_INPUT_REQUIRED, message="jurisdiction unknown")
+            return ValidationResult(check_id="", status=ValidationStatus.USER_INPUT_REQUIRED, message="jurisdiction unknown" + suffix)
         if not reg.requirements:
-            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no regulatory requirements researched")
-        incomplete = [r.id for r in reg.requirements if not (r.provenance.source_url and r.provenance.retrieved_at and r.provenance.content_hash)]
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no regulatory requirements researched" + suffix)
+        archive = open_archive(self.tools, workdir)
+        incomplete: dict[str, list[str]] = {}
+        failed: list[str] = []
+        undecided: dict[str, list[str]] = {}
+        files: dict[str, str] = {}
+        tampered: list[str] = []
+        missing: list[str] = []
+        unarchived: list[str] = []
+        re_extracted: list[str] = []
+        unlocated: dict[str, list[str]] = {}
+        evidence: list[Evidence] = []
+        applicable: list[str] = []
+        not_applicable: list[str] = []
+        docs: dict[str, Any] = {}  # content hash -> loaded document (or None when it could not be loaded)
+
+        def load(title: str, url: str | None, content_hash: str | None, path: str | None, when) -> tuple[str, str, Any]:
+            if content_hash in docs:
+                return "ok" if docs[content_hash] is not None else "missing", "cached", docs[content_hash]
+            if path is None and archive is not None and content_hash:
+                # a quote's document other than the requirement's own (a consolidated text): known by hash only, held by the archive or not at all
+                verdict = archive.verify(SourceRef(title=title, url=url, content_hash=content_hash))
+                doc = archive.load(content_hash) if verdict == "ok" else None
+                docs[content_hash] = doc
+                return verdict, f"archive entry {content_hash} {verdict}", doc
+            verdict, why, doc = locate_source(SourceRef(title=title, url=url, content_hash=content_hash, document_path=path, retrieved_at=when), archive)
+            docs[content_hash] = doc
+            return verdict, why, doc
+
+        for r in reg.requirements:
+            p = r.provenance
+            lacking = [f for f in REGULATORY_PROVENANCE_FIELDS if getattr(p, f) in (None, "")]
+            if p.verification_status is ValidationStatus.FAIL:
+                failed.append(r.id)
+            elif p.verification_status is not ValidationStatus.PASS:
+                lacking.append("verification_status")
+            if lacking:
+                incomplete[r.id] = lacking
+            if r.applicability is Applicability.UNDECIDED:
+                undecided[r.id] = list(r.missing_inputs)
+            elif r.applicability is Applicability.APPLICABLE:
+                applicable.append(r.id)
+            else:
+                not_applicable.append(r.id)
+            if p.content_hash or p.source_document:
+                verdict, why, doc = load(r.title, p.source_url, p.content_hash, p.source_document, p.retrieved_at)
+                files[r.id] = f"{verdict}: {why}"
+                if verdict == "tampered":
+                    tampered.append(r.id)
+                elif verdict == "missing":
+                    missing.append(r.id)
+                elif verdict == "unarchived":
+                    unarchived.append(r.id)
+                elif verdict == "ok" and doc is not None:
+                    if not doc.text_matches_meta:
+                        re_extracted.append(r.id)
+                    if p.source_document and p.content_hash not in {e.content_hash for e in evidence}:
+                        evidence.append(Evidence(description=f"{r.id} archived official text", path=p.source_document, url=p.source_url, content_hash=p.content_hash))
+            # the reviewer's own second opinion: every quote the stage says it found must still stand in the archived text, on that page
+            for q in r.grounded_quotes:
+                if not q.found:
+                    continue
+                if not q.content_hash:
+                    unlocated.setdefault(r.id, []).append(f"{q.section} (no archived document recorded for the quote)")
+                    continue
+                verdict, _why, qdoc = load(r.title, q.source_url, q.content_hash, p.source_document if q.content_hash == p.content_hash else None, p.retrieved_at)
+                if qdoc is None:
+                    if q.content_hash != p.content_hash:
+                        unlocated.setdefault(r.id, []).append(f"{q.section} (archived document {q.content_hash[:19]}… {verdict})")
+                    continue
+                if not qdoc.find_quote(q.quote, q.page):
+                    unlocated.setdefault(r.id, []).append(f"{q.section} (page {q.page})")
+        details: dict = {
+            "requirements": len(reg.requirements), "incomplete": incomplete, "quote_missing": failed, "undecided": undecided, "files": files,
+            "tampered": tampered, "missing_files": missing, "unarchived": unarchived, "re_extracted": re_extracted, "quotes_not_relocated": unlocated,
+            "applicable": applicable, "not_applicable": not_applicable, "archive": str(archive.root) if archive is not None else None,
+        }
+        if failed:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, evidence=evidence, details=details,
+                                    message=f"claimed quote(s) not found in the archived official text for {failed}: the curated candidate list is wrong" + suffix)
+        problems: list[str] = []
         if incomplete:
-            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="regulatory items lack url/date/hash provenance", details={"incomplete": incomplete})
-        return ValidationResult(check_id="", status=worst_status(r.status for r in reg.requirements))
+            problems.append(f"{len(incomplete)} requirement(s) lack provenance fields ({'; '.join(f'{k}: {v}' for k, v in incomplete.items())})")
+        if tampered:
+            problems.append(f"tampered archived text for {tampered}")
+        if missing:
+            problems.append(f"archived text missing on disk for {missing}")
+        if unarchived:
+            problems.append(f"recorded source file is not an archive entry for {unarchived}")
+        if re_extracted:
+            problems.append(f"the archived text re-extracts differently from what was recorded (extractor changed) for {re_extracted}; re-run the regulatory stage")
+        if unlocated:
+            problems.append("quote(s) the stage reported as found are not found in the archived text at review time for "
+                            + "; ".join(f"{k}: {v}" for k, v in unlocated.items()))
+        if undecided:
+            problems.append(f"applicability undecided for {list(undecided)} (answer {sorted({k for keys in undecided.values() for k in keys})})")
+        if problems:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, evidence=evidence, details=details, message="; ".join(problems) + suffix)
+        return ValidationResult(
+            check_id="", status=ValidationStatus.PASS, evidence=evidence, details=details,
+            message=(f"{len(reg.requirements)} regulatory requirement(s) with the ten provenance fields, archived official texts hash-verified, every grounded quote "
+                     f"re-located in the archived text, and applicability decided ({len(applicable)} applicable: {applicable}; {len(not_applicable)} not applicable)" + suffix),
+        )
 
     def check_component_provenance(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
-        """Every component needs an authoritative identity (MPN backed by official data) and verified library entries."""
+        """Every component needs a grounded identity - an MPN found verbatim in an archived, hash-verified datasheet - and verified library entries.
+
+        The same rule as ``ir.component_provenance``
+        (:func:`~ai_eda.parts.identity.mpn_grounding`): an MPN merely tagged
+        authoritative is not grounded; a datasheet altered after grounding is
+        ``tampered`` (NOT_VERIFIED, human). The latest ``component.existence.<ref>``
+        result is read as evidence: it must exist for the component, must not
+        be FAIL (a library entry the design references is not there - a
+        human), must have read the very document the MPN is tagged from and
+        found the MPN in it, and its other sub-checks (catalog included) must
+        not be NOT_VERIFIED - the check's own worst sub-check is passed
+        through, never upgraded.
+        """
+        from ai_eda.parts.identity import existence_conflict, latest_existence, mpn_grounding, open_archive
+
+        if not ir.components:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no components")
+        archive = open_archive(self.tools, workdir)
         weak: list[str] = []
+        reasons: dict[str, str] = {}
+        tampered: list[str] = []
+        failed: list[str] = []
+        grounding: dict[str, dict] = {}
+        evidence: list[Evidence] = []
         for c in ir.components:
-            if not c.has_authoritative_identity:
-                weak.append(f"{c.ref}.mpn[{c.mpn.provenance.kind if c.mpn is not None else 'missing'}]")
+            g = mpn_grounding(c, archive)
+            existence = latest_existence(ir, c.ref)
+            conflict = existence_conflict(existence, g)
+            grounding[c.ref] = {**g.model_dump(mode="json"), "existence_status": existence.status if existence is not None else None, "existence_conflict": conflict}
+            if not g.grounded:
+                weak.append(f"{c.ref}.mpn[{g.label}]")
+                reasons[c.ref] = g.reason
+                if "tampered" in g.label:
+                    tampered.append(c.ref)
+            else:
+                evidence.append(Evidence(description=f"archived datasheet grounding {c.ref} MPN {g.mpn}", path=g.document_path, content_hash=g.content_hash))
             if c.symbol and not c.symbol.verified:
                 weak.append(f"{c.ref}.symbol[unverified]")
             if c.footprint and not c.footprint.verified:
                 weak.append(f"{c.ref}.footprint[unverified]")
+            if existence is None:
+                weak.append(f"{c.ref}.existence[not checked]")
+                reasons.setdefault(c.ref, "no component.existence result: the component stage has not checked this part")
+            elif existence.status is ValidationStatus.FAIL:
+                failed.append(c.ref)
+                reasons[c.ref] = f"component.existence.{c.ref} FAIL: {existence.message}"
+            elif conflict is not None:
+                weak.append(f"{c.ref}.existence[disagrees]")
+                reasons[c.ref] = conflict
+            elif existence.status not in (ValidationStatus.PASS, ValidationStatus.NOT_APPLICABLE):
+                open_checks = [ch["name"] for ch in existence.details.get("checks", []) if ch.get("status") not in (str(ValidationStatus.PASS), str(ValidationStatus.NOT_APPLICABLE))]
+                weak.append(f"{c.ref}.existence[{existence.status}: {', '.join(open_checks) or 'no sub-check listed'}]")
+                reasons.setdefault(c.ref, existence.message)
+        details: dict = {"weak": weak, "reasons": reasons, "tampered": tampered, "existence_failed": failed, "grounding": grounding,
+                         "archive": str(archive.root) if archive is not None else None}
+        if failed:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, evidence=evidence, details=details,
+                                    message=f"the design references library entries that do not exist ({failed}): " + "; ".join(reasons[r] for r in failed))
         if weak:
-            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="component identity not fully verified", details={"weak": weak, "repair": "human"})
-        if not ir.components:
-            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no components")
-        return ValidationResult(check_id="", status=ValidationStatus.PASS)
+            details["repair"] = "human"
+            message = "component identity not fully verified"
+            if tampered:
+                message += f"; tampered archived datasheet for {tampered} (altered after grounding) - re-fetch and re-check"
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, evidence=evidence, details=details,
+                                    message=f"{message}: " + "; ".join(f"{ref}: {why}" for ref, why in reasons.items()))
+        return ValidationResult(
+            check_id="", status=ValidationStatus.PASS, evidence=evidence, details=details,
+            message=f"{len(ir.components)} component(s): MPN found verbatim in an archived, hash-verified datasheet, library entries verified, existence checks PASS",
+        )

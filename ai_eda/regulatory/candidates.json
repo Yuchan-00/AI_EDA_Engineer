@@ -1,0 +1,344 @@
+{
+  "schema_version": 1,
+  "provenance": "curated candidate list; every entry is unverified until fetched and grounded. Entries, URLs, markers and quotes were taken from a read-only probe of the official sites on 2026-09-23 (UA ai-eda-regulatory-probe/0.1); summaries, applicability rules and engineering implications are curated prose, not official text, and never become a compliance verdict.",
+  "curated_at": "2026-09-23",
+  "curated_by": "ai-eda-engineer regulatory probe 2026-09-23 (reviewed by hand)",
+  "placeholders": {
+    "LAW_GO_KR_OC": {
+      "env": "AI_EDA_LAW_GO_KR_OC",
+      "default": "test",
+      "note": "법제처 open API (DRF) user id. 'test' is a whitelisted demo id that worked on 2026-09-23; register a project id at open.law.go.kr for production and set AI_EDA_LAW_GO_KR_OC. An unknown id answers HTTP 200 with an error XML (<Response><result>사용자 정보 검증에 실패하였습니다.</result>), which the expected markers reject as 'not the document'."
+    }
+  },
+  "scope_questions": [
+    {
+      "key": "intended_use",
+      "question": "What is the product's intended use, and who will use it (consumer, professional, custom evaluation kit for R&D)?",
+      "rationale": "recorded as the regulatory state's intended use and given, as data, to a model that proposes further regulations; no rule reads this free text - the exclusions it hints at are asked as yes/no questions (evaluation_kit, finished_apparatus)"
+    },
+    {
+      "key": "mains_powered",
+      "question": "Is the product connected to the AC mains (directly, through a fixed cord or a plug)? (yes/no)",
+      "options": ["yes", "no"],
+      "rationale": "decides AC vs DC for voltage-range rules when the voltage requirement does not say; a contradiction between the two is reported, never resolved"
+    },
+    {
+      "key": "highest_rated_voltage",
+      "question": "What is the highest voltage rating anywhere in the product - input, outputs, internal rails, isolation - e.g. '12 V DC', '230 V AC', '400 V DC'?",
+      "jurisdictions": ["EU", "KR"],
+      "rationale": "the LVD (Article 1) and the KC tiers rate the equipment by its voltage rating, not by its input alone: a 12 V input feeding a 400 V rail is in scope; the input and output voltage requirements are read too, but only this answer lets a rule say NOT_APPLICABLE"
+    },
+    {
+      "key": "evaluation_kit",
+      "question": "Is the product a custom built evaluation kit destined for professionals, to be used solely at research and development facilities? (yes/no)",
+      "options": ["yes", "no"],
+      "jurisdictions": ["EU"],
+      "rationale": "Annex II of the LVD and Article 2(2)(e) of the EMC Directive exclude such kits; the quoted exclusion is evaluated from this answer"
+    },
+    {
+      "key": "radio",
+      "question": "Does the product intentionally transmit or receive radio waves (Wi-Fi, Bluetooth, LoRa, cellular, RFID/NFC, any antenna)? (yes/no)",
+      "options": ["yes", "no"],
+      "rationale": "radio equipment falls under the Radio Equipment Directive / 47 CFR Part 15 Subpart C / 전파법 적합인증 instead of (or in addition to) the general rules"
+    },
+    {
+      "key": "finished_apparatus",
+      "question": "Is the product a finished apparatus made available on the market to end-users (no: a custom built evaluation kit or sub-assembly for R&D professionals)? (yes/no)",
+      "options": ["yes", "no"],
+      "jurisdictions": ["EU"],
+      "rationale": "the EMC Directive applies to 'apparatus' as defined in Article 3 and excludes custom built evaluation kits (Article 2(2)(e))"
+    },
+    {
+      "key": "digital_device",
+      "question": "Does the design contain digital logic, a clock/oscillator or a switching converter (timing signals above 9 kHz)? (yes/no)",
+      "options": ["yes", "no"],
+      "jurisdictions": ["US", "KR"],
+      "rationale": "47 CFR 15.3(k) defines a digital device by pulses above 9,000 per second; 전파법 제58조의2 covers equipment that causes 전자파장해"
+    }
+  ],
+  "candidates": [
+    {
+      "id": "reg.EU.LVD.2014-35-EU",
+      "jurisdiction": "EU",
+      "title": "Directive 2014/35/EU (Low Voltage Directive) - electrical equipment designed for use within certain voltage limits",
+      "authority": "European Parliament and Council of the European Union (published on EUR-Lex, Publications Office of the EU)",
+      "official_url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32014L0035",
+      "document_form": "html",
+      "expected_markers": ["L_2014096EN.01035701.xml", "DIRECTIVE 2014/35/EU OF THE EUROPEAN PARLIAMENT AND OF THE COUNCIL"],
+      "allowed_domains": ["eur-lex.europa.eu"],
+      "summary": "Safety of electrical equipment with a voltage rating of 50-1000 V AC or 75-1500 V DC (Article 1), except the Annex II equipment (e.g. custom built evaluation kits for R&D professionals). Radio equipment is not subject to it directly: RED Article 3(1)(a) carries its safety objectives with no voltage limit.",
+      "engineering_implication": "If applicable: the design must meet the safety objectives of Annex I (protection against electric shock, temperature, mechanical hazards, ...), typically shown through harmonised standards; this needs an engineer and possibly a notified body - not decided here.",
+      "applicability_rule": {
+        "kind": "all_of",
+        "text": "applies when the design is not radio equipment (RED Article 1(4)), is not a custom built evaluation kit for R&D professionals (Annex II) and the equipment's voltage rating lies in 50-1000 V AC or 75-1500 V DC (Article 1)",
+        "rules": [
+          {"kind": "not", "rule": {"kind": "answer", "key": "radio", "equals": "yes"}, "text": "radio equipment is covered by Directive 2014/53/EU instead"},
+          {"kind": "not", "rule": {"kind": "answer", "key": "evaluation_kit", "equals": "yes", "evidence": "Annex II (evaluation kits)"}, "text": "custom built evaluation kits for R&D professionals are outside the scope (Annex II)"},
+          {"kind": "voltage_range", "requirement": "input_voltage", "requirements": ["output_voltage"], "scope_answer": "highest_rated_voltage", "ac": [50, 1000], "dc": [75, 1500], "evidence": "Article 1",
+           "text": "the equipment's voltage rating: the input and output voltage requirements plus the highest rated voltage the user states (highest_rated_voltage); other internal voltages are not read from the IR"}
+        ]
+      },
+      "not_evaluated": "the Annex II exclusions other than custom built evaluation kits (e.g. equipment for use in an explosive atmosphere, equipment for radiology and medical purposes, electrical parts for lifts, electricity meters, plugs and socket outlets for domestic use, electric fence controllers, specialised equipment for ships, aircraft or railways) are not evaluated",
+      "grounding_quotes": [
+        {"section": "Article 1", "quote": "This Directive shall apply to electrical equipment designed for use with a voltage rating of between 50 and 1 000 V for alternating current and between 75 and 1 500 V for direct current, other than the equipment and phenomena listed in Annex II.", "note": "the official HTML writes the thousands separator as U+00A0"},
+        {"section": "Article 1 (purpose)", "quote": "The purpose of this Directive is to ensure that electrical equipment on the market fulfils the requirements providing for a high level of protection of health and safety of persons, and of domestic animals and property, while guaranteeing the functioning of the internal market."},
+        {"section": "Annex II", "quote": "EQUIPMENT AND PHENOMENA OUTSIDE THE SCOPE OF THIS DIRECTIVE"},
+        {"section": "Annex II (evaluation kits)", "quote": "Custom built evaluation kits destined for professionals to be used solely at research and development facilities for such purposes."}
+      ],
+      "version": {"original_celex": "32014L0035", "latest_consolidated_celex": "02014L0035-20260530", "consolidation_note": "M1 = Regulation (EU) 2024/2747 (internal market emergency provisions); Article 1 scope text unchanged"},
+      "related": [
+        {"role": "consolidated", "url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:02014L0035-20260530", "note": "dated consolidated text; scope sentence identical to the original; not fetched by default"},
+        {"role": "canonical_citation", "url": "http://data.europa.eu/eli/dir/2014/35/oj", "note": "ELI; renders the EUR-Lex viewer page, not the bare text"}
+      ]
+    },
+    {
+      "id": "reg.EU.EMC.2014-30-EU",
+      "jurisdiction": "EU",
+      "title": "Directive 2014/30/EU (EMC Directive) - electromagnetic compatibility",
+      "authority": "European Parliament and Council of the European Union (published on EUR-Lex, Publications Office of the EU)",
+      "official_url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32014L0030",
+      "document_form": "html",
+      "expected_markers": ["L_2014096EN.01007901.xml", "DIRECTIVE 2014/30/EU OF THE EUROPEAN PARLIAMENT AND OF THE COUNCIL"],
+      "allowed_domains": ["eur-lex.europa.eu"],
+      "summary": "Electromagnetic compatibility of 'equipment' (apparatus or fixed installation): any finished appliance made available on the market as a single functional unit for the end-user that is liable to generate electromagnetic disturbance or be affected by it. Radio equipment is covered by RED Article 3(1)(b) instead; custom built evaluation kits for R&D professionals are excluded (Article 2(2)(e)).",
+      "engineering_implication": "If applicable: emissions and immunity per the essential requirements of Annex I, typically shown against harmonised EN standards with test-lab evidence - not decided here.",
+      "applicability_rule": {
+        "kind": "all_of",
+        "text": "applies when the design is not radio equipment and is a finished apparatus made available on the market (Article 3(1)(2)), not a custom built evaluation kit (Article 2(2)(e))",
+        "rules": [
+          {"kind": "not", "rule": {"kind": "answer", "key": "radio", "equals": "yes"}, "text": "radio equipment: EMC essential requirements apply through Directive 2014/53/EU Article 3(1)(b)"},
+          {"kind": "not", "rule": {"kind": "answer", "key": "evaluation_kit", "equals": "yes", "evidence": "Article 2(2)(e)"}, "text": "custom built evaluation kits for R&D professionals are excluded (Article 2(2)(e))"},
+          {"kind": "answer", "key": "finished_apparatus", "equals": "yes", "evidence": "Article 3(1)(2)"}
+        ]
+      },
+      "not_evaluated": "the other Article 2(2) exclusions (aeronautical products, radio equipment used by radio amateurs, equipment inherently benign in its electromagnetic effects) and the fixed-installation provisions are not evaluated",
+      "grounding_quotes": [
+        {"section": "Article 1", "quote": "This Directive regulates the electromagnetic compatibility of equipment. It aims to ensure the functioning of the internal market by requiring equipment to comply with an adequate level of electromagnetic compatibility."},
+        {"section": "Article 2(1)", "quote": "This Directive shall apply to equipment as defined in Article 3."},
+        {"section": "Article 3(1)(1)", "quote": "‘equipment’ means any apparatus or fixed installation;", "note": "typographic quotes U+2018/U+2019 in the source"},
+        {"section": "Article 3(1)(2)", "quote": "‘apparatus’ means any finished appliance or combination thereof made available on the market as a single functional unit, intended for the end-user and liable to generate electromagnetic disturbance, or the performance of which is liable to be affected by such disturbance;"},
+        {"section": "Article 2(2)(e)", "quote": "custom built evaluation kits destined for professionals to be used solely at research and development facilities for such purposes."}
+      ],
+      "version": {"original_celex": "32014L0030", "latest_consolidated_celex": "02014L0030-20260530"},
+      "related": [
+        {"role": "consolidated", "url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:02014L0030-20260530", "note": "dated consolidated text; scope sentences identical to the original"},
+        {"role": "canonical_citation", "url": "http://data.europa.eu/eli/dir/2014/30/oj"}
+      ]
+    },
+    {
+      "id": "reg.EU.RoHS.2011-65-EU",
+      "jurisdiction": "EU",
+      "title": "Directive 2011/65/EU (RoHS 2) - restriction of hazardous substances in electrical and electronic equipment",
+      "authority": "European Parliament and Council of the European Union (published on EUR-Lex, Publications Office of the EU)",
+      "official_url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32011L0065",
+      "document_form": "html",
+      "expected_markers": ["L_2011174EN.01008801.xml", "DIRECTIVE 2011/65/EU OF THE EUROPEAN PARLIAMENT AND OF THE COUNCIL"],
+      "extra_documents": [
+        {
+          "url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:02011L0065-20260701",
+          "role": "consolidated",
+          "form": "html",
+          "expected_markers": ["Consolidated TEXT: 32011L0065", "DIRECTIVE 2011/65/EU OF THE EUROPEAN PARLIAMENT AND OF THE COUNCIL"],
+          "version": {"celex": "02011L0065-20260701", "note": "the consolidated Annex II adds DEHP/BBP/DBP/DIBP (Delegated Directive (EU) 2015/863) that the original text lacks"}
+        }
+      ],
+      "allowed_domains": ["eur-lex.europa.eu"],
+      "summary": "EEE in the Annex I categories placed on the EU market must not contain the Annex II substances above the stated concentrations per homogeneous material (Pb, Hg, Cr(VI), PBB, PBDE, DEHP, BBP, DBP, DIBP 0,1 %; Cd 0,01 %). Electronic designs fall in an Annex I category (at least 11, 'other EEE').",
+      "engineering_implication": "Every part in the BOM needs manufacturer RoHS evidence (material declarations); the design itself is compliant only when all of them are - not decided here.",
+      "applicability_rule": {"kind": "always", "evidence": "Article 2(1)", "text": "EEE placed on the EU market falls within an Annex I category; the design is electrical and electronic equipment - decided on the inclusion rule of Article 2(1) only"},
+      "not_evaluated": "the 'subject to paragraph 2' transitional provisions (Article 2(2)) and the Article 2(4) exclusions (e.g. equipment for essential security interests or space, large-scale stationary industrial tools, large-scale fixed installations, means of transport, non-road mobile machinery for professional use, active implantable medical devices, photovoltaic panels in professionally installed permanent systems, equipment designed solely for R&D made available only between businesses) are not evaluated",
+      "grounding_quotes": [
+        {"section": "Article 2(1)", "quote": "This Directive shall, subject to paragraph 2, apply to EEE falling within the categories set out in Annex I."},
+        {"section": "Article 4(1)", "quote": "Member States shall ensure that EEE placed on the market, including cables and spare parts for its repair, its reuse, updating of its functionalities or upgrading of its capacity, does not contain the substances listed in Annex II."},
+        {"section": "Annex I (category 3)", "quote": "IT and telecommunications equipment."},
+        {"section": "Annex I (category 4)", "quote": "Consumer equipment."},
+        {"section": "Annex II", "quote": "Restricted substances referred to in Article 4(1) and maximum concentration values tolerated by weight in homogeneous materials"},
+        {"section": "Annex II (lead)", "quote": "Lead (0,1 %)", "note": "the official HTML writes 'Lead (0,1 %)'"},
+        {"section": "Annex II (cadmium)", "quote": "Cadmium (0,01 %)"},
+        {"section": "Annex II (DEHP, consolidated text)", "quote": "Bis(2-ethylhexyl) phthalate (DEHP) (0,1 %)", "url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:02011L0065-20260701", "note": "present only in the consolidated text"}
+      ],
+      "version": {"original_celex": "32011L0065", "latest_consolidated_celex": "02011L0065-20260701"},
+      "related": [{"role": "canonical_citation", "url": "http://data.europa.eu/eli/dir/2011/65/oj"}]
+    },
+    {
+      "id": "reg.EU.RED.2014-53-EU",
+      "jurisdiction": "EU",
+      "title": "Directive 2014/53/EU (Radio Equipment Directive)",
+      "authority": "European Parliament and Council of the European Union (published on EUR-Lex, Publications Office of the EU)",
+      "official_url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32014L0053",
+      "document_form": "html",
+      "expected_markers": ["L_2014153EN.01006201.xml", "DIRECTIVE 2014/53/EU OF THE EUROPEAN PARLIAMENT AND OF THE COUNCIL"],
+      "allowed_domains": ["eur-lex.europa.eu"],
+      "summary": "Products that intentionally emit and/or receive radio waves for radio communication or radiodetermination (or must be completed with an antenna to do so). In scope, the LVD safety objectives apply with no voltage limit (Article 3(1)(a)) and EMC applies through Article 3(1)(b).",
+      "engineering_implication": "If applicable: essential requirements of Article 3 (safety, EMC, efficient use of spectrum, plus delegated acts), conformity assessment with radio test evidence - not decided here.",
+      "applicability_rule": {"kind": "answer", "key": "radio", "equals": "yes", "evidence": "Article 2(1)(1)", "text": "applies when the product intentionally emits and/or receives radio waves"},
+      "grounding_quotes": [
+        {"section": "Article 1(1)", "quote": "This Directive establishes a regulatory framework for the making available on the market and putting into service in the Union of radio equipment."},
+        {"section": "Article 1(4)", "quote": "Radio equipment falling within the scope of this Directive shall not be subject to Directive 2014/35/EU, except as set out in point (a) of Article 3(1) of this Directive."},
+        {"section": "Article 2(1)(1)", "quote": "‘radio equipment’ means an electrical or electronic product, which intentionally emits and/or receives radio waves for the purpose of radio communication and/or radiodetermination, or an electrical or electronic product which must be completed with an accessory, such as antenna, so as to intentionally emit and/or receive radio waves for the purpose of radio communication and/or radiodetermination;"},
+        {"section": "Article 3(1)(a)", "quote": "the protection of health and safety of persons and of domestic animals and the protection of property, including the objectives with respect to safety requirements set out in Directive 2014/35/EU, but with no voltage limit applying;"},
+        {"section": "Article 3(1)(b)", "quote": "an adequate level of electromagnetic compatibility as set out in Directive 2014/30/EU."}
+      ],
+      "version": {"original_celex": "32014L0053", "latest_consolidated_celex": "02014L0053-20260530"},
+      "related": [{"role": "canonical_citation", "url": "http://data.europa.eu/eli/dir/2014/53/oj"}]
+    },
+    {
+      "id": "reg.KR.ElectricalAppliancesSafetyAct",
+      "jurisdiction": "KR",
+      "title": "전기용품 및 생활용품 안전관리법 (Electrical Appliances and Consumer Products Safety Control Act)",
+      "authority": "산업통상부 국가기술표준원 (KATS); text served by 법제처 국가법령정보센터 open API (law.go.kr)",
+      "official_url": "https://www.law.go.kr/DRF/lawService.do?OC={LAW_GO_KR_OC}&target=law&MST=276591&type=XML",
+      "document_form": "xml",
+      "expected_markers": ["전기용품 및 생활용품 안전관리법", "001459"],
+      "allowed_domains": ["www.law.go.kr"],
+      "summary": "Safety management of 전기용품 (industrially produced goods used connected to AC or DC power, and their parts/accessories). Whether a product is 안전인증대상 / 안전확인대상 / 공급자적합성확인대상 is decided by the 시행규칙 (제3조, 별표 3/4/5).",
+      "engineering_implication": "If applicable: the product category must be looked up in the 시행규칙 product lists to find the KC tier (안전인증 / 안전확인 / 공급자적합성확인), then the corresponding certification or declaration - not decided here.",
+      "applicability_rule": {"kind": "always", "evidence": "제2조 제1호", "text": "the design is a product used connected to AC or DC power (전기용품 definition); the KC tier depends on the product category"},
+      "grounding_quotes": [
+        {"section": "제1조(목적)", "quote": "이 법은 전기용품 및 생활용품의 안전관리에 관한 사항을 규정함으로써 국민의 생명ㆍ신체 및 재산을 보호하고, 소비자의 이익과 안전을 도모함을 목적으로 한다.", "note": "middle dot is U+318D"},
+        {"section": "제2조 제1호", "quote": "\"전기용품\"이란 공업적으로 생산된 물품으로서 교류 전원 또는 직류 전원에 연결하여 사용되는 제품이나 그 부분품 또는 부속품을 말한다."},
+        {"section": "제2조 제10호 가목", "quote": "안전인증대상전기용품: 구조 또는 사용 방법 등으로 인하여 화재ㆍ감전 등의 위해가 발생할 우려가 크다고 인정되는 전기용품으로서 안전인증을 통하여 그 위해를 방지할 수 있다고 인정되어 산업통상부령으로 정하는 것"},
+        {"section": "제5조(안전인증 등) 제1항", "quote": "안전인증대상제품의 제조업자(외국에서 제조하여 대한민국으로 수출하는 자를 포함한다. 이하 같다) 또는 수입업자는 안전인증대상제품에 대하여 모델(산업통상부령으로 정하는 고유한 명칭을 붙인 제품의 형식을 말한다. 이하 같다)별로 산업통상부령으로 정하는 바에 따라 안전인증기관의 안전인증을 받아야 한다.", "note": "the CDATA continues with ' <개정 2025.10.1>', excluded from the quote"}
+      ],
+      "version": {"법령ID": "001459", "MST": "276591", "공포": "법률 제21065호 2025-10-01 (타법개정)", "시행일자": "2025-10-01"},
+      "related": [
+        {"role": "human_page", "url": "https://www.law.go.kr/법령/전기용품및생활용품안전관리법", "note": "iframe/script shell - not machine readable, not fetched"}
+      ],
+      "curation_note": "only the DRF open API type=XML / type=JSON carry the statute text; every HTML form of law.go.kr is a script-loaded shell"
+    },
+    {
+      "id": "reg.KR.ElectricalAppliancesSafetyAct.EnforcementRule",
+      "jurisdiction": "KR",
+      "title": "전기용품 및 생활용품 안전관리법 시행규칙 - 안전관리대상제품의 범위 (제3조, 별표 3/4/5)",
+      "authority": "산업통상부 (KATS); text served by 법제처 국가법령정보센터 open API (law.go.kr)",
+      "official_url": "https://www.law.go.kr/DRF/lawService.do?OC={LAW_GO_KR_OC}&target=law&MST=273575&type=XML",
+      "document_form": "xml",
+      "expected_markers": ["전기용품 및 생활용품 안전관리법 시행규칙", "008044"],
+      "allowed_domains": ["www.law.go.kr"],
+      "summary": "The product lists (별표 3 안전인증대상, 별표 4 안전확인대상, 별표 5 공급자적합성확인대상) and the 1,000 V AC/DC ceiling that define which 전기용품 fall under each KC tier. The 별표 text is included in the XML as <별표내용>.",
+      "engineering_implication": "A design within the 1,000 V scope must be matched against the 별표 3/4/5 product categories by an engineer; the tier then decides the KC procedure - membership is not decided here.",
+      "applicability_rule": {"kind": "voltage_range", "requirement": "input_voltage", "requirements": ["output_voltage"], "scope_answer": "highest_rated_voltage", "ac": [0, 1000], "dc": [0, 1000], "evidence": "제3조 제1항", "text": "the KC tiers cover 전기용품 using AC or DC power of 1,000 V or less (input and output voltage requirements plus the highest rated voltage the user states); the product-category lists are not evaluated automatically"},
+      "not_evaluated": "membership of the 별표 3/4/5 product categories, which decides whether a product is 안전인증 / 안전확인 / 공급자적합성확인 대상 at all, is not evaluated",
+      "grounding_quotes": [
+        {"section": "제3조 제1항", "quote": "안전인증대상전기용품은 1천볼트 이하의 교류전원 또는 직류전원을 사용하는 것으로서 별표 3 제1호에 따른 제품으로 한다."},
+        {"section": "제3조 제5항", "quote": "공급자적합성확인대상전기용품은 1천볼트 이하의 교류전원 또는 직류전원을 사용하는 것으로서 별표 5 제1호에 따른 제품으로 한다."},
+        {"section": "별표 3 제1호", "quote": "안전인증대상제품(제3조제1항 및 제2항 관련)"}
+      ],
+      "version": {"법령ID": "008044", "MST": "273575", "시행일자": "2026-08-27"}
+    },
+    {
+      "id": "reg.KR.RadioWavesAct.58-2",
+      "jurisdiction": "KR",
+      "title": "전파법 (Radio Waves Act) - 제58조의2 방송통신기자재등의 적합성평가 (KC 적합인증 / 적합등록 / 자기적합확인)",
+      "authority": "과학기술정보통신부 / 국립전파연구원 (RRA); text served by 법제처 국가법령정보센터 open API (law.go.kr)",
+      "official_url": "https://www.law.go.kr/DRF/lawService.do?OC={LAW_GO_KR_OC}&target=law&MST=276245&type=XML",
+      "document_form": "xml",
+      "expected_markers": ["전파법", "001732"],
+      "allowed_domains": ["www.law.go.kr"],
+      "summary": "Anyone manufacturing, selling or importing 방송통신기자재 or equipment that causes or is affected by 전자파장해 must obtain 적합인증 (higher-risk, including radio), 적합등록 or 자기적합확인 (제58조의2). Which tier applies to a product class is set in the 고시 「방송통신기자재등의 적합성평가에 관한 고시」 (not fetched).",
+      "engineering_implication": "If applicable: EMC/radio testing at a 지정시험기관 and the KC conformity-assessment procedure for the product's tier - the tier lookup in the 고시 needs an engineer.",
+      "applicability_rule": {
+        "kind": "any_of",
+        "text": "applies when the product is radio equipment or contains circuitry that can cause 전자파장해 (digital logic, clocks, switching converters)",
+        "rules": [
+          {"kind": "answer", "key": "radio", "equals": "yes", "evidence": "제58조의2 제2항"},
+          {"kind": "answer", "key": "digital_device", "equals": "yes", "evidence": "제2조 제14호"}
+        ]
+      },
+      "grounding_quotes": [
+        {"section": "제58조의2 제1항", "quote": "방송통신기자재와 전자파장해를 주거나 전자파로부터 영향을 받는 기자재(이하 \"방송통신기자재등\"이라 한다)를 제조 또는 판매하거나 수입하려는 자는 해당 기자재에 대하여 다음 각 호의 기준(이하 \"적합성평가기준\"이라 한다)에 따라 제2항에 따른 적합인증, 제3항에 따른 적합등록, 제4항에 따른 자기적합확인 또는 제9항에 따른 잠정인증(이하 \"적합성평가\"라 한다)을 받아야 한다.", "note": "the CDATA continues with ' <개정 2013.3.23, 2017.7.26, 2024.1.23>', excluded"},
+        {"section": "제58조의2 제2항", "quote": "전파환경 및 방송통신망 등에 위해를 줄 우려가 있는 기자재와 중대한 전자파장해를 주거나 전자파로부터 정상적인 동작을 방해받을 정도의 영향을 받는 기자재를 제조 또는 판매하거나 수입하려는 자는 해당 기자재에 대하여 제58조의5에 따른 지정시험기관의 적합성평가기준에 관한 시험을 거쳐 과학기술정보통신부장관의 적합인증을 받아야 한다."},
+        {"section": "제58조의2 제3항", "quote": "제2항에 따른 적합인증의 대상이 아닌 방송통신기자재등을 제조 또는 판매하거나 수입하려는 자는 제58조의5에 따른 지정시험기관의 적합성평가기준에 관한 시험을 거쳐 해당 기자재가 적합성평가기준에 적합함을 확인한 후 그 사실을 과학기술정보통신부장관에게 등록(이하 \"적합등록\"이라 한다)하여야 한다."},
+        {"section": "제2조 제14호", "quote": "\"전자파장해\"란 전자파를 발생시키는 기자재로부터 전자파가 방사(放射: 전자파에너지가 공간으로 퍼져나가는 것을 말한다) 또는 전도[전도: 전자파에너지가 전원선(電源線)을 통하여 흐르는 것을 말한다]되어 다른 기자재의 성능에 장해를 주는 것을 말한다."},
+        {"section": "제2조 제16호", "quote": "\"방송통신기자재\"란 방송통신설비에 사용하는 장치ㆍ기기ㆍ부품 또는 선조(線條) 등을 말한다."}
+      ],
+      "version": {"법령ID": "001732", "MST": "276245", "공포": "법률 제21065호 2025-10-01 (타법개정)", "시행일자": "2026-01-02"},
+      "related": [
+        {"role": "explanatory", "url": "https://www.rra.go.kr/ko/license/A_a_about.do", "note": "RRA overview of the four tiers (euc-kr page); explanatory, never the authority - not fetched"},
+        {"role": "tier_lists", "url": null, "note": "방송통신기자재등의 적합성평가에 관한 고시 holds the per-product tier lists; listed as reg.KR.RadioWavesAct.ConformityAssessmentNotice (fetchable: false)"}
+      ]
+    },
+    {
+      "id": "reg.KR.RadioWavesAct.ConformityAssessmentNotice",
+      "jurisdiction": "KR",
+      "title": "방송통신기자재등의 적합성평가에 관한 고시 (과학기술정보통신부 고시) - 적합인증 / 적합등록 / 자기적합확인 대상 기자재 목록",
+      "authority": "과학기술정보통신부 (고시); 국립전파연구원 (RRA) administers 적합성평가; the text is expected on 법제처 국가법령정보센터 (law.go.kr)",
+      "official_url": null,
+      "allowed_domains": ["www.law.go.kr"],
+      "fetchable": false,
+      "unfetchable_reason": "not fetched by the 2026-09-23 probe: the 고시 is an 행정규칙 that the law.go.kr DRF API serves under target=admrul, which was not probed, and no URL form was confirmed - a URL is never guessed and no quote from it has been verified, so nothing here is grounded; the entry is kept so the KC tier lists are reported as NOT_VERIFIED instead of being omitted",
+      "summary": "The per-product lists that assign 방송통신기자재등 to the 전파법 제58조의2 tiers (적합인증 / 적합등록 / 자기적합확인). Named by the probe as where the tier of a product class is decided; its text was not read.",
+      "engineering_implication": "Once archived, an engineer must look the product class up in the 고시's tier lists; until then the KC tier for the product is unknown.",
+      "applicability_rule": {
+        "kind": "any_of",
+        "text": "same trigger as 전파법 제58조의2 (radio equipment, or circuitry that can cause 전자파장해); which tier applies is decided by the lists in this 고시 and is not evaluated automatically",
+        "rules": [
+          {"kind": "answer", "key": "radio", "equals": "yes"},
+          {"kind": "answer", "key": "digital_device", "equals": "yes"}
+        ]
+      },
+      "grounding_quotes": [],
+      "related": [
+        {"role": "parent_statute", "url": null, "note": "reg.KR.RadioWavesAct.58-2 is the statutory basis (제58조의2 제1항-제4항)"},
+        {"role": "api_hint", "url": null, "note": "law.go.kr DRF lawService.do with target=admrul is the expected machine-readable form (not probed)"}
+      ],
+      "curation_note": "included without a URL and without quotes on purpose: an unverified pointer would be a guess"
+    },
+    {
+      "id": "reg.US.FCC.47CFR15",
+      "jurisdiction": "US",
+      "title": "47 CFR Part 15 - Radio Frequency Devices (FCC)",
+      "authority": "Federal Communications Commission; text published by the Office of the Federal Register (eCFR versioner API)",
+      "official_url": "https://www.ecfr.gov/api/versioner/v1/full/{DATE}/title-47.xml?part=15",
+      "date_discovery": {
+        "url": "https://www.ecfr.gov/api/versioner/v1/titles.json",
+        "list_key": "titles",
+        "match": {"number": 47},
+        "field": "up_to_date_as_of"
+      },
+      "document_form": "xml",
+      "expected_markers": ["PART 15—RADIO FREQUENCY DEVICES", "Radio frequency devices"],
+      "allowed_domains": ["www.ecfr.gov"],
+      "summary": "Regulations for intentional, unintentional and incidental radiators. Digital logic clocked above 9 kHz makes the product a 'digital device' (unintentional radiator, Subpart B) that must be authorised before marketing through SDoC or certification (§ 15.101) unless exempt (§ 15.103, e.g. power consumption <= 6 nW, or every frequency below 1.705 MHz and no AC-line operation). Transmitters are intentional radiators (Subpart C, certification). The eCFR is not the official legal edition; the GPO annual edition is (see related).",
+      "engineering_implication": "If applicable: emissions testing against the Subpart B limits (Class A/B by marketing) or the Subpart C rules for transmitters, then SDoC or certification through subpart J of part 2 - the exemption and tier decisions need an engineer.",
+      "applicability_rule": {
+        "kind": "any_of",
+        "text": "applies when the product is an intentional radiator (transmitter) or a digital device (timing signals above 9 kHz)",
+        "rules": [
+          {"kind": "answer", "key": "radio", "equals": "yes", "evidence": "§ 15.3(o)"},
+          {"kind": "answer", "key": "digital_device", "equals": "yes", "evidence": "§ 15.3(k)"}
+        ]
+      },
+      "grounding_quotes": [
+        {"section": "§ 15.1(a)", "quote": "This part sets out the regulations under which an intentional, unintentional, or incidental radiator may be operated without an individual license. It also contains the technical specifications, administrative requirements and other conditions relating to the marketing of part 15 devices."},
+        {"section": "§ 15.3(k)", "quote": "Digital device. (Previously defined as a computing device). An unintentional radiator (device or system) that generates and uses timing signals or pulses at a rate in excess of 9,000 pulses (cycles) per second and uses digital techniques;"},
+        {"section": "§ 15.3(z)", "quote": "Unintentional radiator. A device that intentionally generates radio frequency energy for use within the device, or that sends radio frequency signals by conduction to associated equipment via connecting wiring, but which is not intended to emit RF energy by radiation or induction."},
+        {"section": "§ 15.3(o)", "quote": "Intentional radiator. A device that intentionally generates and emits radio frequency energy by radiation or induction."},
+        {"section": "§ 15.3(i)", "quote": "Class B digital device. A digital device that is marketed for use in a residential environment notwithstanding use in commercial, business and industrial environments."},
+        {"section": "§ 15.101(a)", "quote": "Except as otherwise exempted in §§ 15.23, 15.103, and 15.113, unintentional radiators shall be authorized prior to the initiation of marketing, pursuant to the procedures for certification or Supplier's Declaration of Conformity (SDoC) given in subpart J of part 2 of this chapter, as follows:", "note": "straight apostrophe in the XML (fcc.gov pages use U+2019)"},
+        {"section": "§ 15.103(f)", "quote": "Digital devices that have a power consumption not exceeding 6 nW."},
+        {"section": "§ 15.103(h)", "quote": "Digital devices in which both the highest frequency generated and the highest frequency used are less than 1.705 MHz and which do not operate from the AC power lines or contain provisions for operation while connected to the AC power lines."}
+      ],
+      "version": {"ecfr_probed_date": "2026-09-01", "titles_json_up_to_date_as_of": "2026-09-21", "part15_latest_amendment_date": "2026-04-27", "govinfo_annual_edition": "2025-10-01 (CFR-2025-title47-vol1)"},
+      "related": [
+        {"role": "annual_edition", "url": "https://www.govinfo.gov/link/cfr/47/15?link-type=xml", "note": "GPO official annual edition (302 to /content/pkg/CFR-2025-title47-vol1/xml/...); lags the eCFR; not fetched by default"},
+        {"role": "human_page", "url": "https://www.ecfr.gov/current/title-47/chapter-I/subchapter-A/part-15", "note": "302 to unblock.federalregister.gov (bot wall) - not fetched"},
+        {"role": "guidance", "url": "https://www.fcc.gov/oet/ea/rfdevice", "note": "FCC OET explanatory page; not rules - not fetched"},
+        {"role": "guidance", "url": "https://apps.fcc.gov/oetcf/kdb/forms/FTSSearchResultPage.cfm?switch=P&id=203240", "note": "KDB 896810 SDoC guidance; the KDB says it 'does not constitute rules' - not fetched"}
+      ],
+      "curation_note": "'current' is not accepted as a date by the versioner API; the date comes from titles.json up_to_date_as_of and is recorded with the archived document"
+    }
+  ],
+  "not_included": [
+    {"id": "eu.eli.dated_consolidated_url_form", "url": "https://eur-lex.europa.eu/eli/dir/2014/35/2026-05-30/eng", "reason": "answered the AWS WAF 202 challenge on both attempts; the URL form could not be confirmed"},
+    {"id": "eu.celex.consolidated_without_date", "url": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:02014L0035", "reason": "202 WAF challenge on both attempts; no evidence it resolves - dated CELEX ids are discovered from the ALL page"},
+    {"id": "kr.law.go.kr.html_pages", "url": "https://www.law.go.kr/법령/전파법", "reason": "every HTML form (path URL, lsInfoP.do, DRF type=HTML) is an iframe / script shell without the statute text"},
+    {"id": "kr.kats.product_safety_page", "url": "https://www.kats.go.kr/content.do?cmsid=37", "reason": "policy overview only, no statutory text or product lists"},
+    {"id": "kr.safetykorea.targets", "url": "https://www.safetykorea.kr/policy/targetsSafetyCert", "reason": "explanatory prose citing a stale article number (제3조 for a duty now in 제5조) - never a grounding source"},
+    {"id": "kr.rra.overview", "url": "https://www.rra.go.kr/ko/license/A_a_about.do", "reason": "explanatory page (euc-kr) confirming the four tiers; supporting evidence only, not a regulation"},
+    {"id": "us.ecfr.html_pages", "url": "https://www.ecfr.gov/current/title-47/chapter-I/subchapter-A/part-15", "reason": "302 to unblock.federalregister.gov (bot wall, HTTP 200 'Request Access' page)"},
+    {"id": "us.govinfo.link_type_html", "url": "https://www.govinfo.gov/link/cfr/47/15?link-type=html", "reason": "400 'Invalid link-type.'; only xml and pdf link types exist for the CFR"},
+    {"id": "us.fcc.guidance_pages", "url": "https://www.fcc.gov/oet/ea/rfdevice", "reason": "FCC OET pages and KDB 896810 are guidance ('does not constitute rules'); kept as related pointers, not as regulations"},
+    {"id": "eu.lvd.pdf", "url": "https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32014L0035", "reason": "fetchable, but the HTML form is preferred (byte-stable body, structured text)"}
+  ]
+}

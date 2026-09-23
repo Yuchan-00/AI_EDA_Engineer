@@ -219,13 +219,23 @@ def test_pipeline_runs_the_slice_with_real_tools(tmp_path: Path):
     assert review[ReviewArea.REGULATORY_PROVENANCE].status is S.NOT_VERIFIED
     assert review[ReviewArea.MANUFACTURING_CAPABILITIES].status is S.NOT_VERIFIED
     assert not [r for r in review.values() if r.status is S.FAIL]
+    # parts / regulatory tracks without a document archive in this context: nothing fetched, nothing verified, nothing upgraded
+    # (the online counterpart against a loopback fake is tests/test_parts_regulatory_e2e.py)
+    for ref in ("R1", "R2", "J1"):
+        existence = ir.validation.latest(f"component.existence.{ref}")
+        assert existence.status is S.NOT_VERIFIED and existence.tool == "parts.existence" and "no document archive" in existence.message
+    assert ir.validation.latest("ir.component_provenance").status is S.NOT_VERIFIED  # tagged authoritative, not grounded in an archived datasheet
+    assert review[ReviewArea.COMPONENT_PROVENANCE].status is S.NOT_VERIFIED and "not fully verified" in review[ReviewArea.COMPONENT_PROVENANCE].message
+    assert ir.validation.latest("regulatory.compliance").status is S.NOT_VERIFIED
+    assert "compliance not assessed" in review[ReviewArea.REGULATORY_PROVENANCE].message
 
     # release: never on missing evidence - and the message names exactly what is missing
     release = state.outcomes[-1]
     assert release.stage == Stage.RELEASE and release.status is S.NOT_VERIFIED
     assert release.message.startswith("not releasable: overall validation is NOT_VERIFIED")
     blocking = _blocking(release.message)
-    assert {"regulatory.research", "mfg.capability", "review.regulatory_provenance", "review.manufacturing_capabilities"} <= set(blocking)
+    assert {"regulatory.research", "regulatory.compliance", "mfg.capability", "review.regulatory_provenance", "review.manufacturing_capabilities",
+            "review.component_provenance", "component.existence.R1"} <= set(blocking)
     assert not [b for b in blocking if "spice" in b or "calc" in b or "analog" in b], blocking
     assert ir.validation.overall() is S.NOT_VERIFIED
 

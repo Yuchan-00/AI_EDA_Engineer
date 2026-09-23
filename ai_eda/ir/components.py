@@ -93,6 +93,13 @@ class Component(BaseModel):
         return None
 
     @property
-    def has_authoritative_identity(self) -> bool:
-        """True when MPN is backed by a datasheet or official part data."""
+    def mpn_tagged_authoritative(self) -> bool:
+        """True when the MPN merely carries ``authoritative`` provenance - a tag, **not** a grounding check.
+
+        Whether that tag rests on an archived, hash-verified datasheet that
+        still contains the MPN is decided only by
+        :func:`ai_eda.parts.identity.mpn_grounding`; a fixture, a hand edit or
+        a record whose file is gone is tagged all the same and this property
+        can not tell them apart.
+        """
         return bool(self.mpn and self.mpn.provenance.kind == ProvenanceKind.AUTHORITATIVE)

@@ -9,18 +9,39 @@
                              final stage is FAIL; NOT_VERIFIED is exit 0 - nothing wrong, nothing proven;
                              exit 2 for a usage error such as --answer without '=')
         --answer KEY=VALUE               answer an open question (confirm_requirements=yes,
-                                         accept_implicit=k1,k2 / reject_implicit=k3 for model-inferred items)
+                                         accept_implicit=k1,k2 / reject_implicit=k3 for model-inferred items;
+                                         regulatory scope: mains_powered=no radio=no finished_apparatus=yes
+                                         evaluation_kit=no highest_rated_voltage="12 V DC" ...;
+                                         confirm_parts=yes|no for the candidate-parts table; datasheet_facts_file=<json>;
+                                         extract_datasheet_facts=yes / propose_regulations=yes ask the model (billed);
+                                         confirm_facts=yes|no for the model's datasheet-facts table;
+                                         accept_regulations=id1,id2 / reject_regulations=id3)
         --llm openrouter | fake:<json>   let the requirement agent extract from the free-text request
         --llm-model ID                   primary model (default anthropic/claude-sonnet-5)
         --llm-budget-usd X / --llm-budget-tokens N   the budget you grant; without one no call is made
                                          (0 USD allows only the free fake client)
+        --online                         open an online session: the one NETWORK_FETCH approval of this run;
+                                         datasheets and official regulatory texts are then fetched (https only)
+                                         from the trusted hosts - KiCad library Datasheet hosts of the parts,
+                                         the official domains of the regulatory candidate list, --trust-host -
+                                         and archived under --sources-dir by sha256. Without it nothing is
+                                         fetched and every source stays NOT_VERIFIED (offline)
+        --trust-host HOST                trust every URL on HOST (repeatable)
+        --datasheet-url REF=URL          the datasheet of component REF is exactly this URL (repeatable)
+        --source-url ID=URL              an official text is exactly this URL (repeatable)
+        --sources-dir DIR                the document archive (default <workdir>/sources)
+        --catalog CSV --catalog-date ISO your distributor catalog export and the date you exported it
+                                         (--catalog-authority / --catalog-supplier label it); backs sourcing
+                                         values, never an identity
+        --regulatory-candidates PATH     a candidate list other than the packaged one
     ai-eda review IR.json    run only the independent reviewer (exit 1 on any FAIL)
 
-Without ``--llm`` the pipeline is exactly what it was before the LLM stage.
-The budget flags are the user's approval of paid calls: they are recorded in
-the approval gate's audit log and the service refuses to exceed them. The IR
-is saved (and the LLM usage printed) whatever happens after the pipeline
-starts, so a paid extraction is never lost to a later crash.
+Without ``--llm`` the pipeline is exactly what it was before the LLM stage;
+without ``--online`` it opens no socket. The budget flags are the user's
+approval of paid calls and ``--online`` the approval of network fetches:
+both are recorded in the approval gate's audit log. The IR is saved (and
+the LLM usage printed) whatever happens after the pipeline starts, so a
+paid extraction or an archived fetch is never lost to a later crash.
 """
 
 from __future__ import annotations
@@ -144,12 +165,30 @@ def parse_answers(items: list[str] | None) -> dict[str, str]:
     return answers
 
 
+def build_source_session(args: argparse.Namespace, ir, workdir: Path, library):
+    """The run's :class:`~ai_eda.workflow.session.SourceSession` from the ``--online`` / ``--trust-host`` / ``--datasheet-url`` /
+    ``--source-url`` / ``--sources-dir`` / ``--catalog*`` / ``--regulatory-candidates`` flags (``SessionError`` for a usage error)."""
+    from ai_eda.security.approval import default_gate
+    from ai_eda.workflow.session import open_session, parse_key_urls
+
+    return open_session(
+        workdir=workdir, ir=ir, library=library, online=bool(getattr(args, "online", False)),
+        trust_hosts=getattr(args, "trust_host", None) or [],
+        datasheet_urls=parse_key_urls(getattr(args, "datasheet_url", None), "--datasheet-url"),
+        source_urls=parse_key_urls(getattr(args, "source_url", None), "--source-url"),
+        sources_dir=getattr(args, "sources_dir", None),
+        catalog=getattr(args, "catalog", None), catalog_date=getattr(args, "catalog_date", None),
+        catalog_authority=getattr(args, "catalog_authority", None), catalog_supplier=getattr(args, "catalog_supplier", None),
+        candidates=getattr(args, "regulatory_candidates", None), gate=default_gate(),
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from ai_eda.agents import AgentContext
     from ai_eda.errors import ApprovalRequiredError, ToolUnavailableError
     from ai_eda.tools.kicad import KicadCli, KicadLibrary
     from ai_eda.tools.spice import NgspiceShared
-    from ai_eda.workflow import Orchestrator
+    from ai_eda.workflow import Orchestrator, SessionError
 
     try:
         answers = parse_answers(args.answer)
@@ -166,9 +205,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     ir = _load(args.ir)
     workdir = Path(ir.project.workdir or Path(args.ir).parent)
+    library = KicadLibrary()
+    try:
+        session = build_source_session(args, ir, workdir, library)
+    except SessionError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(session.summary())
+    for note in session.notes:
+        print(f"  note: {note}")
     ctx = AgentContext(
         workdir=workdir,
-        tools={"kicad_cli": KicadCli(), "kicad_library": KicadLibrary(), "spice": NgspiceShared()},
+        tools={"kicad_cli": KicadCli(), "kicad_library": library, "spice": NgspiceShared(), **session.tools()},
         answers=answers,
         llm=llm,
     )
@@ -178,6 +226,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         state = Orchestrator(ctx).run(ir)
     finally:
+        session.close()
         # whatever happened after the pipeline started (a defect in a later stage, Ctrl-C), what the
         # requirement stage applied - a paid extraction included - is on disk, and the spend is reported
         if state is not None:
@@ -194,8 +243,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             # the questions the IR now holds were meant for the user: show them, so a confirmation given
             # next time refers to a table that was actually seen
             _print_questions(ir.requirements.blocking_questions, header="\nOPEN QUESTIONS in the saved IR (pass with --answer key=value):")
+    _print_existence(ir)
     if state.blocked:
         _print_questions(state.open_questions, header="\nBLOCKED - answer these to continue (pass with --answer key=value):")
+    _print_questions(state.optional_questions, header="\nOPTIONAL QUESTIONS (not blocking; answer with --answer key=value to decide more):")
     return run_exit_code(state)
 
 
@@ -206,6 +257,23 @@ def _print_questions(questions, *, header: str) -> None:
     for q in questions:
         label = " (model question)" if getattr(q, "source", "system") == "llm" else ""
         print(f"  [{q.key}]{label} {q.question}")
+
+
+def _print_existence(ir) -> None:
+    """Why an identity is not verified: the sub-checks of every ``component.existence.<ref>`` result that is not PASS."""
+    from ai_eda.ir import ValidationStatus
+    from ai_eda.parts.existence import CHECK_PREFIX
+
+    latest = ir.validation.latest_by_check()
+    rows = [(k, r) for k, r in sorted(latest.items()) if k.startswith(CHECK_PREFIX) and r.status is not ValidationStatus.PASS]
+    if not rows:
+        return
+    print("\nCOMPONENT EXISTENCE - why an identity is not verified (sub-checks that did not pass):")
+    for check_id, r in rows:
+        print(f"  {check_id} {r.status}")
+        for c in r.details.get("checks", []):
+            if c.get("status") not in (str(ValidationStatus.PASS), str(ValidationStatus.NOT_APPLICABLE)):
+                print(f"    - {c.get('name')}: {c.get('status')}: {c.get('message')}")
 
 
 def run_exit_code(state) -> int:
@@ -226,10 +294,14 @@ def run_exit_code(state) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
+    from ai_eda.parts.identity import open_archive
     from ai_eda.review import IndependentReviewer
 
     ir = _load(args.ir)
-    report = IndependentReviewer().review(ir, Path(ir.project.workdir or Path(args.ir).parent))
+    workdir = Path(ir.project.workdir or Path(args.ir).parent)
+    archive = open_archive({}, workdir)  # earlier runs' archived copies, read-only: hashes are re-verified, nothing is fetched
+    tools = {"archive": archive} if archive is not None else {}
+    report = IndependentReviewer(tools=tools).review(ir, workdir)
     for r in report.results:
         print(f"{r.check_id:<36} {r.status:<20} {r.message}")
     print(report.summary())
@@ -255,11 +327,31 @@ def main(argv: list[str] | None = None) -> int:
 
     r = sub.add_parser("run", help="run the pipeline")
     r.add_argument("ir")
-    r.add_argument("--answer", action="append", metavar="KEY=VALUE", help="answer an open question; confirm_requirements=yes, accept_implicit=k1,k2, reject_implicit=k3 steer the LLM extraction")
+    r.add_argument(
+        "--answer", action="append", metavar="KEY=VALUE",
+        help=(
+            "answer an open question; confirm_requirements=yes, accept_implicit=k1,k2, reject_implicit=k3 steer the LLM extraction; "
+            "mains_powered=yes|no, radio=yes|no, finished_apparatus=yes|no, evaluation_kit=yes|no, digital_device=yes|no, "
+            "highest_rated_voltage='12 V DC', intended_use=... are the regulatory scope answers; "
+            "confirm_parts=yes|no decides the candidate-parts table; datasheet_facts_file=<json> grounds your datasheet facts "
+            "(layouts: ai_eda.parts.datasheet_facts.load_facts_file); extract_datasheet_facts=yes and propose_regulations=yes ask the model (billed); "
+            "confirm_facts=yes|no decides the model's datasheet-facts table; accept_regulations=id1,id2 / reject_regulations=id3 decide shown model proposals"
+        ),
+    )
     r.add_argument("--llm", metavar="openrouter|fake:<json>", help="extract requirements from the request with a model (openrouter needs OPENROUTER_API_KEY; fake:<json> replays a script offline)")
     r.add_argument("--llm-model", metavar="ID", help="primary model id (default anthropic/claude-sonnet-5; fallback anthropic/claude-haiku-4.5)")
     r.add_argument("--llm-budget-usd", type=float, metavar="X", help="approve up to X USD of provider-reported cost for this run")
     r.add_argument("--llm-budget-tokens", type=int, metavar="N", help="approve up to N prompt+completion tokens for this run")
+    r.add_argument("--online", action="store_true", help="approve network fetches for this run (NETWORK_FETCH 'online session'): datasheets and official regulatory texts are fetched from trusted hosts only and archived by sha256; without it nothing is fetched")
+    r.add_argument("--trust-host", action="append", metavar="HOST", help="trust every URL on HOST for fetching (repeatable; KiCad library datasheet hosts and the candidate list's official domains are trusted already)")
+    r.add_argument("--datasheet-url", action="append", metavar="REF=URL", help="the datasheet of component REF is exactly this URL (repeatable; trusted as that URL only)")
+    r.add_argument("--source-url", action="append", metavar="ID=URL", help="an official text is exactly this URL (repeatable; trusted as that URL only)")
+    r.add_argument("--sources-dir", metavar="DIR", help="the document archive directory (default <workdir>/sources)")
+    r.add_argument("--catalog", metavar="CSV", help="your distributor catalog export (columns mpn, manufacturer, package + optional supplier_part_number, stock, unit_price, currency, assembly_class; JLCPCB/LCSC header spellings are mapped)")
+    r.add_argument("--catalog-date", metavar="ISO8601", help="the date you exported the catalog (required with --catalog)")
+    r.add_argument("--catalog-authority", metavar="TEXT", help="who produced the catalog data, e.g. 'JLCPCB export'")
+    r.add_argument("--catalog-supplier", metavar="NAME", help="the supplier label for sourcing entries, e.g. JLCPCB")
+    r.add_argument("--regulatory-candidates", metavar="PATH", help="a regulatory candidate list other than the packaged ai_eda/regulatory/candidates.json")
     r.set_defaults(fn=cmd_run)
 
     v = sub.add_parser("review", help="independent review only")

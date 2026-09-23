@@ -15,6 +15,20 @@ on disk (``False`` when the KiCad libraries are not installed - tests that need
 them skip). This module is deliberately self-contained: it depends only on
 ``ai_eda.ir``, ``ai_eda.tools.calc`` and ``ai_eda.tools.kicad.library``.
 
+Datasheets: the parts' :class:`SourceRef` entries point at PDFs on
+:data:`VENDOR_HOST` (``https://www.example-vendor.com/ds/...``) that only the
+tests' loopback fake (``tests/fake_sources.py``) ever serves, from
+:data:`DATASHEETS` (hand-written pages that state the MPNs on page 2). No
+real host is ever contacted: a run without an online session records the
+pointer and fetches nothing, an online run against the fake archives the
+PDFs by sha256 and finds the MPNs in them. The values below are tagged
+``authoritative`` because a person wrote the fixture from the vendor's data,
+but until a run archives the datasheet they are exactly what the
+``ir.component_provenance`` validator downgrades: tagged, not grounded.
+:data:`SCOPE_ANSWERS` are the regulatory scope answers a run of this design
+gives (12 V DC bench tool, EU, not mains, no radio, a finished apparatus,
+not an evaluation kit, 12 V DC the highest voltage anywhere in it).
+
 SPICE: the resistors are bound as ``R`` elements with their authoritative
 resistance, the header is excluded (no electrical model), and
 :func:`divider_simulation` describes the 12 V DC stimulus on ``VIN``, an
@@ -76,6 +90,13 @@ __all__ = [
     "SHORTING_PLACEMENTS",
     "RESISTOR_DS",
     "HEADER_DS",
+    "VENDOR_HOST",
+    "RESISTOR_DS_URL",
+    "HEADER_DS_URL",
+    "RESISTOR_DATASHEET_PAGES",
+    "HEADER_DATASHEET_PAGES",
+    "DATASHEETS",
+    "SCOPE_ANSWERS",
     "USER",
     "divider_with_connector_ir",
     "divider_simulation",
@@ -91,16 +112,43 @@ PROJECT_ID = "divider_conn"
 #: provenance of the simulation setup: the person who wrote the fixture decided what to simulate
 USER = Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="fixture simulation setup")
 
-RESISTOR_DS = SourceRef(
-    title="Generic thick film chip resistor datasheet",
-    authority="Vendor",
-    content_hash="sha256:fixture-resistor-datasheet",
-)
-HEADER_DS = SourceRef(
-    title="2.54 mm pin header datasheet",
-    authority="Vendor",
-    content_hash="sha256:fixture-header-datasheet",
-)
+#: the fixture vendor's host: served only by the tests' loopback fake, never contacted for real
+VENDOR_HOST = "www.example-vendor.com"
+RESISTOR_DS_URL = f"https://{VENDOR_HOST}/ds/rc0603.pdf"
+HEADER_DS_URL = f"https://{VENDOR_HOST}/ds/ph1.pdf"
+
+#: a resistor datasheet that states the fixture's orderable part numbers on page 2 (WinAnsi text only: see tests/pdf_fixture.py)
+RESISTOR_DATASHEET_PAGES: list[list[str]] = [
+    ["RC0603 Series Thick Film Chip Resistors", "Generic (fixture vendor)", "Power rating 0.1 W at 70 degC", "Package 0603 (1608 metric)"],
+    [
+        "Ordering information",
+        "Part number: RC0603FR-0710kL  10 kOhm  +/- 1 %  0603  reel",
+        "Part number: RC0603FR-075kL  5 kOhm  +/- 1 %  0603  reel",
+        "Part number: RC0603JR-0710kL  10 kOhm  +/- 5 %  0603  reel",
+        "Maximum working voltage 75 V",
+    ],
+]
+#: a pin header datasheet that states the fixture's part numbers on page 2
+HEADER_DATASHEET_PAGES: list[list[str]] = [
+    ["PH1 Series 2.54 mm pin headers", "Generic (fixture vendor)", "Package PinHeader_1x03_P2.54mm_Vertical"],
+    ["Ordering information", "Part number: PH1-03-UA  1x03  vertical  tin", "Part number: PH1-02-UA  1x02  vertical  tin", "Rated current 3 A"],
+]
+#: URL -> pages: what the loopback fake serves for this design (``fake.add_pdf(url, pages)`` for each)
+DATASHEETS: dict[str, list[list[str]]] = {RESISTOR_DS_URL: RESISTOR_DATASHEET_PAGES, HEADER_DS_URL: HEADER_DATASHEET_PAGES}
+
+RESISTOR_DS = SourceRef(title="Generic thick film chip resistor datasheet", authority="Vendor", url=RESISTOR_DS_URL)
+HEADER_DS = SourceRef(title="2.54 mm pin header datasheet", authority="Vendor", url=HEADER_DS_URL)
+
+#: the answers a run of this design gives: baseline questions plus the regulatory scope questions of the packaged candidate list
+SCOPE_ANSWERS: dict[str, str] = {
+    "application": "bench voltage divider",
+    "jurisdiction": "EU",
+    "mains_powered": "no",
+    "radio": "no",
+    "finished_apparatus": "yes",
+    "evaluation_kit": "no",
+    "highest_rated_voltage": "12 V DC",
+}
 
 #: net name -> {(ref, pin)} - what the exported KiCad netlist must reproduce exactly
 EXPECTED_NETS: dict[str, set[tuple[str, str]]] = {
@@ -259,7 +307,8 @@ def divider_with_connector_ir(tmp_path: Path, library: KicadLibrary | None = Non
         provenance=Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="fixture"),
     )
     ir.requirements.requirements = [
-        Requirement(id="req.v_in", key="v_in", text="12 V DC input on the header", kind=RequirementKind.EXPLICIT, value=user_requirement(12.0, "V")),
+        # key ``input_voltage``: the name the regulatory applicability rules read (LVD: 75-1500 V DC -> not applicable at 12 V DC)
+        Requirement(id="req.v_in", key="input_voltage", text="12 V DC input on the header", kind=RequirementKind.EXPLICIT, value=user_requirement(12.0, "V")),
         Requirement(id="req.v_out", key="v_out", text="6 V output (half the input) within 1 %", kind=RequirementKind.EXPLICIT, value=user_requirement(6.0, "V")),
         Requirement(
             id="req.v_out_half", key="v_out_half", text="the output stays half the input: 3 V at a 6 V input, within 1 %",

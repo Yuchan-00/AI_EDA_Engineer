@@ -73,6 +73,11 @@ class PipelineState(BaseModel):
     def open_questions(self) -> list[MissingInformation]:
         return [q for o in self.outcomes for q in o.questions if q.required]
 
+    @property
+    def optional_questions(self) -> list[MissingInformation]:
+        """Questions a stage asked without stopping the pipeline (regulatory scope answers, model proposals to accept); answerable with ``--answer``."""
+        return [q for o in self.outcomes for q in o.questions if not q.required]
+
     def outcome(self, stage: Stage) -> StageOutcome | None:
         for o in self.outcomes:
             if o.stage == stage:

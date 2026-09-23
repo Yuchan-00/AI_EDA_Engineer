@@ -624,9 +624,13 @@ def test_missing_identity_is_not_verified_in_bom_reviewer_and_validator(tmp_path
     row = next(iter(csv.DictReader(open(art.path, newline="", encoding="utf-8"))))
     assert (row["Manufacturer"], row["MPN"], row["Package"], row["Supplier"], row["SupplierPN"]) == ("NOT_VERIFIED",) * 5
     r = _review(ir, tmp_path, ReviewArea.COMPONENT_PROVENANCE)
-    assert r.status is S.NOT_VERIFIED and r.details["weak"] == ["R1.mpn[missing]"]
+    assert r.status is S.NOT_VERIFIED and "R1.mpn[missing]" in r.details["weak"] and r.details["repair"] == "human"
     v = default_registry.get("ir.component_provenance").validate(ir, ValidationContext(workdir=tmp_path))[0]
     assert v.status is S.NOT_VERIFIED and v.details["unverified"] == ["R1.mpn[missing]"]
-    ir.components = [make_component("R1", "10k")]  # authoritative MPN + package: identity is fine
-    assert _review(ir, tmp_path, ReviewArea.COMPONENT_PROVENANCE).status is S.PASS
-    assert default_registry.get("ir.component_provenance").validate(ir, ValidationContext(workdir=tmp_path))[0].status is S.PASS
+    # an MPN merely *tagged* authoritative (the fixture's SourceRef names no archived copy) is not grounded either:
+    # identity becomes authoritative only through an archived, hash-verified datasheet (tests/test_parts_regulatory_e2e.py)
+    ir.components = [make_component("R1", "10k")]
+    r = _review(ir, tmp_path, ReviewArea.COMPONENT_PROVENANCE)
+    assert r.status is S.NOT_VERIFIED and "R1.mpn[authoritative, unarchived]" in r.details["weak"] and "tagged authoritative but not grounded" in r.message
+    v = default_registry.get("ir.component_provenance").validate(ir, ValidationContext(workdir=tmp_path))[0]
+    assert v.status is S.NOT_VERIFIED and v.details["unverified"] == ["R1.mpn[authoritative, unarchived]"] and "not grounded" in v.message

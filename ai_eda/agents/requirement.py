@@ -69,9 +69,13 @@ step - the model never decides what enters the IR:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
+from ai_eda.agents.component import CONFIRM_FACTS_KEY, CONFIRM_PARTS_KEY, EXTRACT_FACTS_KEY, FACTS_FILE_KEY
+from ai_eda.agents.regulatory import ACCEPT_REGS_KEY, PROPOSE_REGS_KEY, REJECT_REGS_KEY
 from ai_eda.ir import (
     CircuitIR,
     Jurisdiction,
@@ -111,6 +115,7 @@ from ai_eda.llm.extraction import (
 )
 from ai_eda.llm.router import TaskKind
 from ai_eda.llm.service import BudgetExceededError, LLMService, StructuredOutputError
+from ai_eda.regulatory.candidates import CandidateList, load_candidates
 
 #: Baseline information every design needs before we may proceed.
 BASELINE_QUESTIONS: list[MissingInformation] = [
@@ -122,23 +127,47 @@ BASELINE_QUESTIONS: list[MissingInformation] = [
 
 EXTRACTION_CHECK = "requirements.extraction"
 
-#: answer keys that steer the agent and are never requirements themselves
-CONTROL_KEYS: frozenset[str] = frozenset({CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY})
+#: answer keys that steer an agent (this one, the component agent, the regulatory agent) and are never requirements themselves
+CONTROL_KEYS: frozenset[str] = frozenset({
+    CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY, CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY, ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY,
+})
 
 
 def _split_codes(answer: str) -> list[str]:
     return [c.strip() for c in answer.replace(";", ",").split(",") if c.strip()]
 
 
-def _answer_requirement(key: str, answer: str) -> Requirement:
-    return Requirement(
-        id=f"req.{key}",
-        key=key,
-        text=f"{key}: {answer}",
-        kind=RequirementKind.EXPLICIT,
-        value=user_requirement(answer),
-        category="regulatory" if key == "jurisdiction" else "application" if key == "application" else "electrical",
-    )
+def regulatory_scope_keys(ctx: AgentContext) -> frozenset[str]:
+    """The regulatory stage's scope-question keys (``mains_powered``, ``radio``, ...) from the candidate list the run uses.
+
+    An answer to one of them is the user's regulatory scope statement, not an
+    electrical requirement a component could serve; it is recorded with
+    category ``regulatory`` so the reviewer does not demand a component for it.
+    """
+    given = ctx.tools.get("regulatory_candidates")
+    try:
+        if isinstance(given, CandidateList):
+            return frozenset(q.key for q in given.scope_questions)
+        if isinstance(given, (str, Path)):
+            return frozenset(q.key for q in load_candidates(given).scope_questions)
+        return _packaged_scope_keys()
+    except ValueError:
+        return _packaged_scope_keys()
+
+
+@lru_cache(maxsize=1)
+def _packaged_scope_keys() -> frozenset[str]:
+    return frozenset(q.key for q in load_candidates().scope_questions)
+
+
+def _answer_requirement(key: str, answer: str, scope_keys: frozenset[str] = frozenset()) -> Requirement:
+    if key == "jurisdiction" or key in scope_keys:
+        category = "regulatory"
+    elif key == "application":
+        category = "application"
+    else:
+        category = "electrical"
+    return Requirement(id=f"req.{key}", key=key, text=f"{key}: {answer}", kind=RequirementKind.EXPLICIT, value=user_requirement(answer), category=category)
 
 
 def _now() -> str:
@@ -154,8 +183,9 @@ class RequirementAgent(Agent):
         confirm_answer = ctx.answers.get(CONFIRM_KEY)
         accept = set(_split_codes(ctx.answers.get(ACCEPT_KEY, "")))
         reject = set(_split_codes(ctx.answers.get(REJECT_KEY, "")))
-        # Answers the user gave become explicit requirements with user_requirement provenance.
-        answer_reqs = [_answer_requirement(k, v) for k, v in answers.items() if ir.requirements.get(k) is None]
+        # Answers the user gave become explicit requirements with user_requirement provenance (regulatory scope answers as such).
+        scope_keys = regulatory_scope_keys(ctx)
+        answer_reqs = [_answer_requirement(k, v, scope_keys) for k, v in answers.items() if ir.requirements.get(k) is None]
         answer_jurisdictions = [
             Jurisdiction(code=code, name=code, provided_by_user=True)
             for k, v in answers.items() if k == "jurisdiction" and ir.requirements.get(k) is None

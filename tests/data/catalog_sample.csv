@@ -1,0 +1,7 @@
+LCSC Part #,MFR.Part #,Manufacturer,Package,Stock,Type,Price (USD),Datasheet,Description
+C25792,0402WGF4702TCE,UNI-ROYAL(Uniroyal Elec),0402	,1000000,Basic,0.0011,https://datasheet.lcsc.com/szlcsc/Uniroyal-Elec-0402WGF4702TCE_C25792.pdf,47kΩ ±1% 1/16W 0402 Chip Resistor
+C10002,LM2596SX-5.0/NOPB,Texas Instruments,TO-263-5,3520,Extended,"1-499:1.4321,500-1499:1.2900",https://www.ti.com/lit/ds/symlink/lm2596.pdf,"5V 3A step-down regulator, ""SIMPLE SWITCHER"""
+25804,RC0603FR-0710KL,YAGEO,0603,52000,basic,0.0009,,10kΩ ±1% 1/10W 0603 Chip Resistor
+C7171,VR1-0603-200V-A,Example Vendor,0603,120,Extended,0.0450,https://www.example-vendor.com/ds/vr1.pdf,VR1 series 200 V thin film resistor
+C99,NOSTOCK-1,Example Vendor,0603,n/a,Extended,call,,row with unreadable stock and price
+C100,,Example Vendor,0603,1,Basic,0.01,,this row has an empty mpn cell and is skipped

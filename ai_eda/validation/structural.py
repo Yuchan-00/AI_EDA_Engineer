@@ -38,34 +38,64 @@ class ConnectivityValidator(Validator):
 
 class ComponentProvenanceValidator(Validator):
     id = "ir.component_provenance"
-    description = "Component identity (MPN/package/pins) must be authoritative, never model output or absent"
+    description = "Component identity must be grounded: an MPN found verbatim in an archived, hash-verified datasheet - never model output, absent, or merely tagged"
 
     def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
+        """What makes an identity authoritative is the archived datasheet, not the tag.
+
+        For every component :func:`~ai_eda.parts.identity.mpn_grounding` is
+        applied (the reviewer applies the same rule): the MPN must be
+        ``authoritative`` *and* its SourceRef must name an archived copy
+        (``document_path`` + ``content_hash`` + ``retrieved_at``) that still
+        hashes to its name. An MPN tagged authoritative without such a copy is
+        downgraded to NOT_VERIFIED with the reason; a copy altered on disk is
+        ``tampered``. The latest ``component.existence.<ref>`` result of the
+        COMPONENT_SELECTION stage is read as corroboration and outranks the tag
+        when it disagrees (another document, MPN not found, FAIL).
+        """
+        from ai_eda.parts.identity import existence_conflict, latest_existence, mpn_grounding, open_archive
+
+        if not ir.components:
+            return [self.not_applicable("no components")]
+        archive = open_archive(ctx.tools, ctx.workdir)
         unverified: list[str] = []
+        tampered: list[str] = []
+        grounding: dict[str, dict] = {}
         for c in ir.components:
-            fields = {"mpn": c.mpn, "package": c.package, "manufacturer": c.manufacturer}
-            for name, traced in fields.items():
+            for name, traced in {"mpn": c.mpn, "package": c.package, "manufacturer": c.manufacturer}.items():
                 if traced is not None and traced.provenance.kind == ProvenanceKind.LLM_GENERATED:
-                    unverified.append(f"{c.ref}.{name}")
-            if not c.has_authoritative_identity:
-                # no MPN, or one that is not backed by official part data: nobody can source this part
-                unverified.append(f"{c.ref}.mpn[{c.mpn.provenance.kind if c.mpn is not None else 'missing'}]")
+                    unverified.append(f"{c.ref}.{name}")  # model output as such, whatever the grounding says
+            g = mpn_grounding(c, archive)
+            existence = latest_existence(ir, c.ref)
+            conflict = existence_conflict(existence, g)
+            grounding[c.ref] = {
+                **g.model_dump(mode="json"),
+                "existence": None if existence is None else {"status": existence.status, "artifact_hash": existence.artifact_hash, "message": existence.message},
+                "existence_conflict": conflict,
+            }
+            if not g.grounded:
+                unverified.append(f"{c.ref}.mpn[{g.label}]")
+                if "tampered" in g.label:
+                    tampered.append(c.ref)
+            elif conflict is not None:
+                unverified.append(f"{c.ref}.mpn[existence check disagrees]")
             for p in c.pins:
                 if p.provenance.kind == ProvenanceKind.LLM_GENERATED:
                     unverified.append(f"{c.ref}.pin[{p.number}]")
+        details = {"unverified": sorted(set(unverified)), "tampered": tampered, "grounding": grounding, "archive": str(archive.root) if archive is not None else None}
         if unverified:
-            return [
-                ValidationResult(
-                    check_id=self.id,
-                    status=ValidationStatus.NOT_VERIFIED,
-                    message="component identity must be verified against a datasheet / official part data",
-                    tool=self.id,
-                    details={"unverified": sorted(set(unverified))},
-                )
-            ]
-        if not ir.components:
-            return [self.not_applicable("no components")]
-        return [ValidationResult(check_id=self.id, status=ValidationStatus.PASS, tool=self.id)]
+            reasons = "; ".join(
+                f"{ref}: {g['reason'] if g['status'] != str(ValidationStatus.PASS) else g['existence_conflict']}"
+                for ref, g in grounding.items() if g["status"] != str(ValidationStatus.PASS) or g["existence_conflict"]
+            )
+            message = "component identity must be grounded in an archived, hash-verified datasheet (MPN found verbatim in it)"
+            if tampered:
+                message += f"; tampered archived datasheet for {tampered} - a human must re-fetch and re-check"
+            return [ValidationResult(check_id=self.id, status=ValidationStatus.NOT_VERIFIED, message=f"{message}: {reasons}", tool=self.id, details=details)]
+        return [ValidationResult(
+            check_id=self.id, status=ValidationStatus.PASS, tool=self.id,
+            message=f"{len(ir.components)} component(s) with an MPN grounded in an archived, hash-verified datasheet", details=details,
+        )]
 
 
 def simulation_assumptions(ir: CircuitIR) -> list[str]:

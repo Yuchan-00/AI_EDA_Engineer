@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, Field
 
@@ -50,6 +50,17 @@ class SourceRef(BaseModel):
     @staticmethod
     def hash_bytes(data: bytes) -> str:
         return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def from_document(doc: Any, section: str | None = None, title: str | None = None, authority: str | None = None) -> "SourceRef":
+        """A reference to an archived document (:class:`ai_eda.tools.sources.ArchivedDocument`): its final URL, path, hash and retrieval time.
+
+        ``section`` names where in the document the claim stands (``"page 3"``,
+        an article heading). The document object is duck-typed (it must offer
+        ``source_ref(title, section, authority)``) so the IR does not import the
+        tools layer.
+        """
+        return doc.source_ref(title=title, section=section, authority=authority)
 
 
 class Provenance(BaseModel):
