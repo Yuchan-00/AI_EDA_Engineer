@@ -19,6 +19,15 @@ Verification-first AI circuit design system. **The LLM never decides design trut
 - Bash-tool heredocs (`cat > f <<'EOF'`) are unreliable here — write files with the Write/Edit tools.
 - Scratch/experiment files go in `C:\Users\yc012\AppData\Local\Temp\claude\B--Claude\abcacf4d-e090-437c-84fc-e48862689e37\scratchpad`, never in the repo. Do not touch `projects/`.
 
+## Linux / Claude Code web / any other machine
+- The "Environment" section above describes the Windows PC this was built on; nothing there is a requirement. Every tool is discovered at runtime: `kicad-cli` via PATH (`ai_eda.tools.kicad.cli.find_kicad_cli`); KiCad symbol/footprint libraries from that binary's install root (`<root>/share/kicad`, e.g. `/usr/share/kicad` on Debian/Ubuntu) or `$KICAD10_SYMBOL_DIR` / `$KICAD_SYMBOL_DIR`; the ngspice shared library from `$NGSPICE_DLL` (path must exist) else `ngspice.dll` next to `kicad-cli`; XSPICE code models from `$NGSPICE_CODEMODEL_DIR` else `<root>/lib/ngspice`. `python -m ai_eda.cli doctor` prints what was found.
+- Setup: `python -m venv .venv && . .venv/bin/activate && pip install -e ".[dev,llm,parts]"`; add `cryptography` if datasheet PDFs are AES-encrypted (3 of 20 sampled manufacturer PDFs were). Run tests with `python -m pytest -q -p no:cacheprovider -rs`.
+- Without KiCad / ngspice the tool-backed tests skip (`skipif`) and the pipeline reports those stages `NOT_VERIFIED`. A green run without them is not tool verification. Reference on this PC with both installed: 1040 passed, 5 skipped (2026-09-23).
+- To get the tool-backed tests on Linux (NOT yet measured as of 2026-09-23 - verify, then update this note): install KiCad 10 (`kicad-cli` on PATH) and ngspice's shared library (`libngspice0` -> e.g. `NGSPICE_DLL=/usr/lib/x86_64-linux-gnu/libngspice.so.0`, `NGSPICE_CODEMODEL_DIR=<directory with the *.cm files>`). The loader uses `ctypes.CDLL` and guards the Windows-only `os.add_dll_directory`. The measured ngspice facts above come from KiCad's ngspice-46 build; re-measure another build with `tests/ngspice_parser_harness.py` before trusting `ai_eda.tools.calc.si`.
+- Network-touching tests skip unless `AI_EDA_ONLINE=1` (read-only fetches of EUR-Lex, law.go.kr, eCFR); live OpenRouter tests need `OPENROUTER_API_KEY` and spend credits. Never enable either by default in CI. The archive never opens a socket without `--online`.
+- Line endings are forced to LF by `.gitattributes`; write files with LF. The cp949 / heredoc notes above are Windows-only.
+- Git: `origin` = https://github.com/Yuchan-00/AI_EDA_Engineer (branch `main`). Commit messages end with the Co-Authored-By line the session provides. Never force-push.
+
 ## Conventions
 - Python 3.12, pydantic v2, `from __future__ import annotations`, type hints everywhere, small modules, docstrings that state the invariant the module enforces.
 - Tests in `tests/`; tests that need `kicad-cli` use `pytest.mark.skipif(not KicadCli().available(), ...)` and must otherwise run against the real binary.
