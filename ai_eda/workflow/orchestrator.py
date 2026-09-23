@@ -57,6 +57,14 @@ from ai_eda.validation import ValidationContext, default_registry
 from ai_eda.workflow.stages import STAGE_ORDER, Stage
 
 
+def _stamp(results: list[ValidationResult], ir: CircuitIR) -> None:
+    """Record the IR version the results are about (a result that already carries one keeps it)."""
+    if results:
+        h = ir.content_hash()
+        for r in results:
+            r.ir_hash = r.ir_hash or h
+
+
 def _field_annotation(model: Any, name: str) -> Any:
     """The declared type of field ``name`` on a pydantic model instance (``Any`` when it is not a model field)."""
     if isinstance(model, BaseModel):
@@ -167,6 +175,7 @@ class Orchestrator:
 
     def run(self, ir: CircuitIR, stop_after: Stage | None = None) -> PipelineState:
         state = PipelineState()
+        self._fresh_from = len(ir.validation.results)  # results before this index were carried over from earlier runs
         for stage in STAGE_ORDER:
             state.current = stage
             outcome = self.stages[stage](ir, self.ctx)
@@ -243,6 +252,9 @@ class Orchestrator:
         def fn(ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
             result: AgentResult = agent.run(ir, ctx)
             self.apply_proposals(ir, result.proposals)
+            # An agent's results were computed on the IR *before* its proposals, about the part of the design it
+            # owns and proposes; they carry no ir_hash (neither hash would be honest) and count as evidence only
+            # in the run that produced them (see _release).
             ir.validation.extend(result.validation)
             notes = list(result.notes)
             if result.blocked_on_user:
@@ -277,6 +289,7 @@ class Orchestrator:
         for v in default_registry.select(ir):
             if v.consumes & produced:
                 out.extend(v.validate(ir, vctx))
+        _stamp(out, ir)
         ir.validation.extend(out)
         return out
 
@@ -300,6 +313,7 @@ class Orchestrator:
 
     def _ir_validate(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         results = default_registry.run(ir, ValidationContext(workdir=ctx.workdir, tools=ctx.tools))
+        _stamp(results, ir)  # validators read the whole IR as it is now: their verdicts are about this version
         ir.validation.extend(results)
         status = worst_status(r.status for r in results)
         # a validator that needs the user (assumptions, undecided model-inferred requirements) is shown as a
@@ -417,16 +431,21 @@ class Orchestrator:
     def _release(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         """RELEASE is PASS only on evidence: every latest result PASS (or NOT_APPLICABLE), tool-backed, and about this IR.
 
-        A PASS without a ``tool`` is an opinion (ARCHITECTURE invariant 4) and
-        a PASS stamped with another IR version's hash is about a different
-        design; neither releases anything, however the aggregate reads.
+        A PASS without a ``tool`` is an opinion (ARCHITECTURE invariant 4); a
+        PASS stamped with another IR version's hash is about a different
+        design; a PASS without any stamp (an agent's result) is about this
+        design only when this run produced it - one carried over from an
+        earlier run in ``ir.validation`` vouches for nothing now. None of
+        them releases anything, however the aggregate reads.
         """
         latest = ir.validation.latest_by_check()
         overall = ir.validation.overall()
         current = ir.content_hash()
+        fresh = {r.check_id for r in ir.validation.results[getattr(self, "_fresh_from", 0):]}
         opinions = sorted(k for k, r in latest.items() if r.status == ValidationStatus.PASS and not r.is_tool_backed)
         stale = sorted(k for k, r in latest.items() if r.status == ValidationStatus.PASS and r.ir_hash and r.ir_hash != current)
-        if overall == ValidationStatus.PASS and not opinions and not stale:
+        carried = sorted(k for k, r in latest.items() if r.status == ValidationStatus.PASS and not r.ir_hash and k not in fresh)
+        if overall == ValidationStatus.PASS and not opinions and not stale and not carried:
             return StageOutcome(stage=Stage.RELEASE, status=ValidationStatus.PASS, message="evidence-backed release")
         reasons: list[str] = []
         if overall != ValidationStatus.PASS:
@@ -436,5 +455,7 @@ class Orchestrator:
             reasons.append(f"PASS without a tool is an opinion, not evidence ({', '.join(opinions)})")
         if stale:
             reasons.append(f"PASS produced for another IR version ({', '.join(stale)})")
+        if carried:
+            reasons.append(f"PASS carried over from an earlier run without an IR version, not re-produced by this one ({', '.join(carried)})")
         status = overall if overall != ValidationStatus.PASS else ValidationStatus.NOT_VERIFIED
         return StageOutcome(stage=Stage.RELEASE, status=status, message="not releasable: " + "; ".join(reasons))

@@ -61,8 +61,9 @@ class RegulatoryProvenance(BaseModel):
     source_document: str | None = None  # archived local path
     content_hash: str | None = None
 
-    # the verdict and the local path are state about the design (what a run found where), not the design
-    _design = drop_in_design_view("verification_status", "source_document")
+    # the verdict, the local path and the fetch time are state about the design (what a run found where and when);
+    # content_hash / source_url (which official text the decision rests on) are the design's provenance
+    _design = drop_in_design_view("verification_status", "source_document", "retrieved_at")
 
 
 class GroundedQuote(BaseModel):

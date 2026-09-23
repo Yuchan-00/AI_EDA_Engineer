@@ -101,12 +101,20 @@ Round 6 (the rest of the verification pass):
 59. The zero / negative check for passives also refused a 0 V or negative V / I source.
 60. ``Traced`` accepted ``inf`` / ``nan``; ``save`` wrote ``null`` and the project did not load again, while a
     hand-written JSON ``Infinity`` token loaded as a number.
+
+Round 7 (the workflow's final critic):
+
+61. RELEASE honoured "about the current IR" only for results that carry an ``ir_hash``; a tool-backed PASS
+    without one (an agent's result) carried over from an earlier run released even after the design changed.
+62. ``mfg.capability`` was PASS ("fab capability data is authoritative") without comparing the board to any limit.
+63. ``retrieved_at`` (the fetch wall-clock) was in the design hash, so re-fetching an unchanged document moved it.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 import logging
 import math
 import os
@@ -115,7 +123,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from ai_eda.agents import AgentContext, RequirementAgent
+from ai_eda.agents import AgentContext, ManufacturingAgent, RequirementAgent
 from ai_eda.agents.base import IRProposal
 from ai_eda.agents.regulatory import ACCEPT_REGS_KEY
 from ai_eda.cli import main as cli_main, project_workdir, run_exit_code
@@ -163,6 +171,7 @@ from ai_eda.ir import (
     user_requirement,
 )
 from ai_eda.ir.provenance import llm_generated
+from ai_eda.ir.pcb import ManufacturingConstraints
 from ai_eda.ir.regulatory import Applicability, GroundedQuote, RegulatoryProvenance, RegulatoryRequirement
 from ai_eda.llm.client import LLMError, LLMMessage
 from ai_eda.llm.extraction import (
@@ -189,6 +198,8 @@ from ai_eda.tools.sources.archive import ArchivedDocument
 from ai_eda.tools.sources.policy import host_of, normalise_url, port_of
 from ai_eda.tools.spice.ngspice_shared import find_codemodel_dir, find_ngspice_dll, find_system_ngspice, validate_deck
 from ai_eda.tools.spice import NgspiceRunner, SpiceAnalysis, SpiceResult
+from ai_eda.tools.spice.rawfile import parse as parse_rawfile
+from ai_eda.tools.manufacturing import FabCapability
 from ai_eda.tools.spice.stage import judge, reduce_expectation, run_spice_for
 from ai_eda.tools.calc import ngspice_reads
 from ai_eda.compilers.spice import build, build_report
@@ -534,6 +545,8 @@ def test_17_locators_and_verification_outcomes_do_not_move_the_design_hash(divid
     h = divider_ir.content_hash()
     r1.mpn.provenance.source.document_path = str(tmp_path / "projB" / "sources" / "x.pdf")
     assert divider_ir.content_hash() == h  # the same archived document (same sha256) under another workdir
+    r1.mpn.provenance.source.retrieved_at = datetime(2026, 9, 23, tzinfo=timezone.utc)
+    assert divider_ir.content_hash() == h  # when it was fetched is a clock, not the design (63)
     r1.mpn.provenance.source.content_hash = "sha256:" + "b" * 64
     assert divider_ir.content_hash() != h  # another document is another design
     h = divider_ir.content_hash()
@@ -546,6 +559,7 @@ def test_17_locators_and_verification_outcomes_do_not_move_the_design_hash(divid
     divider_ir.regulatory.requirements.append(req)
     h = divider_ir.content_hash()
     req.status, req.source_status, req.provenance.verification_status, req.provenance.source_document = S.FAIL, "ok", S.PASS, "/x/y.html"
+    req.provenance.retrieved_at = datetime(2026, 9, 23, tzinfo=timezone.utc)
     req.grounded_quotes[0].found, req.grounded_quotes[0].page, req.grounded_quotes[0].context = True, 3, "... [1 000 V] ..."
     assert divider_ir.content_hash() == h  # what a run found is state about the design
     req.grounded_quotes[0].found, req.grounded_quotes[0].reason = False, "offline: not fetched (offline)"
@@ -1183,6 +1197,15 @@ def test_55_the_system_ngspice_library_is_found_without_the_env_var(tmp_path: Pa
 # --------------------------------------------------------------------------- 56: what a regulatory run found is not the design
 
 
+def _leaf_diff(x, y, path: str = "") -> list[str]:
+    """Paths of the leaves where two JSON-shaped values differ."""
+    if isinstance(x, dict) and isinstance(y, dict):
+        return [d for k in sorted(set(x) | set(y)) for d in _leaf_diff(x.get(k), y.get(k), f"{path}.{k}")]
+    if isinstance(x, list) and isinstance(y, list) and len(x) == len(y):
+        return [d for i, (p, q) in enumerate(zip(x, y)) for d in _leaf_diff(p, q, f"{path}[{i}]")]
+    return [] if x == y else [path]
+
+
 def test_56_the_outcome_of_a_regulatory_run_does_not_move_the_design_hash(fake, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     answers = {"mains_powered": "no", "radio": "no", "intended_use": "bench"}
 
@@ -1209,6 +1232,10 @@ def test_56_the_outcome_of_a_regulatory_run_does_not_move_the_design_hash(fake, 
     assert lvd.provenance.section == "Article 1" and "; evidence: Article 1" in lvd.provenance.applicability_rationale
     assert "grounded" not in lvd.provenance.applicability_rationale and "page" not in lvd.provenance.section
     h = ir.content_hash()
+    # offline -> the first successful fetch: only the document identity (hash, URL, the archived title) moves the hash
+    online, before = ir.design_dict()["regulatory"]["requirements"][0], a.design_dict()["regulatory"]["requirements"][0]  # the LVD entry
+    assert h != a.content_hash() and _leaf_diff(before, online) and all(p.split(".")[-1] in {"content_hash", "source_url", "source_title"} for p in _leaf_diff(before, online))
+    assert "retrieved_at" not in json.dumps(online)  # the fetch time is not the design (63)
     monkeypatch.setattr(ArchivedDocument, "find_quote", lambda self, *a, **k: [])
     lvd = run(ir, tmp_path / "c", None)  # reuses the workdir's copies offline
     assert lvd.source_status == "quote_missing" and lvd.status is S.FAIL and [q.found for q in lvd.grounded_quotes] == [False, False]
@@ -1309,3 +1336,57 @@ def test_60_a_non_finite_traced_number_is_refused_and_a_json_infinity_does_not_l
     path.write_text(text.replace('"value": 1.0', '"value": Infinity'), encoding="utf-8")
     with pytest.raises(IRSchemaError, match="Infinity"):
         CircuitIR.load(path)
+
+
+
+# --------------------------------------------------------------------------- 54: a rawfile without a Command line
+
+
+def test_54_a_rawfile_without_a_command_line_parses(tmp_path: Path):
+    text = "Title: t\nDate: today\nPlotname: Operating Point\nFlags: real\nNo. Variables: 2\nNo. Points: 1\nVariables:\n\t0\tv(vout)\tvoltage\n\t1\tv(vin)\tvoltage\nValues:\n0\t6.0\n\t12.0\n"
+    p = tmp_path / "op.raw"
+    p.write_bytes(text.encode())
+    plot = parse_rawfile(p)
+    assert plot.command == "" and plot.plotname == "Operating Point" and plot.vectors["v(vout)"] == [6.0]
+
+
+# =========================================================================== round 7
+
+
+# --------------------------------------------------------------------------- 61: evidence is about this IR, or from this run
+
+
+def test_61_a_pass_carried_over_from_an_earlier_run_without_an_ir_version_is_not_evidence(divider_ir: CircuitIR, tmp_path: Path):
+    ctx = AgentContext(workdir=tmp_path)
+    orch = Orchestrator(ctx)
+    n = len(divider_ir.validation.results)
+    divider_ir.validation.extend([ValidationResult(check_id="component.existence.R1", status=S.PASS, tool="parts.existence", message="from an earlier run")])
+    orch._fresh_from = n + 1  # what run() records: everything before it was carried over
+    divider_ir.validation.extend([ValidationResult(check_id="regulatory.sources", status=S.PASS, tool="regulatory.research")])  # this run's, no hash: fine
+    out = orch._release(divider_ir, ctx)
+    assert out.status is S.NOT_VERIFIED and "component.existence.R1" in out.message and "earlier run" in out.message and "regulatory.sources" not in out.message
+    divider_ir.validation.extend([ValidationResult(check_id="component.existence.R1", status=S.PASS, tool="parts.existence")])  # re-produced by this run
+    assert orch._release(divider_ir, ctx).status is S.PASS
+    # a validator's verdict is about the whole IR as it stands: it is stamped, and a stamped match from an earlier run still counts
+    m = len(divider_ir.validation.results)
+    orch._ir_validate(divider_ir, ctx)
+    assert divider_ir.validation.results[m:] and all(r.ir_hash == divider_ir.content_hash() for r in divider_ir.validation.results[m:])
+    before = len(divider_ir.validation.results)
+    fresh = Orchestrator(ctx)
+    fresh.run(divider_ir, stop_after=Stage.REQUIREMENT_ANALYSIS)
+    assert fresh._fresh_from == before  # run() draws the line where this run's results begin
+
+
+# --------------------------------------------------------------------------- 62: authoritative limits are not a comparison
+
+
+def test_62_authoritative_fab_limits_without_a_comparison_are_not_a_pass(tmp_path: Path):
+    limits = ManufacturingConstraints(fab="X", min_track_width_mm=authoritative(0.127, DS, "mm"), min_clearance_mm=authoritative(0.127, DS, "mm"))
+    cap = FabCapability(fab="X", constraints=limits, source=DS)
+    assert cap.verification_status() is S.PASS  # the data is authoritative ...
+    ir = CircuitIR(project=ProjectMeta(id="p", name="p", workdir=str(tmp_path)))
+    for tools in ({"fab_capability": cap}, {}):
+        r = ManufacturingAgent().run(ir, AgentContext(workdir=tmp_path, tools=tools)).validation[0]
+        assert r.check_id == "mfg.capability" and r.status is S.NOT_VERIFIED and r.details["compared"] is False  # ... but nothing was compared
+    r = ManufacturingAgent().run(ir, AgentContext(workdir=tmp_path, tools={"fab_capability": cap})).validation[0]
+    assert "not compared" in r.message and r.details["limits"] is S.PASS

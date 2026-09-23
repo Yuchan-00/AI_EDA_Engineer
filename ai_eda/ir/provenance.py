@@ -76,9 +76,9 @@ class SourceRef(BaseModel):
     #: the same; ``content_hash`` (which stays) pins the document
     document_path: str | None = None
     content_hash: str | None = None  # sha256 of the archived document
-    retrieved_at: datetime | None = None
+    retrieved_at: datetime | None = None  # when it was fetched: a clock, not the design (out of the design view)
 
-    _design = drop_in_design_view("document_path")
+    _design = drop_in_design_view("document_path", "retrieved_at")
 
     @staticmethod
     def hash_bytes(data: bytes) -> str:
