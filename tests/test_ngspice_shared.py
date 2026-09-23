@@ -25,7 +25,8 @@ from ai_eda.tools.spice import (
     rawfile,
     validate_deck,
 )
-from ai_eda.tools.spice.ngspice_shared import find_ngspice_dll
+from ai_eda.tools.spice.ngspice_shared import INFORMATIONAL_STDERR_RE, EngineDead, _Capture, _Engine, bind_reset, find_ngspice_dll
+from tests.conftest import rawfile_command_ok
 
 DLL_PRESENT = NgspiceShared().available()
 needs_dll = pytest.mark.skipif(not DLL_PRESENT, reason="ngspice.dll (KiCad's bundled ngspice shared library) not found")
@@ -171,6 +172,40 @@ def test_binary_runner_is_optional_and_unavailable_here(tmp_path: Path):
     assert NgspiceRunner.batch_deck("t\r\nR1 a 0 1k\r\n", "op") == "t\nR1 a 0 1k\n.op\n.end\n"
 
 
+def test_bind_reset_is_optional_for_builds_without_ngspice_reset():
+    """KiCad's ngspice-46 exports ``ngSpice_Reset``; Debian/Ubuntu ``libngspice0`` (ngspice-42) does not - the runner still loads it."""
+    from ctypes import c_int
+
+    class Modern:
+        class ngSpice_Reset:  # a ctypes function pointer stand-in: argtypes / restype are assigned
+            pass
+
+    class Old:
+        def __getattr__(self, name: str):
+            raise AttributeError(f"undefined symbol: {name}")
+
+    assert bind_reset(Modern()) is True
+    assert Modern.ngSpice_Reset.argtypes == [] and Modern.ngSpice_Reset.restype is c_int
+    assert bind_reset(Old()) is False
+
+
+def test_recover_without_ngspice_reset_marks_the_engine_dead_with_the_reason():
+    eng = _Engine.__new__(_Engine)
+    eng.dead, eng.dead_reason, eng.reset_supported, eng.dll_path = False, "", False, Path("/usr/lib/x86_64-linux-gnu/libngspice.so.0")
+    with pytest.raises(EngineDead, match="does not export ngSpice_Reset"):
+        eng.recover()
+    assert eng.dead and "restart the process" in eng.dead_reason
+
+
+def test_informational_stderr_is_kept_in_the_transcript_but_is_not_an_error():
+    cap = _Capture()
+    cap.chars += ["stderr Using SPARSE 1.3 as Direct Linear Solver", "stderr Using KLU as Direct Linear Solver", "stderr Error: unknown subckt: x1", "stdout Circuit: t"]
+    assert cap.stderr() == ["Error: unknown subckt: x1"]
+    assert cap.stdout() == ["Circuit: t"]
+    assert len(cap.chars) == 4  # the transcript (SpiceResult.log) still shows the banner
+    assert not INFORMATIONAL_STDERR_RE.match("Warning: singular matrix")
+
+
 # --------------------------------------------------------------------------------------- real DLL
 
 
@@ -206,7 +241,9 @@ def test_divider_op(runner: NgspiceShared, work: Path):
     assert res.raw_output_path and Path(res.raw_output_path).parent == work.resolve()
     assert res.raw_output_hash == sha256_of(res.raw_output_path)
     assert "stdout Circuit: divider" in res.log.splitlines()
-    assert "stderr" not in res.log
+    # KiCad's build prints nothing on stderr for a clean run; Debian/Ubuntu libngspice0 (42) announces its linear solver there
+    stderr_lines = [ln for ln in res.log.splitlines() if ln.startswith("stderr ")]
+    assert all(INFORMATIONAL_STDERR_RE.match(ln[7:].strip()) for ln in stderr_lines), stderr_lines
     assert "3 : v1 vin 0 dc 12" in res.listing  # the deck as ngspice parsed it
     assert res.final("vout") == res.vectors["vout"][0] == res.final("v(VOUT)")
     assert res.final("i(v1)") == res.vectors["v1#branch"][0]
@@ -354,7 +391,7 @@ def test_rawfile_round_trip_matches_the_in_memory_vectors(runner: NgspiceShared,
     assert ascii_res.succeeded, ascii_res.errors
     plot = rawfile.parse(ascii_res.raw_output_path)
     assert not plot.binary and plot.title == "rc lowpass" and plot.plotname == "Transient Analysis"
-    assert plot.command.startswith(ascii_res.engine_version + ",")
+    assert rawfile_command_ok(plot.command, ascii_res.engine_version), plot.command
     assert plot.n_points == ascii_res.n_points and plot.scale == "time"
     back = plot.as_plot_vectors()
     assert set(back) == set(ascii_res.vectors)

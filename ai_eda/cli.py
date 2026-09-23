@@ -70,7 +70,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     shared = NgspiceShared()
     if shared.available():
         try:
-            info = f"  ({shared.version()}, build {shared.build()}, code models {'loaded' if shared.codemodels_loaded else 'NOT loaded'})"
+            reset = "" if shared.engine_info()["reset_supported"] else ", no ngSpice_Reset: a ControlledExit is not recoverable"
+            info = f"  ({shared.version()}, build {shared.build()}, code models {'loaded' if shared.codemodels_loaded else 'NOT loaded'}{reset})"
         except ToolUnavailableError as e:
             info = f"  (UNUSABLE: {e})"
         print(f"ngspice dll: {shared.dll_path}{info}")

@@ -25,6 +25,14 @@ from ai_eda.ir import (
 )
 
 DS = SourceRef(title="Generic resistor datasheet", authority="Vendor", content_hash="sha256:abc")
+
+
+def rawfile_command_ok(command: str, version: str) -> bool:
+    """KiCad's ngspice-46 stamps ``Command: ngspice-46, Build ...`` into every rawfile; Debian/Ubuntu ``libngspice0``
+    (ngspice-42) leaves the ``Command:`` line empty (measured 2026-09-23). The line is evidence of the writer, not data."""
+    if version == "ngspice-42":
+        return command == ""
+    return command.startswith(version + ", Build ")
 AUTH = Provenance(kind=ProvenanceKind.AUTHORITATIVE, source=DS)
 
 

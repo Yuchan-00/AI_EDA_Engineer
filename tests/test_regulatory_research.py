@@ -1,5 +1,5 @@
 """Regulatory research against a local fake of the official sites (tests/fake_sources.py); nothing here touches the network
-except the one live test at the end, which runs only with AI_EDA_ONLINE=1.
+except the three live tests at the end (EUR-Lex, law.go.kr, eCFR), which run only with AI_EDA_ONLINE=1.
 
 What is proven: offline nothing is fetched and every source is NOT_VERIFIED; online only the allow-listed hosts are
 contacted, documents are archived and every claimed quote grounded (PASS means exactly that); a bot wall, a 404, a

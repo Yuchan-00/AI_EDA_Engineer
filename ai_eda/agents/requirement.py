@@ -199,7 +199,11 @@ class RequirementAgent(Agent):
             proposals.append(IRProposal(description=f"record user answer for {req.key}", target="requirements.requirements", operation="append", payload=req))
         for j in answer_jurisdictions:
             proposals.append(IRProposal(description=f"add jurisdiction {j.code}", target="regulatory.jurisdictions", operation="append", payload=j))
-        questions = [q for q in BASELINE_QUESTIONS if q.key not in answers and ir.requirements.get(q.key) is None]
+        # a jurisdiction recorded on ir.regulatory (an earlier answer, or a confirmed extraction) is answered: do not ask again
+        questions = [
+            q for q in BASELINE_QUESTIONS
+            if q.key not in answers and ir.requirements.get(q.key) is None and not (q.key == "jurisdiction" and ir.regulatory.jurisdictions)
+        ]
         notes = []
         if ctx.llm is None:
             notes.append("no LLM configured: free-text parsing skipped, baseline checklist only")
@@ -489,7 +493,10 @@ class RequirementAgent(Agent):
             proposals.append(IRProposal(description=f"record user answer for {req.key}", target="requirements.requirements", operation="append", payload=req))
         for j in answer_jurisdictions:
             proposals.append(IRProposal(description=f"add jurisdiction {j.code}", target="regulatory.jurisdictions", operation="append", payload=j))
-        questions = [q for q in BASELINE_QUESTIONS if q.key not in answers and ir.requirements.get(q.key) is None]
+        questions = [
+            q for q in BASELINE_QUESTIONS
+            if q.key not in answers and ir.requirements.get(q.key) is None and not (q.key == "jurisdiction" and ir.regulatory.jurisdictions)
+        ]
         kind = type(error).__name__
         result = ValidationResult(
             check_id=EXTRACTION_CHECK,

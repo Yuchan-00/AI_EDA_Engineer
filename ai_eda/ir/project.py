@@ -11,11 +11,12 @@ from typing import Iterable
 
 from pydantic import BaseModel, Field
 
+from ai_eda.errors import IRSchemaError
 from ai_eda.ir.components import Component
 from ai_eda.ir.constraints import Constraint
 from ai_eda.ir.nets import Net, PinRef
 from ai_eda.ir.pcb import PCBDesign
-from ai_eda.ir.provenance import Traced
+from ai_eda.ir.provenance import DESIGN_VIEW, Traced, design_data, drop_in_design_view
 from ai_eda.ir.regulatory import RegulatoryState
 from ai_eda.ir.requirements import RequirementSet
 from ai_eda.ir.simulation import SimulationSetup
@@ -32,6 +33,22 @@ NON_DESIGN_REQUIREMENT_FIELDS: tuple[str, ...] = ("extraction_cache",)
 #: wall-clock keys stripped from every nested object before hashing (``Provenance.created_at`` defaults to
 #: *now*, so two identical designs built a millisecond apart would otherwise never share a hash)
 WALL_CLOCK_KEYS: frozenset[str] = frozenset({"created_at"})
+
+
+def unknown_keys(raw, dumped, path: str = "") -> list[str]:
+    """Dotted paths of keys present in ``raw`` (loaded JSON) that ``dumped`` (the validated model dumped back) lacks."""
+    out: list[str] = []
+    if isinstance(raw, dict) and isinstance(dumped, dict):
+        for k, v in raw.items():
+            here = f"{path}.{k}" if path else str(k)
+            if k not in dumped:
+                out.append(here)
+            else:
+                out.extend(unknown_keys(v, dumped[k], here))
+    elif isinstance(raw, list) and isinstance(dumped, list):
+        for i, (a, b) in enumerate(zip(raw, dumped)):
+            out.extend(unknown_keys(a, b, f"{path}[{i}]"))
+    return out
 
 
 def strip_wall_clock(obj):
@@ -123,6 +140,8 @@ class ProjectMeta(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     workdir: str | None = None
 
+    _design = drop_in_design_view(*NON_DESIGN_PROJECT_FIELDS)
+
 
 class CircuitIR(BaseModel):
     schema_version: str = IR_SCHEMA_VERSION
@@ -168,23 +187,24 @@ class CircuitIR(BaseModel):
     _NON_DESIGN_FIELDS = ("validation", "artifacts")
 
     def design_dict(self) -> dict:
-        """The design content as JSON-able data: what :meth:`content_hash` hashes.
+        """The design content as JSON-able data: what :meth:`content_hash` hashes (the *design view*).
 
-        Excludes ``validation`` / ``artifacts`` (state about the design),
-        ``project.workdir`` / ``project.created_at`` (where and when it was
-        built), ``requirements.extraction_cache`` (what a model said, not
-        what the design is) and every ``created_at`` timestamp, so the same
-        design built twice - in another folder, at another time, or loaded
-        from disk - hashes the same. ``SourceRef.retrieved_at`` stays: which
-        retrieval of a datasheet was used is design provenance, and it is
-        never filled in by a clock default.
+        Left out, each by the model that owns it (:func:`~ai_eda.ir.provenance.drop_in_design_view`):
+        ``validation`` / ``artifacts`` (state about the design);
+        ``project.workdir`` / ``project.created_at`` (where and when it was built);
+        ``requirements.extraction_cache`` (what a model said, not what the design is);
+        every ``Provenance.created_at`` (a clock default);
+        the locators ``SourceRef.document_path``, ``LibraryRef.library_path`` and
+        ``RegulatoryProvenance.source_document`` (where a copy lives - the hashes that pin the copies stay);
+        and the regulatory verification outcomes (``RegulatoryRequirement.status`` / ``source_status``,
+        ``RegulatoryProvenance.verification_status``, ``GroundedQuote.found`` / ``page`` / ``context``), which an
+        offline and an online run of the same design fill in differently.
+        So the same design built twice - in another folder, at another time, against another KiCad install, or
+        loaded from disk - hashes the same. ``SourceRef.retrieved_at`` and ``content_hash`` stay: which document
+        version was used is design provenance, and neither is filled in by a clock default. A user parameter that
+        happens to be called ``created_at`` is design content and is hashed.
         """
-        data = self.model_dump(mode="json", exclude=set(self._NON_DESIGN_FIELDS))
-        for key in NON_DESIGN_PROJECT_FIELDS:
-            data["project"].pop(key, None)
-        for key in NON_DESIGN_REQUIREMENT_FIELDS:
-            data["requirements"].pop(key, None)
-        return strip_wall_clock(data)
+        return self.model_dump(mode="json", exclude=set(self._NON_DESIGN_FIELDS), context={"view": DESIGN_VIEW})
 
     def content_hash(self) -> str:
         """Stable hash of the design content (see :meth:`design_dict` for what is excluded)."""
@@ -201,4 +221,22 @@ class CircuitIR(BaseModel):
 
     @classmethod
     def load(cls, path: str | Path) -> "CircuitIR":
-        return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
+        """The IR saved at ``path``, or :class:`~ai_eda.errors.IRSchemaError` when it is not one this code can read faithfully.
+
+        Pydantic ignores keys a model does not declare, so a misspelled key in
+        a hand-edited file (``serves_requirement``) would silently delete
+        design or traceability data and the truncated IR would then be treated
+        as the design; likewise a file written by another schema version. Both
+        are refused with the offending paths named.
+        """
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise IRSchemaError(f"{path}: not an IR object")
+        version = raw.get("schema_version")
+        if version != IR_SCHEMA_VERSION:
+            raise IRSchemaError(f"{path}: schema_version {version!r} is not {IR_SCHEMA_VERSION!r} (this code reads no other version)")
+        ir = cls.model_validate(raw)
+        unknown = unknown_keys(raw, ir.model_dump(mode="json"))
+        if unknown:
+            raise IRSchemaError(f"{path}: unknown key(s) the IR models would drop: {', '.join(unknown)}")
+        return ir

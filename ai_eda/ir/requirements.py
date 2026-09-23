@@ -33,7 +33,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ai_eda.ir.provenance import Traced
+from ai_eda.ir.provenance import Traced, drop_in_design_view
 
 
 class RequirementKind(StrEnum):
@@ -99,6 +99,9 @@ class RequirementSet(BaseModel):
     #: memo of model extractions keyed by ``sha256:`` of :meth:`request_text`; not design content
     #: (excluded from the design hash), see the module docstring
     extraction_cache: dict[str, Any] = Field(default_factory=dict)
+
+    _design = drop_in_design_view("extraction_cache")
+
 
     def request_text(self) -> str:
         """The request as an extraction sees it: ``raw_input`` plus every correction on its own labelled line."""

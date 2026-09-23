@@ -680,16 +680,30 @@ class DocumentArchive:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if meta.get("normalised_url") != norm or meta.get("status") != "ok":
+            if not isinstance(meta, dict) or meta.get("normalised_url") != norm or meta.get("status") != "ok":
                 continue
+            # the hash is the file's name; a meta whose own ``sha256`` names another document is corrupt or
+            # planted and answers for nothing (it would otherwise redirect a URL lookup to a different file)
+            named = meta_path.name[: -len(".meta.json")]
+            try:
+                hexd = sha256_hex(named)
+            except ValueError:
+                continue
+            claimed = meta.get("sha256")
+            if claimed is not None:
+                try:
+                    if sha256_hex(str(claimed)) != hexd:
+                        continue
+                except ValueError:
+                    continue
             when = str(meta.get("retrieved_at") or "")
             if best is None or when > best[0]:
-                best = (when, str(meta.get("sha256") or meta_path.name.split(".", 1)[0]))
+                best = (when, f"sha256:{hexd}")
         if best is None:
             return None
         try:
             return self.load(best[1])
-        except ArchiveError:
+        except (ArchiveError, ValueError):
             return None
 
     def documents(self) -> list[str]:

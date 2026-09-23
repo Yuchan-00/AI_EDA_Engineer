@@ -1,23 +1,29 @@
 """BOM and CPL generation directly from the IR.
 
-The BOM refuses to print an MPN / manufacturer / package / supplier part
-number that is not authoritative, and it does not print a blank for one that
-is *absent* either: both are emitted as ``NOT_VERIFIED`` so the gap is
-visible in the file itself rather than papered over (a blank cell reads as
-"nothing to say", an unknown identity is a finding). ``DatasheetHash`` is
-the sha256 of the archived datasheet the MPN's own SourceRef names (the copy
-the MPN was found in, ``document_path`` + ``content_hash``) - the evidence
-pointer travels with the BOM; an MPN whose datasheet grounding is absent has
-``NOT_VERIFIED`` there even when its value prints.
+The BOM prints an MPN / manufacturer / package / supplier part number only
+when its provenance is ``authoritative`` (found in an archived datasheet)
+or ``user_requirement`` (typed by the user); a model proposal, an
+assumption or a derived value prints as ``NOT_VERIFIED``, and so does an
+*absent* identity - never a blank, so the gap is visible in the file
+itself rather than papered over (a blank cell reads as "nothing to say",
+an unknown identity is a finding). ``DatasheetHash`` is the sha256 of the
+archived datasheet the MPN's own SourceRef names (the copy the MPN was
+found in, ``document_path`` + ``content_hash``) - the evidence pointer
+travels with the BOM; an MPN whose datasheet grounding is absent (a
+user-typed MPN included) has ``NOT_VERIFIED`` there even when its value
+prints, and ``ir.component_provenance`` / the reviewer say the same.
 
 The BOM is opened in spreadsheet software and uploaded to assembly houses,
-so an identity / sourcing cell that such software would execute (a value
-starting with ``=``, ``+``, ``-``, ``@``, or carrying a control character -
-CSV formula injection from a community catalog dump or a hand-edited IR)
-is refused with :class:`~ai_eda.errors.CompileError` rather than written.
-The free-text ``Value`` / ``Description`` columns are the design's own
-words and are written as they stand (known gap: they are not neutralised,
-because the reviewer compares ``Value`` with the board).
+so a reference, identity, footprint or sourcing cell that such software
+would execute (a value starting with ``=``, ``+``, ``-``, ``@``, or
+carrying a control character - CSV formula injection from a community
+catalog dump, a ``--catalog-supplier`` label or a hand-edited IR) is
+refused with :class:`~ai_eda.errors.CompileError` rather than written; the
+check runs on the stripped text, as the catalog reader's does. The
+free-text ``Value`` / ``Description`` columns are the design's own words
+and are written as they stand (known gap: they are not neutralised,
+because the reviewer compares ``Value`` with the board and rail names such
+as ``-12V`` are legitimate values).
 
 The CPL writes the IR placement as-is: ``Mid X`` / ``Mid Y`` are the
 footprint anchor in board coordinates (mm, Y down), ``Rotation`` the IR
@@ -38,16 +44,20 @@ from ai_eda.parts.catalog import unsafe_cell
 NOT_VERIFIED = "NOT_VERIFIED"
 
 
+def _plain(text: str, where: str) -> str:
+    """``text`` as a cell, or :class:`CompileError` when spreadsheet software would execute it (checked stripped, like the catalog does)."""
+    why = unsafe_cell(text.strip())
+    if why is not None:
+        raise CompileError(f"BOM cell {where} = {text!r} {why}; refusing to write a cell spreadsheet software would execute")
+    return text
+
+
 def _fact(t: Traced | None, where: str = "") -> str:
-    """Cell text for a traced identity value: the value if authoritative, else ``NOT_VERIFIED`` (also when absent); never a cell a spreadsheet would execute."""
+    """Cell text for a traced identity value: the value if authoritative or typed by the user, else ``NOT_VERIFIED`` (also when absent); never a cell a spreadsheet would execute."""
     if t is None:
         return NOT_VERIFIED
     if t.provenance.kind in (ProvenanceKind.AUTHORITATIVE, ProvenanceKind.USER_REQUIREMENT):
-        text = str(t.value)
-        why = unsafe_cell(text)
-        if why is not None:
-            raise CompileError(f"BOM cell {where or 'identity'} = {text!r} {why}; refusing to write a cell spreadsheet software would execute")
-        return text
+        return _plain(str(t.value), where or "identity")
     return NOT_VERIFIED
 
 
@@ -75,14 +85,14 @@ class BOMCompiler(Compiler):
             supplier = c.sourcing[0] if c.sourcing else None
             w.writerow(
                 [
-                    c.ref,
+                    _plain(c.ref, "Reference"),
                     c.value,
                     c.description,
                     _fact(c.manufacturer, f"{c.ref}.Manufacturer"),
                     _fact(c.mpn, f"{c.ref}.MPN"),
                     _fact(c.package, f"{c.ref}.Package"),
-                    f"{c.footprint.library}:{c.footprint.name}" if c.footprint and c.footprint.verified else NOT_VERIFIED,
-                    supplier.supplier if supplier else NOT_VERIFIED,
+                    _plain(f"{c.footprint.library}:{c.footprint.name}", f"{c.ref}.Footprint") if c.footprint and c.footprint.verified else NOT_VERIFIED,
+                    _plain(supplier.supplier, f"{c.ref}.Supplier") if supplier else NOT_VERIFIED,
                     _fact(supplier.supplier_part_number, f"{c.ref}.SupplierPN") if supplier else NOT_VERIFIED,
                     _datasheet_hash(c.mpn),
                     1,
@@ -103,5 +113,5 @@ class CPLCompiler(Compiler):
         w.writerow(self.COLUMNS)
         if ir.pcb is not None:
             for p in sorted(ir.pcb.placements, key=lambda p: p.component_ref):
-                w.writerow([p.component_ref, f"{p.x_mm:.4f}mm", f"{p.y_mm:.4f}mm", f"{p.rotation_deg:g}", p.side.value.capitalize()])
+                w.writerow([_plain(p.component_ref, "Designator"), f"{p.x_mm:.4f}mm", f"{p.y_mm:.4f}mm", f"{p.rotation_deg:g}", p.side.value.capitalize()])
         return self._write(ir, ctx.workdir / "cpl.csv", buf.getvalue())

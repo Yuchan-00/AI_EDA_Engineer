@@ -335,8 +335,21 @@ class RegulatoryAgent(Agent):
                 notes.append(f"{p.id}: accepted; its official document is fetched and the title grounded on the next --online run")
                 continue
             assert archive is not None
-            archive.policy.trust_host(host_of(p.official_url), f"official domain allow-listed in candidates.json (accepted model proposal {p.id})")
-            outcome = archive.fetch(p.official_url, purpose=f"{p.id}: official text of an accepted model proposal", expect="any")
+            # the allow-list is checked again here, not only when the proposal was screened: ``refused`` is a stored
+            # field of the IR (a hand edit or an older candidate list could clear it), and a model URL is fetched only
+            # while its host is in the official-domain allow-list of the candidate list in force now
+            try:
+                norm, _ = normalise_url(p.official_url)
+                host = host_key(host_of(norm))
+            except ValueError as e:
+                notes.append(f"{p.id}: accepted, but its URL is unusable ({e}); not fetched")
+                continue
+            allowed_now = candidates.allowed_hosts(codes) or candidates.allowed_hosts()
+            if host not in {host_key(h) for h in allowed_now}:
+                notes.append(f"{p.id}: accepted, but host {host!r} is not in the official-domain allow-list of candidates.json; not fetched")
+                continue
+            archive.policy.trust_host(host, f"official domain allow-listed in candidates.json (accepted model proposal {p.id})")
+            outcome = archive.fetch(norm, purpose=f"{p.id}: official text of an accepted model proposal", expect="any")
             doc = outcome.document if outcome.ok else archive.lookup(p.official_url)
             if doc is None:
                 notes.append(f"{p.id}: official document {outcome.status} ({outcome.reason}); not accepted into the requirements")

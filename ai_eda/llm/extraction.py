@@ -118,7 +118,8 @@ CONFIRM_ANSWERS: frozenset[str] = frozenset({
 })
 #: answers that reject the table without saying what is wrong - the agent asks again instead of re-extracting
 NEGATIVE_ANSWERS: frozenset[str] = frozenset({"no", "n", "nope", "cancel", "아니오", "아니요", "아니", "취소", "틀림", "틀렸어요", "틀렸습니다"})
-#: a non-confirming answer shorter than this (after normalisation) is not a correction: the agent asks again
+#: a non-confirming answer shorter than this (after normalisation), or a single word without a digit, is not a
+#: correction: the agent asks again
 MIN_CORRECTION_CHARS = 4
 #: relative tolerance between the model's number and the deterministic parse of its quote
 REL_TOL = 1e-9
@@ -467,7 +468,13 @@ def is_correction(answer: str | None) -> bool:
     improve anything, so the agent asks again instead.
     """
     norm = normalise_answer(answer)
-    return bool(norm) and not is_confirmation(answer) and not is_rejection(answer) and len(norm) >= MIN_CORRECTION_CHARS
+    if not norm or is_confirmation(answer) or is_rejection(answer) or len(norm) < MIN_CORRECTION_CHARS:
+        return False
+    # ``sure`` / ``fine`` / ``좋습니다``: one word without a digit says yes or no in a spelling the lists lack; it is
+    # not a statement about the design, and appending it would change the request's hash and pay for a re-extraction
+    if " " not in norm and not any(ch.isdigit() for ch in norm):
+        return False
+    return True
 
 
 # --- quantity agreement -------------------------------------------------------

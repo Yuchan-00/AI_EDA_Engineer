@@ -27,6 +27,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from ai_eda.ir.provenance import drop_in_design_view
 from ai_eda.ir.validation import ValidationStatus
 
 
@@ -60,6 +61,9 @@ class RegulatoryProvenance(BaseModel):
     source_document: str | None = None  # archived local path
     content_hash: str | None = None
 
+    # the verdict and the local path are state about the design (what a run found where), not the design
+    _design = drop_in_design_view("verification_status", "source_document")
+
 
 class GroundedQuote(BaseModel):
     """One phrase the curated list claims the official text contains, and whether the archived text does."""
@@ -74,6 +78,9 @@ class GroundedQuote(BaseModel):
     #: final URL and hash of the archived document the quote was looked for in
     source_url: str | None = None
     content_hash: str | None = None
+
+    # the claim (section, quote, which document) is design provenance; whether and where it was found is a verdict
+    _design = drop_in_design_view("found", "page", "context")
     #: why it was not found or not looked for (offline, blocked, wrong document, ...)
     reason: str | None = None
 
@@ -100,6 +107,9 @@ class RegulatoryRequirement(BaseModel):
     #: what happened to the official source: ok | archived | offline | blocked | missing | refused | error |
     #: wrong_document | no_text | unfetchable | unresolved | quote_missing | tampered (the copy the IR recorded was altered on disk)
     source_status: str | None = None
+
+    # ``status`` / ``source_status`` are what a run found (they flip between an offline and an online run), not the design
+    _design = drop_in_design_view("status", "source_status")
 
 
 class ProposedRegulation(BaseModel):

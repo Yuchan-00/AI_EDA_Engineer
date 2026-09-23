@@ -244,7 +244,7 @@ def _nodes(ir: CircuitIR) -> _Nodes:
             # mangles or drops the others), so the compiler must refuse them first
             raise CompileError(
                 f"net {n.name!r} is not usable as a SPICE node name: ngspice keeps only "
-                f"[A-Za-z0-9_./+-:#@[]] intact (the runner would reject the netlist)"
+                f"A-Z a-z 0-9 _ . / + - : # @ [ ] intact (the runner would reject the netlist)"
             )
         low = n.name.lower()
         if low in seen:

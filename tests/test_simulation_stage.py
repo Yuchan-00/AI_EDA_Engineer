@@ -53,6 +53,10 @@ S = ValidationStatus
 LIB = KicadLibrary()
 runner = NgspiceShared()
 pytestmark = pytest.mark.skipif(not runner.available(), reason="ngspice.dll (KiCad's bundled ngspice shared library) not found")
+HAS_LIBS = LIB.footprint_file("Resistor_SMD", "R_0603_1608Metric") is not None and LIB.symbol_file("Device") is not None
+#: the tests that assert on the WHOLE review report also need the KiCad libraries: without them component.existence.<ref>
+#: fails for Device:R / Conn_01x03 and review.component_provenance is a second FAIL beside the SPICE one under test
+needs_libs = pytest.mark.skipif(not HAS_LIBS, reason="KiCad libraries not installed (Device:R / R_0603_1608Metric)")
 
 
 def _context(tmp_path: Path) -> AgentContext:
@@ -121,7 +125,7 @@ def test_divider_spice_stage_passes_with_real_evidence(tmp_path: Path):
     assert Path(results.path) == tmp_path / "spice" / "results.json"
 
     summary = ir.validation.latest("spice")
-    assert summary.status is S.PASS and summary.tool == "ngspice-shared" and summary.tool_version == runner.version() == "ngspice-46"
+    assert summary.status is S.PASS and summary.tool == "ngspice-shared" and summary.tool_version == runner.version()
     assert summary.artifact_hash == netlist.content_hash and summary.ir_hash == ir_hash
     assert set(summary.details["analyses"]) == {"op", "dc_vin"}
     assert summary.details["analyses"]["op"] == {**summary.details["analyses"]["op"], "command": "op", "succeeded": True, "n_points": 1, "plot_name": "op1"}
@@ -145,7 +149,7 @@ def test_divider_spice_stage_passes_with_real_evidence(tmp_path: Path):
 
     # results.json is the persisted evidence: every SpiceResult, keyed by analysis id, naming the netlist it ran on
     data = read_results(results.path)
-    assert data["netlist_hash"] == netlist.content_hash and data["ir_hash"] == ir_hash and data["engine_version"] == "ngspice-46"
+    assert data["netlist_hash"] == netlist.content_hash and data["ir_hash"] == ir_hash and data["engine_version"] == runner.version()
     assert data["analyses"]["op"]["result"]["vectors"]["vout"] == pytest.approx([6.0])
     assert len(data["analyses"]["dc_vin"]["result"]["vectors"]["v-sweep"]) == 13
     assert data["netlist_report"]["accepted_provenance_kinds"] == ["authoritative", "derived", "user_requirement"]
@@ -212,6 +216,7 @@ def test_second_pipeline_run_is_consistent_and_ir_build_sees_the_bias(tmp_path: 
 # --------------------------------------------------------------------------- honest failures
 
 
+@needs_libs
 def test_wrong_nominal_fails_and_is_not_repairable(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, LIB)
     ir.simulation.expectations[0].nominal = user_requirement(5.0, "V", note="wrong on purpose")
@@ -234,6 +239,7 @@ def test_wrong_nominal_fails_and_is_not_repairable(tmp_path: Path):
     assert "human" in outcome.unresolved[0].message
 
 
+@needs_libs
 def test_design_change_is_resimulated_and_the_old_expectation_fails_honestly(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, LIB)
     ctx = _context(tmp_path)
@@ -268,6 +274,7 @@ def test_design_change_is_resimulated_and_the_old_expectation_fails_honestly(tmp
     assert final[ReviewArea.SPICE_VS_REQUIREMENTS].status is S.FAIL and final[ReviewArea.SPICE_VS_REQUIREMENTS].details["repair"] == "human"
 
 
+@needs_libs
 def test_design_change_with_recalculated_nominals_and_requirements_converges_to_pass(tmp_path: Path):
     """R1 -> 20k *and* the user now asks for 4 V: nominals and requirements move together, so the loop converges.
 
@@ -299,6 +306,7 @@ def test_design_change_with_recalculated_nominals_and_requirements_converges_to_
     assert ir.artifacts[ArtifactKind.SPICE_RESULT].generated_from_ir_hash == changed and ir.artifacts[ArtifactKind.SPICE_RESULT].matches_disk()
 
 
+@needs_libs
 def test_hand_edited_results_are_detected_and_rerun(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, LIB)
     ctx = _context(tmp_path)

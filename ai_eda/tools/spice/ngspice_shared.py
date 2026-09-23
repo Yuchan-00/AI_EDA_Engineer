@@ -95,6 +95,10 @@ CODEMODELS: tuple[str, ...] = ("spice2poly.cm", "analog.cm", "digital.cm", "xtra
 #: what KiCad sets right after ``ngSpice_Init``
 INIT_SETTINGS: tuple[str, ...] = ("unset interactive", "set noaskquit", "set nomoremode")
 BENIGN_INIT_STDERR: tuple[str, ...] = ("Warning: can't find the initialization file spinit.",)
+#: stderr lines that are information, not errors: ngspice builds other than KiCad's announce their linear solver
+#: on stderr before every analysis (Debian/Ubuntu ``libngspice0`` 42: ``Using SPARSE 1.3 as Direct Linear Solver``).
+#: They stay in the transcript (``log``) but do not fail a run.
+INFORMATIONAL_STDERR_RE = re.compile(r"^Using \S.* as Direct Linear Solver$")
 DEFAULT_TIMEOUT_S = 120.0
 
 # ------------------------------------------------------------------------------------------ sharedspice.h
@@ -185,15 +189,23 @@ def find_ngspice_dll() -> Path | None:
 
 
 def find_codemodel_dir(dll: Path | None) -> Path | None:
-    """``$NGSPICE_CODEMODEL_DIR`` if set, else ``<root>/lib/ngspice`` for a DLL at ``<root>/bin/ngspice.dll``."""
+    """``$NGSPICE_CODEMODEL_DIR`` if set, else the code model directory next to the library.
+
+    Two layouts are known: KiCad's ``<root>/lib/ngspice`` for a DLL at
+    ``<root>/bin/ngspice.dll``, and Debian/Ubuntu's ``<libdir>/ngspice`` for
+    ``<libdir>/libngspice.so.0`` (measured 2026-09-23 on Ubuntu 24.04:
+    ``/usr/lib/x86_64-linux-gnu/ngspice/*.cm``).
+    """
     env = os.environ.get("NGSPICE_CODEMODEL_DIR")
     if env:
         p = Path(env)
         return p if p.is_dir() else None
     if dll is None:
         return None
-    p = dll.parent.parent / "lib" / "ngspice"
-    return p if p.is_dir() else None
+    for p in (dll.parent.parent / "lib" / "ngspice", dll.parent / "ngspice"):
+        if p.is_dir():
+            return p
+    return None
 
 
 def check_path_for_command(path: Path) -> None:
@@ -262,7 +274,7 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
     command, so a card would be inert and misleading), no ``.control`` /
     ``.include`` / ``.lib`` / ``.title`` / ``.save``; element lines with a
     name, their nodes and a value (R C L) or model (D Q J Z M); node names in
-    ``[A-Za-z0-9_./+-:#@[]]``; no duplicate element names; at least one
+    ``A-Z a-z 0-9 _ . / + - : # @ [ ]`` (:data:`NODE_RE`); no duplicate element names; at least one
     non-ground node; no two node names that collide after lowercasing.
     """
     lines = [ln.rstrip("\r") for ln in text.split("\n")]
@@ -356,7 +368,8 @@ class _Capture:
         return [s[7:] for s in self.chars if s.startswith("stdout ")]
 
     def stderr(self) -> list[str]:
-        return [s[7:] for s in self.chars if s.startswith("stderr ")]
+        """The engine's stderr lines since ``clear()`` minus :data:`INFORMATIONAL_STDERR_RE` (kept in ``chars``)."""
+        return [s[7:] for s in self.chars if s.startswith("stderr ") and not INFORMATIONAL_STDERR_RE.match(s[7:].strip())]
 
     def clear(self) -> None:
         self.chars.clear()
@@ -379,6 +392,21 @@ class _Vector:
 
 def _sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def bind_reset(lib) -> bool:
+    """Bind ``ngSpice_Reset`` if the library exports it (KiCad's ngspice-46 does; Debian/Ubuntu ``libngspice0`` 42 does not).
+
+    Without it a ControlledExit cannot be recovered from and marks the engine dead for the rest of the process
+    (``engine_info()["reset_supported"]`` says which case applies). Returns whether the symbol was bound.
+    """
+    try:
+        reset = lib.ngSpice_Reset
+    except AttributeError:
+        return False
+    reset.argtypes = []
+    reset.restype = c_int
+    return True
 
 
 class _Engine:
@@ -422,10 +450,9 @@ class _Engine:
             lib.ngSpice_AllVecs.restype = POINTER(c_char_p)
             lib.ngSpice_running.argtypes = []
             lib.ngSpice_running.restype = c_bool
-            lib.ngSpice_Reset.argtypes = []
-            lib.ngSpice_Reset.restype = c_int
         except AttributeError as e:
             raise ToolUnavailableError(f"{dll} does not export the ngspice shared-library API: {e}") from e
+        self.reset_supported = bind_reset(lib)
         try:
             self._init_engine()
         except EngineDead as e:
@@ -644,6 +671,8 @@ class _Engine:
         """After a ControlledExit: ``ngSpice_Reset`` + ``ngSpice_Init`` + settings + code models + self-test."""
         if self.dead:
             raise EngineDead(self.dead_reason)
+        if not self.reset_supported:
+            raise self._mark_dead(f"{self.dll_path} does not export ngSpice_Reset (ngspice < 44): the engine cannot be recovered after a ControlledExit; restart the process")
         try:
             rc = self.lib.ngSpice_Reset()
         except OSError as e:
@@ -1014,6 +1043,7 @@ class NgspiceShared(SpiceRunner):
             "version": eng.version,
             "build": eng.build,
             "dll_path": str(eng.dll_path),
+            "reset_supported": eng.reset_supported,
             "codemodel_dir": None if eng.codemodel_dir is None else str(eng.codemodel_dir),
             "codemodels_loaded": eng.codemodels_loaded,
             "codemodel_errors": list(eng.codemodel_errors),
