@@ -79,10 +79,12 @@ class GroundedQuote(BaseModel):
     source_url: str | None = None
     content_hash: str | None = None
 
-    # the claim (section, quote, which document) is design provenance; whether and where it was found is a verdict
-    _design = drop_in_design_view("found", "page", "context")
     #: why it was not found or not looked for (offline, blocked, wrong document, ...)
     reason: str | None = None
+
+    # the claim (section, quote, which document) is design provenance; whether, where and why-not it was found is a
+    # verdict of one run (an offline run says "offline: ...", the next online run finds it) - not the design
+    _design = drop_in_design_view("found", "page", "context", "reason")
 
 
 class RegulatoryRequirement(BaseModel):

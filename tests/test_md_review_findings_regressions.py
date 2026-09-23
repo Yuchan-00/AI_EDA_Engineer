@@ -529,6 +529,8 @@ def test_17_locators_and_verification_outcomes_do_not_move_the_design_hash(divid
     req.status, req.source_status, req.provenance.verification_status, req.provenance.source_document = S.FAIL, "ok", S.PASS, "/x/y.html"
     req.grounded_quotes[0].found, req.grounded_quotes[0].page, req.grounded_quotes[0].context = True, 3, "... [1 000 V] ..."
     assert divider_ir.content_hash() == h  # what a run found is state about the design
+    req.grounded_quotes[0].found, req.grounded_quotes[0].reason = False, "offline: not fetched (offline)"
+    assert divider_ir.content_hash() == h  # ... and so is why a run did not find it (the next online run will)
     req.grounded_quotes[0].quote = "1 500 V"
     assert divider_ir.content_hash() != h  # the claim itself is design provenance
     req.provenance.content_hash = "sha256:" + "c" * 64
