@@ -230,7 +230,7 @@ class RequirementAgent(Agent):
         answer_reqs = [_answer_requirement(k, v, scope_keys) for k, v in answers.items() if _answerable(ir, k)]
         answer_jurisdictions = [
             Jurisdiction(code=code, name=code, provided_by_user=True)
-            for k, v in answers.items() if k == "jurisdiction" and ir.requirements.get(k) is None
+            for k, v in answers.items() if k == "jurisdiction" and _answerable(ir, k)  # the same rule as the requirement row
             for code in _split_codes(v)
             if not any(j.code == code for j in ir.regulatory.jurisdictions)
         ]

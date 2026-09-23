@@ -52,6 +52,7 @@ import sys
 from pathlib import Path
 
 from ai_eda import __version__
+from ai_eda.errors import IRSchemaError
 
 FAKE_PREFIX = "fake:"
 
@@ -127,6 +128,32 @@ def _load(path: str):
     from ai_eda.ir import CircuitIR
 
     return CircuitIR.load(path)
+
+
+def project_workdir(ir, ir_path: str | Path) -> Path:
+    """The project's working directory for ``run`` / ``review`` (artifacts, sources, the parts cache).
+
+    ``project.workdir`` when it is absolute (``new`` records it so); the
+    ir.json's own directory when the IR records none. A *relative* workdir
+    (an ir.json written before ``new`` recorded absolute paths, or a hand
+    edit) is never resolved against the caller's cwd - that put the outputs
+    wherever the command happened to be started. It is accepted only when
+    the ir.json's directory ends with it (the layout ``new`` created:
+    ``<workdir>/ir.json``), otherwise refused as ambiguous.
+    """
+    here = Path(ir_path).resolve().parent
+    if not ir.project.workdir:
+        return here
+    workdir = Path(ir.project.workdir)
+    if workdir.is_absolute():
+        return workdir
+    parts = workdir.parts
+    if not parts or here.parts[-len(parts):] == parts:
+        return here
+    raise IRSchemaError(
+        f"{ir_path}: project.workdir {ir.project.workdir!r} is relative and does not name this ir.json's directory ({here}); "
+        "record an absolute path (ai-eda new does) or remove it to use the ir.json's directory"
+    )
 
 
 def build_llm_service(args: argparse.Namespace):
@@ -207,7 +234,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"--llm: {e}", file=sys.stderr)
         return 2
     ir = _load(args.ir)
-    workdir = Path(ir.project.workdir or Path(args.ir).parent)
+    try:
+        workdir = project_workdir(ir, args.ir)
+    except IRSchemaError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     library = KicadLibrary()
     try:
         session = build_source_session(args, ir, workdir, library)
@@ -301,7 +332,11 @@ def cmd_review(args: argparse.Namespace) -> int:
     from ai_eda.review import IndependentReviewer
 
     ir = _load(args.ir)
-    workdir = Path(ir.project.workdir or Path(args.ir).parent)
+    try:
+        workdir = project_workdir(ir, args.ir)
+    except IRSchemaError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     archive = open_archive({}, workdir)  # earlier runs' archived copies, read-only: hashes are re-verified, nothing is fetched
     tools = {"archive": archive} if archive is not None else {}
     report = IndependentReviewer(tools=tools).review(ir, workdir)

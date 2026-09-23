@@ -66,7 +66,11 @@ becomes a :class:`~ai_eda.ir.Requirement`:
   quote; jurisdiction codes must be 2-3 upper-case letters (``EU``, ``US``,
   ``KR``) *and* the quote must name that jurisdiction (the code itself as an
   upper-case token, or a name from :data:`JURISDICTION_NAMES`): ``EU`` is
-  not grounded on ``US에서 판매``.
+  not grounded on ``US에서 판매``. The application is the one explicit item
+  whose value is the model's few-word summary rather than the user's words:
+  the quote it was grounded on stays in the note (the confirmation table
+  shows it under "in your request"), and once confirmed it is the regulatory
+  scope answer ``intended_use`` falls back to.
 * **Prompt injection**: the request is data. Any extracted item whose text
   (key, text, quote, rationale, question, description, summary) contains one
   of :data:`DIRECTIVE_PHRASES` - phrases addressed to an assistant, matched

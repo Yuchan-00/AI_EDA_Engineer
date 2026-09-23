@@ -91,6 +91,16 @@ Round 5 (residuals the independent verification pass found in the fixed tree):
 56. A regulatory run's outcome still moved the design hash: ``GroundedQuote.reason`` ("offline: ..." vs "missing: HTTP
     404"), the URL a 404 came from as the quote's ``source_url``, the page in ``RegulatoryProvenance.section`` and the
     "(grounded)" words in ``applicability_rationale``.
+
+Round 6 (the rest of the verification pass):
+
+57. ``--answer jurisdiction=KR`` over an extraction item keyed ``jurisdiction`` replaced the requirement row but
+    never entered ``ir.regulatory.jurisdictions``, so the regulatory stage kept asking.
+58. ``run`` / ``review`` resolved a relative ``project.workdir`` (a pre-fix or hand-edited ir.json) against the
+    caller's cwd, so artifacts, sources and the parts cache landed away from the ir.json.
+59. The zero / negative check for passives also refused a 0 V or negative V / I source.
+60. ``Traced`` accepted ``inf`` / ``nan``; ``save`` wrote ``null`` and the project did not load again, while a
+    hand-written JSON ``Infinity`` token loaded as a number.
 """
 
 from __future__ import annotations
@@ -98,6 +108,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -107,7 +118,7 @@ from pydantic import ValidationError
 from ai_eda.agents import AgentContext, RequirementAgent
 from ai_eda.agents.base import IRProposal
 from ai_eda.agents.regulatory import ACCEPT_REGS_KEY
-from ai_eda.cli import main as cli_main, run_exit_code
+from ai_eda.cli import main as cli_main, project_workdir, run_exit_code
 from ai_eda.compilers import BOMCompiler, CompileContext, CPLCompiler, PCBCompiler, SchematicCompiler
 from ai_eda.compilers.ids import pad_uuid
 from ai_eda.compilers.pins import pad_pin_types
@@ -151,6 +162,7 @@ from ai_eda.ir import (
     authoritative,
     user_requirement,
 )
+from ai_eda.ir.provenance import llm_generated
 from ai_eda.ir.regulatory import Applicability, GroundedQuote, RegulatoryProvenance, RegulatoryRequirement
 from ai_eda.llm.client import LLMError, LLMMessage
 from ai_eda.llm.extraction import (
@@ -1136,10 +1148,13 @@ def test_52_a_non_finite_sample_anywhere_in_the_vector_is_not_judged():
 
 
 def test_53_a_non_finite_tolerance_or_nominal_is_no_tolerance():
-    inf = Expectation(id="e", analysis_id="op", vector="v(VOUT)", reduce=Reduce.VALUE, nominal=user_requirement(1.0, "V"), tol_abs=user_requirement(float("inf"), "V"), provenance=USER)
+    # Traced refuses inf itself now (test 60); the judge and the compiler still guard a value built around validation
+    unchecked = Traced.model_construct(value=float("inf"), unit="V", provenance=Provenance(kind=ProvenanceKind.USER_REQUIREMENT))
+    inf = Expectation(id="e", analysis_id="op", vector="v(VOUT)", reduce=Reduce.VALUE, nominal=user_requirement(1.0, "V"), provenance=USER)
+    inf.tol_abs = unchecked  # plain assignment is not validated
     assert judge(1e9, inf)[0] is S.UNRESOLVED
     ir = spice_divider_ir()
-    ir.simulation.expectations[0].tol_abs = user_requirement(float("inf"), "V")
+    ir.simulation.expectations[0].tol_abs = unchecked
     with pytest.raises(CompileError, match="must be a finite number"):
         build(ir)
 
@@ -1199,3 +1214,98 @@ def test_56_the_outcome_of_a_regulatory_run_does_not_move_the_design_hash(fake, 
     assert lvd.source_status == "quote_missing" and lvd.status is S.FAIL and [q.found for q in lvd.grounded_quotes] == [False, False]
     assert lvd.provenance.content_hash and lvd.provenance.section == "Article 1"
     assert ir.content_hash() == h  # same design, same document; only the verdict changed
+
+
+# =========================================================================== round 6
+
+
+# --------------------------------------------------------------------------- 57: a typed jurisdiction answer enters the scope
+
+
+def test_57_a_typed_jurisdiction_answer_enters_the_regulatory_scope_over_an_extracted_one(tmp_path: Path):
+    ir = CircuitIR(project=ProjectMeta(id="p", name="p", workdir=str(tmp_path)))
+    ir.requirements.requirements.append(Requirement(id="req.jurisdiction", key="jurisdiction", text="jurisdiction: EU", kind=RequirementKind.EXPLICIT,
+                                                    value=llm_generated("EU", "fake-model")))
+    result = RequirementAgent().run(ir, AgentContext(workdir=tmp_path, answers={"jurisdiction": "KR"}))
+    Orchestrator.apply_proposals(ir, result.proposals)
+    assert [(j.code, j.provided_by_user) for j in ir.regulatory.jurisdictions] == [("KR", True)]
+    req = ir.requirements.get("jurisdiction")
+    assert req.value.value == "KR" and req.value.provenance.kind is ProvenanceKind.USER_REQUIREMENT
+    assert [r.key for r in ir.requirements.requirements].count("jurisdiction") == 1
+    # answered: the checklist does not ask for the jurisdiction again, and a second run adds nothing twice
+    result2 = RequirementAgent().run(ir, AgentContext(workdir=tmp_path, answers={"jurisdiction": "KR"}))
+    Orchestrator.apply_proposals(ir, result2.proposals)
+    assert [j.code for j in ir.regulatory.jurisdictions] == ["KR"] and not any(q.key == "jurisdiction" for q in result2.questions)
+
+
+# --------------------------------------------------------------------------- 58: a relative workdir is not the cwd
+
+
+def test_58_a_relative_project_workdir_is_never_resolved_against_the_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    project = tmp_path / "projects" / "demo"
+    project.mkdir(parents=True)
+    ir = CircuitIR(project=ProjectMeta(id="demo", name="demo", workdir="projects/demo"))  # the layout `new` wrote before it recorded absolute paths
+    path = ir.save(project / "ir.json")
+    assert project_workdir(ir, path) == project.resolve()
+    ir.project.workdir = "."
+    assert project_workdir(ir, path) == project.resolve()
+    ir.project.workdir = None
+    assert project_workdir(ir, path) == project.resolve()
+    ir.project.workdir = str(tmp_path / "elsewhere")
+    assert project_workdir(ir, path) == tmp_path / "elsewhere"
+    ir.project.workdir = "other/dir"
+    with pytest.raises(IRSchemaError, match="relative"):
+        project_workdir(ir, path)
+    # `review` started from another directory: the legacy layout works on the project, the ambiguous one is refused (exit 2)
+    seen: dict[str, Path] = {}
+
+    def review(self, ir, workdir):
+        seen["workdir"] = Path(workdir)
+        return ReviewReport(ir_hash=ir.content_hash())
+
+    monkeypatch.setattr(IndependentReviewer, "review", review)
+    other = tmp_path / "other" / "projects" / "demo"  # the old cwd-relative reading would have landed here
+    other.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path / "other")
+    ir.project.workdir = "projects/demo"
+    ir.save(path)
+    assert cli_main(["review", str(path)]) != 2 and seen["workdir"] == project.resolve()
+    ir.project.workdir = "other/dir"
+    ir.save(path)
+    seen.clear()
+    assert cli_main(["review", str(path)]) == 2 and not seen
+
+
+# --------------------------------------------------------------------------- 59: a 0 V / negative source is a source
+
+
+@pytest.mark.parametrize("volts", [0.0, -5.0])
+def test_59_a_zero_or_negative_source_value_is_not_a_passive(volts: float):
+    ir = spice_divider_ir()
+    ir.components.append(component("B1", f"{volts} V", 2, SpiceBinding(device=SpiceDevice.V, value=authoritative(volts, DS, "V"), provenance=AUTH)))
+    ground = next(n.name for n in ir.nets if n.kind is NetKind.GROUND)
+    for net_name, pin in (("VOUT", "1"), (ground, "2")):
+        next(n for n in ir.nets if n.name == net_name).pins.append(PinRef(component_ref="B1", pin_number=pin))
+    lines = [l for l in build(ir).splitlines() if l.startswith("VB1 ")]
+    assert len(lines) == 1 and lines[0].startswith("VB1 VOUT 0 ") and float(lines[0].split()[-1]) == volts, lines
+
+
+# --------------------------------------------------------------------------- 60: a traced number is finite
+
+
+def test_60_a_non_finite_traced_number_is_refused_and_a_json_infinity_does_not_load(tmp_path: Path):
+    for bad in (math.inf, -math.inf, math.nan):
+        with pytest.raises(ValidationError, match="finite"):
+            user_requirement(bad, "V")
+    with pytest.raises(ValidationError, match="finite"):
+        user_requirement([1.0, math.inf])
+    with pytest.raises(ValidationError, match="finite"):
+        user_requirement({"a": {"b": math.nan}})
+    ir = CircuitIR(project=ProjectMeta(id="p", name="p", workdir=str(tmp_path)))
+    ir.parameters["v"] = user_requirement(1.0, "V")
+    path = ir.save(tmp_path / "ir.json")
+    text = path.read_text(encoding="utf-8")
+    assert text.count('"value": 1.0') == 1
+    path.write_text(text.replace('"value": 1.0', '"value": Infinity'), encoding="utf-8")
+    with pytest.raises(IRSchemaError, match="Infinity"):
+        CircuitIR.load(path)

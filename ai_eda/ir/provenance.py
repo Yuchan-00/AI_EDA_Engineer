@@ -12,6 +12,7 @@ The five kinds map directly to the project spec:
 from __future__ import annotations
 
 import hashlib
+import math
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Generic, TypeVar
@@ -126,6 +127,17 @@ class Provenance(BaseModel):
 T = TypeVar("T")
 
 
+def _non_finite(v: Any) -> bool:
+    """Whether ``v`` is, or contains, a float that is not a number JSON can carry (``inf`` / ``nan``)."""
+    if isinstance(v, float):
+        return not math.isfinite(v)
+    if isinstance(v, (list, tuple)):
+        return any(_non_finite(x) for x in v)
+    if isinstance(v, dict):
+        return any(_non_finite(x) for x in v.values())
+    return False
+
+
 def _jsonish(v: Any) -> Any:
     """``v`` with tuples turned into lists at any depth (what JSON would make of them)."""
     if isinstance(v, (list, tuple)):
@@ -155,11 +167,15 @@ class Traced(BaseModel, Generic[T]):
         ``bool`` (``True`` would read as 1.0): a number that arrives as text
         from a model or a hand edit is not a measured value with this
         provenance. Tuples become lists so a value compares and hashes the
-        same before and after a JSON round trip.
+        same before and after a JSON round trip. ``inf`` / ``nan`` are refused
+        at any depth: JSON has no token for them, so ``save`` would write
+        ``null`` and the project would not load again.
         """
         annotation = cls.model_fields["value"].annotation
         if annotation in (float, int) and isinstance(v, (bool, str)):
             raise ValueError(f"{annotation.__name__} value must be a number, not {type(v).__name__} {v!r}")
+        if _non_finite(v):
+            raise ValueError(f"a traced number must be finite; got {v!r}")
         return _jsonish(v)
 
     def __str__(self) -> str:  # pragma: no cover - display only

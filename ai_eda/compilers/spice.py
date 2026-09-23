@@ -688,8 +688,9 @@ def _compile(ir: CircuitIR) -> _Compiled:
             if b.value is None and b.model_name is None:
                 raise CompileError(f"{c.ref}: a {dev.value} element needs a value (or a model_name)")
             if b.value is not None:
-                if _is_number(b.value.value) and float(b.value.value) <= 0.0:
-                    # ngspice simulates R=0 as ~1 mΩ and a negative passive without a word (measured on ngspice-42)
+                if dev in (SpiceDevice.R, SpiceDevice.C, SpiceDevice.L) and _is_number(b.value.value) and float(b.value.value) <= 0.0:
+                    # ngspice simulates R=0 as ~1 mΩ and a negative passive without a word (measured on ngspice-42);
+                    # a 0 V / negative V or I source is an ordinary source (a current probe, a negative rail)
                     raise CompileError(f"{c.ref}: a {dev.value} value must be positive; got {b.value.value!r} (ngspice would silently simulate a different part)")
                 rest.append(_number(ledger.accept(b.value, f"{c.ref} value"), f"{c.ref} value", ledger))
                 value_sources[name] = _reconcile_value(c, b.value, dev)

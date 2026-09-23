@@ -229,7 +229,10 @@ class CircuitIR(BaseModel):
         as the design; likewise a file written by another schema version. Both
         are refused with the offending paths named.
         """
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        def constant(token: str):  # Python's json accepts the non-standard Infinity / NaN tokens; the IR holds no such number
+            raise IRSchemaError(f"{path}: JSON token {token} is not a number the IR can hold")
+
+        raw = json.loads(Path(path).read_text(encoding="utf-8"), parse_constant=constant)
         if not isinstance(raw, dict):
             raise IRSchemaError(f"{path}: not an IR object")
         version = raw.get("schema_version")
