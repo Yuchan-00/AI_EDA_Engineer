@@ -73,6 +73,7 @@ these facts:
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import hashlib
 import os
 import re
@@ -172,9 +173,33 @@ class EngineDead(RuntimeError):
 # ------------------------------------------------------------------------------------------ locating the DLL
 
 
+#: where a Linux / macOS system ngspice shared library lives (Debian multiarch first), besides ``$LD_LIBRARY_PATH``
+_SYSTEM_LIB_DIRS: tuple[str, ...] = ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/lib", "/opt/homebrew/lib", "/usr/local/opt/ngspice/lib")
+
+
+def find_system_ngspice() -> Path | None:
+    """The ngspice shared library the system's loader knows (``libngspice.so.0`` from Debian's ``libngspice0``), else None.
+
+    ``ctypes.util.find_library`` gives the soname, not a path; the file is
+    looked for on ``$LD_LIBRARY_PATH`` and the usual library directories.
+    Windows KiCad installs are handled by :func:`find_ngspice_dll`.
+    """
+    if os.name == "nt":
+        return None
+    name = ctypes.util.find_library("ngspice")
+    if not name:
+        return None
+    dirs = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if d] + list(_SYSTEM_LIB_DIRS)
+    for d in dirs:
+        p = Path(d) / name
+        if p.is_file():
+            return p.resolve()
+    return None
+
+
 def find_ngspice_dll() -> Path | None:
     """``$NGSPICE_DLL`` if set (must exist), else ``ngspice.dll`` next to the ``kicad-cli`` that
-    :func:`ai_eda.tools.kicad.cli.find_kicad_cli` finds, else None."""
+    :func:`ai_eda.tools.kicad.cli.find_kicad_cli` finds, else the system library (:func:`find_system_ngspice`), else None."""
     env = os.environ.get("NGSPICE_DLL")
     if env:
         p = Path(env)
@@ -182,10 +207,11 @@ def find_ngspice_dll() -> Path | None:
     from ai_eda.tools.kicad.cli import find_kicad_cli  # lazy: kicad.cli imports ai_eda.ir, which imports this package
 
     cli = find_kicad_cli()
-    if not cli:
-        return None
-    p = Path(cli).resolve().parent / "ngspice.dll"
-    return p if p.is_file() else None
+    if cli:
+        p = Path(cli).resolve().parent / "ngspice.dll"
+        if p.is_file():
+            return p
+    return find_system_ngspice()
 
 
 def find_codemodel_dir(dll: Path | None) -> Path | None:
@@ -223,16 +249,21 @@ def check_path_for_command(path: Path) -> None:
 #: characters ngspice keeps intact in a node name (measured); ``( ) { } = , ; ' "`` and non-ASCII are mangled or fatal
 NODE_RE = re.compile(r"[A-Za-z0-9_./+\-:#@\[\]]+")
 GROUND_NODES = frozenset({"0", "gnd"})
-_ANALYSIS_CARDS = (".op", ".dc", ".ac", ".tran")
 #: cards refused because they execute commands, pull in files, change the title or hide vectors
 _FORBIDDEN_CARDS: dict[str, str] = {
     ".control": "a .control block executes arbitrary ngspice commands (including shell) when the file is sourced",
     ".endc": "a .control block executes arbitrary ngspice commands (including shell) when the file is sourced",
-    ".include": ".include reads a file outside the netlist (the netlist must be self-contained)",
+    ".inc": ".include reads a file outside the netlist (the netlist must be self-contained)",
     ".lib": ".lib reads a file outside the netlist (the netlist must be self-contained)",
     ".title": "the first line is the title; a .title card would change what the plot records",
     ".save": ".save limits which vectors ngspice keeps; the runner records every vector of the plot",
+    ".opt": ".options changes the engine's numerics or temperature behind the result's back (the runner records its settings)",
+    ".ic": ".ic imposes initial conditions the IR does not state",
+    ".nodeset": ".nodeset imposes initial guesses the IR does not state",
+    ".global": ".global renames connectivity behind the netlist's back",
 }
+#: keys of :data:`_FORBIDDEN_CARDS` are matched as prefixes, the way ngspice matches ``.inc`` / ``.include`` and ``.opt`` / ``.options``
+_ANALYSIS_CARDS = (".op", ".dc", ".ac", ".tran", ".tf", ".noise", ".pz", ".sens", ".disto", ".sp", ".four")
 #: node count per element letter, for the letters where it is fixed (E/G: only the two output nodes are
 #: certain - the behavioural forms ``E1 out 0 value={...}`` have no controlling node pair)
 _ELEMENT_NODES: dict[str, int] = {
@@ -300,8 +331,9 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
         low = s.lower()
         if s[0] == ".":
             card = low.split()[0]
-            if card in _FORBIDDEN_CARDS:
-                problems.append(f"line {i}: {_FORBIDDEN_CARDS[card]}")
+            forbidden = next((k for k in _FORBIDDEN_CARDS if card.startswith(k)), None)
+            if forbidden is not None:
+                problems.append(f"line {i}: {_FORBIDDEN_CARDS[forbidden]}")
                 if card == ".control":
                     in_control = True
                 elif card == ".endc":

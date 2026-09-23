@@ -18,11 +18,16 @@ un-normalised KiCad value fields expecting SI. Letters after the scale
 factor (``10kOhm``, ``4.7uF``) are ignored by ngspice; :func:`parse_spice_number`
 rejects them unless ``ignore_trailing_letters=True`` is passed, because in
 our own data a trailing unit is a sign of a value that was never parsed.
-Forms ngspice does not read as one number (``4k7``, ``10 k`` with a space,
-``1e+``) are rejected in both modes; a dangling exponent marker (``1e``) is
-just a trailing letter to ngspice (the value is 1), so it is rejected only in
-the strict mode. ``a`` (atto) is not a scale factor here: ngspice
-versions differ on it, so a value that needs it is written with an exponent.
+Forms that do not spell one number (``4k7``, ``10 k`` with a space, ``1e+``)
+are rejected in both modes - ngspice does not refuse them, it reads them
+silently as 4000 / 1 (measured on ngspice-42), which is why a strict
+formatter never writes them; a dangling exponent marker (``1e``) is just a
+trailing letter to ngspice (the value is 1), so it is rejected only in the
+strict mode. ``a`` (atto) is not a scale factor here and :func:`ngspice_reads`
+does not vouch for it (``None``): ngspice-42 reads a bare ``a`` / ``A`` tail
+as 1e-18 (``2A`` is 2e-18, measured 2026-09-23), other builds may not, so a
+value that needs atto is written with an exponent and a bare ``A`` unit
+letter is never emitted.
 
 :func:`parse_spice_number` is *correctly rounded*: the scale factor is
 applied as a decimal exponent (``4.7u`` becomes ``float("4.7e-6")``), so the
@@ -178,6 +183,9 @@ def ngspice_reads(text: str) -> float | None:
     non-number raises ``ValueError``.
     """
     m = _match(text)
+    trail = (m.group("trail") or "")
+    if not m.group("scale") and trail[:1].lower() == "a":
+        return None  # a bare a/A tail is atto (1e-18) on ngspice-42 and not modelled here
     int_part, _, frac = m.group("mant").partition(".")
     mantissa = int((int_part + frac) or "0")
     if mantissa >= NGSPICE_EXACT_MANTISSA:

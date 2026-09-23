@@ -69,6 +69,22 @@ Round 3 (the review/repair/orchestrator/CLI and compiler reviewers):
     left unwired instead of refused.
 45. ``SchematicCompiler`` silently fell back to the installed libraries when ``tools['kicad_library']`` was not a
     ``KicadLibrary`` (the PCB compiler refused the same input).
+
+Round 4 (the SPICE / calculator / portability reviewer):
+
+46. A ``model_card`` was a verbatim pass-through: ``.inc`` (ngspice's prefix match of ``.include``), ``.opt``, ``.ic``,
+    ``.nodeset``, ``.global``, other analysis cards and bare element lines reached ngspice unreported; ``validate_deck``
+    matched forbidden cards by whole word only.
+47. ``ngspice_reads`` vouched for a bare ``a`` / ``A`` tail as a trailing letter (2.0) while ngspice-42 reads it as atto.
+48. The batch ``NgspiceRunner`` could never PASS in ``run_spice_for``: it reported the hash of its analysis-card copy,
+    and Debian's solver banner on stderr counted as an error.
+49. A pin in no net was accepted when listed in ``ignored_pins`` (which is for *connected* pins the element ignores).
+50. A non-ASCII ``project.id`` failed the SPICE stage with a message about node names.
+51. R / C / L values of 0 or negative compiled; ngspice simulates R=0 as ~1 mΩ without a word.
+52. A vector with a NaN / infinite sample in the middle was judged (``builtins.max`` skips a NaN that is not first).
+53. A non-finite ``tol_abs`` / ``nominal`` was accepted by the compiler and judged (``tol_abs=inf`` passed anything).
+54. The rawfile ``Command:`` line is absent on ngspice-42, not empty (docs and parser note).
+55. On Linux the system ``libngspice.so.0`` was found only through ``NGSPICE_DLL``.
 """
 
 from __future__ import annotations
@@ -76,6 +92,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -102,6 +119,10 @@ from ai_eda.ir import (
     ArtifactKind,
     ArtifactRef,
     CircuitDomain,
+    Expectation,
+    Reduce,
+    SpiceBinding,
+    SpiceDevice,
     SourceRef,
     CircuitIR,
     Jurisdiction,
@@ -147,7 +168,12 @@ from ai_eda.regulatory.applicability import MAINS_KEY, _current_kind, evaluate
 from ai_eda.security import ApprovalGate
 from ai_eda.tools.sources import DocumentArchive, NetworkPolicy
 from ai_eda.tools.sources.policy import host_of, normalise_url, port_of
-from ai_eda.tools.spice.ngspice_shared import find_codemodel_dir
+from ai_eda.tools.spice.ngspice_shared import find_codemodel_dir, find_ngspice_dll, find_system_ngspice, validate_deck
+from ai_eda.tools.spice import NgspiceRunner, SpiceAnalysis, SpiceResult
+from ai_eda.tools.spice.stage import judge, reduce_expectation, run_spice_for
+from ai_eda.tools.calc import ngspice_reads
+from ai_eda.compilers.spice import build, build_report
+from tests.test_spice_netlist import DIODE_CARD, OPAMP_CARD, USER, component, divider_ir as spice_divider_ir, net, op_setup, resistor
 from ai_eda.workflow import Orchestrator, Stage
 from tests.conftest import AUTH, DS, make_component
 from tests.fake_openrouter import FakeOpenRouter
@@ -973,3 +999,155 @@ def test_44_repeated_pad_numbers_get_distinct_ids_and_repeated_pin_numbers_are_r
 def test_45_schematic_compiler_refuses_a_wrong_library_object(divider_ir: CircuitIR, tmp_path: Path):
     with pytest.raises(CompileError, match="not a KicadLibrary"):
         SchematicCompiler().compile(divider_ir, CompileContext(workdir=tmp_path, tools={"kicad_library": "not a library"}))
+
+
+# =========================================================================== round 4
+
+
+import shutil  # noqa: E402
+
+
+# --------------------------------------------------------------------------- 46: a model card is .model / .subckt text only
+
+
+@pytest.mark.parametrize("card", [
+    ".model dx d(is=1e-14)\nR99 VOUT 0 1",  # an element outside a subcircuit adds a part the IR does not have
+    ".model dx d(is=1e-14)\n.inc /tmp/extra.cir",  # ngspice reads .inc as .include
+    ".model dx d(is=1e-14)\n.INCLUDE /tmp/extra.cir",
+    ".model dx d(is=1e-14)\n.opt temp=100",
+    ".model dx d(is=1e-14)\n.ic v(VOUT)=100",
+    ".model dx d(is=1e-14)\n.nodeset v(VOUT)=1",
+    ".model dx d(is=1e-14)\n.global VOUT",
+    ".model dx d(is=1e-14)\n.tf v(VOUT) VVIN",
+    ".model dx d(is=1e-14)\n.param x=1",  # .param is the body of a subcircuit, not a top-level card
+    ".subckt S a b\nR1 a b 1k",  # unclosed
+])
+def test_46_model_cards_that_are_not_models_are_refused(card: str):
+    ir = spice_divider_ir()
+    ir.components.append(component("D1", "1N4148", 2, SpiceBinding(device=SpiceDevice.D, model_name="dx", model_card=authoritative(card, DS), pin_order=["1", "2"], provenance=AUTH)))
+    ir.net("VOUT").pins.append(PinRef(component_ref="D1", pin_number="1"))
+    ir.net("GND").pins.append(PinRef(component_ref="D1", pin_number="2"))
+    with pytest.raises(CompileError, match="model_card"):
+        build(ir)
+
+
+def test_46_a_subcircuit_with_elements_and_params_inside_is_a_model_card():
+    ir = spice_divider_ir()
+    card = ".subckt IDEALOPAMP inp inn out\n.param g=100k\nE1 out 0 inp inn {g}\n* a comment\n.ends IDEALOPAMP"
+    ir.components.append(component("U1", "opamp", 3, SpiceBinding(device=SpiceDevice.X, model_name="IDEALOPAMP", model_card=user_requirement(card), pin_order=["1", "2", "3"], provenance=USER)))
+    ir.net("VIN").pins.append(PinRef(component_ref="U1", pin_number="1"))
+    ir.net("GND").pins.append(PinRef(component_ref="U1", pin_number="2"))
+    ir.nets.append(net("OUT", ("U1", "3")))
+    assert "XU1 VIN 0 OUT IDEALOPAMP" in build(ir)
+    # the runner's own gate matches the way ngspice matches: by prefix
+    for line in (".inc x", ".INCLUDE x", ".lib x y", ".opt temp=100", ".ic v(a)=1", ".nodeset v(a)=1", ".global a", ".tf v(a) v1"):
+        problems, _ = validate_deck(f"t\n{line}\nR1 a 0 1k\n.end\n")
+        assert problems, line
+    assert validate_deck("t\n.model dx d(is=1e-14)\nR1 a 0 1k\n.end\n")[0] == []
+
+
+# --------------------------------------------------------------------------- 47: a bare a/A tail is not modelled
+
+
+def test_47_ngspice_reads_does_not_vouch_for_a_bare_a_tail():
+    assert ngspice_reads("2A") is None and ngspice_reads("1a") is None and ngspice_reads("0.5Amp") is None
+    assert ngspice_reads("2") == 2.0 and ngspice_reads("2k") == 2000.0 and ngspice_reads("2kA") == 2000.0  # a unit letter after a scale is ignored, as before
+
+
+# --------------------------------------------------------------------------- 48: the batch runner is an engine the stage accepts
+
+
+@pytest.mark.skipif(shutil.which("ngspice") is None, reason="no ngspice binary on PATH")
+def test_48_the_batch_runner_reports_the_original_netlist_and_passes_the_stage(tmp_path: Path):
+    from ai_eda.compilers import SpiceNetlistCompiler
+
+    ir = spice_divider_ir(tmp_path=tmp_path)
+    ir.artifacts[ArtifactKind.SPICE_NETLIST] = SpiceNetlistCompiler().compile(ir, CompileContext(workdir=tmp_path, tools={}))
+    results = {r.check_id: r for r in run_spice_for(ir, {"spice": NgspiceRunner()}, tmp_path)}
+    assert results["spice"].status is S.PASS, results["spice"].message
+    assert results["spice.vout"].status is S.PASS
+    res = NgspiceRunner().run(Path(ir.artifacts[ArtifactKind.SPICE_NETLIST].path), SpiceAnalysis.OP, tmp_path / "again")
+    assert res.succeeded and res.netlist_hash == ir.artifacts[ArtifactKind.SPICE_NETLIST].content_hash and res.deck_hash and res.deck_hash != res.netlist_hash
+    assert Path(res.deck_path).read_text(encoding="utf-8").endswith(".op\n.end\n")
+
+
+# --------------------------------------------------------------------------- 49: ignored_pins is for connected pins
+
+
+def test_49_an_unconnected_pin_cannot_hide_in_ignored_pins():
+    ir = spice_divider_ir()
+    pot = component("RV1", "10k", 3, SpiceBinding(device=SpiceDevice.R, value=authoritative(10_000.0, DS, "ohm"), pin_order=["1", "2"], ignored_pins={"3": "wiper unused"}, provenance=AUTH))
+    ir.components.append(pot)
+    ir.net("VIN").pins.append(PinRef(component_ref="RV1", pin_number="1"))
+    ir.net("GND").pins.append(PinRef(component_ref="RV1", pin_number="2"))
+    with pytest.raises(CompileError, match="listed in ignored_pins but is in no net"):
+        build(ir)
+    ir.net("VOUT").pins.append(PinRef(component_ref="RV1", pin_number="3"))  # connected and unused: what ignored_pins is for
+    assert build_report(ir)["ignored_pins"] == {"RV1": {"3": "wiper unused"}}
+
+
+# --------------------------------------------------------------------------- 50: the title is ASCII
+
+
+def test_50_a_non_ascii_project_id_is_refused_with_the_reason():
+    ir = spice_divider_ir()
+    ir.project.id = "분압기"
+    with pytest.raises(CompileError, match="must be ASCII: it is the SPICE netlist's title line"):
+        build(ir)
+
+
+# --------------------------------------------------------------------------- 51: passive values are positive
+
+
+@pytest.mark.parametrize("ohms", [0.0, -1000.0])
+def test_51_zero_or_negative_passive_values_are_refused(ohms: float):
+    ir = spice_divider_ir()
+    ir.component("R1").spice.value = authoritative(ohms, DS, "ohm")
+    ir.component("R1").electrical["resistance"] = ir.component("R1").spice.value
+    with pytest.raises(CompileError, match="value must be positive"):
+        build(ir)
+
+
+# --------------------------------------------------------------------------- 52 / 53: non-finite samples and tolerances
+
+
+def _tran(vout: list[float]) -> SpiceResult:
+    n = len(vout)
+    return SpiceResult(engine="t", engine_version="t", netlist_path="x", netlist_hash="sha256:x", analysis=SpiceAnalysis.TRAN, command="tran 1u 5m",
+                       vectors={"time": [i * 1e-3 for i in range(n)], "vout": vout}, scale="time", n_points=n, succeeded=True)
+
+
+def test_52_a_non_finite_sample_anywhere_in_the_vector_is_not_judged():
+    exp = Expectation(id="e", analysis_id="tran", vector="v(VOUT)", reduce=Reduce.MAX, nominal=user_requirement(5.0, "V"), tol_abs=user_requirement(0.1, "V"), provenance=USER)
+    r = reduce_expectation(_tran([5.0, float("nan"), 2.0]), exp, "vout")
+    assert r.measured is None and "non-finite samples" in r.problem
+    r = reduce_expectation(_tran([5.0, float("inf"), 2.0]), exp.model_copy(update={"reduce": Reduce.MIN}), "vout")
+    assert r.measured is None and "non-finite samples" in r.problem
+    assert reduce_expectation(_tran([5.0, 4.0, 2.0]), exp, "vout").measured == 5.0
+
+
+def test_53_a_non_finite_tolerance_or_nominal_is_no_tolerance():
+    inf = Expectation(id="e", analysis_id="op", vector="v(VOUT)", reduce=Reduce.VALUE, nominal=user_requirement(1.0, "V"), tol_abs=user_requirement(float("inf"), "V"), provenance=USER)
+    assert judge(1e9, inf)[0] is S.UNRESOLVED
+    ir = spice_divider_ir()
+    ir.simulation.expectations[0].tol_abs = user_requirement(float("inf"), "V")
+    with pytest.raises(CompileError, match="must be a finite number"):
+        build(ir)
+
+
+# --------------------------------------------------------------------------- 55: the system library is found
+
+
+def test_55_the_system_ngspice_library_is_found_without_the_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import ctypes.util
+
+    lib = tmp_path / "libngspice.so.0"
+    lib.write_bytes(b"")
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: "libngspice.so.0" if name == "ngspice" else None)
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(tmp_path))
+    monkeypatch.delenv("NGSPICE_DLL", raising=False)
+    monkeypatch.setattr("ai_eda.tools.kicad.cli.find_kicad_cli", lambda: None)
+    if os.name != "nt":
+        assert find_system_ngspice() == lib.resolve() and find_ngspice_dll() == lib.resolve()
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+    assert find_system_ngspice() is None

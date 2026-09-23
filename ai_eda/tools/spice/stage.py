@@ -153,6 +153,16 @@ def reduce_expectation(res: SpiceResult, exp: Expectation, vector: str) -> Reduc
         return Reduction(None, f"vector not produced: {vector!r} is not in the {res.analysis.value} plot (vectors: {sorted(res.vectors)})")
     except ValueError as e:
         return Reduction(None, str(e))
+    # every sample must be a number: builtins.max/min skip a NaN that is not first, and a waveform with a NaN or
+    # an infinity in it is not a usable result wherever the bad sample sits
+    try:
+        samples = res.vector(vector)
+    except KeyError:
+        samples = []
+    if any(not math.isfinite(x) for x in samples):
+        return Reduction(None, f"{vector} contains non-finite samples (the simulation did not produce a usable waveform)")
+    if exp.reduce == Reduce.AT and any(not math.isfinite(x) for x in res.scale_values()):
+        return Reduction(None, "the scale vector contains non-finite samples")
     if not math.isfinite(measured):
         return Reduction(None, f"{vector} {exp.reduce.value} is not finite ({measured!r})")
     return Reduction(float(measured), None, interpolation)
@@ -180,7 +190,8 @@ def judge(measured: float, exp: Expectation, interpolation: Interpolation | None
         limits.append(abs(float(exp.tol_abs.value)))
     if exp.tol_rel is not None and nominal != 0.0:
         limits.append(abs(float(exp.tol_rel.value)) * abs(nominal))
-    if not limits:
+    if not limits or any(not math.isfinite(x) for x in limits) or not math.isfinite(nominal):
+        # a tolerance that is not a number is no tolerance (inf would pass anything, nan nothing)
         return ValidationStatus.UNRESOLVED, None, deviation
     limit = max(limits)
     if interpolation is None or interpolation.exact:
@@ -303,7 +314,8 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
         return Evidence(description=f"ngspice rawfile of analysis {analysis_id} ({res.command})", path=res.raw_output_path, content_hash=res.raw_output_hash)
 
     failed_analyses: dict[str, list[str]] = {aid: list(r.errors) for aid, r in results.items() if not r.succeeded}
-    # each result may only claim the hash the runner itself computed for the file it loaded
+    # each result may only claim the hash the runner itself computed for the file it loaded (the batch runner
+    # loads a copy with the analysis card and reports the original's hash plus ``deck_hash`` of the copy)
     for aid, r in results.items():
         if r.netlist_hash != art.content_hash:
             failed_analyses.setdefault(aid, []).append(f"runner loaded a file with hash {r.netlist_hash}, the artifact records {art.content_hash}")

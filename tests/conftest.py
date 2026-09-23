@@ -29,7 +29,8 @@ DS = SourceRef(title="Generic resistor datasheet", authority="Vendor", content_h
 
 def rawfile_command_ok(command: str, version: str) -> bool:
     """KiCad's ngspice-46 stamps ``Command: ngspice-46, Build ...`` into every rawfile; Debian/Ubuntu ``libngspice0``
-    (ngspice-42) leaves the ``Command:`` line empty (measured 2026-09-23). The line is evidence of the writer, not data."""
+    (ngspice-42) writes no ``Command:`` line at all, so the parsed command is empty (measured 2026-09-23). The line is
+    evidence of the writer, not data."""
     if version == "ngspice-42":
         return command == ""
     return command.startswith(version + ", Build ")
