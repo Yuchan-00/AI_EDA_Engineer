@@ -6,6 +6,7 @@ from ai_eda.agents import AgentContext
 from ai_eda.compilers import CompileContext, Compiler
 from ai_eda.errors import CompileError, NothingToCompileError
 from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, ProjectMeta, ValidationStatus
+from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.workflow import Orchestrator, Stage
 
 
@@ -29,12 +30,18 @@ def test_answers_become_requirements_and_jurisdiction(tmp_path: Path):
 
 
 def test_full_run_never_releases_unverified_design(divider_ir: CircuitIR, tmp_path: Path):
-    ctx = AgentContext(workdir=tmp_path, answers={"application": "test", "jurisdiction": "EU"})
+    # an empty library root: on a machine with KiCad libraries the PLACEMENT stage would otherwise place R1/R2 and compile a board;
+    # this test is about the run without one, on every machine
+    ctx = AgentContext(workdir=tmp_path, answers={"application": "test", "jurisdiction": "EU"}, tools={"kicad_library": KicadLibrary(roots=[tmp_path / "nolib"])})
     state = Orchestrator(ctx).run(divider_ir)
     assert not state.blocked
     release = state.outcomes[-1]
     assert release.stage == Stage.RELEASE
     assert release.status != ValidationStatus.PASS
+    # no library -> nothing placed (a note, no proposal, no question), so ir.pcb stays None
+    placement = state.outcome(Stage.PLACEMENT)
+    assert placement.status == ValidationStatus.NOT_VERIFIED and "not placed" in placement.message and placement.questions == []
+    assert divider_ir.pcb is None
     # divider_ir has no ir.pcb: the PCB stage has nothing to lay out -> NOT_VERIFIED (not FAIL, not a crash)
     pcb = state.outcome(Stage.PCB)
     assert pcb.status == ValidationStatus.NOT_VERIFIED and "ir.pcb is None" in pcb.message

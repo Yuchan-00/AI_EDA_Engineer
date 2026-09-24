@@ -137,7 +137,7 @@ from ai_eda.repair.loop import RepairOutcome
 from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.review.reviewer import ReviewReport
 from ai_eda.tools.kicad import sexpr
-from ai_eda.tools.kicad.library import SymbolDef, SymbolPin
+from ai_eda.tools.kicad.library import KicadLibrary, SymbolDef, SymbolPin
 from ai_eda.tools.kicad.sexpr import SExprError
 from ai_eda.workflow.session import SessionError, parse_key_urls
 from ai_eda.ir import (
@@ -809,9 +809,15 @@ def _areas(ir: CircuitIR, tmp_path: Path) -> dict[str, ValidationResult]:
 # --------------------------------------------------------------------------- 31: a compiler refusal is a recorded verdict
 
 
+def _no_library(tmp_path: Path) -> dict:
+    """An empty library root: these runs are about a design *without* a board, on every machine (with KiCad libraries the PLACEMENT stage would place R1/R2)."""
+    return {"kicad_library": KicadLibrary(roots=[tmp_path / "nolib"])}
+
+
 def test_31_a_compile_refusal_is_recorded_and_reaches_release_and_the_exit_code(divider_ir: CircuitIR, tmp_path: Path):
     divider_ir.components[0].symbol.verified = False  # the schematic compiler refuses an unverified symbol
-    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS)).run(divider_ir)
+    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS, tools=_no_library(tmp_path))).run(divider_ir)
+    assert state.outcome(Stage.PLACEMENT).status is S.NOT_VERIFIED and "not placed" in state.outcome(Stage.PLACEMENT).message and divider_ir.pcb is None
     assert state.outcome(Stage.SCHEMATIC).status is S.FAIL
     rec = divider_ir.validation.latest("compile.kicad_sch")
     assert rec is not None and rec.status is S.FAIL and rec.is_tool_backed and rec.ir_hash == divider_ir.content_hash() and rec.details["repair"] == "human"
@@ -827,7 +833,8 @@ def test_31_a_compile_refusal_is_recorded_and_reaches_release_and_the_exit_code(
 
 def test_32_a_bom_cell_refusal_is_a_fail_stage_not_an_exception(divider_ir: CircuitIR, tmp_path: Path):
     divider_ir.components[0].mpn = authoritative("=CMD()", DS)
-    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS)).run(divider_ir)
+    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS, tools=_no_library(tmp_path))).run(divider_ir)
+    assert state.outcome(Stage.PLACEMENT).status is S.NOT_VERIFIED and "not placed" in state.outcome(Stage.PLACEMENT).message and divider_ir.pcb is None
     out = state.outcome(Stage.MANUFACTURING_OUTPUTS)
     assert out.status is S.FAIL and "refusing to write a cell" in out.message and "bom compile refused" in out.message
     assert divider_ir.validation.latest("compile.bom").status is S.FAIL and ArtifactKind.BOM not in divider_ir.artifacts

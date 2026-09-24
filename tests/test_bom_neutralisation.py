@@ -21,6 +21,7 @@ from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, PCBDesign, Placement
 from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.review import reviewer as reviewer_module
 from ai_eda.tools.kicad.board import BoardFootprint
+from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.manufacturing.csv_cells import TEXT_PREFIX, bom_cell_text, free_text_cell, unsafe_cell
 from ai_eda.workflow import Orchestrator, Stage
 from tests.conftest import AUTH, DS, make_component
@@ -222,7 +223,9 @@ def test_reviewer_compares_value_through_the_bom_encoding(tmp_path: Path, monkey
 
 def test_orchestrator_reports_neutralised_cells(divider_ir: CircuitIR, tmp_path: Path):
     divider_ir.components[0].value = "-5V"
-    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS)).run(divider_ir)
+    # an empty library root: this run is about a design without a board on every machine (with KiCad libraries PLACEMENT would place R1/R2)
+    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS, tools={"kicad_library": KicadLibrary(roots=[tmp_path / "nolib"])})).run(divider_ir)
+    assert state.outcome(Stage.PLACEMENT).status is S.NOT_VERIFIED and "not placed" in state.outcome(Stage.PLACEMENT).message and divider_ir.pcb is None
     out = state.outcome(Stage.MANUFACTURING_OUTPUTS)
     assert out.status is S.NOT_VERIFIED and "no PCB" in out.message, out.message  # no board here: the stage stays unverified
     assert "bom: 1 cell(s) neutralised (R1.Value)" in out.message

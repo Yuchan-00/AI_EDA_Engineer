@@ -7,6 +7,7 @@ class Stage(StrEnum):
     REGULATORY_RESEARCH = "regulatory_research"
     ARCHITECTURE = "architecture"
     COMPONENT_SELECTION = "component_selection"
+    PLACEMENT = "placement"
     IR_BUILD = "ir_build"
     CALCULATION = "calculation"
     SPICE = "spice"

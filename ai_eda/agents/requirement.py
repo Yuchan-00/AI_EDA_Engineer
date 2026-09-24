@@ -75,6 +75,7 @@ from typing import Any
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
 from ai_eda.agents.component import CONFIRM_FACTS_KEY, CONFIRM_PARTS_KEY, EXTRACT_FACTS_KEY, FACTS_FILE_KEY
+from ai_eda.agents.pcb import PLACEMENT_KEY
 from ai_eda.agents.regulatory import ACCEPT_REGS_KEY, PROPOSE_REGS_KEY, REJECT_REGS_KEY
 from ai_eda.ir import (
     CircuitIR,
@@ -127,9 +128,10 @@ BASELINE_QUESTIONS: list[MissingInformation] = [
 
 EXTRACTION_CHECK = "requirements.extraction"
 
-#: answer keys that steer an agent (this one, the component agent, the regulatory agent) and are never requirements themselves
+#: answer keys that steer an agent (this one, the component, regulatory and PCB agents) and are never requirements themselves
 CONTROL_KEYS: frozenset[str] = frozenset({
     CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY, CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY, ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY,
+    PLACEMENT_KEY,
 })
 
 

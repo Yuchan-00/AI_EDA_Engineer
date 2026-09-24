@@ -6,8 +6,12 @@ is blocked on user input, and records every outcome so the GUI can show
 where the design is and why.
 
 What the orchestrator does *not* do: it never places, routes or otherwise
-changes the design to make a stage pass. It compiles what the IR contains
-(``ir.pcb.tracks`` included) and lets the tools judge it. A stage whose input
+changes the design itself to make a stage pass. The PLACEMENT stage applies
+the ``PCBAgent``'s deterministic grid proposal like any other proposal
+(through :meth:`Orchestrator.apply_proposals`, before IR_BUILD so every
+validator hash is about the placed design) and the compilers / DRC judge it;
+routing stays whatever the IR contains. The orchestrator compiles what the
+IR contains (``ir.pcb.tracks`` included) and lets the tools judge it. A stage whose input
 does not exist yet (no components, no ``ir.pcb``, no board to export) is
 NOT_VERIFIED; a stage whose input is inconsistent (pins that do not match
 the library, a pin in no net, an unverified footprint) is FAIL with the
@@ -162,6 +166,7 @@ class Orchestrator:
             Stage.REGULATORY_RESEARCH: self._agent_stage(RegulatoryAgent()),
             Stage.ARCHITECTURE: self._agent_stage(CircuitDesignAgent()),
             Stage.COMPONENT_SELECTION: self._agent_stage(ComponentAgent()),
+            Stage.PLACEMENT: self._agent_stage(PCBAgent()),
             Stage.IR_BUILD: self._ir_validate,
             Stage.CALCULATION: self._calculation,
             Stage.SPICE: self._agent_stage(SimulationAgent()),
@@ -304,6 +309,7 @@ class Orchestrator:
             "regulatory": Stage.REGULATORY_RESEARCH,
             "circuit_design": Stage.ARCHITECTURE,
             "component": Stage.COMPONENT_SELECTION,
+            "pcb": Stage.PLACEMENT,
             "simulation": Stage.SPICE,
             "manufacturing": Stage.MANUFACTURABILITY,
             "review": Stage.INDEPENDENT_REVIEW,
@@ -414,7 +420,9 @@ class Orchestrator:
             try:
                 status, message = self._compile(ir, ctx, kind)
             except ToolUnavailableError as e:
-                return StageOutcome(stage=stage, status=ValidationStatus.NOT_VERIFIED, message=f"{'; '.join(notes)}; {kind} export skipped: {e}")
+                # the missing tool makes *this* export unverified; an earlier BOM/CPL FAIL in ``statuses`` still counts
+                notes.append(f"{kind} export skipped: {e}")
+                return StageOutcome(stage=stage, status=worst_status(statuses + [ValidationStatus.NOT_VERIFIED]), message="; ".join(notes))
             if status != ValidationStatus.PASS:
                 statuses.append(status)
                 notes.append(f"{kind}: {message}")
