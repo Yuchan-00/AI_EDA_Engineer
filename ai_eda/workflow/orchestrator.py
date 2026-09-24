@@ -192,8 +192,13 @@ class Orchestrator:
 
     # --- driver ------------------------------------------------------------------
 
-    def run(self, ir: CircuitIR, stop_after: Stage | None = None) -> PipelineState:
-        state = PipelineState()
+    def run(self, ir: CircuitIR, stop_after: Stage | None = None, *, state: PipelineState | None = None) -> PipelineState:
+        """Run the stages in order into ``state`` (a fresh one by default) and return it.
+
+        A caller that passes its own ``state`` keeps the partial outcomes when
+        a stage raises: ``state.current`` is then the stage that died.
+        """
+        state = PipelineState() if state is None else state
         self._fresh_from = len(ir.validation.results)  # results before this index were carried over from earlier runs
         for stage in STAGE_ORDER:
             state.current = stage

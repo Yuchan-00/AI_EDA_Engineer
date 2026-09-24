@@ -39,13 +39,28 @@
                                          page, quote); the URL is trusted exactly, every limit is grounded
                                          verbatim on the archived page and recorded in ir.pcb.manufacturing
     ai-eda review IR.json    run only the independent reviewer (exit 1 on any FAIL)
+    ai-eda report IR.json [-o FILE]
+                             write one self-contained HTML file (default <workdir>/report.html) showing
+                             what ir.json and <workdir>/pipeline.json record: every status is copied, none
+                             is computed, nothing is saved (exit 0 written, 2 usage/IR error; never 1 -
+                             the report is not a verdict)
+    ai-eda serve IR.json [--port N]
+                             serve that report on 127.0.0.1 only (default port 8765; 0 = a free port,
+                             printed), GET / only, re-rendered on every request so a later `run` shows on
+                             refresh; there is no --host flag on purpose
 
 Without ``--llm`` the pipeline is exactly what it was before the LLM stage;
-without ``--online`` it opens no socket. The budget flags are the user's
-approval of paid calls and ``--online`` the approval of network fetches:
-both are recorded in the approval gate's audit log. The IR is saved (and
-the LLM usage printed) whatever happens after the pipeline starts, so a
-paid extraction or an archived fetch is never lost to a later crash.
+without ``--online`` ``run`` opens no socket. ``serve`` is the one command
+that opens a socket without a flag: a loopback *listening* socket on
+127.0.0.1 that answers only requests whose Host header names this machine -
+no outbound connection is ever made, so no ``ExternalAction`` is involved.
+The budget flags are the user's approval of paid calls and ``--online`` the
+approval of network fetches: both are recorded in the approval gate's audit
+log. The IR is saved (and the LLM usage printed) whatever happens after the
+pipeline starts, so a paid extraction or an archived fetch is never lost to
+a later crash; ``run`` then records its stage outcomes in
+``<workdir>/pipeline.json`` (a run log like ``ir.validation``: not an
+artifact, not hashed) for ``report`` / ``serve``.
 """
 
 from __future__ import annotations
@@ -222,7 +237,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     from ai_eda.errors import ApprovalRequiredError, ToolUnavailableError
     from ai_eda.tools.kicad import KicadCli, KicadLibrary
     from ai_eda.tools.spice import NgspiceShared
-    from ai_eda.workflow import Orchestrator, SessionError
+    from ai_eda.workflow import Orchestrator, PipelineState, SessionError
 
     try:
         answers = parse_answers(args.answer)
@@ -260,23 +275,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     if llm is not None:
         ctx.usage = llm.usage
-    state = None
+    state = PipelineState()
+    results_before = len(ir.validation.results)  # the run's starting index in ir.validation.results, recorded in pipeline.json
+    aborted: str | None = None
     try:
-        state = Orchestrator(ctx).run(ir)
+        Orchestrator(ctx).run(ir, state=state)
+    except BaseException as e:
+        aborted = type(e).__name__  # only the type: an error text can embed a URL or a header, and it is written to disk
+        raise
     finally:
         session.close()
         # whatever happened after the pipeline started (a defect in a later stage, Ctrl-C), what the
         # requirement stage applied - a paid extraction included - is on disk, and the spend is reported
-        if state is not None:
-            for o in state.outcomes:
-                print(f"{o.stage:<24} {o.status:<20} {o.message}")
+        for o in state.outcomes:
+            print(f"{o.stage:<24} {o.status:<20} {o.message}")
         if llm is not None:
             print(f"\nLLM usage: {llm.summary()}")
+        saved = False
         try:
             ir.save(args.ir)
+            saved = True
         except Exception as e:  # noqa: BLE001 - reported, never masks the original exception
             print(f"could not save {args.ir}: {e}", file=sys.stderr)
-        if state is None:
+        _record_pipeline(state, ir, args.ir, workdir, results_before=results_before, aborted=aborted, ir_saved=saved)
+        if aborted is not None:
             print(f"pipeline aborted by an unexpected error; IR saved to {args.ir} with what had been applied", file=sys.stderr)
             # the questions the IR now holds were meant for the user: show them, so a confirmation given
             # next time refers to a table that was actually seen
@@ -286,6 +308,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         _print_questions(state.open_questions, header="\nBLOCKED - answer these to continue (pass with --answer key=value):")
     _print_questions(state.optional_questions, header="\nOPTIONAL QUESTIONS (not blocking; answer with --answer key=value to decide more):")
     return run_exit_code(state)
+
+
+def _record_pipeline(state, ir, ir_path: str, workdir: Path, *, results_before: int, aborted: str | None, ir_saved: bool) -> None:
+    """Write ``<workdir>/pipeline.json`` for ``ai-eda report``; a failure is reported on stderr and never masks the run's own outcome."""
+    from ai_eda.report.pipeline_log import PIPELINE_FILE, save_pipeline_record, sha256_of_file
+
+    try:
+        ir_file_sha256 = sha256_of_file(ir_path) if ir_saved else None
+        path = save_pipeline_record(state, ir, ir_path, workdir, results_before=results_before, ir_file_sha256=ir_file_sha256, aborted=aborted)
+    except Exception as e:  # noqa: BLE001 - reported, never masks the original exception
+        print(f"could not save {Path(workdir) / PIPELINE_FILE}: {e}", file=sys.stderr)
+        return
+    # the leading spaces keep the line out of the stage table (one line per stage, first word = stage)
+    print(f"  stage outcomes recorded in {path} (ai-eda report {ir_path} renders them)")
 
 
 def _print_questions(questions, *, header: str) -> None:
@@ -352,6 +388,54 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0 if not report.failures else 1
 
 
+def _report_inputs(args: argparse.Namespace):
+    """``(ir, workdir)`` for ``report`` / ``serve``, or ``None`` after printing why (a usage / IR error, exit 2)."""
+    try:
+        ir = _load(args.ir)
+    except (OSError, ValueError, IRSchemaError) as e:  # missing / unreadable file, not JSON or not an IR, another schema
+        print(f"{args.ir}: {e}" if isinstance(e, (OSError, ValueError)) else str(e), file=sys.stderr)
+        return None
+    try:
+        return ir, project_workdir(ir, args.ir)
+    except IRSchemaError as e:
+        print(str(e), file=sys.stderr)
+        return None
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Write one self-contained HTML file; exit 0 written, 2 for a usage / IR error - never 1, the report is not a verdict."""
+    from ai_eda.report import build_report_data, render_html
+    from ai_eda.report.pipeline_log import PIPELINE_FILE
+
+    loaded = _report_inputs(args)
+    if loaded is None:
+        return 2
+    ir, workdir = loaded
+    out = Path(args.output) if args.output else workdir / "report.html"
+    # the IR is the only original design data and pipeline.json its run log: neither is ever overwritten with HTML
+    protected = {Path(args.ir).resolve(), (workdir / PIPELINE_FILE).resolve()}
+    if out.resolve() in protected:
+        print(f"refusing to write the report over {out}: pass another -o path", file=sys.stderr)
+        return 2
+    try:
+        html = render_html(build_report_data(ir, Path(args.ir), workdir))
+        out.write_text(html, encoding="utf-8", newline="\n")
+    except OSError as e:
+        print(f"could not write {out}: {e}", file=sys.stderr)
+        return 2
+    print(f"wrote {out}")
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Serve the report on 127.0.0.1 (a loopback listening socket, nothing outbound); exit 0 on Ctrl-C, 2 for a usage / IR / bind error."""
+    from ai_eda.report import serve
+
+    if _report_inputs(args) is None:
+        return 2
+    return serve(Path(args.ir), args.port)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="ai-eda", description="AI EDA ENGINEER")
     p.add_argument("--version", action="version", version=__version__)
@@ -401,6 +485,16 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("ir")
     v.add_argument("--json", action="store_true")
     v.set_defaults(fn=cmd_review)
+
+    rp = sub.add_parser("report", help="write a self-contained HTML report of the IR, its validation log and the last run (read-only; no verdict)")
+    rp.add_argument("ir")
+    rp.add_argument("-o", "--output", metavar="FILE", help="where to write the HTML (default <workdir>/report.html; never the ir.json or pipeline.json)")
+    rp.set_defaults(fn=cmd_report)
+
+    sv = sub.add_parser("serve", help="serve the report on 127.0.0.1 (read-only, re-rendered on every request; no --host on purpose)")
+    sv.add_argument("ir")
+    sv.add_argument("--port", type=int, default=8765, help="TCP port on 127.0.0.1 (default 8765; 0 picks a free port and prints it)")
+    sv.set_defaults(fn=cmd_serve)
 
     args = p.parse_args(argv)
     return args.fn(args)
