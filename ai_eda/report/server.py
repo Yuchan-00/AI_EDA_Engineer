@@ -46,14 +46,13 @@ def host_allowed(host_header: str | None) -> bool:
 
 
 def render_page(ir_path: Path) -> str:
-    """The report of ``ir_path`` right now (loads ir.json and pipeline.json afresh; saves nothing)."""
+    """The report of ``ir_path`` right now (reads ir.json and pipeline.json afresh, each exactly once; saves nothing)."""
     from ai_eda.cli import project_workdir
-    from ai_eda.ir import CircuitIR
-    from ai_eda.report.data import build_report_data
+    from ai_eda.report.data import build_report_data, load_ir_file
     from ai_eda.report.html import render_html
 
-    ir = CircuitIR.load(ir_path)
-    return render_html(build_report_data(ir, ir_path, project_workdir(ir, ir_path)))
+    ir, ir_sha = load_ir_file(ir_path)
+    return render_html(build_report_data(ir, ir_path, project_workdir(ir, ir_path), ir_sha=ir_sha))
 
 
 class _Handler(BaseHTTPRequestHandler):

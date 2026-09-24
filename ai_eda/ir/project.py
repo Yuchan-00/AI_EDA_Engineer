@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -49,6 +51,16 @@ def unknown_keys(raw, dumped, path: str = "") -> list[str]:
         for i, (a, b) in enumerate(zip(raw, dumped)):
             out.extend(unknown_keys(a, b, f"{path}[{i}]"))
     return out
+
+
+def _mode_for(path: Path) -> int:
+    """Permission bits a fresh write of ``path`` gets: the existing file's, else the process default (0o666 under the umask)."""
+    try:
+        return path.stat().st_mode & 0o7777
+    except OSError:
+        umask = os.umask(0)
+        os.umask(umask)
+        return 0o666 & ~umask
 
 
 def strip_wall_clock(obj):
@@ -225,10 +237,55 @@ class CircuitIR(BaseModel):
     # --- persistence ---------------------------------------------------------
 
     def save(self, path: str | Path) -> Path:
+        """Write the IR to ``path`` atomically: a reader never sees a half-written ir.json.
+
+        The text is written to a temporary file in the same directory and
+        moved over ``path`` with :func:`os.replace`, so ``ai-eda serve`` (which
+        re-reads ir.json on every request while ``ai-eda run`` saves it) reads
+        either the previous complete file or the new one. The bytes are the
+        same as a plain text write of ``model_dump_json(indent=2)`` (platform
+        newlines, UTF-8), and an existing file keeps its permission bits.
+        """
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        fd, tmp_name = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:  # text mode: the same newline translation as write_text
+                f.write(self.model_dump_json(indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, _mode_for(p))
+            os.replace(tmp, p)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         return p
+
+    @classmethod
+    def loads(cls, raw: bytes | str, source: str = "<ir>") -> "CircuitIR":
+        """The IR serialised in ``raw`` (the bytes or text of one ir.json), with every check :meth:`load` makes.
+
+        ``source`` names the file in error messages. A caller that must also
+        hash what it parsed (the report's ``ir_file_sha256``) reads the bytes
+        once and passes them here, so the hash and the content can never come
+        from two different versions of a file being rewritten.
+        """
+        def constant(token: str):  # Python's json accepts the non-standard Infinity / NaN tokens; the IR holds no such number
+            raise IRSchemaError(f"{source}: JSON token {token} is not a number the IR can hold")
+
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        data = json.loads(text, parse_constant=constant)
+        if not isinstance(data, dict):
+            raise IRSchemaError(f"{source}: not an IR object")
+        version = data.get("schema_version")
+        if version != IR_SCHEMA_VERSION:
+            raise IRSchemaError(f"{source}: schema_version {version!r} is not {IR_SCHEMA_VERSION!r} (this code reads no other version)")
+        ir = cls.model_validate(data)
+        unknown = unknown_keys(data, ir.model_dump(mode="json"))
+        if unknown:
+            raise IRSchemaError(f"{source}: unknown key(s) the IR models would drop: {', '.join(unknown)}")
+        return ir
 
     @classmethod
     def load(cls, path: str | Path) -> "CircuitIR":
@@ -238,19 +295,7 @@ class CircuitIR(BaseModel):
         a hand-edited file (``serves_requirement``) would silently delete
         design or traceability data and the truncated IR would then be treated
         as the design; likewise a file written by another schema version. Both
-        are refused with the offending paths named.
+        are refused with the offending paths named. The file is read exactly
+        once; :meth:`loads` does the checking.
         """
-        def constant(token: str):  # Python's json accepts the non-standard Infinity / NaN tokens; the IR holds no such number
-            raise IRSchemaError(f"{path}: JSON token {token} is not a number the IR can hold")
-
-        raw = json.loads(Path(path).read_text(encoding="utf-8"), parse_constant=constant)
-        if not isinstance(raw, dict):
-            raise IRSchemaError(f"{path}: not an IR object")
-        version = raw.get("schema_version")
-        if version != IR_SCHEMA_VERSION:
-            raise IRSchemaError(f"{path}: schema_version {version!r} is not {IR_SCHEMA_VERSION!r} (this code reads no other version)")
-        ir = cls.model_validate(raw)
-        unknown = unknown_keys(raw, ir.model_dump(mode="json"))
-        if unknown:
-            raise IRSchemaError(f"{path}: unknown key(s) the IR models would drop: {', '.join(unknown)}")
-        return ir
+        return cls.loads(Path(path).read_bytes(), source=str(path))

@@ -15,7 +15,10 @@ An aborted run stores only the exception's type name and the stage that was
 running: no message, no traceback (an error text can embed a URL or a
 header). Loading is as strict as :meth:`ai_eda.ir.CircuitIR.load`: another
 ``schema_version`` or a key the models would drop is refused with
-:class:`PipelineRecordError`, never rendered as a truncated record.
+:class:`PipelineRecordError`, never rendered as a truncated record. The
+file is read exactly once: :func:`load_pipeline_record` returns the record
+together with the sha256 of the very bytes it parsed, so a report never
+labels one version of the file with the hash of another.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 from pydantic import BaseModel, ValidationError
 
@@ -37,12 +41,26 @@ PIPELINE_SCHEMA_VERSION = "1"
 
 
 class PipelineRecordError(AiEdaError):
-    """``pipeline.json`` exists but is not a record this code can read faithfully."""
+    """``pipeline.json`` exists but is not a record this code can read faithfully.
+
+    ``file_sha256`` is the hash of the bytes that were refused (``None`` when
+    they could not be read at all), so a report can still name the file it
+    looked at without reading it a second time.
+    """
+
+    def __init__(self, message: str, *, file_sha256: str | None = None) -> None:
+        super().__init__(message)
+        self.file_sha256 = file_sha256
+
+
+def sha256_of_bytes(raw: bytes) -> str:
+    """``sha256:<hex>`` of ``raw``."""
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 def sha256_of_file(path: str | Path) -> str:
     """``sha256:<hex>`` of the bytes at ``path`` (the file must exist)."""
-    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return sha256_of_bytes(Path(path).read_bytes())
 
 
 class PipelineRecord(BaseModel):
@@ -91,27 +109,43 @@ def save_pipeline_record(
     return path
 
 
-def load_pipeline_record(workdir: Path) -> PipelineRecord | None:
-    """The record in ``workdir``, ``None`` when there is none, :class:`PipelineRecordError` when it cannot be read faithfully."""
+class LoadedPipelineRecord(NamedTuple):
+    """A record and the ``sha256:<hex>`` of the exact bytes it was parsed from."""
+
+    record: PipelineRecord
+    file_sha256: str
+
+
+def load_pipeline_record(workdir: Path) -> LoadedPipelineRecord | None:
+    """The record in ``workdir`` with the hash of the bytes it was parsed from, ``None`` when there is no file,
+    :class:`PipelineRecordError` when it cannot be read faithfully (the error carries the hash of the refused bytes)."""
     path = Path(workdir) / PIPELINE_FILE
     if not path.is_file():
         return None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
+        data = path.read_bytes()
+    except OSError as e:
         raise PipelineRecordError(f"{path}: not readable as JSON: {e}") from e
+    file_sha256 = sha256_of_bytes(data)
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except ValueError as e:
+        raise PipelineRecordError(f"{path}: not readable as JSON: {e}", file_sha256=file_sha256) from e
     if not isinstance(raw, dict):
-        raise PipelineRecordError(f"{path}: not a pipeline record object")
+        raise PipelineRecordError(f"{path}: not a pipeline record object", file_sha256=file_sha256)
     version = raw.get("schema_version")
     if version != PIPELINE_SCHEMA_VERSION:
         raise PipelineRecordError(
-            f"{path}: schema_version {version!r} is not {PIPELINE_SCHEMA_VERSION!r} (this code reads no other version)"
+            f"{path}: schema_version {version!r} is not {PIPELINE_SCHEMA_VERSION!r} (this code reads no other version)",
+            file_sha256=file_sha256,
         )
     try:
         record = PipelineRecord.model_validate(raw)
     except ValidationError as e:
-        raise PipelineRecordError(f"{path}: not a valid pipeline record: {e.errors()[0].get('msg', e) if e.errors() else e}") from e
+        raise PipelineRecordError(
+            f"{path}: not a valid pipeline record: {e.errors()[0].get('msg', e) if e.errors() else e}", file_sha256=file_sha256
+        ) from e
     unknown = unknown_keys(raw, record.model_dump(mode="json"))
     if unknown:
-        raise PipelineRecordError(f"{path}: unknown key(s) the record models would drop: {', '.join(unknown)}")
-    return record
+        raise PipelineRecordError(f"{path}: unknown key(s) the record models would drop: {', '.join(unknown)}", file_sha256=file_sha256)
+    return LoadedPipelineRecord(record, file_sha256)

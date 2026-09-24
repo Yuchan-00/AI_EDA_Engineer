@@ -7,11 +7,20 @@ about hashes and files - whether a result's ``ir_hash`` is the current
 design hash (fresh / stale / unstamped), whether an artifact or an evidence
 file is still on disk with the recorded hash, and whether ``pipeline.json``
 describes the ir.json it sits next to (``ir_file_sha256``). The RELEASE
-verdict and its reasons come only from the recorded RELEASE outcome; the
+verdict and its reasons come only from the recorded RELEASE outcome, and
+they carry the same run-freshness label as the stage table, so a recorded
+PASS is never shown as if it described a design that changed since; the
 aggregate of the latest results is labelled as not a verdict. Everything is
 rendered from ``model_dump(mode="json")`` so timestamps read exactly as the
 files store them, and every field is a str / int / bool / list of those, so
 the renderer can never print an object repr.
+
+Each input file is read exactly once: ``ir_sha`` is the hash of the bytes
+the caller parsed into ``ir`` (:func:`load_ir_file`), and the pipeline.json
+hash is the one :func:`load_pipeline_record` computed from the bytes it
+parsed. Hashing a path again after parsing it would let a page built while
+``ai-eda run`` rewrites the files show one version's content under another
+version's hash.
 """
 
 from __future__ import annotations
@@ -26,7 +35,14 @@ from ai_eda import __version__
 from ai_eda.ir.project import ArtifactRef, CircuitIR
 from ai_eda.ir.requirements import MissingInformation
 from ai_eda.ir.validation import Evidence, ValidationResult, ValidationStatus
-from ai_eda.report.pipeline_log import PIPELINE_FILE, PipelineRecord, PipelineRecordError, load_pipeline_record, sha256_of_file
+from ai_eda.report.pipeline_log import (
+    PIPELINE_FILE,
+    PipelineRecord,
+    PipelineRecordError,
+    load_pipeline_record,
+    sha256_of_bytes,
+    sha256_of_file,
+)
 from ai_eda.review.areas import ReviewArea
 from ai_eda.workflow.stages import STAGE_ORDER, Stage
 
@@ -47,6 +63,8 @@ EVIDENCE_MISSING = "missing"
 #: labels about the run log
 PIPELINE_DESCRIBES_IR = "pipeline.json describes this ir.json"
 PIPELINE_STALE_IR = "ir.json changed since pipeline.json was written"
+RUN_CURRENT_IR = "recorded for the current IR"
+RUN_EARLIER_IR = "recorded for an earlier IR version"
 NO_RECORDED_RUN = "no recorded run: run `ai-eda run` first"
 OPINION = "opinion (no tool)"
 MODEL_OUTPUT = "model output"
@@ -242,6 +260,11 @@ class ReleaseSection(BaseModel):
     reasons: list[str]
     at: str
     note: str
+    #: the run-freshness label of the recorded outcome (the stage table's ``run_hash_label``, or PIPELINE_STALE_IR
+    #: when the design hash still matches but ir.json is not the file the run wrote); "" when nothing is recorded
+    freshness: str
+    #: whether the recorded outcome describes this ir.json as it is now (False for a stale label)
+    current: bool
 
 
 class ReportData(BaseModel):
@@ -351,10 +374,12 @@ def _validation_row(r: ValidationResult, index: int, fresh: _Freshness, kinds_by
 # --- sections ------------------------------------------------------------------
 
 
-def _meta(ir: CircuitIR, ir_path: Path, workdir: Path, record: PipelineRecord | None, record_error: str | None, ir_sha: str) -> MetaSection:
+def _meta(
+    ir: CircuitIR, ir_path: Path, workdir: Path, record: PipelineRecord | None, record_error: str | None, ir_sha: str, pipeline_sha: str | None
+) -> MetaSection:
     p = ir.project.model_dump(mode="json")
     pipeline_path = workdir / PIPELINE_FILE
-    has_file = pipeline_path.is_file()
+    has_file = pipeline_sha is not None or pipeline_path.is_file()  # a stat only: the file's bytes were read by load_pipeline_record
     if record is not None:
         note = PIPELINE_DESCRIBES_IR if record.ir_file_sha256 == ir_sha else PIPELINE_STALE_IR
     elif record_error is not None:
@@ -373,9 +398,16 @@ def _meta(ir: CircuitIR, ir_path: Path, workdir: Path, record: PipelineRecord | 
         ir_file_path=str(ir_path),
         ir_file_sha256=ir_sha,
         pipeline_file_path=str(pipeline_path) if has_file else None,
-        pipeline_file_sha256=sha256_of_file(pipeline_path) if has_file else None,
+        pipeline_file_sha256=pipeline_sha,
         pipeline_note=note,
     )
+
+
+def run_hash_label(record: PipelineRecord, design_hash: str) -> str:
+    """Whether the recorded run ended on this design hash (a fact about hashes, not a status)."""
+    if record.ir_hash == design_hash:
+        return RUN_CURRENT_IR
+    return f"{RUN_EARLIER_IR} (IR {record.ir_hash[:16]})"
 
 
 def _stages(record: PipelineRecord, design_hash: str) -> StagesSection:
@@ -388,11 +420,10 @@ def _stages(record: PipelineRecord, design_hash: str) -> StagesSection:
             rows.append(StageRow(stage=str(stage), status=d["status"], message=o.message, at=d["at"], questions=len(o.questions), reached=True))
         else:
             rows.append(StageRow(stage=str(stage), status="", message="not reached", at="", questions=0, reached=False))
-    label = "recorded for the current IR" if record.ir_hash == design_hash else f"recorded for an earlier IR version (IR {record.ir_hash[:16]})"
     return StagesSection(
         rows=rows,
         run_ir_hash=record.ir_hash,
-        run_hash_label=label,
+        run_hash_label=run_hash_label(record, design_hash),
         blocked=record.state.blocked,
         current=_s(record.state.current) or None,
         aborted=record.aborted,
@@ -515,35 +546,59 @@ def _domain(title: str, prefixes: tuple[str, ...], latest: list[ValidationRow], 
     return DomainSection(title=title, prefixes=list(prefixes), results=matching, ir_json=_json(ir_part), note=note)
 
 
-def _release(record: PipelineRecord | None) -> ReleaseSection:
+def _release(record: PipelineRecord | None, design_hash: str, describes: bool) -> ReleaseSection:
+    """The recorded RELEASE outcome, labelled with what it describes: the design changed since (``run_hash_label``),
+    or ir.json is no longer the file the run wrote (``describes`` False), or the current IR."""
     if record is None:
-        return ReleaseSection(status=None, message="", reasons=[], at="", note=NO_RECORDED_RUN)
+        return ReleaseSection(status=None, message="", reasons=[], at="", note=NO_RECORDED_RUN, freshness="", current=False)
+    label = run_hash_label(record, design_hash)
+    current = describes and label == RUN_CURRENT_IR
+    if label == RUN_CURRENT_IR and not describes:
+        label = PIPELINE_STALE_IR
     outcome = record.state.outcome(Stage.RELEASE)
     if outcome is None:
         why = f"last run aborted: {record.aborted}" if record.aborted else "the last run stopped before RELEASE"
-        return ReleaseSection(status=None, message="", reasons=[], at="", note=f"{NO_RECORDED_RUN.split(':')[0]} ({why})")
+        return ReleaseSection(status=None, message="", reasons=[], at="", note=f"{NO_RECORDED_RUN.split(':')[0]} ({why})",
+                              freshness=label, current=current)
     d = outcome.model_dump(mode="json")
     if outcome.status is ValidationStatus.PASS:
         reasons = [outcome.message]  # 'evidence-backed release', verbatim
     else:
         reasons = [x for x in outcome.message.removeprefix(RELEASE_PREFIX).split("; ") if x]
-    return ReleaseSection(status=d["status"], message=outcome.message, reasons=reasons, at=d["at"], note="recorded RELEASE outcome of the last run")
+    note = "recorded RELEASE outcome of the last run" + ("" if current else f" - {label}; it says nothing about ir.json as it is now")
+    return ReleaseSection(status=d["status"], message=outcome.message, reasons=reasons, at=d["at"], note=note, freshness=label, current=current)
 
 
 # --- entry point -----------------------------------------------------------------
 
 
-def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path) -> ReportData:
-    """Everything the report shows about ``ir`` (loaded from ``ir_path``) and ``<workdir>/pipeline.json``; nothing is written."""
+def load_ir_file(ir_path: Path) -> tuple[CircuitIR, str]:
+    """``(ir, ir_sha)``: ir.json parsed with every :meth:`CircuitIR.load` check, and the ``sha256:<hex>`` of the exact bytes parsed.
+
+    This is the one read of ir.json a report makes; the hash is passed to
+    :func:`build_report_data` so the page can never show one version's
+    content under another version's hash.
+    """
+    raw = Path(ir_path).read_bytes()
+    return CircuitIR.loads(raw, source=str(ir_path)), sha256_of_bytes(raw)
+
+
+def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: str) -> ReportData:
+    """Everything the report shows about ``ir`` (parsed from ``ir_path``, whose bytes hashed to ``ir_sha``) and
+    ``<workdir>/pipeline.json``; nothing is written and ir.json is not read again."""
     ir_path = Path(ir_path)
-    ir_sha = sha256_of_file(ir_path)
     design_hash = ir.content_hash()
     record: PipelineRecord | None = None
     record_error: str | None = None
+    pipeline_sha: str | None = None
     try:
-        record = load_pipeline_record(workdir)
+        loaded = load_pipeline_record(workdir)
     except PipelineRecordError as e:
         record_error = str(e)
+        pipeline_sha = e.file_sha256
+    else:
+        if loaded is not None:
+            record, pipeline_sha = loaded
     describes = record is not None and record.ir_file_sha256 == ir_sha
     fresh = _Freshness(design_hash, record.results_before if describes and record is not None else None)
     kinds_by_hash = {art.content_hash: str(kind) for kind, art in ir.artifacts.items() if art.content_hash}
@@ -554,7 +609,7 @@ def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path) -> ReportData
     else:
         stages_reason = None
     return ReportData(
-        meta=_meta(ir, ir_path, workdir, record, record_error, ir_sha),
+        meta=_meta(ir, ir_path, workdir, record, record_error, ir_sha, pipeline_sha),
         stages=stages,
         stages_reason=stages_reason,
         requirements=_requirements(ir),
@@ -571,5 +626,5 @@ def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path) -> ReportData
         simulation=_domain("Simulation", SIMULATION_PREFIXES, validation.latest,
                            ir.simulation.model_dump(mode="json") if ir.simulation is not None else None,
                            "latest spice / domain.analog.* results; ir.simulation as stored"),
-        release=_release(record),
+        release=_release(record, design_hash, describes),
     )

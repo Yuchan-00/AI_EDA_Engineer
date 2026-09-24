@@ -389,14 +389,17 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 
 def _report_inputs(args: argparse.Namespace):
-    """``(ir, workdir)`` for ``report`` / ``serve``, or ``None`` after printing why (a usage / IR error, exit 2)."""
+    """``(ir, workdir, ir_sha)`` for ``report`` / ``serve`` - the IR, its workdir and the hash of the bytes the IR was parsed
+    from (one read) - or ``None`` after printing why (a usage / IR error, exit 2)."""
+    from ai_eda.report.data import load_ir_file
+
     try:
-        ir = _load(args.ir)
+        ir, ir_sha = load_ir_file(Path(args.ir))
     except (OSError, ValueError, IRSchemaError) as e:  # missing / unreadable file, not JSON or not an IR, another schema
         print(f"{args.ir}: {e}" if isinstance(e, (OSError, ValueError)) else str(e), file=sys.stderr)
         return None
     try:
-        return ir, project_workdir(ir, args.ir)
+        return ir, project_workdir(ir, args.ir), ir_sha
     except IRSchemaError as e:
         print(str(e), file=sys.stderr)
         return None
@@ -410,7 +413,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     loaded = _report_inputs(args)
     if loaded is None:
         return 2
-    ir, workdir = loaded
+    ir, workdir, ir_sha = loaded
     out = Path(args.output) if args.output else workdir / "report.html"
     # the IR is the only original design data and pipeline.json its run log: neither is ever overwritten with HTML
     protected = {Path(args.ir).resolve(), (workdir / PIPELINE_FILE).resolve()}
@@ -418,7 +421,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(f"refusing to write the report over {out}: pass another -o path", file=sys.stderr)
         return 2
     try:
-        html = render_html(build_report_data(ir, Path(args.ir), workdir))
+        html = render_html(build_report_data(ir, Path(args.ir), workdir, ir_sha=ir_sha))
         out.write_text(html, encoding="utf-8", newline="\n")
     except OSError as e:
         print(f"could not write {out}: {e}", file=sys.stderr)

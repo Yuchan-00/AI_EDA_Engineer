@@ -45,6 +45,7 @@ from ai_eda.report import (
     ReportServer,
     build_report_data,
     esc,
+    load_ir_file,
     load_pipeline_record,
     render_html,
     render_report_file,
@@ -62,13 +63,15 @@ from ai_eda.report.data import (
     OPINION,
     PIPELINE_DESCRIBES_IR,
     PIPELINE_STALE_IR,
+    RUN_CURRENT_IR,
+    RUN_EARLIER_IR,
     STALE,
     UNSTAMPED_CARRIED,
     UNSTAMPED_PRODUCED,
     UNSTAMPED_UNKNOWN,
 )
-from ai_eda.report.pipeline_log import sha256_of_file
-from ai_eda.report.server import host_allowed, serve
+from ai_eda.report.pipeline_log import sha256_of_bytes, sha256_of_file
+from ai_eda.report.server import host_allowed, render_page, serve
 from ai_eda.review.areas import ReviewArea
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.workflow import STAGE_ORDER, Orchestrator, PipelineState, Stage, StageOutcome
@@ -81,6 +84,12 @@ def _cli(*argv: str) -> tuple[int, str, str]:
     with redirect_stdout(out), redirect_stderr(err):
         code = cli_main(list(argv))
     return code, out.getvalue(), err.getvalue()
+
+
+def _data(ir_path: Path, workdir: Path):
+    """The report data of the ir.json at ``ir_path``: one read, its hash passed along (what report / serve do)."""
+    ir, ir_sha = load_ir_file(ir_path)
+    return build_report_data(ir, ir_path, workdir, ir_sha=ir_sha)
 
 
 def _offline_ctx(workdir: Path, **answers: str) -> AgentContext:
@@ -118,8 +127,8 @@ def test_cmd_run_records_pipeline_json(tmp_path: Path):
     # the line about it starts with a space: test_cli_llm's stdout parser (first word = stage) never sees it
     line = next(line for line in out.splitlines() if PIPELINE_FILE in line)
     assert line.startswith(" ")
-    record = load_pipeline_record(tmp_path / "demo")
-    assert isinstance(record, PipelineRecord)
+    record, record_sha = load_pipeline_record(tmp_path / "demo")
+    assert isinstance(record, PipelineRecord) and record_sha == sha256_of_file(record_path)
     ir = CircuitIR.load(ir_path)
     assert record.ir_hash == ir.content_hash()
     assert record.ir_file_sha256 == sha256_of_file(ir_path)
@@ -131,7 +140,7 @@ def test_cmd_run_records_pipeline_json(tmp_path: Path):
     assert record.state.outcomes[-1].message.startswith("not releasable: ")
     # a second run starts where the first left the log
     code, out, _ = _cli("run", str(ir_path), "--answer", "application=bench supply", "--answer", "jurisdiction=EU")
-    assert load_pipeline_record(tmp_path / "demo").results_before == len(ir.validation.results)
+    assert load_pipeline_record(tmp_path / "demo").record.results_before == len(ir.validation.results)
 
 
 def test_pipeline_record_written_when_the_run_aborts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -150,7 +159,7 @@ def test_pipeline_record_written_when_the_run_aborts(tmp_path: Path, monkeypatch
     assert record_path.is_file()
     text = record_path.read_text(encoding="utf-8")
     assert "token=abc" not in text and "secret-looking" not in text  # only the type name is stored
-    record = load_pipeline_record(tmp_path / "demo")
+    record = load_pipeline_record(tmp_path / "demo").record
     assert record.aborted == "RuntimeError" and record.aborted_stage == Stage.IR_BUILD
     assert record.state.current == Stage.IR_BUILD
     assert [o.stage for o in record.state.outcomes] == STAGE_ORDER[: STAGE_ORDER.index(Stage.IR_BUILD)]
@@ -175,8 +184,9 @@ def test_load_pipeline_record_rejects_unknown_keys_and_other_versions(project: t
     with pytest.raises(PipelineRecordError, match=r"unknown key.*state\.outcomes\[0\]\.bogus"):
         load_pipeline_record(tmp_path)
     # the report shows the message instead of guessing: no stage table, no RELEASE outcome
-    data = build_report_data(CircuitIR.load(ir_path), ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     assert data.stages is None and "bogus" in (data.stages_reason or "") and "bogus" in data.meta.pipeline_note
+    assert data.meta.pipeline_file_sha256 == sha256_of_file(record_path) and data.meta.pipeline_file_path == str(record_path)
     assert data.release.status is None and data.release.note == NO_RECORDED_RUN
     html = render_html(data)
     assert "bogus" in html and "evidence-backed" not in html
@@ -217,7 +227,7 @@ def test_report_of_offline_divider_run(project: tuple[Path, PipelineState], tmp_
         assert esc(o.message) in html
     # nothing external, no script, ever
     assert "<script" not in html and "<link" not in html and "@import" not in html and "http://" not in html.replace("https://", "")
-    data = build_report_data(ir, ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     latest = {r.check_id: r for r in data.validation.latest}
     assert latest["compile.bom"].status == "PASS" and latest["compile.bom"].freshness == FRESH
     assert latest["compile.bom"].artifact_kind == "bom" and latest["compile.bom"].artifact_hash == ir.artifacts[ArtifactKind.BOM].content_hash
@@ -272,10 +282,10 @@ def test_stale_missing_unstamped_and_carried_over_labels(divider_ir: CircuitIR, 
     n_first = len(divider_ir.validation.results)
     # run 2 stops after REGULATORY_RESEARCH: it re-produces the regulatory rows, not the component ones
     _run_and_record(divider_ir, tmp_path, stop_after=Stage.REGULATORY_RESEARCH)
-    record = load_pipeline_record(tmp_path)
+    record = load_pipeline_record(tmp_path).record
     assert record.results_before == n_first and record.state.outcomes[-1].stage == Stage.REGULATORY_RESEARCH
     ir = CircuitIR.load(ir_path)
-    data = build_report_data(ir, ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     latest = {r.check_id: r for r in data.validation.latest}
     assert latest["regulatory.sources"].freshness == UNSTAMPED_PRODUCED
     assert latest["component.existence.R1"].freshness == UNSTAMPED_CARRIED
@@ -287,7 +297,7 @@ def test_stale_missing_unstamped_and_carried_over_labels(divider_ir: CircuitIR, 
     # the design changes and ir.json is saved without a run: stamped rows and artifacts are stale, the run log describes an older file
     ir.parameters["v_in"] = user_requirement(24.0, "V")
     ir.save(ir_path)
-    data = build_report_data(CircuitIR.load(ir_path), ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     latest = {r.check_id: r for r in data.validation.latest}
     assert latest["compile.bom"].freshness.startswith(f"{STALE} (IR ")
     assert latest["component.existence.R1"].freshness == UNSTAMPED_UNKNOWN
@@ -300,7 +310,7 @@ def test_stale_missing_unstamped_and_carried_over_labels(divider_ir: CircuitIR, 
     (tmp_path / "bom.csv").unlink()
     with (tmp_path / "cpl.csv").open("a", encoding="utf-8") as f:
         f.write("\n")
-    data = build_report_data(CircuitIR.load(ir_path), ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     arts = {a.kind: a for a in data.artifacts}
     assert arts["bom"].disk == MISSING_ON_DISK and arts["cpl"].disk == CHANGED_ON_DISK
     latest = {r.check_id: r for r in data.validation.latest}
@@ -310,7 +320,7 @@ def test_stale_missing_unstamped_and_carried_over_labels(divider_ir: CircuitIR, 
 
     # no pipeline.json at all: no stage table, no RELEASE, unstamped rows are of an unknown run
     (tmp_path / PIPELINE_FILE).unlink()
-    data = build_report_data(CircuitIR.load(ir_path), ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     assert data.stages is None and PIPELINE_FILE in (data.stages_reason or "")
     assert data.release.status is None and data.release.note == NO_RECORDED_RUN
     assert {r.freshness for r in data.validation.latest if r.check_id.startswith("component.existence")} == {UNSTAMPED_UNKNOWN}
@@ -322,7 +332,7 @@ def test_evidence_changed_on_disk_is_reported(project: tuple[Path, PipelineState
     ir_path, _state = project
     with (tmp_path / "bom.csv").open("a", encoding="utf-8") as f:
         f.write("# edited by hand\n")
-    data = build_report_data(CircuitIR.load(ir_path), ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     latest = {r.check_id: r for r in data.validation.latest}
     assert latest["review.pcb_vs_bom"].evidence[0].state == CHANGED_ON_DISK
     assert {a.kind: a.disk for a in data.artifacts}["bom"] == CHANGED_ON_DISK
@@ -348,11 +358,58 @@ def test_release_section_renders_pass_verbatim(tmp_path: Path):
     ir.validation.add(ValidationResult(check_id="x.tool", status=ValidationStatus.PASS, tool="x", ir_hash=ir.content_hash()))
     ir_path = _record(tmp_path, ir, [StageOutcome(stage=s, status=ValidationStatus.PASS) for s in STAGE_ORDER[:-1]]
                       + [StageOutcome(stage=Stage.RELEASE, status=ValidationStatus.PASS, message="evidence-backed release")])
-    data = build_report_data(CircuitIR.load(ir_path), ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     assert data.release.status == "PASS" and data.release.reasons == ["evidence-backed release"]
+    assert data.release.freshness == RUN_CURRENT_IR and data.release.current
     html = render_html(data)
     assert "evidence-backed release" in html and "not releasable" not in html
     assert '<span class="st st-PASS">PASS</span>' in html
+    assert f'<span class="note"> - {RUN_CURRENT_IR}</span>' in _release_section(html)
+
+
+def _release_section(html: str) -> str:
+    start = html.index("<h2>RELEASE</h2>")
+    return html[start: html.index("</section>", start)]
+
+
+def test_release_pass_recorded_for_an_earlier_ir_is_labelled_beside_the_status(tmp_path: Path):
+    """A recorded RELEASE PASS says nothing about a design that changed since: the label sits next to the badge, not only in the header."""
+    ir = _plain_ir(tmp_path)
+    ir.validation.add(ValidationResult(check_id="x.tool", status=ValidationStatus.PASS, tool="x", ir_hash=ir.content_hash()))
+    ir_path = _record(tmp_path, ir, [StageOutcome(stage=s, status=ValidationStatus.PASS) for s in STAGE_ORDER[:-1]]
+                      + [StageOutcome(stage=Stage.RELEASE, status=ValidationStatus.PASS, message="evidence-backed release")])
+    run_hash = ir.content_hash()
+    # the design changes and ir.json is saved without a run
+    ir.parameters["v_in"] = user_requirement(24.0, "V")
+    ir.save(ir_path)
+    data = _data(ir_path, tmp_path)
+    assert data.release.status == "PASS" and data.release.reasons == ["evidence-backed release"]  # still verbatim
+    assert data.release.freshness == f"{RUN_EARLIER_IR} (IR {run_hash[:16]})" and not data.release.current
+    assert data.release.freshness == data.stages.run_hash_label
+    assert data.release.note.startswith("recorded RELEASE outcome of the last run - " + RUN_EARLIER_IR)
+    section = _release_section(render_html(data))
+    assert '<span class="st st-PASS">PASS</span>' in section
+    assert f'<span class="warn"> - {esc(data.release.freshness)}</span>' in section
+    assert esc(data.release.note) in section and RUN_CURRENT_IR not in section
+
+    # the same design hash but not the file the run wrote (a result appended, saved without a run): the file label, not the hash label
+    ir = CircuitIR.load(ir_path)
+    ir.parameters.pop("v_in")
+    assert ir.content_hash() == run_hash
+    ir.validation.add(ValidationResult(check_id="later.tool", status=ValidationStatus.NOT_VERIFIED, tool="x"))
+    ir.save(ir_path)
+    data = _data(ir_path, tmp_path)
+    assert data.meta.pipeline_note == PIPELINE_STALE_IR and data.stages.run_hash_label == RUN_CURRENT_IR
+    assert data.release.status == "PASS" and data.release.freshness == PIPELINE_STALE_IR and not data.release.current
+    assert f'<span class="warn"> - {PIPELINE_STALE_IR}</span>' in _release_section(render_html(data))
+
+    # a run that stopped before RELEASE on an earlier IR carries the label too (no status, the note says why)
+    ir_path = _record(tmp_path, ir, [StageOutcome(stage=Stage.REQUIREMENT_ANALYSIS, status=ValidationStatus.PASS)])
+    ir.parameters["v_in"] = user_requirement(9.0, "V")
+    ir.save(ir_path)
+    data = _data(ir_path, tmp_path)
+    assert data.release.status is None and "stopped before RELEASE" in data.release.note
+    assert data.release.freshness.startswith(RUN_EARLIER_IR) and not data.release.current
 
 
 def test_pass_without_tool_is_labelled_opinion(tmp_path: Path):
@@ -360,14 +417,14 @@ def test_pass_without_tool_is_labelled_opinion(tmp_path: Path):
     ir.validation.add(ValidationResult(check_id="someone.says", status=ValidationStatus.PASS, message="looks fine", ir_hash=ir.content_hash()))
     ir.validation.add(ValidationResult(check_id="tool.says", status=ValidationStatus.PASS, message="checked", tool="t", ir_hash=ir.content_hash()))
     ir_path = ir.save(tmp_path / "ir.json")
-    data = build_report_data(ir, ir_path, tmp_path)
+    data = build_report_data(ir, ir_path, tmp_path, ir_sha=sha256_of_file(ir_path))
     latest = {r.check_id: r for r in data.validation.latest}
     assert latest["someone.says"].opinion and not latest["tool.says"].opinion
     assert render_html(data).count(OPINION) == 1
     # NOT_VERIFIED stays NOT_VERIFIED and an empty log aggregates to NOT_VERIFIED, never PASS
     empty = _plain_ir(tmp_path)
     p2 = empty.save(tmp_path / "empty" / "ir.json")
-    d2 = build_report_data(empty, p2, tmp_path / "empty")
+    d2 = build_report_data(empty, p2, tmp_path / "empty", ir_sha=sha256_of_file(p2))
     assert d2.validation.aggregate == "NOT_VERIFIED" and d2.release.status is None
 
 
@@ -380,7 +437,7 @@ def test_questions_have_answer_commands_and_model_labels(tmp_path: Path):
     ]
     ir_path = _record(tmp_path, ir, [StageOutcome(stage=Stage.REQUIREMENT_ANALYSIS, status=ValidationStatus.USER_INPUT_REQUIRED,
                                                    questions=[MissingInformation(key="radio", question="Radio?", options=["yes", "no"], required=False)])])
-    data = build_report_data(CircuitIR.load(ir_path), ir_path, tmp_path)
+    data = _data(ir_path, tmp_path)
     rows = {q.key: q for q in data.questions}
     assert rows["application"].command == f"ai-eda run {ir_path} --answer application=<value>" and rows["application"].required
     assert rows["mains_powered"].command.endswith("--answer mains_powered=<yes|no>")
@@ -424,7 +481,7 @@ def test_every_untrusted_string_is_escaped(tmp_path: Path):
                              questions=[MissingInformation(key="q", question=img, options=[hostile])]),
                 StageOutcome(stage=Stage.RELEASE, status=ValidationStatus.FAIL, message=f"not releasable: {td}; {img}")]
     ir_path = _record(tmp_path, ir, outcomes)
-    html = render_html(build_report_data(CircuitIR.load(ir_path), ir_path, tmp_path))
+    html = render_html(_data(ir_path, tmp_path))
     assert "<script" not in html and "<svg" not in html and "<img" not in html and "<b>x</b>" not in html
     assert html.count("onerror=") == html.count("&quot;&gt;&lt;img src=x onerror=") > 10
     assert html.count("&lt;script&gt;") >= 3 and "&lt;/td&gt;" in html
@@ -492,6 +549,57 @@ def test_host_header_rule():
         assert host_allowed(ok), ok
     for bad in (None, "", "evil.example", "127.0.0.1.evil", "127.0.0.1:abc", "[::1", "localhost:80:1", "127.0.0.1 evil", "::1"):
         assert not host_allowed(bad), bad
+
+
+def test_rendered_hashes_are_of_the_bytes_that_were_parsed(project: tuple[Path, PipelineState], tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """ir.json and pipeline.json are each read once: while ``run`` rewrites them, a page never labels one version's content
+    with another version's hash, and 'pipeline.json describes this ir.json' is decided on the bytes actually parsed."""
+    ir_path, _state = project
+    record_path = tmp_path / PIPELINE_FILE
+    ir_v1, rec_v1 = ir_path.read_bytes(), record_path.read_bytes()
+    ir = CircuitIR.load(ir_path)
+    ir.project.name = "renamed-v2"
+    ir.save(ir_path)
+    ir_v2 = ir_path.read_bytes()
+    assert ir_v1 != ir_v2 and b"renamed-v2" not in ir_v1
+    # a second record: written for v2, so exactly one (record, ir.json) pairing describes the other
+    save_pipeline_record(PipelineState(outcomes=[StageOutcome(stage=Stage.REQUIREMENT_ANALYSIS, status=ValidationStatus.PASS)],
+                                       current=Stage.REQUIREMENT_ANALYSIS), ir, ir_path, tmp_path, results_before=7,
+                         ir_file_sha256=sha256_of_bytes(ir_v2))
+    rec_v2 = record_path.read_bytes()
+    assert rec_v1 != rec_v2
+    ir_path.write_bytes(ir_v1)
+    record_path.write_bytes(rec_v1)
+
+    # every read of either file returns the other version than the read before: a writer racing the renderer, made deterministic
+    versions = {ir_path.name: [ir_v1, ir_v2], record_path.name: [rec_v1, rec_v2]}
+    reads: dict[str, int] = {ir_path.name: 0, record_path.name: 0}
+    real_read_bytes = Path.read_bytes
+
+    def alternating(self: Path) -> bytes:
+        if self.name in versions and self.resolve().parent == tmp_path.resolve():
+            n = reads[self.name]
+            reads[self.name] = n + 1
+            return versions[self.name][n % 2]
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", alternating)
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: alternating(self).decode("utf-8"))  # no path may read the file twice
+    hashes = {sha256_of_bytes(b): b for b in (ir_v1, ir_v2, rec_v1, rec_v2)}
+    for page_no in range(6):
+        page = render_page(ir_path) if page_no % 2 else render_report_file(ir_path, tmp_path / "page.html").read_text(encoding="utf-8")
+        shown_ir = ir_v2 if "renamed-v2 - design report" in page else ir_v1
+        header = page[: page.index("<section>")]
+        stated = [h for h in hashes if h in header]
+        assert len(stated) == 2, stated  # one ir.json hash, one pipeline.json hash
+        ir_stated = next(h for h in stated if hashes[h] in (ir_v1, ir_v2))
+        rec_stated = next(h for h in stated if hashes[h] in (rec_v1, rec_v2))
+        assert hashes[ir_stated] == shown_ir, page_no  # the hash is of the bytes whose content the page shows
+        record = PipelineRecord.model_validate_json(hashes[rec_stated])
+        assert f"results before the run</th><td>{record.results_before}</td>" in page, page_no  # same for pipeline.json
+        expected_note = PIPELINE_DESCRIBES_IR if record.ir_file_sha256 == ir_stated else PIPELINE_STALE_IR
+        assert expected_note in header and (PIPELINE_STALE_IR if expected_note == PIPELINE_DESCRIBES_IR else PIPELINE_DESCRIBES_IR) not in header
+    assert reads[ir_path.name] == 6 and reads[record_path.name] == 6  # one read per file per page
 
 
 def _get(port: int, path: str = "/", headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:

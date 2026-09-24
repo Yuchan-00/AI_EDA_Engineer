@@ -152,14 +152,21 @@ def _header(data: ReportData) -> str:
 
 
 def _release(data: ReportData) -> str:
+    """The recorded RELEASE outcome with its run-freshness label right beside the status badge (a stale PASS never stands alone)."""
     r = data.release
     if r.status is None:
         return block("section", tag("h2", "RELEASE"), tag("p", r.note, class_="warn"))
     return block(
         "section",
         tag("h2", "RELEASE"),
-        block("p", tag("span", "recorded status: "), tag("span", r.status, class_=f"st st-{r.status}"), tag("span", f" at {r.at}")),
-        tag("p", r.note, class_="note"),
+        block(
+            "p",
+            tag("span", "recorded status: "),
+            tag("span", r.status, class_=f"st st-{r.status}"),
+            tag("span", f" at {r.at}"),
+            tag("span", f" - {r.freshness}", class_="note" if r.current else "warn"),
+        ),
+        tag("p", r.note, class_="note" if r.current else "warn"),
         _list(list(r.reasons)),
     )
 
