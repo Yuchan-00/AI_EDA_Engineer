@@ -68,6 +68,13 @@ Ambiguity rules (each one is pinned by ``tests/test_quantity.py``):
 * :func:`parse_quantity` answers only for an unambiguous phrase: exactly one
   quantity and no other digit anywhere else (``12V 입력`` -> 12 V;
   ``5V 2A``, ``12-5V`` and ``LM7805 at 12V`` -> ``None``).
+* :func:`parse_answer` is stricter still, for a value that becomes a design
+  input or a review target: the whole stripped text must be that one
+  quantity (not a range, not a ``±`` tolerance), with nothing beside it but
+  the AC / DC words (``12 V DC``, ``DC 12 V``, ``12 V (DC)``, ``직류 12 V``).
+  A qualifier is not read away: ``12 V max``, ``min 5 V``, ``12 V rms``,
+  ``12V 입력`` and ``not more than 12 V`` -> ``None`` - a stated limit is not
+  a nominal value.
 """
 
 from __future__ import annotations
@@ -294,6 +301,36 @@ def parse_quantity(text: str) -> Quantity | QuantityRange | None:
     return found
 
 
+#: what may stand beside the one quantity of an answer: the AC / DC words (``DC 12 V``, ``12 V (DC)``, ``직류 12 V``),
+#: the same spellings :mod:`ai_eda.regulatory.applicability` reads next to a voltage; anything else is a qualifier
+_ACDC_WORDS_RE = re.compile(r"^\s*(?:\(?\s*(?:AC|DC|ac|dc|Ac|Dc|교류|직류)\s*\)?\s*)*$")
+
+
+def parse_answer(text: str) -> Quantity | None:
+    """The one quantity ``text`` states *as a whole*, or ``None``.
+
+    Unlike :func:`parse_quantity` the quantity must be the entire stripped
+    text - only the AC / DC words may stand beside it - and it must be a
+    single value (no range, no ``±`` tolerance). ``'12 V'``, ``'12 V DC'``,
+    ``'DC 12 V'``, ``'12 V (DC)'`` and ``'10 mA'`` parse; ``'12 V max'``,
+    ``'min 5 V'``, ``'12 V rms'``, ``'12V 입력'``, ``'3.3~5V'``, ``'5V 2A'``,
+    ``'±5%'`` and ``'10k'`` do not. Used wherever a typed answer becomes a
+    number the design rests on (:mod:`ai_eda.design.inputs`) or a value a
+    verdict is compared with (the reviewer), so the two cannot drift.
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"expected str, got {type(text).__name__}")
+    hits = find_quantities(text)
+    if len(hits) != 1:
+        return None
+    (start, end), found = hits[0]
+    if not isinstance(found, Quantity) or found.plus_minus:
+        return None
+    if _ACDC_WORDS_RE.fullmatch(text[:start] + " " + text[end:]) is None:
+        return None
+    return found
+
+
 def parse_unit(text: str) -> tuple[str, int] | None:
     """``(canonical unit, prefix exponent)`` for a unit spelling on its own (``"kΩ"`` -> ``("ohm", 3)``,
     ``"m"`` -> ``("m", 0)``, ``"mA"`` -> ``("A", -3)``); ``None`` for a prefix alone or an unknown unit."""
@@ -366,6 +403,7 @@ __all__ = [
     "QuantityRange",
     "find_quantities",
     "format_quantity",
+    "parse_answer",
     "parse_quantity",
     "parse_unit",
 ]

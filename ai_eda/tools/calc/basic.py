@@ -16,7 +16,7 @@ import math
 
 from ai_eda.ir.provenance import Traced, derived
 
-CALC_VERSION = "0.4"
+CALC_VERSION = "0.5"
 
 #: tool id -> input roles, in the calculator's parameter order
 ROLES: dict[str, tuple[str, ...]] = {
@@ -32,6 +32,11 @@ ROLES: dict[str, tuple[str, ...]] = {
     "calc.rc.lowpass_phase_deg": ("f", "tau"),
     "calc.parallel.R": ("r_a", "r_b"),
     "calc.led.R": ("v_supply", "v_f", "i_f"),
+    "calc.divider.r1_for_v_out": ("v_in", "v_out", "r2"),
+    "calc.led.I": ("v_supply", "v_f", "r"),
+    "calc.rc.r_for_cutoff": ("f_c", "c"),
+    "calc.rc.ac_fstart": ("f_c",),
+    "calc.rc.ac_fstop": ("f_c",),
 }
 #: tool id -> the unit each role's input is expected to carry (``None``: any); an input whose unit is set
 #: and differs is refused by the recompute (a swapped voltage / resistance would otherwise be computed)
@@ -48,6 +53,11 @@ ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.rc.lowpass_phase_deg": ("Hz", "s"),
     "calc.parallel.R": ("ohm", "ohm"),
     "calc.led.R": ("V", "V", "A"),
+    "calc.divider.r1_for_v_out": ("V", "V", "ohm"),
+    "calc.led.I": ("V", "V", "ohm"),
+    "calc.rc.r_for_cutoff": ("Hz", "F"),
+    "calc.rc.ac_fstart": ("Hz",),
+    "calc.rc.ac_fstop": ("Hz",),
 }
 
 
@@ -141,3 +151,44 @@ def led_series_resistor(v_supply: Traced[float], v_forward: Traced[float], i_for
     if v_supply.value <= v_forward.value:
         raise ValueError("supply voltage must exceed LED forward voltage")
     return _derived((v_supply.value - v_forward.value) / i_forward.value, "calc.led.R", ids, "ohm", "R = (V_supply - V_f) / I_f")
+
+
+def divider_r1_for_v_out(v_in: Traced[float], v_out: Traced[float], r2: Traced[float], ids: tuple[str, str, str] = ("v_in", "v_out", "r2")) -> Traced[float]:
+    """The upper resistor that makes an unloaded divider with lower resistor ``r2`` output ``v_out`` from ``v_in``: R1 = R2 (V_in - V_out) / V_out."""
+    if r2.value <= 0:
+        raise ValueError("r2 must be positive")
+    if v_out.value <= 0 or v_out.value >= v_in.value:
+        raise ValueError("a divider needs 0 < v_out < v_in")
+    return _derived(r2.value * (v_in.value - v_out.value) / v_out.value, "calc.divider.r1_for_v_out", ids, "ohm", "R1 = R2 * (V_in - V_out) / V_out")
+
+
+def led_current(v_supply: Traced[float], v_forward: Traced[float], r: Traced[float], ids: tuple[str, str, str] = ("v_supply", "v_f", "r")) -> Traced[float]:
+    """Current through a series resistor ``r`` feeding an ideal constant-drop LED: I = (V_supply - V_f) / R."""
+    if r.value <= 0:
+        raise ValueError("resistance must be positive")
+    if v_supply.value <= v_forward.value:
+        raise ValueError("supply voltage must exceed LED forward voltage")
+    return _derived((v_supply.value - v_forward.value) / r.value, "calc.led.I", ids, "A", "I = (V_supply - V_f) / R (ideal constant-V_f LED)")
+
+
+def rc_r_for_cutoff(f_c: Traced[float], c: Traced[float], ids: tuple[str, str] = ("f_c", "c")) -> Traced[float]:
+    """The resistor that gives a first-order RC low-pass with capacitor ``c`` the cutoff (|H| = 1/sqrt 2) ``f_c``: R = 1 / (2 pi f_c C)."""
+    if f_c.value <= 0:
+        raise ValueError("cutoff frequency must be positive")
+    if c.value <= 0:
+        raise ValueError("capacitance must be positive")
+    return _derived(1.0 / (2.0 * math.pi * f_c.value * c.value), "calc.rc.r_for_cutoff", ids, "ohm", "R = 1 / (2 pi f_c C)")
+
+
+def rc_ac_fstart(f_c: Traced[float], ids: tuple[str] = ("f_c",)) -> Traced[float]:
+    """Start of an ac sweep around the corner ``f_c``: two decades below it."""
+    if f_c.value <= 0:
+        raise ValueError("cutoff frequency must be positive")
+    return _derived(f_c.value / 100.0, "calc.rc.ac_fstart", ids, "Hz", "f_start = f_c / 100 (two decades below the corner)")
+
+
+def rc_ac_fstop(f_c: Traced[float], ids: tuple[str] = ("f_c",)) -> Traced[float]:
+    """End of an ac sweep around the corner ``f_c``: two decades above it."""
+    if f_c.value <= 0:
+        raise ValueError("cutoff frequency must be positive")
+    return _derived(f_c.value * 100.0, "calc.rc.ac_fstop", ids, "Hz", "f_stop = f_c * 100 (two decades above the corner)")

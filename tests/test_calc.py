@@ -74,6 +74,11 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
         "calc.rc.lowpass_phase_deg": (user_requirement(150.0), user_requirement(1e-3)),
         "calc.parallel.R": (authoritative(1e3, DS), authoritative(1e3, DS)),
         "calc.led.R": (user_requirement(5.0), authoritative(2.0, DS), authoritative(0.01, DS)),
+        "calc.divider.r1_for_v_out": (user_requirement(12.0), user_requirement(5.0), user_requirement(1e4)),
+        "calc.led.I": (user_requirement(5.0), authoritative(2.0, DS), user_requirement(300.0)),
+        "calc.rc.r_for_cutoff": (user_requirement(1e3), user_requirement(1e-7)),
+        "calc.rc.ac_fstart": (user_requirement(1e3),),
+        "calc.rc.ac_fstop": (user_requirement(1e3),),
     }
     assert set(CALCULATORS) == set(sample) == set(ROLES) == set(ROLE_UNITS)
     for tool, (fn, keys) in CALCULATORS.items():

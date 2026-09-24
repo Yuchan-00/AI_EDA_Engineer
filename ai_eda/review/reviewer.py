@@ -29,13 +29,22 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   verify a requirement whose numeric value it does not agree with** (a 6 V
   requirement is not verified by an expectation whose nominal is 4 V: the
   nominal must match the requirement's value, same unit, within the
-  expectation's tolerance); NOT_VERIFIED when an expectation is traced to a
+  expectation's tolerance; a requirement whose value is the user's typed
+  text is read with :func:`~ai_eda.tools.calc.quantity.parse_answer` - the
+  whole text must be one quantity, ``'12 V max'`` is not comparable - and
+  ``details["quantity_version"]`` names the parser; for a ``reduce == AT``
+  expectation whose nominal is unit-less (an ac magnitude ratio) the sweep
+  point ``at`` is what is compared with the requirement, in the
+  requirement's unit); NOT_VERIFIED when an expectation is traced to a
   requirement without a comparable numeric value ("traced but not
   compared"), or when the netlist rests on an assumption; PASS only when
   every expectation of the current run passed and agrees with its
   requirement, with the rawfiles and ``results.json`` as evidence
   (expectations without a ``requirement_id`` are listed under
-  ``details["untraced"]``). Every verdict says it holds at nominal component
+  ``details["untraced"]``; components excluded from the netlist that serve
+  a verified requirement are listed under ``details["excluded_serving"]``
+  and named in the message - a verdict about an ideal source that replaces
+  a part says so). Every verdict says it holds at nominal component
   values and one temperature only (``details["conditions"]``).
 * ``review.calculations_vs_design``: the reviewer recomputes every derived
   value itself (:func:`ai_eda.tools.calc.recompute_parameters`, the same
@@ -95,12 +104,14 @@ from ai_eda.ir import (
     CircuitIR,
     Evidence,
     ProvenanceKind,
+    Reduce,
     SourceRef,
     ValidationResult,
     ValidationStatus,
     worst_status,
 )
 from ai_eda.review.areas import ReviewArea
+from ai_eda.tools.calc.quantity import QUANTITY_VERSION, parse_answer
 from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters
 from ai_eda.tools.kicad.board import BoardFootprint, read_board_footprints
 from ai_eda.tools.kicad.geometry import normalize_angle
@@ -618,11 +629,19 @@ class IndependentReviewer:
                 elif problem is not None:
                     not_compared.append(f"{exp.id}: {problem}")
         assumptions = list(spice.details.get("assumptions") or [])
+        # a part left out of the netlist whose requirement an expectation verified: the verdict is about what replaced it
+        verified_ids = {rid for rid in verified.values() if rid is not None}
+        excluded_serving: list[dict] = []
+        for entry in spice.details.get("excluded") or []:
+            c = ir.component(str(entry.get("ref"))) if isinstance(entry, dict) else None
+            if c is not None and set(c.serves_requirements) & verified_ids:
+                excluded_serving.append({"ref": c.ref, "reason": str(entry.get("reason", "")), "requirements": [rid for rid in c.serves_requirements if rid in verified_ids]})
         details: dict = {
-            "verified": verified, "untraced": untraced, "not_compared": not_compared, "assumptions": assumptions,
+            "verified": verified, "untraced": untraced, "not_compared": not_compared, "assumptions": assumptions, "excluded_serving": excluded_serving,
             "conditions": spice.details.get("conditions"), "engine": data.get("engine"), "engine_version": data.get("engine_version"),
-            "netlist_hash": netlist.content_hash,
+            "netlist_hash": netlist.content_hash, "quantity_version": QUANTITY_VERSION,
         }
+        excluded_note = "".join(f"; verified with {e['ref']} excluded: {e['reason']}" for e in excluded_serving)
         if spice.status is ValidationStatus.FAIL and not failed:
             failed.append(f"spice: {spice.message}")
         if failed or missing or unknown_req or disagree:
@@ -657,6 +676,7 @@ class IndependentReviewer:
             message=(
                 f"{len(verified)} expectation(s) verified by {data.get('engine')} {data.get('engine_version')} on the current netlist "
                 f"({traced} traced to requirements, nominals agree with the requirement values) - at nominal component values and one temperature only"
+                + excluded_note
             ),
             details=details,
             evidence=evidence,
@@ -669,24 +689,48 @@ class IndependentReviewer:
         ``(None, True)`` when they agree within the expectation's tolerance;
         ``(why, True)`` when both are numbers in the same unit and disagree;
         ``(why, False)`` when the requirement has no numeric value or another
-        unit, so nothing can be compared.
+        unit, so nothing can be compared. A requirement whose value is the
+        user's typed text (``'5 V'``) is read with
+        :func:`~ai_eda.tools.calc.quantity.parse_answer`: the whole text must
+        be that one quantity (``'5 V typ'`` or a range is not comparable).
+        For a ``reduce == AT`` expectation whose nominal carries no unit (an ac
+        magnitude ratio) and whose sweep point ``at`` is in the requirement's
+        unit, it is ``at`` that must be the requirement's value (the cutoff
+        frequency the ratio is checked at); a unit-ful nominal keeps the
+        nominal comparison.
         """
         value = req.value
         if value is None:
             return f"requirement {req.id} has no value to compare the nominal with", False
-        if isinstance(value.value, bool) or not isinstance(value.value, (int, float)):
-            return f"requirement {req.id} value {value.value!r} is not a number", False
-        unit_e, unit_r = (exp.nominal.unit or "").strip().lower(), (value.unit or "").strip().lower()
+        raw = value.value
+        if isinstance(raw, str):
+            q = parse_answer(raw)
+            if q is None:
+                return f"requirement {req.id} value {raw!r} is not one whole quantity with a unit", False
+            target, unit_req = q.value, q.unit
+        elif isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return f"requirement {req.id} value {raw!r} is not a number", False
+        else:
+            target, unit_req = float(raw), value.unit
+        unit_e, unit_r = (exp.nominal.unit or "").strip().lower(), (unit_req or "").strip().lower()
+        if exp.reduce == Reduce.AT and exp.at is not None and not unit_e:
+            unit_at = (exp.at.unit or "").strip().lower()
+            if unit_at and unit_r and unit_at == unit_r:
+                at = float(exp.at.value)
+                limit = abs(float(exp.tol_rel.value)) * abs(target) if exp.tol_rel is not None and target != 0.0 else 1e-9 * max(1.0, abs(target))
+                if abs(at - target) <= limit:
+                    return None, True
+                return f"sweep point {at:.6g} {unit_req} is not requirement {req.id}'s {target:.6g} {unit_req} (+/- {limit:.3g} {unit_req})", True
         if unit_e and unit_r and unit_e != unit_r:
-            return f"nominal unit {exp.nominal.unit!r} is not the requirement's {value.unit!r}", False
-        nominal, target = float(exp.nominal.value), float(value.value)
+            return f"nominal unit {exp.nominal.unit!r} is not the requirement's {unit_req!r}", False
+        nominal = float(exp.nominal.value)
         limits = [abs(float(exp.tol_abs.value))] if exp.tol_abs is not None else []
         if exp.tol_rel is not None and target != 0.0:
             limits.append(abs(float(exp.tol_rel.value)) * abs(target))
         limit = max(limits) if limits else 1e-9 * max(1.0, abs(target))
         if abs(nominal - target) <= limit:
             return None, True
-        unit = f" {value.unit}" if value.unit else ""
+        unit = f" {unit_req}" if unit_req else ""
         return f"nominal {nominal:.6g}{unit} is not requirement {req.id}'s {target:.6g}{unit} (+/- {limit:.3g}{unit})", True
 
     def check_calculations_vs_design(self, ir: CircuitIR, workdir: Path) -> ValidationResult:

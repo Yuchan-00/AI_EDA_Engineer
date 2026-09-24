@@ -160,7 +160,7 @@ def _bench_ir(tmp_path: Path, *parts: Component, nets: dict[str, list[tuple[str,
 
 def test_calculators_and_thermal_units():
     p = power_from_voltage_resistance(user_requirement(6.0, "V"), authoritative(1e4, DS, "ohm"), ("R1.v_across", "R1.resistance"))
-    assert p.value == pytest.approx(3.6e-3) and p.unit == "W" and p.provenance.tool == "calc.power.P_VR" and p.provenance.tool_version == CALC_VERSION == "0.4"
+    assert p.value == pytest.approx(3.6e-3) and p.unit == "W" and p.provenance.tool == "calc.power.P_VR" and p.provenance.tool_version == CALC_VERSION == "0.5"
     assert p.provenance.inputs == {"v": "R1.v_across", "r": "R1.resistance"}
     with pytest.raises(ZeroDivisionError):
         power_from_voltage_resistance(user_requirement(6.0), user_requirement(0.0))
