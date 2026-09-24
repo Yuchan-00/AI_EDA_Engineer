@@ -289,8 +289,12 @@ def test_power_needs_a_plain_r_binding_and_an_authoritative_resistance(monkeypat
         _part("R4", 2, SpiceBinding(device=SpiceDevice.R, value=r, provenance=AUTH), rating),  # no electrical resistance
         _part("R5", 2, SpiceBinding(device=SpiceDevice.R, value=r, provenance=AUTH), {**rating, "resistance": assumption(1e3, "guessed", "ohm")}),
         _part("R6", 2, SpiceBinding(device=SpiceDevice.R, value=r, provenance=AUTH), {**rating, "resistance": r}),
+        # a value AND a model: ngspice simulates the model's resistance, not the value - the value alone must not make it a plain R
+        _part("R7", 2, SpiceBinding(device=SpiceDevice.R, value=r, model_name="rmod", provenance=AUTH), {**rating, "resistance": r}),
+        _part("R8", 2, SpiceBinding(device=SpiceDevice.R, value=r, model_name="rmod", model_card=user_requirement(".model rmod r (rsh=1)"), provenance=AUTH), {**rating, "resistance": r}),
+        _part("R9", 2, SpiceBinding(device=SpiceDevice.R, value=r, model_card=user_requirement(".model rmod r (rsh=1)"), provenance=AUTH), {**rating, "resistance": r}),
     ]
-    nets = {"VIN": [(f"R{i}", "1") for i in range(1, 7)], "GND": [(f"R{i}", "2") for i in range(1, 7)]}
+    nets = {"VIN": [(f"R{i}", "1") for i in range(1, 10)], "GND": [(f"R{i}", "2") for i in range(1, 10)]}
     ir = _bench_ir(tmp_path, *parts, nets=nets)
     res = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]}))
     comp = res.details["components"]
@@ -301,17 +305,38 @@ def test_power_needs_a_plain_r_binding_and_an_authoritative_resistance(monkeypat
     assert comp["R5"]["power"]["reason"] == "resistance is assumption (needs confirmation)"
     assert comp["R6"]["power"]["status"] == "PASS" and comp["R6"]["power"]["p"] == pytest.approx(0.1) and comp["R6"]["power"]["reason"] == "100 mW <= 250 mW (power_rating)"
     assert comp["R6"]["power"]["dissipation"] == {**comp["R6"]["power"]["dissipation"], "tool": "calc.power.P_VR", "tool_version": CALC_VERSION, "unit": "W", "inputs": {"v": "R6.v_across", "r": "R6.resistance"}}
+    for ref in ("R7", "R8"):
+        assert comp[ref]["power"]["status"] == "NOT_VERIFIED" and "dissipation" not in comp[ref]["power"], ref
+        assert comp[ref]["power"]["reason"] == f"dissipation not computed: {ref} carries model 'rmod'; ngspice simulates a resistance that is not electrical[resistance]"
+    assert comp["R9"]["power"]["status"] == "NOT_VERIFIED" and comp["R9"]["power"]["reason"].startswith("dissipation not computed: R9 carries model card (without model_name)")
     # the voltage criterion does not care about params: every R sees 10 V <= 50 V
-    assert all(comp[f"R{i}"]["voltage"]["status"] == "PASS" for i in range(1, 7)) and comp["R6"]["status"] == "PASS" and res.status is S.NOT_VERIFIED
-    # thermal on the same op: R1 (params) never reaches a Tj, R6 does
+    assert all(comp[f"R{i}"]["voltage"]["status"] == "PASS" for i in range(1, 10)) and comp["R6"]["status"] == "PASS" and res.status is S.NOT_VERIFIED
+    # thermal on the same op: R1 (params), R7 / R8 (a model) and R9 (a card) never reach a Tj, R6 does
     ir.topology.domains.append(CircuitDomain.POWER)
-    _thermal(ir, ("R1", "R6"), theta_ja=100.0, t_j_max=155.0)
+    _thermal(ir, ("R1", "R6", "R7", "R8", "R9"), theta_ja=100.0, t_j_max=155.0)
     ir.simulation = __import__("ai_eda.ir", fromlist=["SimulationSetup"]).SimulationSetup(temperature_c=user_requirement(27.0, "degC"))
     th = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]}), THERMAL)
     tc = th.details["components"]
     assert tc["R1"]["thermal"]["status"] == "NOT_VERIFIED" and tc["R1"]["thermal"]["reason"].startswith("dissipation not computed: R1 carries SPICE params ['m']")
     assert tc["R6"]["thermal"]["status"] == "PASS" and tc["R6"]["thermal"]["t_j"] == pytest.approx(37.0) and tc["R6"]["thermal"]["calc"]["tool"] == "calc.thermal.T_j"
+    for ref in ("R7", "R8"):
+        assert tc[ref]["thermal"]["status"] == "NOT_VERIFIED" and tc[ref]["thermal"]["reason"].startswith(f"dissipation not computed: {ref} carries model 'rmod'") and "t_j" not in tc[ref]["thermal"]
+    assert tc["R9"]["thermal"]["status"] == "NOT_VERIFIED" and "carries model card (without model_name)" in tc["R9"]["thermal"]["reason"]
     assert tc["R2"]["thermal"]["reason"] == "no theta_ja / t_j_max (datasheet facts: theta_ja in K/W, t_j_max in degC)" and th.status is S.NOT_VERIFIED
+
+
+def test_a_stress_exactly_at_its_rating_is_within_the_limit(monkeypatch, tmp_path: Path):
+    """The comparisons are ``>``: v == v_max and p == power_rating are PASS (100 % of the rating, no derating), one unit more is FAIL."""
+    r = authoritative(100.0, DS, "ohm")  # 10 V across 100 ohm: exactly 1 W
+    parts = [
+        _part("R1", 2, SpiceBinding(device=SpiceDevice.R, value=r, provenance=AUTH), {"resistance": r, "v_max": authoritative(10.0, DS, "V"), "power_rating": authoritative(1.0, DS, "W")}),
+        _part("R2", 2, SpiceBinding(device=SpiceDevice.R, value=r, provenance=AUTH), {"resistance": r, "v_max": authoritative(9.999, DS, "V"), "power_rating": authoritative(0.999, DS, "W")}),
+    ]
+    ir = _bench_ir(tmp_path, *parts, nets={"VIN": [("R1", "1"), ("R2", "1")], "GND": [("R1", "2"), ("R2", "2")]})
+    comp = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]})).details["components"]
+    assert comp["R1"]["voltage"] == {**comp["R1"]["voltage"], "status": "PASS", "v": 10.0, "limit": 10.0, "reason": "10 V <= 10 V (v_max)"}
+    assert comp["R1"]["power"] == {**comp["R1"]["power"], "status": "PASS", "p": 1.0, "limit": 1.0, "reason": "1 W <= 1 W (power_rating)"} and comp["R1"]["status"] == "PASS"
+    assert comp["R2"]["voltage"]["status"] == "FAIL" and comp["R2"]["power"]["status"] == "FAIL" and comp["R2"]["power"]["reason"] == "1 W > 999 mW (power_rating)"
 
 
 def test_ratings_must_be_authoritative_numbers_with_the_expected_unit(monkeypatch, tmp_path: Path):
@@ -381,6 +406,34 @@ def test_thermal_ambient_rules(monkeypatch, tmp_path: Path):
     ir.component("R1").electrical["t_j_max"] = authoritative(36.0, RESISTOR_DS, "degC")
     th = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]}), THERMAL)
     assert th.status is S.FAIL and th.details["repair"] == "human" and th.details["components"]["R1"]["thermal"]["reason"] == "Tj 37 degC > t_j_max 36 degC"
+    # exactly at the rating (Tj == t_j_max) is within the limit: the comparison is ``>``
+    ir.component("R1").electrical["t_j_max"] = authoritative(37.0, RESISTOR_DS, "degC")
+    th = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]}), THERMAL)
+    assert th.status is S.PASS and th.details["components"]["R1"]["thermal"]["reason"] == "Tj 37 degC <= t_j_max 37 degC" and th.details["components"]["R1"]["thermal"]["t_j"] == 37.0
+    # the same gate as component.fit: a would-be PASS is NOT_VERIFIED when the netlist rests on an assumption ...
+    th = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]}, assumptions=["R1 value: guessed"]), THERMAL)
+    t = th.details["components"]["R1"]["thermal"]
+    assert th.status is S.NOT_VERIFIED and t["status"] == "NOT_VERIFIED" and t["t_j"] == 37.0  # the numbers stay
+    assert t["reason"] == "within limit (Tj 37 degC <= t_j_max 37 degC) but the netlist rests on assumption(s) ['R1 value: guessed'] that nobody confirmed"
+    assert th.details["assumptions"] == ["R1 value: guessed"] and "R1 NOT_VERIFIED (thermal: within limit" in th.message and "repair" not in th.details
+    # ... or the run's spice summary is FAIL ...
+    th = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]}, spice_status=S.FAIL), THERMAL)
+    t = th.details["components"]["R1"]["thermal"]
+    assert th.status is S.NOT_VERIFIED and t["status"] == "NOT_VERIFIED" and t["reason"] == "within limit (Tj 37 degC <= t_j_max 37 degC) but computed on an op of a run whose spice summary is FAIL"
+    assert th.message.startswith("computed on an op of a run whose spice summary is FAIL; ") and th.details["spice_status"] == "FAIL"
+    # ... while an over-limit Tj stays FAIL whatever the run says
+    ir.component("R1").electrical["t_j_max"] = authoritative(36.0, RESISTOR_DS, "degC")
+    for run in (_fake_run(ir, {"vin": [10.0]}, spice_status=S.FAIL), _fake_run(ir, {"vin": [10.0]}, assumptions=["R1 value: guessed"])):
+        th = _judge(monkeypatch, ir, run, THERMAL)
+        assert th.status is S.FAIL and th.details["repair"] == "human" and th.details["components"]["R1"]["thermal"]["reason"] == "Tj 37 degC > t_j_max 36 degC"
+    ir.component("R1").electrical["t_j_max"] = authoritative(40.0, RESISTOR_DS, "degC")
+    # an ambient in another unit is not judged as degC, even at the op's number
+    ir.simulation = SimulationSetup(temperature_c=user_requirement(27.0, "K"))
+    th = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]}), THERMAL)
+    t = th.details["components"]["R1"]["thermal"]
+    assert th.status is S.NOT_VERIFIED and t["status"] == "NOT_VERIFIED" and t["reason"] == "simulation.temperature_c carries unit 'K', expected degC" and "t_j" not in t
+    assert th.details["t_a"] is None and "expected degC" in th.message
+    ir.simulation = SimulationSetup(temperature_c=user_requirement(27.0, "degC"))
     # a thermal key with the wrong unit family or provenance
     ir.component("R1").electrical["theta_ja"] = authoritative(100.0, RESISTOR_DS, "ohm")
     th = _judge(monkeypatch, ir, _fake_run(ir, {"vin": [10.0]}), THERMAL)

@@ -161,16 +161,52 @@ def test_datasheet_hash_cell_is_refused_not_neutralised(tmp_path: Path):
         ("10k", "line1\nline2", "R1.Description"),  # a newline would open a new CSV row that may start with '='
         ("\t=1+1", "resistor", "R1.Value"),  # the tab is a control character even though the stripped check would neutralise it
         ("10k\x7f", "resistor", "R1.Value"),
+        # Unicode line breaks: a C1 control (NEL) and the line / paragraph separators end a line for str.splitlines and Unicode-aware readers
+        ("10k\x85=1+1", "resistor", "R1.Value"),
+        ("10k", "a\u2028=cmd", "R1.Description"),
+        ("10k", "a\u2029=cmd", "R1.Description"),
+        # format characters (invisible): a byte-order mark hides the formula prefix from the check, a bidi override hides what is shown
+        ("\ufeff=1+1", "resistor", "R1.Value"),
+        ("10k", "res\u202eistor", "R1.Description"),
+        ("10k", "zero\u200bwidth", "R1.Description"),
     ],
 )
 def test_control_character_in_free_text_is_refused(tmp_path: Path, value: str, description: str, cell: str):
     part = make_component("R1", value)
     part.description = description
-    with pytest.raises(CompileError, match=f"{cell}.*control character"):
+    with pytest.raises(CompileError, match=f"{cell}.*control character U\\+[0-9A-F]{{4}} \\(Unicode category (Cc|Zl|Zp|Cf)\\)"):
         _compile(_ir(tmp_path, part), tmp_path)
     assert not (tmp_path / "bom.csv").exists()
     with pytest.raises(ValueError, match="control character"):
         free_text_cell(value + description, cell)
+
+
+def test_unicode_separators_are_refused_in_identity_cells_and_by_the_catalog(tmp_path: Path):
+    """The same rule for every cell: an MPN with U+2028 is refused by the BOM compiler and its catalog row is skipped; printable non-ASCII passes."""
+    from ai_eda.parts.catalog import CatalogSource
+
+    for bad in ("RC0603\u2028=cmd", "RC0603\x85x", "\ufeffRC0603", "RC\u200b0603"):
+        assert unsafe_cell(bad) is not None and "control character" in unsafe_cell(bad), bad
+        part = make_component("R1", "10k")
+        part.mpn = authoritative(bad, DS)
+        with pytest.raises(CompileError, match="R1.MPN.*control character U\\+.*refusing"):
+            _compile(_ir(tmp_path, part), tmp_path)
+        assert not (tmp_path / "bom.csv").exists()
+    for ok in ("RC0603", "10 kΩ", "저항 0603", "R-0603", "±5 %"):
+        assert unsafe_cell(ok) is None, ok
+        assert free_text_cell(ok, "x") == (ok, None) or ok[0] in "=+-@"
+    csv_path = tmp_path / "catalog.csv"
+    csv_path.write_text(
+        "mpn,manufacturer,package,stock,unit_price\n"
+        "GOOD-1,Example Vendor,0603,10,0.01\n"
+        "BAD\u2028=cmd,Example Vendor,0603,10,0.01\n"
+        "\ufeffBAD-2,Example Vendor,0603,10,0.01\n"
+        "GOOD-2,Example\u2029=x Vendor,0603,10,0.01\n",
+        encoding="utf-8",
+    )
+    cat = CatalogSource.load(csv_path, "2026-09-24", "community dump")
+    assert [r.mpn for r in cat.rows] == ["GOOD-1"]
+    assert sum(1 for n in cat.notes if "skipped" in n and "control character U+" in n) == 3, cat.notes
 
 
 # --------------------------------------------------------------------------- the reviewer decodes the cell

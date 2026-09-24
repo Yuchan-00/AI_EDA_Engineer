@@ -25,12 +25,20 @@ and KiCad-saved demo boards):
   absolute-position formula above applies unchanged to the *stored* offsets.
 
 All results are rounded to 1e-6 mm, KiCad's internal resolution.
+
+A box is only ever built from finite points: ``min`` / ``max`` drop a NaN
+silently and an infinite coordinate makes a box that is everywhere, so a
+non-finite pad or courtyard coordinate (the library loader refuses them at
+the source; a hand-built :class:`FootprintDef` could still carry one) is a
+:class:`~ai_eda.errors.CompileError` naming the footprint, never a smaller
+extent.
 """
 
 from __future__ import annotations
 
 import math
 
+from ai_eda.errors import CompileError
 from ai_eda.ir import BoardSide, Placement
 from ai_eda.tools.kicad.library import BBox, FootprintDef, Pad
 
@@ -49,6 +57,7 @@ __all__ = [
     "courtyard_bbox",
     "pads_bbox",
     "footprint_bbox",
+    "finite_bbox",
 ]
 
 #: KiCad's internal unit is 1 nm = 1e-6 mm.
@@ -132,12 +141,23 @@ def pad_layers(placement: Placement, pad: Pad) -> list[str]:
     return [mirrored_layer(layer, placement.side) for layer in pad.layers]
 
 
-def _bbox_of_points(points: list[tuple[float, float]]) -> BBox | None:
+def _bbox_of_points(points: list[tuple[float, float]], what: str) -> BBox | None:
+    """Axis-aligned box around ``points``; ``None`` for no points; :class:`CompileError` when a coordinate is not finite (module docstring)."""
     if not points:
         return None
+    bad = [pt for pt in points if not (math.isfinite(pt[0]) and math.isfinite(pt[1]))]
+    if bad:
+        raise CompileError(f"{what} has a non-finite coordinate ({bad[0][0]!r}, {bad[0][1]!r}); its extent cannot be measured")
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     return BBox(_q(min(xs)), _q(min(ys)), _q(max(xs)), _q(max(ys)))
+
+
+def finite_bbox(box: BBox, what: str) -> BBox:
+    """``box`` when all four coordinates are finite, else :class:`CompileError` naming ``what``."""
+    if not all(math.isfinite(v) for v in (box.x1, box.y1, box.x2, box.y2)):
+        raise CompileError(f"{what} has a non-finite extent ({box}); refusing to use it")
+    return box
 
 
 def courtyard_bbox(placement: Placement, fp: FootprintDef) -> BBox | None:
@@ -150,7 +170,7 @@ def courtyard_bbox(placement: Placement, fp: FootprintDef) -> BBox | None:
     if cy is None:
         return None
     corners = [(cy.x1, cy.y1), (cy.x2, cy.y1), (cy.x2, cy.y2), (cy.x1, cy.y2)]
-    return _bbox_of_points([to_board(placement, x, y) for x, y in corners])
+    return _bbox_of_points([to_board(placement, x, y) for x, y in corners], f"footprint {fp.lib_id} courtyard")
 
 
 def pads_bbox(placement: Placement, fp: FootprintDef) -> BBox | None:
@@ -165,12 +185,12 @@ def pads_bbox(placement: Placement, fp: FootprintDef) -> BBox | None:
         else:
             hx = hy = math.hypot(pad.size_w, pad.size_h) / 2.0
         points += [(cx - hx, cy - hy), (cx + hx, cy + hy)]
-    return _bbox_of_points(points)
+    return _bbox_of_points(points, f"footprint {fp.lib_id} pads")
 
 
 def footprint_bbox(placement: Placement, fp: FootprintDef) -> BBox | None:
-    """Union of :func:`courtyard_bbox` and :func:`pads_bbox` (None when neither exists)."""
+    """Union of :func:`courtyard_bbox` and :func:`pads_bbox` (None when neither exists); never a box with a non-finite coordinate."""
     boxes = [b for b in (courtyard_bbox(placement, fp), pads_bbox(placement, fp)) if b is not None]
     if not boxes:
         return None
-    return BBox(min(b.x1 for b in boxes), min(b.y1 for b in boxes), max(b.x2 for b in boxes), max(b.y2 for b in boxes))
+    return finite_bbox(BBox(min(b.x1 for b in boxes), min(b.y1 for b in boxes), max(b.x2 for b in boxes), max(b.y2 for b in boxes)), f"footprint {fp.lib_id}")

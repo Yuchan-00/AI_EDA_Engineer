@@ -178,8 +178,10 @@ def component_stress(ir: CircuitIR, run: FreshSpiceRun, c: Component) -> Compone
         what = []
         if b.params:
             what.append(f"SPICE params {sorted(b.params)}")
-        if b.model_name is not None or b.model_card is not None:
+        if b.model_name is not None:
             what.append(f"model {b.model_name!r}")
+        elif b.model_card is not None:
+            what.append("model card (without model_name)")
         if b.value is None:
             what.append("no value")
         st.p_reason = f"dissipation not computed: {c.ref} carries {' and '.join(what)}; ngspice simulates a resistance that is not electrical[resistance]"

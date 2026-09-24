@@ -24,12 +24,14 @@ from ai_eda.errors import CompileError
 from ai_eda.ir import (
     ArtifactKind,
     BoardOutline,
+    BoardSide,
     CircuitIR,
     Layer,
     ManufacturingConstraints,
     Net,
     PCBDesign,
     PinRef,
+    Placement,
     ProjectMeta,
     Provenance,
     ProvenanceKind,
@@ -43,8 +45,9 @@ from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.cli import KicadCli
 from ai_eda.tools.kicad.geometry import footprint_bbox
-from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary, LibraryFormatError
+from ai_eda.tools.kicad.library import BBox, FootprintDef, KicadLibrary, LibraryFormatError, Pad
 from ai_eda.tools.placement import COLUMNS, MARGIN_MM, PLACER_ID, PLACER_VERSION, SPACING_MM, footprint_extent, grid_pitch, grid_placement
+from ai_eda.tools.placement.grid import _disjoint
 from ai_eda.workflow import Orchestrator, Stage
 from ai_eda.workflow.stages import STAGE_ORDER
 from tests.conftest import DS
@@ -173,6 +176,78 @@ def test_tool_refuses_instead_of_guessing(tmp_path: Path, lib: KicadLibrary):
     g = grid_placement(ir, lib, outline=BoardOutline(width_mm=20.0, height_mm=10.0, origin_x_mm=50.0, origin_y_mm=40.0))
     assert g.outline == BoardOutline(width_mm=20.0, height_mm=10.0, origin_x_mm=50.0, origin_y_mm=40.0)
     assert (g.placements[0].x_mm, g.placements[0].y_mm) == (50.0 + 3.2, 40.0 + 2.6)
+
+
+def test_touching_extents_are_refused_by_the_guard(tmp_path: Path, lib: KicadLibrary):
+    """With ``spacing=0`` the pitch equals the extent, so neighbouring extents share an edge: the re-measured guard refuses the grid."""
+    ir = parts_ir(tmp_path, lib, refs=("R1", "R2"))
+    with pytest.raises(CompileError, match=r"placed extents of 'R1' and 'R2' touch or overlap .*; refusing the grid"):
+        grid_placement(ir, lib, spacing=0.0)
+    with pytest.raises(CompileError, match="touch or overlap"):  # one column: the shared edge is horizontal
+        grid_placement(ir, lib, spacing=0.0, columns=1)
+    assert len(grid_placement(ir, lib, spacing=0.01).placements) == 2  # any gap at all is apart
+    # the rule itself: a shared edge is not disjoint, a 0.01 mm gap is, and the test is symmetric
+    a = BBox(0.0, 0.0, 2.0, 1.0)
+    for b in (BBox(2.0, 0.0, 4.0, 1.0), BBox(0.0, 1.0, 2.0, 2.0), BBox(-2.0, 0.0, 0.0, 1.0), BBox(0.0, -1.0, 2.0, 0.0), BBox(1.0, 0.5, 3.0, 1.5), a):
+        assert not _disjoint(a, b) and not _disjoint(b, a), b
+    for b in (BBox(2.01, 0.0, 4.0, 1.0), BBox(0.0, 1.01, 2.0, 2.0), BBox(-2.0, 0.0, -0.01, 1.0), BBox(0.0, -1.0, 2.0, -0.01)):
+        assert _disjoint(a, b) and _disjoint(b, a), b
+
+
+def _write_footprint(root: Path, name: str, at: str, size: str) -> KicadLibrary:
+    """``Test:<name>`` with the synthetic courtyard and one pad whose ``(at ...)`` / ``(size ...)`` are given verbatim."""
+    pretty = root / "footprints" / "Test.pretty"
+    pretty.mkdir(parents=True, exist_ok=True)
+    (pretty / f"{name}.kicad_mod").write_text(
+        f'(footprint "{name}" (version 20260206) (generator "pcbnew") (layer "F.Cu") (attr smd)\n'
+        f'  (fp_rect (start -1 -0.6) (end 1 0.6) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))\n'
+        f'  (pad "1" smd rect (at {at}) (size {size}) (layers "F.Cu" "F.Mask" "F.Paste")))\n',
+        encoding="utf-8",
+    )
+    return KicadLibrary(roots=[root])
+
+
+@pytest.mark.parametrize("at, size, what", [("nan 0", "0.8 0.9", "pad '1' (at x)"), ("0.8 0", "inf 0.9", "pad '1' (size w)"), ("0.8 -inf", "0.8 0.9", "pad '1' (at y)")])
+def test_non_finite_footprint_geometry_is_refused_not_dropped(tmp_path: Path, lib: KicadLibrary, at: str, size: str, what: str):
+    """``float("nan")`` vanishes from ``min`` / ``max`` and ``inf`` is everywhere: such a pad is refused at the loader, the extent and the agent, never placed without it."""
+    fresh = _write_footprint(tmp_path / "kicad_bad", "FP", at, size)  # its own root: ``lib`` (the good Test:FP) resolves the part first
+    ir = parts_ir(tmp_path, lib, refs=("R1",))
+    ref = ir.component("R1").footprint
+    assert fresh.footprint_file("Test", "FP") is not None  # the file exists; it is the geometry that is refused (resolve loads it, so it refuses too)
+    pattern = rf"FP\.kicad_mod: footprint 'FP': {what.replace('(', chr(92) + '(').replace(')', chr(92) + ')')} is not a finite number"
+    with pytest.raises(LibraryFormatError, match=pattern):
+        fresh.load_footprint(ref)
+    with pytest.raises(LibraryFormatError, match=pattern):
+        fresh.resolve_footprint(ref)
+    with pytest.raises(CompileError, match="not a finite number"):
+        grid_placement(ir, fresh)
+    res = _run_agent(ir, tmp_path, fresh)
+    assert res.proposals == [] and len(res.notes) == 1 and res.notes[0].startswith("not placed: ") and "is not a finite number" in res.notes[0] and "FP.kicad_mod" in res.notes[0]
+
+
+def test_extent_of_a_hand_built_footprint_with_non_finite_geometry_is_refused():
+    """Belt and braces behind the loader: ``footprint_bbox`` / ``footprint_extent`` never return a box that dropped a NaN pad or reaches infinity."""
+
+    def pad(**over: float) -> Pad:
+        fields = {"number": "1", "pad_type": "smd", "shape": "rect", "x": -0.8, "y": 0.0, "rotation": 0.0, "size_w": 0.8, "size_h": 0.9, "drill": None, "layers": ["F.Cu"]}
+        return Pad(**{**fields, **over})
+
+    courtyard = BBox(-1.0, -0.6, 1.0, 0.6)
+    finite = FootprintDef(lib_id="Test:Finite", name="Finite", node=["footprint", "Finite"], pads=[pad()], attr="smd", courtyard=courtyard)
+    assert footprint_extent(finite) == BBox(-1.2, -0.6, 1.0, 0.6)
+    placed = Placement(component_ref="R1", x_mm=5.0, y_mm=5.0, rotation_deg=0.0, side=BoardSide.TOP)
+    # a NaN pad would silently shrink the extent to the courtyard and an infinite one stretches it to infinity: both are refused
+    for pads, cy in (
+        ([pad(), pad(number="2", x=float("nan"))], courtyard),
+        ([pad(), pad(number="2", x=0.8, size_w=float("inf"))], courtyard),
+        ([pad()], BBox(-1.0, float("nan"), 1.0, 0.6)),
+        ([pad()], BBox(-1.0, -0.6, float("inf"), 0.6)),
+    ):
+        fp = FootprintDef(lib_id="Test:Bad", name="Bad", node=["footprint", "Bad"], pads=pads, attr="smd", courtyard=cy)
+        with pytest.raises(CompileError, match="footprint Test:Bad .*non-finite"):
+            footprint_extent(fp)
+        with pytest.raises(CompileError, match="footprint Test:Bad .*non-finite"):
+            footprint_bbox(placed, fp)
 
 
 def test_every_placement_is_traced_to_the_tool_and_its_inputs(tmp_path: Path, lib: KicadLibrary):

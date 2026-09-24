@@ -47,7 +47,7 @@ from typing import Mapping
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import BoardOutline, BoardSide, CircuitIR, Placement, Provenance, ProvenanceKind
-from ai_eda.tools.kicad.geometry import RESOLUTION_DECIMALS, footprint_bbox
+from ai_eda.tools.kicad.geometry import RESOLUTION_DECIMALS, finite_bbox, footprint_bbox
 from ai_eda.tools.kicad.library import BBox, FootprintDef, KicadLibrary
 
 __all__ = [
@@ -93,13 +93,16 @@ def footprint_extent(fp: FootprintDef) -> BBox:
     """The footprint's extent (courtyard union pads) around its own origin at rotation 0 on the top side.
 
     Raises :class:`CompileError` when the footprint has neither a courtyard
-    nor pads: a size for it would be a guess.
+    nor pads (a size for it would be a guess) or when the measured box has a
+    non-finite coordinate (a NaN pad would otherwise vanish from ``min`` /
+    ``max`` and an infinite one is everywhere; the library loader refuses
+    such numbers at the source and this is the guard behind it).
     """
     origin = Placement(component_ref="", x_mm=0.0, y_mm=0.0, rotation_deg=0.0, side=BoardSide.TOP)
     box = footprint_bbox(origin, fp)
     if box is None:
         raise CompileError(f"footprint {fp.lib_id} has neither a courtyard nor pads; its extent cannot be measured")
-    return box
+    return finite_bbox(box, f"footprint {fp.lib_id}")
 
 
 def grid_pitch(extents: Mapping[str, BBox], spacing: float) -> tuple[float, float]:
@@ -201,7 +204,7 @@ def grid_placement(
             provenance=placement_provenance(fp.lib_id, spacing, margin, columns),
         )
         box = footprint_bbox(placement, fp)
-        assert box is not None  # the extent was measurable a moment ago from the same footprint
+        assert box is not None  # the extent was measurable (and finite) a moment ago from the same footprint
         placements.append(placement)
         placed[ref] = box
     if outline is None:
