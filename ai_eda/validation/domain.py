@@ -26,6 +26,7 @@ THERMAL_VERSION = "0.1"
 #: the ``Component.electrical`` keys the thermal check reads and the unit family each must carry
 THERMAL_KEYS: dict[str, str] = {"theta_ja": "K/W", "t_j_max": "degC"}
 NO_THERMAL_KEYS = "no component carries theta_ja / t_j_max (datasheet facts: theta_ja in K/W, t_j_max in degC)"
+NO_THERMAL_KEYS_OUTSIDE_POWER = NO_THERMAL_KEYS + "; the design is not in the POWER domain, so nothing is claimed"
 
 S = ValidationStatus
 
@@ -47,12 +48,16 @@ class PowerThermalValidator(Validator):
     every input authoritative, no netlist assumption and a ``spice``
     summary that is not FAIL; every other case is NOT_VERIFIED naming the
     missing key, kind, unit or ambient. One result for the design, worst
-    over its components; a design where no component carries a thermal key
-    at all is NOT_VERIFIED naming the keys to ground.
+    over its components. The check applies to every design (a part that
+    dissipates power is not confined to the POWER domain): a design where
+    no component carries a thermal key at all is NOT_VERIFIED naming the
+    keys to ground when the topology declares the POWER domain, and
+    NOT_APPLICABLE otherwise (nothing claimed, nothing to judge); as soon
+    as one component carries a key it is judged whatever the domain.
     """
 
     id = THERMAL_TOOL
-    domains = frozenset({CircuitDomain.POWER})
+    domains = frozenset()  # every design; the POWER domain only decides how "no thermal data" is reported
     description = "Junction temperature from the op dissipation (Tj = Ta + P * theta_ja) vs the datasheet t_j_max"
     consumes = frozenset({SPICE_CHECK_ID})
 
@@ -89,7 +94,8 @@ class PowerThermalValidator(Validator):
         if not ir.components:
             return [self._result(ir, S.NOT_APPLICABLE, "no components")]
         if not any(k in c.electrical for c in ir.components for k in THERMAL_KEYS):
-            return [self._result(ir, S.NOT_VERIFIED, NO_THERMAL_KEYS)]
+            power = ir.topology is not None and CircuitDomain.POWER in ir.topology.domains
+            return [self._result(ir, S.NOT_VERIFIED if power else S.NOT_APPLICABLE, NO_THERMAL_KEYS if power else NO_THERMAL_KEYS_OUTSIDE_POWER)]
         run = fresh_spice_run(ir, needs="thermal analysis needs an operating point from SPICE")
         if isinstance(run, str):
             return [self._result(ir, S.NOT_VERIFIED, run)]

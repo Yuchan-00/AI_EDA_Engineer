@@ -184,9 +184,15 @@ def test_no_run_attached_every_op_validator_refuses_with_its_need(divider_ir: Ci
     assert fit.message == "component fit needs an operating point from SPICE; no tool-backed spice result attached"
     assert fit.details["criteria_evaluated"] == ["electrical stress"] and fit.details["criteria_not_evaluated"] == list(FIT_CRITERIA[1:])
     assert fit.artifact_hash is None and fit.evidence == [] and fit.ir_hash == divider_ir.content_hash()
+    # thermal runs for every design: outside the POWER domain a design without thermal keys claims nothing ...
+    assert CircuitDomain.POWER not in divider_ir.topology.domains
+    [th] = THERMAL.validate(divider_ir, _vctx(tmp_path))
+    assert th.status is S.NOT_APPLICABLE and th.message.startswith(NO_THERMAL_KEYS) and "not in the POWER domain" in th.message
     divider_ir.topology.domains.append(CircuitDomain.POWER)
     [th] = THERMAL.validate(divider_ir, _vctx(tmp_path))
     assert th.status is S.NOT_VERIFIED and th.message == NO_THERMAL_KEYS and th.tool == THERMAL_TOOL and th.tool_version == THERMAL_VERSION
+    # ... and with a key present it is judged whatever the domain
+    divider_ir.topology.domains.remove(CircuitDomain.POWER)
     _thermal(divider_ir, ("R1",))
     [th] = THERMAL.validate(divider_ir, _vctx(tmp_path))
     assert th.status is S.NOT_VERIFIED and th.message == "thermal analysis needs an operating point from SPICE; no tool-backed spice result attached"
@@ -412,7 +418,8 @@ def test_pipeline_divider_without_ratings_is_not_verified_with_real_evidence(tmp
     assert d["components"]["J1"]["voltage"] == {"status": "NOT_VERIFIED", "reason": "excluded from SPICE (connector, no electrical model): no operating point"}
     assert "J1 NOT_VERIFIED (voltage: excluded from SPICE" in fit.message and "one temperature (27 degC)" in fit.message
     # the thermal validator does not run on an ANALOG-only design (registry selection), and nothing was written into the IR
-    assert ir.validation.latest(THERMAL_TOOL) is None
+    th = ir.validation.latest(THERMAL_TOOL)  # thermal runs for every design; an ANALOG divider without thermal keys claims nothing
+    assert th is not None and th.status is S.NOT_APPLICABLE and "not in the POWER domain" in th.message and th.ir_hash == ir.content_hash()
     assert "component.fit" in ir.validation.latest_by_check() and recompute_parameters(ir).status is S.PASS
 
 
