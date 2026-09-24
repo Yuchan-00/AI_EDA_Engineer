@@ -202,7 +202,8 @@ class CircuitIR(BaseModel):
         Left out, each by the model that owns it (:func:`~ai_eda.ir.provenance.drop_in_design_view`):
         ``validation`` / ``artifacts`` (state about the design);
         ``project.workdir`` / ``project.created_at`` (where and when it was built);
-        ``requirements.extraction_cache`` (what a model said, not what the design is);
+        ``requirements.extraction_cache`` (what a model said, not what the design is) and
+        ``requirements.presented`` (which question texts the user has been shown - bookkeeping of the dialogue);
         every ``Provenance.created_at`` (a clock default);
         the locators ``SourceRef.document_path``, ``LibraryRef.library_path`` and
         ``RegulatoryProvenance.source_document`` (where a copy lives - the hashes that pin the copies stay);

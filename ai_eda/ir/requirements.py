@@ -99,8 +99,14 @@ class RequirementSet(BaseModel):
     #: memo of model extractions keyed by ``sha256:`` of :meth:`request_text`; not design content
     #: (excluded from the design hash), see the module docstring
     extraction_cache: dict[str, Any] = Field(default_factory=dict)
+    #: bookkeeping of what the user has been shown, by answer key: ``sha256:`` of the text of a system question
+    #: (a template's ``confirm_design`` table) as it was last asked. A confirmation counts only for the text the
+    #: user saw, so the agent that asks records it here and compares before it honours the answer. Not design
+    #: content (a table names library paths; the same design shown on two machines must hash the same): excluded
+    #: from the design hash like ``extraction_cache``.
+    presented: dict[str, str] = Field(default_factory=dict)
 
-    _design = drop_in_design_view("extraction_cache")
+    _design = drop_in_design_view("extraction_cache", "presented")
 
 
     def request_text(self) -> str:

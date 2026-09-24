@@ -297,3 +297,21 @@ def test_unfetched_url_of_an_accepted_proposal_is_reported(fake, tmp_path: Path)
     _run_agent(ir, _llm_ctx(tmp_path, svc))
     result = _run_agent(ir, _llm_ctx(tmp_path, svc, online_archive(tmp_path / "sources", fake), **{ACCEPT_REGS_KEY: GOOD_ID}))
     assert any("official document missing" in n for n in result.notes) and GOOD_ID not in [r.id for r in ir.regulatory.requirements]
+
+
+def test_control_answers_of_every_agent_never_reach_the_rules_or_the_scope_answers(tmp_path: Path):
+    """One CONTROL_KEYS for every agent: confirm_design / pcb.placement (and the rest) are neither rule inputs nor recorded scope answers."""
+    from ai_eda.agents import keys
+    from ai_eda.agents.regulatory import CONTROL_KEYS as REG_KEYS
+    from ai_eda.agents.requirement import CONTROL_KEYS as REQ_KEYS
+
+    assert REG_KEYS is REQ_KEYS is keys.CONTROL_KEYS and {"confirm_design", "pcb.placement", "confirm_requirements", "accept_regulations"} <= keys.CONTROL_KEYS
+    ir = _ir(tmp_path, "EU")
+    answers = {k: "yes" for k in keys.CONTROL_KEYS} | {"pcb.placement": "skip", "mains_powered": "no", "radio": "no"}
+    result = _run_agent(ir, AgentContext(workdir=tmp_path, answers=answers))
+    app = _latest(result, APPLICABILITY_CHECK)
+    assert set(app.details["answers"]) == {"mains_powered", "radio"} and not (set(app.details["answers"]) & keys.CONTROL_KEYS)
+    assert set(ir.regulatory.scope_answers) == {"mains_powered", "radio"}
+    assert all(not (set(r.applicability_inputs) & keys.CONTROL_KEYS) for r in ir.regulatory.requirements)
+    used = next(n for n in result.notes if n.startswith("scope answers used"))
+    assert "confirm_design" not in used and "pcb.placement" not in used

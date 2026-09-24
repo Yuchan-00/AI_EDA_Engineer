@@ -65,8 +65,8 @@ from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
 from ai_eda.ir import CircuitIR, MissingInformation, ProvenanceKind, ValidationResult, ValidationStatus
 from ai_eda.ir.regulatory import Applicability, GroundedQuote, ProposedRegulation, RegulatoryProvenance, RegulatoryRequirement, RegulatoryState
 from ai_eda.llm.client import LLMError, LLMMessage
-from ai_eda.agents.component import CONFIRM_FACTS_KEY, CONFIRM_PARTS_KEY, EXTRACT_FACTS_KEY, FACTS_FILE_KEY
-from ai_eda.llm.extraction import ACCEPT_KEY, CONFIRM_KEY, REJECT_KEY, _strictify, find_directive, is_confirmation
+from ai_eda.agents.keys import ACCEPT_REGS_KEY, CONTROL_KEYS, PROPOSE_REGS_KEY, REJECT_REGS_KEY
+from ai_eda.llm.extraction import _strictify, find_directive, is_confirmation
 from ai_eda.llm.router import TaskKind
 from ai_eda.llm.service import BudgetExceededError, LLMService, StructuredOutputError
 from ai_eda.regulatory.applicability import yes_no
@@ -76,15 +76,11 @@ from ai_eda.security.approval import ApprovalGate
 from ai_eda.tools.sources.archive import DocumentArchive
 from ai_eda.tools.sources.policy import NetworkPolicy, host_key, host_of, normalise_url
 
-#: answer keys that steer this agent (comma-separated proposal ids) and are never scope answers
-ACCEPT_REGS_KEY = "accept_regulations"
-REJECT_REGS_KEY = "reject_regulations"
-#: ``--answer propose_regulations=yes``: the user's explicit request for the (billed) model call that proposes further regulations;
-#: without it the model is never asked, while decisions on proposals shown in an earlier run are still applied
-PROPOSE_REGS_KEY = "propose_regulations"
-CONTROL_KEYS: frozenset[str] = frozenset({
-    ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY, CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY, CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY,
-})
+#: ``ACCEPT_REGS_KEY`` / ``REJECT_REGS_KEY`` (comma-separated proposal ids) steer this agent and are never scope answers;
+#: ``--answer propose_regulations=yes`` is the user's explicit request for the (billed) model call that proposes further
+#: regulations - without it the model is never asked, while decisions on proposals shown in an earlier run are still applied.
+#: All three are defined in :mod:`ai_eda.agents.keys` with every other control key (``CONTROL_KEYS``): a control answer of
+#: any agent never reaches the applicability rules and is never recorded as a scope answer.
 PROPOSALS_CHECK = "regulatory.proposals"
 #: bumped whenever the prompt, the schema or the screening rules change (cached proposals made under other rules are stale)
 PROPOSAL_VERSION = "1"

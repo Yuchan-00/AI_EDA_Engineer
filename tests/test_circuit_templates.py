@@ -19,8 +19,9 @@ from pathlib import Path
 import pytest
 
 from ai_eda.agents import AgentContext, CircuitDesignAgent
-from ai_eda.agents.circuit import CONFIRM_DESIGN_KEY
-from ai_eda.agents.requirement import CONTROL_KEYS
+from ai_eda.agents.circuit import CONFIRM_DESIGN_KEY, table_hash
+from ai_eda.agents.keys import CONTROL_KEYS, PLACEMENT_KEY
+from ai_eda.agents.requirement import CONTROL_KEYS as REQUIREMENT_CONTROL_KEYS
 from ai_eda.compilers import BOMCompiler, CompileContext, SchematicCompiler, SpiceNetlistCompiler
 from ai_eda.design import (
     CHOICE_NOTE_PREFIX,
@@ -28,7 +29,9 @@ from ai_eda.design import (
     TEMPLATE_VERSION,
     TOOL_ID,
     check_inputs_vs_requirements,
+    late_load_changes,
     read_inputs,
+    read_value,
 )
 from ai_eda.ir import (
     ArtifactKind,
@@ -44,8 +47,10 @@ from ai_eda.ir import (
     llm_generated,
     user_requirement,
 )
+from ai_eda.llm.extraction import ACCEPT_KEY, CONFIRM_KEY
 from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.tools.calc import CALC_VERSION, parse_answer, recompute_parameters
+from ai_eda.tools.calc.basic import led_series_resistor
 from ai_eda.tools.calc.quantity import QUANTITY_VERSION
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.library import KicadLibrary
@@ -53,6 +58,7 @@ from ai_eda.tools.kicad.sexpr import Q, S as SX
 from ai_eda.tools.spice import NgspiceShared
 from ai_eda.validation import ValidationContext, default_registry
 from ai_eda.workflow import Orchestrator, Stage
+from tests.test_requirement_agent_llm import USAGE, _req, _service
 
 runner = NgspiceShared()
 needs_dll = pytest.mark.skipif(not runner.available(), reason="ngspice shared library not found")
@@ -146,7 +152,9 @@ def _present(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary, answers: dict[str
     assert state.blocked and state.current is Stage.ARCHITECTURE
     assert [q.key for q in state.open_questions] == [CONFIRM_DESIGN_KEY]
     assert ir.components == [] and ir.nets == [] and ir.parameters == {} and ir.simulation is None and ir.topology is None
-    return state.open_questions[0].question
+    question = state.open_questions[0].question
+    assert ir.requirements.presented[CONFIRM_DESIGN_KEY] == table_hash(question) and "presented" not in ir.design_dict()["requirements"]
+    return question
 
 
 def _confirm(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary, stop_after: Stage | None = Stage.ARCHITECTURE, *, spice: bool = False):
@@ -183,6 +191,13 @@ def test_first_run_presents_the_table_and_applies_nothing(tmp_path: Path):
     res = CircuitDesignAgent().run(ir, _ctx(tmp_path, lib, {}))
     assert ir.content_hash() == before and res.proposals == [] and res.validation == [] and res.blocked_on_user
     assert res.questions[0].question == question  # deterministic: the same IR yields the same table
+    assert [q.key for q in res.questions] == [CONFIRM_DESIGN_KEY, "output_current"]  # the advisory load question is asked with the table
+    # before any table was shown, the only proposal is the record of the one shown now (outside the design hash)
+    ir.requirements.presented.clear()
+    res = CircuitDesignAgent().run(ir, _ctx(tmp_path, lib, {}))
+    assert [(p.target, p.operation) for p in res.proposals] == [("requirements.presented", "set")] and res.proposals[0].payload == {CONFIRM_DESIGN_KEY: table_hash(question)}
+    Orchestrator.apply_proposals(ir, res.proposals)
+    assert ir.content_hash() == before
 
 
 def test_confirm_applies_the_divider_with_the_choices_as_user_values(tmp_path: Path):
@@ -197,7 +212,7 @@ def test_confirm_applies_the_divider_with_the_choices_as_user_values(tmp_path: P
     assert [q.key for q in out.questions] == ["output_current"] and not out.questions[0].required  # advisory, the real key
     assert not state.blocked and state.outcomes[-1].stage is Stage.RELEASE and state.outcomes[-1].status is not S.PASS
     assert [r.id for r in ir.requirements.requirements] == ids_before  # a template never authors a requirement
-    assert ir.requirements.get(CONFIRM_DESIGN_KEY) is None and CONFIRM_DESIGN_KEY in CONTROL_KEYS
+    assert ir.requirements.get(CONFIRM_DESIGN_KEY) is None and CONFIRM_DESIGN_KEY in CONTROL_KEYS and REQUIREMENT_CONTROL_KEYS is CONTROL_KEYS
     # the design
     assert [c.ref for c in ir.components] == ["R1", "R2", "J1"] and [n.name for n in ir.nets] == ["VIN", "VOUT", "GND"]
     assert ir.topology.name == "resistive divider" and [c.id for c in ir.constraints] == ["c.divider.unloaded"]
@@ -246,7 +261,7 @@ def test_confirm_applies_the_divider_with_the_choices_as_user_values(tmp_path: P
     out3 = state3.outcome(Stage.ARCHITECTURE)
     assert out3.status is S.PASS and out3.message.startswith("design content already present (3 component(s), 3 net(s), a topology, a simulation setup); templates only start an empty design, nothing proposed")
     check = ir.validation.latest(INPUTS_CHECK)
-    assert check.status is S.PASS and check.tool == TOOL_ID and check.tool_version == TEMPLATE_VERSION and check.ir_hash == ir.content_hash()
+    assert check.status is S.PASS and check.tool == TOOL_ID and check.tool_version == TEMPLATE_VERSION and check.ir_hash is None  # unstamped: an agent result of this run
     assert check.details["quantity_version"] == QUANTITY_VERSION and set(check.details["parameters"]) == {"v_in", "v_out_target"}
     assert len(ir.components) == 3 and out3.questions == []
 
@@ -267,8 +282,8 @@ def test_confirmation_counts_only_for_a_table_shown_in_an_earlier_run(tmp_path: 
     ir = _ir(tmp_path)
     state, _ = _run(ir, tmp_path, lib, {**BASE, **DIVIDER, CONFIRM_DESIGN_KEY: "yes"})
     out = state.outcome(Stage.ARCHITECTURE)
-    assert state.blocked and [q.key for q in out.questions] == [CONFIRM_DESIGN_KEY] and ir.components == []
-    assert f"{CONFIRM_DESIGN_KEY} ignored: input(s) ['input_voltage', 'output_voltage'] were given in this run" in out.message
+    assert state.blocked and [q.key for q in out.questions] == [CONFIRM_DESIGN_KEY, "output_current"] and ir.components == []
+    assert f"{CONFIRM_DESIGN_KEY} ignored: answer(s) ['application', 'input_voltage', 'jurisdiction', 'output_voltage'] were given in this run" in out.message
     state, _ = _confirm(ir, tmp_path, lib)  # the inputs are requirements now: the table was shown, the confirmation counts
     assert not state.blocked and len(ir.components) == 3
 
@@ -283,7 +298,7 @@ def test_no_leaves_the_design_empty_and_other_answers_ask_again(tmp_path: Path):
     assert f"{CONFIRM_DESIGN_KEY}='no': template divider not applied, the design stays empty" in out.message
     state, _ = _run(ir, tmp_path, lib, {CONFIRM_DESIGN_KEY: "maybe later"})
     out = state.outcome(Stage.ARCHITECTURE)
-    assert state.blocked and [q.key for q in out.questions] == [CONFIRM_DESIGN_KEY] and ir.components == []
+    assert state.blocked and [q.key for q in out.questions] == [CONFIRM_DESIGN_KEY, "output_current"] and ir.components == []
     assert "answer 'maybe later' to confirm_design not understood" in out.message
 
 
@@ -298,7 +313,10 @@ def test_divider_refuses_a_load_with_the_real_key_and_the_pipeline_continues(tmp
     assert out.status is S.NOT_VERIFIED and ir.components == [] and not state.blocked
     assert "template divider not proposed: the request needs 5 V at 2 A from 12 V (req.output_current): a resistive divider cannot supply a load" in out.message
     assert [(q.key, q.required) for q in out.questions] == [("output_current", False)]
-    assert out.questions[0].question.startswith("The request needs 5 V at 2 A from 12 V (req.output_current): a resistive divider cannot supply a load. Answer output_current=0 A if VOUT drives no load")
+    q = out.questions[0].question
+    assert q.startswith("The request needs 5 V at 2 A from 12 V (req.output_current): a resistive divider cannot supply a load. This template cannot serve that requirement")
+    assert "Change the requirement req.output_current in the IR (or correct the request) so it states 0 A, choose another design" in q
+    assert "Answer output_current=0 A" not in q  # req.output_current is the user's typed value: an --answer for that key would be kept out
     assert state.outcomes[-1].stage is Stage.RELEASE and state.outcomes[-1].status is not S.PASS
     assert ir.requirements.get("circuit_for_load") is None  # no system-authored key became a requirement
     report = IndependentReviewer(tools=ctx.tools).review(ir, tmp_path)
@@ -626,3 +644,215 @@ def test_the_design_package_never_returns_a_model_or_assumption_value(tmp_path: 
         text = str(dumped["components"]) + str(dumped["nets"]) + str(dumped["simulation"]) + str(dumped["topology"]) + str(dumped["constraints"])
         assert "llm_generated" not in text and "assumption" not in text, name
         assert copy.deepcopy(ir).content_hash() == ir.content_hash()
+
+
+# --------------------------------------------------------------------------- a confirmation counts only for the table the user saw
+
+
+DIVIDER_CANNED = {
+    "requirements": [
+        _req("input_voltage", "Input voltage is 12 V", "12 V input", 12, "V", "12 V"),
+        _req("output_voltage", "Output voltage is 5 V", "5 V output", 5, "V", "5 V"),
+    ],
+    "questions": [], "conflicts": [], "assumptions": [],
+    "application": {"summary": "bench reference", "quote": "bench reference"},
+    "jurisdictions": [{"code": "EU", "quote": "EU"}],
+}
+
+
+def _llm_run(ir: CircuitIR, svc, tmp_path: Path, lib: KicadLibrary, answers: dict[str, str]):
+    return Orchestrator(AgentContext(workdir=tmp_path, llm=svc, tools={"kicad_library": lib}, answers=answers)).run(ir)
+
+
+def test_confirm_design_beside_confirm_requirements_in_one_run_asks_the_table_and_applies_nothing(tmp_path: Path):
+    """The run that confirms the extraction is the first in which the inputs are usable: no table was shown before it."""
+    lib = template_library(tmp_path / "kicad")
+    svc, client = _service([{"structured": DIVIDER_CANNED, "usage": USAGE}])
+    ir = _ir(tmp_path, "llm")
+    ir.requirements.raw_input = "12 V input, 5 V output, bench reference, EU"
+    state = _llm_run(ir, svc, tmp_path, lib, {})
+    assert state.blocked and [q.key for q in state.open_questions] == [CONFIRM_KEY] and ir.requirements.presented == {}
+    state = _llm_run(ir, svc, tmp_path, lib, {CONFIRM_KEY: "yes", CONFIRM_DESIGN_KEY: "yes"})
+    assert ir.requirements.get("input_voltage").value.provenance.kind is ProvenanceKind.USER_REQUIREMENT  # confirmed in this run
+    out = state.outcome(Stage.ARCHITECTURE)
+    assert state.blocked and state.current is Stage.ARCHITECTURE and [q.key for q in state.open_questions] == [CONFIRM_DESIGN_KEY]
+    assert ir.components == [] and ir.nets == [] and ir.parameters == {} and ir.topology is None
+    assert f"{CONFIRM_DESIGN_KEY} ignored: answer(s) ['{CONFIRM_KEY}'] were given in this run and can change the inputs a template reads" in out.message
+    assert ir.requirements.presented[CONFIRM_DESIGN_KEY] == table_hash(state.open_questions[0].question) and len(client.calls) == 1
+    # any non-control answer beside the confirmation is the same case: the table this run shows is not the one on screen
+    state = _llm_run(ir, svc, tmp_path, lib, {"application": "bench reference", CONFIRM_DESIGN_KEY: "yes"})
+    assert state.blocked and ir.components == [] and "answer(s) ['application'] were given in this run" in state.outcome(Stage.ARCHITECTURE).message
+    # a decision on an inferred item is one too; a control key of another agent is not
+    state = _llm_run(ir, svc, tmp_path, lib, {ACCEPT_KEY: "nothing", CONFIRM_DESIGN_KEY: "yes"})
+    assert state.blocked and ir.components == [] and f"answer(s) ['{ACCEPT_KEY}'] were given in this run" in state.outcome(Stage.ARCHITECTURE).message
+    assert len(client.calls) == 1  # the extraction was never re-run: every run above hit the cache
+    state = _llm_run(ir, svc, tmp_path, lib, {CONFIRM_DESIGN_KEY: "yes", PLACEMENT_KEY: "skip"})
+    assert not state.blocked and [c.ref for c in ir.components] == ["R1", "R2", "J1"] and ir.pcb is None
+
+
+def test_confirmation_is_content_based_a_requirement_edited_between_the_runs_re_asks(tmp_path: Path):
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path)
+    question = _present(ir, tmp_path, lib, DIVIDER)
+    saved = ir.save(tmp_path / "ir.json")
+    ir = CircuitIR.load(saved)  # the record survives the strict loader
+    assert ir.requirements.presented[CONFIRM_DESIGN_KEY] == table_hash(question)
+    ir.requirements.get("output_voltage").value = user_requirement("6 V")  # a hand edit, no --answer: the given-now guard cannot see it
+    state, _ = _confirm(ir, tmp_path, lib)
+    out = state.outcome(Stage.ARCHITECTURE)
+    assert state.blocked and ir.components == [] and [q.key for q in out.questions] == [CONFIRM_DESIGN_KEY, "output_current"]
+    assert f"{CONFIRM_DESIGN_KEY} ignored: the table below (" in out.message and "is not the one you confirmed - the table shown to you before was sha256:" in out.message
+    shown = out.questions[0].question
+    assert "req.output_voltage: output_voltage = 6 V (stated as '6 V')" in shown and ir.requirements.presented[CONFIRM_DESIGN_KEY] == table_hash(shown) != table_hash(question)
+    state, _ = _confirm(ir, tmp_path, lib)  # the 6 V table was shown by the previous run: this confirmation counts
+    assert not state.blocked and len(ir.components) == 3 and ir.parameters["v_out_target"].value == 6.0
+    # no record at all (an IR whose bookkeeping was dropped) is not a shown table either
+    ir = _ir(tmp_path, "norec")
+    _present(ir, tmp_path, lib, DIVIDER)
+    ir.requirements.presented.clear()
+    state, _ = _confirm(ir, tmp_path, lib)
+    assert state.blocked and ir.components == [] and "no table was recorded as shown" in state.outcome(Stage.ARCHITECTURE).message
+    state, _ = _confirm(ir, tmp_path, lib)
+    assert not state.blocked and len(ir.components) == 3
+
+
+# --------------------------------------------------------------------------- the inputs check is an agent result of its run, never stale within it
+
+
+def test_inputs_check_is_unstamped_so_a_later_stage_of_the_same_run_cannot_make_it_stale(tmp_path: Path):
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path)
+    _present(ir, tmp_path, lib, DIVIDER)
+    _run(ir, tmp_path, lib, {CONFIRM_DESIGN_KEY: "yes", PLACEMENT_KEY: "skip"}, None)
+    assert len(ir.components) == 3 and ir.pcb is None
+    state, _ = _run(ir, tmp_path, lib, {}, None)  # PLACEMENT now applies a proposal after ARCHITECTURE produced the check
+    check = ir.validation.latest(INPUTS_CHECK)
+    assert check.status is S.PASS and check.ir_hash is None and ir.pcb is not None
+    release = state.outcomes[-1]
+    assert release.stage is Stage.RELEASE and "another IR version" not in release.message and INPUTS_CHECK not in release.message
+
+
+# --------------------------------------------------------------------------- the divider's load question: with the table, and after the build
+
+
+def test_load_question_is_asked_with_the_table_and_a_zero_answer_before_the_build_is_served(tmp_path: Path):
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path)
+    state, _ = _run(ir, tmp_path, lib, {**BASE, **DIVIDER})
+    assert [q.key for q in state.open_questions] == [CONFIRM_DESIGN_KEY]
+    load = [q for q in state.optional_questions if q.key == "output_current"]
+    assert len(load) == 1 and load[0].question.startswith("No load current was stated: does VOUT need to supply one?. Answer output_current=0 A if VOUT drives no load")
+    state, _ = _run(ir, tmp_path, lib, {"output_current": "0 A", CONFIRM_DESIGN_KEY: "yes"})  # answered as instructed: a new input, so the table is re-shown
+    out = state.outcome(Stage.ARCHITECTURE)
+    assert state.blocked and ir.components == [] and "answer(s) ['output_current'] were given in this run" in out.message
+    assert "req.output_current: output_current = 0 A (stated as '0 A')" in out.questions[0].question and [q.key for q in out.questions] == [CONFIRM_DESIGN_KEY]
+    state, ctx = _confirm(ir, tmp_path, lib, None)
+    assert not state.blocked and ir.net("VOUT").serves_requirements == ["req.output_voltage", "req.output_current"]
+    r = IndependentReviewer(tools=ctx.tools).check_requirements_vs_ir(ir, tmp_path)
+    assert r.status is S.PASS and "req.output_current" in r.details["traced"]
+
+
+def test_a_zero_load_stated_after_the_build_is_served_by_a_proposal_and_a_load_is_named(tmp_path: Path):
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path)
+    _present(ir, tmp_path, lib, DIVIDER)
+    _confirm(ir, tmp_path, lib)
+    assert late_load_changes(ir).changes == [] and ir.net("VOUT").serves_requirements == ["req.output_voltage"]
+    state, ctx = _run(ir, tmp_path, lib, {"output_current": "0 A"}, None)
+    out = state.outcome(Stage.ARCHITECTURE)
+    assert out.status is S.PASS and "req.output_current = 0 A stated after the build: VOUT is a high-impedance reference and is proposed to serve it" in out.message
+    assert "no component or net serves" not in out.message and ir.net("VOUT").serves_requirements == ["req.output_voltage", "req.output_current"]
+    assert ir.net("VOUT").provenance.tool == f"{TOOL_ID}.divider" and ir.validation.latest(INPUTS_CHECK).status is S.PASS
+    report = IndependentReviewer(tools=ctx.tools).review(ir, tmp_path)
+    assert {x.check_id: x for x in report.results}[ReviewArea.REQUIREMENTS_VS_IR].status is S.PASS
+    assert ReviewArea.REQUIREMENTS_VS_IR not in state.outcomes[-1].message
+    state, _ = _run(ir, tmp_path, lib, {})  # idempotent: nothing left to serve
+    assert "proposed to serve" not in state.outcome(Stage.ARCHITECTURE).message and ir.net("VOUT").serves_requirements == ["req.output_voltage", "req.output_current"]
+    # a load stated after the build: named, not served, and the reviewer still FAILs it (honest)
+    ir = _ir(tmp_path, "load")
+    _present(ir, tmp_path, lib, DIVIDER)
+    _confirm(ir, tmp_path, lib)
+    state, ctx = _run(ir, tmp_path, lib, {"output_current": "2 A"}, None)
+    out = state.outcome(Stage.ARCHITECTURE)
+    assert "req.output_current = 2 A: a resistive divider cannot supply a load; VOUT does not serve it" in out.message
+    assert "no component or net serves: req.output_current" in out.message and ir.net("VOUT").serves_requirements == ["req.output_voltage"]
+    r = {x.check_id: x for x in IndependentReviewer(tools=ctx.tools).review(ir, tmp_path).results}[ReviewArea.REQUIREMENTS_VS_IR]
+    assert r.status is S.FAIL and r.details["unserved"] == ["req.output_current"]
+    # a hand-made design (VOUT not the divider's) is left alone
+    ir.net("VOUT").provenance = Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="mine")
+    ir.requirements.get("output_current").value = user_requirement("0 A")
+    assert late_load_changes(ir).changes == [] and late_load_changes(ir).notes == []
+
+
+def test_a_typed_answer_dropped_for_a_key_that_holds_a_typed_value_is_noted(tmp_path: Path):
+    """The refusal names req.output_current and says to change it; answering the key again does nothing, and a note says so."""
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path)
+    state, _ = _run(ir, tmp_path, lib, {**BASE, **DIVIDER, "output_current": "2 A"})
+    [q] = [q for q in state.optional_questions if q.key == "output_current"]
+    assert "Change the requirement req.output_current in the IR" in q.question and "--answer" not in q.question and "Answer output_current=" not in q.question
+    state, _ = _run(ir, tmp_path, lib, {"output_current": "0 A"})
+    assert ir.requirements.get("output_current").value.value == "2 A" and [r.key for r in ir.requirements.requirements].count("output_current") == 1
+    msg = state.outcome(Stage.REQUIREMENT_ANALYSIS).message
+    assert "output_current: answer '0 A' not applied - req.output_current already holds your earlier answer '2 A', which is kept; to change it edit that requirement in the IR" in msg
+    assert "template divider not proposed: the request needs 5 V at 2 A from 12 V (req.output_current)" in state.outcome(Stage.ARCHITECTURE).message
+    # an unreadable stated load names its requirement id too
+    ir = _ir(tmp_path, "unreadable")
+    state, _ = _run(ir, tmp_path, lib, {**BASE, **DIVIDER, "output_current": "2 A max"})
+    [q] = [q for q in state.optional_questions if q.key == "output_current"]
+    assert q.question.startswith("Output_current is stated but not readable (req.output_current: '2 A max' is not one whole quantity") and "Change the requirement req.output_current in the IR" in q.question
+
+
+# --------------------------------------------------------------------------- non-finite numbers: a refusal note, never a traceback
+
+
+def test_non_finite_typed_values_are_unusable_not_a_crash(tmp_path: Path):
+    lib = template_library(tmp_path / "kicad")
+    req = Requirement(id="req.input_voltage", key="input_voltage", text="x", kind=RequirementKind.EXPLICIT, value=user_requirement("1e309 V"))
+    assert read_value(req, "V") == (None, "req.input_voltage: '1e309 V' is not a finite number")
+    req = Requirement(id="req.cutoff_frequency", key="cutoff_frequency", text="x", kind=RequirementKind.EXPLICIT, value=user_requirement(1e300, "GHz"))
+    assert read_value(req, "Hz") == (None, "req.cutoff_frequency: 1e+300 GHz is not a finite number in Hz")
+    ir = _ir(tmp_path)
+    state, _ = _run(ir, tmp_path, lib, {**BASE, "input_voltage": "1e309 V", "output_voltage": "5 V"}, None)
+    out = state.outcome(Stage.ARCHITECTURE)
+    assert not state.blocked and ir.components == [] and "input_voltage not usable: req.input_voltage: '1e309 V' is not a finite number" in out.message
+    assert state.outcomes[-1].stage is Stage.RELEASE
+    ir = _ir(tmp_path, "rc")
+    ir.requirements.requirements.append(Requirement(id="req.cutoff_frequency", key="cutoff_frequency", text="x", kind=RequirementKind.EXPLICIT, value=user_requirement(1e300, "GHz")))
+    state, _ = _run(ir, tmp_path, lib, {**BASE})
+    assert ir.components == [] and "cutoff_frequency not usable: req.cutoff_frequency: 1e+300 GHz is not a finite number in Hz" in state.outcome(Stage.ARCHITECTURE).message
+
+
+def test_a_calculator_that_overflows_refuses_the_template_with_a_sentence(tmp_path: Path):
+    lib = template_library(tmp_path / "kicad")
+    with pytest.raises(ValueError, match=r"^calc\.led\.R overflows: R = \(V_supply - V_f\) / I_f is not a finite number for these inputs$"):
+        led_series_resistor(user_requirement(5.0, "V"), user_requirement(2.0, "V"), user_requirement(1e-320, "A"))
+    ir = _ir(tmp_path)
+    state, _ = _run(ir, tmp_path, lib, {**BASE, **LED, "led_forward_current": "1e-320 A"}, None)
+    out = state.outcome(Stage.ARCHITECTURE)
+    assert not state.blocked and ir.components == [] and state.outcomes[-1].stage is Stage.RELEASE
+    assert "template led not proposed: calc.led.R overflows: R = (V_supply - V_f) / I_f is not a finite number for these inputs (req.input_voltage = 5 V" in out.message
+    assert "validation error" not in out.message and "Traced" not in out.message
+    # the divider's and the RC's calculators are guarded the same way
+    ir = _ir(tmp_path, "div")
+    state, _ = _run(ir, tmp_path, lib, {**BASE, "input_voltage": "1e308 V", "output_voltage": "1e-308 V"})
+    assert ir.components == [] and "template divider not proposed: calc.divider.r1_for_v_out overflows" in state.outcome(Stage.ARCHITECTURE).message
+    ir = _ir(tmp_path, "rc")
+    state, _ = _run(ir, tmp_path, lib, {**BASE, "cutoff_frequency": "1e-310 Hz"})
+    assert ir.components == [] and "template rc_lowpass not proposed: calc.rc.r_for_cutoff overflows: R = 1 / (2 pi f_c C) is not a finite number" in state.outcome(Stage.ARCHITECTURE).message
+    ir = _ir(tmp_path, "rc0")
+    state, _ = _run(ir, tmp_path, lib, {**BASE, "cutoff_frequency": "1e-320 Hz"})  # the product underflows to zero: a sentence, not a ZeroDivisionError
+    assert ir.components == [] and "template rc_lowpass not proposed: calc.rc.r_for_cutoff underflows: 2 pi f_c C is zero" in state.outcome(Stage.ARCHITECTURE).message
+
+
+def test_inputs_check_reports_a_non_finite_edited_requirement_as_not_verified(tmp_path: Path):
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path)
+    _present(ir, tmp_path, lib, DIVIDER)
+    _confirm(ir, tmp_path, lib)
+    ir.requirements.get("input_voltage").value = user_requirement("1e309 V")
+    r = check_inputs_vs_requirements(ir)
+    assert r.status is S.NOT_VERIFIED and r.message == "1 template input(s) could not be re-read: v_in: req.input_voltage: '1e309 V' is not a finite number"
+    assert r.details["parameters"]["v_in"]["status"] == S.NOT_VERIFIED.value and "reread" not in r.details["parameters"]["v_in"]
+    state, _ = _run(ir, tmp_path, lib, {}, None)
+    assert state.outcome(Stage.ARCHITECTURE).status is S.NOT_VERIFIED and state.outcomes[-1].stage is Stage.RELEASE

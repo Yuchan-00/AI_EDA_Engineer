@@ -6,7 +6,8 @@ own parameter order, plus the same ids as ``derived_from``), so
 :func:`ai_eda.tools.calc.recompute.recompute_parameters` can rebuild the call
 by role instead of trusting the positional order of a list. A caller that
 passes the wrong number of ids gets a ``ValueError`` here, not a provenance
-that cannot be checked later. The roles and the unit each role expects are
+that cannot be checked later; so does a result that is not a finite number
+(``'... overflows'``), since a ``Traced`` never holds one. The roles and the unit each role expects are
 published in :data:`ROLES` / :data:`ROLE_UNITS` for the recompute registry.
 """
 
@@ -65,6 +66,9 @@ def _derived(value: float, tool: str, ids: tuple[str, ...], unit: str | None, no
     roles = ROLES[tool]
     if len(ids) != len(roles):
         raise ValueError(f"{tool} takes {len(roles)} input ids {list(roles)}, got {len(ids)}: {list(ids)}")
+    if not math.isfinite(value):
+        # a Traced holds no inf / nan (the IR cannot carry one): say so in one sentence a note can quote
+        raise ValueError(f"{tool} overflows: {note} is not a finite number for these inputs")
     return derived(value, tool=tool, inputs=dict(zip(roles, ids)), unit=unit, tool_version=CALC_VERSION, note=note)
 
 
@@ -177,7 +181,10 @@ def rc_r_for_cutoff(f_c: Traced[float], c: Traced[float], ids: tuple[str, str] =
         raise ValueError("cutoff frequency must be positive")
     if c.value <= 0:
         raise ValueError("capacitance must be positive")
-    return _derived(1.0 / (2.0 * math.pi * f_c.value * c.value), "calc.rc.r_for_cutoff", ids, "ohm", "R = 1 / (2 pi f_c C)")
+    denominator = 2.0 * math.pi * f_c.value * c.value
+    if denominator == 0:
+        raise ValueError("calc.rc.r_for_cutoff underflows: 2 pi f_c C is zero in float arithmetic for these inputs")
+    return _derived(1.0 / denominator, "calc.rc.r_for_cutoff", ids, "ohm", "R = 1 / (2 pi f_c C)")
 
 
 def rc_ac_fstart(f_c: Traced[float], ids: tuple[str] = ("f_c",)) -> Traced[float]:

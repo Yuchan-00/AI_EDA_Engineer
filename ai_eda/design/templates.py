@@ -12,14 +12,21 @@ question under that requirement's own key - the agent never invents a key.
 Two templates triggered at once is *ambiguous* and refused. A template
 never authors a requirement: what it verifies is tied to the user's own
 requirement (the RC's |H(f_c)| expectation names ``cutoff_frequency`` and the
-reviewer compares the sweep point with it).
+reviewer compares the sweep point with it). A calculator that refuses its
+inputs, overflows (``ValueError``) or divides by an underflowed product
+(``ZeroDivisionError``) refuses the template with that sentence as the note -
+a build never raises on a number the user typed.
 
 Templates:
 
 * ``divider`` - unloaded resistive divider from ``input_voltage`` and
   ``output_voltage`` (R2 chosen, R1 computed; ``output_current`` is served
   only when it is 0 A - a load refuses the template, no verified template
-  supplies one);
+  supplies one). Its advisory load question is asked with the confirmation
+  table, so a ``0 A`` answer can arrive before the build; one stated after
+  the build is served by :func:`late_load_changes` (VOUT is proposed to
+  serve it - a proposal the agent applies, never a silent edit) and a
+  non-zero one is named as unservable;
 * ``led`` - LED with series resistor from ``input_voltage``,
   ``led_forward_voltage`` and ``led_forward_current``; the LED is modelled
   as an ideal constant forward drop (a stimulus ``VLED`` = v_f, ``D1``
@@ -30,6 +37,8 @@ Templates:
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 
 from ai_eda.ir import (
     AnalysisSpec,
@@ -69,8 +78,8 @@ from ai_eda.tools.calc.si import format_spice_number
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.spice import SpiceAnalysis
 
-from ai_eda.design.base import TEMPLATE_VERSION, Choice, DesignChange, Plan, Template, choice_provenance, structural_provenance, unserved_requirements
-from ai_eda.design.inputs import UNIT_OF, DesignInput, read_inputs
+from ai_eda.design.base import TEMPLATE_VERSION, Choice, DesignChange, Plan, Template, choice_provenance, structural_provenance, template_tool, unserved_requirements
+from ai_eda.design.inputs import KEY_ALIASES, UNIT_OF, DesignInput, read_inputs, read_value
 from ai_eda.design.library_parts import TemplateRefusal, library_component, pin_by_name, require_pins, two_terminals
 
 RESISTOR = (("Device", "R"), ("Resistor_SMD", "R_0603_1608Metric"))
@@ -131,25 +140,36 @@ class DividerTemplate(Template):
 
     R2_OHM = 10_000.0
     TOL_REL = 0.01
+    #: asked with the table when no load current is stated at all: an answer then enters the IR and is read before the build
     LOAD_QUESTION = (
         "Answer output_current=0 A if VOUT drives no load (a resistive divider is only valid unloaded, as a high-impedance reference); "
         "otherwise provide the circuit (components / nets) in the IR yourself - no verified template supplies a load."
     )
+    #: the refusal when a load current *is* stated: the requirement exists, so an ``--answer`` for its key is not what changes it
+    LOAD_REFUSAL = (
+        "This template cannot serve that requirement: a resistive divider is only valid unloaded (a high-impedance reference) and no verified "
+        "template supplies a load. Change the requirement {rid} in the IR (or correct the request) so it states 0 A, choose another design, "
+        "or provide the circuit (components / nets) in the IR yourself."
+    )
 
-    def _load_question(self, why: str) -> MissingInformation:
-        return MissingInformation(key="output_current", required=False, question=f"{why[0].upper()}{why[1:]}. {self.LOAD_QUESTION}", rationale=why)
+    def _load_question(self, why: str, requirement_id: str | None = None) -> MissingInformation:
+        text = f"{why[0].upper()}{why[1:]}. "
+        text += self.LOAD_QUESTION if requirement_id is None else self.LOAD_REFUSAL.format(rid=requirement_id)
+        return MissingInformation(key="output_current", required=False, question=text, rationale=why)
 
     def refusals(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str]) -> list[MissingInformation]:
         """The closed-world rule plus the divider's own: a stated load current must be 0 A."""
         out = super().refusals(ir, inputs, unusable)
         v_in, v_out = inputs["input_voltage"], inputs["output_voltage"]
         if "output_current" in unusable:
-            out.append(self._load_question(f"output_current is stated but not readable ({unusable['output_current']}), and the divider is only valid unloaded"))
+            ids = ", ".join(r.id for r in ir.requirements.requirements if r.key in KEY_ALIASES["output_current"]) or "req.output_current"
+            out.append(self._load_question(f"output_current is stated but not readable ({unusable['output_current']}), and the divider is only valid unloaded", ids))
         elif "output_current" in inputs and inputs["output_current"].traced.value != 0.0:
             i_out = inputs["output_current"]
             out.append(self._load_question(
                 f"the request needs {v_out.traced.value:.12g} V at {i_out.traced.value:.12g} A from {v_in.traced.value:.12g} V ({i_out.requirement.id}): "
-                f"a resistive divider cannot supply a load"
+                f"a resistive divider cannot supply a load",
+                i_out.requirement.id,
             ))
         return out
 
@@ -170,8 +190,11 @@ class DividerTemplate(Template):
         tol_choice, tol = _choice(t, "tol_rel", self.TOL_REL, None, "relative tolerance of the v(VOUT) expectation (1 %)", confirmed)
         plan.choices = [r2_choice, tol_choice]
         params: dict[str, Traced] = {"v_in": v_in.traced, "v_out_target": v_out.traced, "r2": r2}
-        params["r1"] = divider_r1_for_v_out(params["v_in"], params["v_out_target"], params["r2"], ("v_in", "v_out_target", "r2"))
-        params["v_out"] = voltage_divider_output(params["v_in"], params["r1"], params["r2"], ("v_in", "r1", "r2"))
+        try:
+            params["r1"] = divider_r1_for_v_out(params["v_in"], params["v_out_target"], params["r2"], ("v_in", "v_out_target", "r2"))
+            params["v_out"] = voltage_divider_output(params["v_in"], params["r1"], params["r2"], ("v_in", "r1", "r2"))
+        except (ValueError, ZeroDivisionError) as e:
+            return _refused(plan, f"{e} ({v_in.requirement.id} = {v_in.traced.value:.12g} V, {v_out.requirement.id} = {v_out.traced.value:.12g} V)")
         params["tol_rel"] = tol
         plan.computed = [("r1", params["r1"]), ("v_out", params["v_out"])]
         try:
@@ -256,9 +279,9 @@ class LedTemplate(Template):
         params: dict[str, Traced] = {"v_in": v_in.traced, "v_f": v_f.traced, "i_f": i_f.traced}
         try:
             params["r_led"] = led_series_resistor(params["v_in"], params["v_f"], params["i_f"], ("v_in", "v_f", "i_f"))
-        except ValueError as e:
+            params["i_led"] = led_current(params["v_in"], params["v_f"], params["r_led"], ("v_in", "v_f", "r_led"))
+        except (ValueError, ZeroDivisionError) as e:
             return _refused(plan, f"{e} ({v_in.requirement.id} = {v_in.traced.value:.12g} V, {v_f.requirement.id} = {v_f.traced.value:.12g} V, {i_f.requirement.id} = {i_f.traced.value:.12g} A)")
-        params["i_led"] = led_current(params["v_in"], params["v_f"], params["r_led"], ("v_in", "v_f", "r_led"))
         tol_choice, tol = _choice(t, "tol_rel", self.TOL_REL, None, "relative tolerance of the i(VLED) expectation (1 %)", confirmed)
         params["tol_rel"] = tol
         plan.choices = [Choice("led_model", self.MODEL), tol_choice]
@@ -346,13 +369,13 @@ class RcLowpassTemplate(Template):
         params: dict[str, Traced] = {"f_c": f_c.traced, "c": c}
         try:
             params["r"] = rc_r_for_cutoff(params["f_c"], params["c"], ("f_c", "c"))
-        except ValueError as e:
+            params["tau"] = rc_time_constant(params["r"], params["c"], ("r", "c"))
+            params["h_fc"] = rc_lowpass_magnitude(params["f_c"], params["tau"], ("f_c", "tau"))
+            params["tol_rel"] = tol
+            params["ac_fstart"] = rc_ac_fstart(params["f_c"], ("f_c",))
+            params["ac_fstop"] = rc_ac_fstop(params["f_c"], ("f_c",))
+        except (ValueError, ZeroDivisionError) as e:
             return _refused(plan, f"{e} ({f_c.requirement.id} = {f_c.traced.value:.12g} Hz)")
-        params["tau"] = rc_time_constant(params["r"], params["c"], ("r", "c"))
-        params["h_fc"] = rc_lowpass_magnitude(params["f_c"], params["tau"], ("f_c", "tau"))
-        params["tol_rel"] = tol
-        params["ac_fstart"] = rc_ac_fstart(params["f_c"], ("f_c",))
-        params["ac_fstop"] = rc_ac_fstop(params["f_c"], ("f_c",))
         params["ac_probe"] = probe
         plan.computed = [(k, params[k]) for k in ("r", "tau", "h_fc", "ac_fstart", "ac_fstop")]
         req = f_c.requirement.id
@@ -417,6 +440,53 @@ def template_keys_text() -> str:
     return "; ".join(f"{t.id} needs {' + '.join(t.needs)}" for t in TEMPLATES)
 
 
+@dataclass
+class LateLoad:
+    """What a divider-templated design does with ``output_current`` requirements stated after it was built."""
+
+    #: the ``nets`` change that makes VOUT serve the 0 A requirement(s), when there is one to make
+    changes: list[DesignChange] = field(default_factory=list)
+    #: requirement ids the change serves
+    served: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+def late_load_changes(ir: CircuitIR) -> LateLoad:
+    """The divider's rule applied after the build: a confirmed ``output_current`` that reads exactly 0 A is served by VOUT.
+
+    Only a design whose ``VOUT`` net the divider template made qualifies
+    (``provenance.tool`` = ``design.template.divider``); the change is a
+    proposal on ``nets`` (the whole list, VOUT's ``serves_requirements``
+    extended), so the orchestrator applies it like any other. A non-zero or
+    unreadable load is named as one the design cannot serve - nothing is
+    guessed and the reviewer still reports it.
+    """
+    out = LateLoad()
+    vout = ir.net("VOUT")
+    if vout is None or vout.provenance.tool != template_tool(DividerTemplate.id):
+        return out
+    reqs = [r for r in ir.requirements.requirements if r.key in KEY_ALIASES["output_current"] and r.id not in vout.serves_requirements]
+    for r in reqs:
+        traced, why = read_value(r, UNIT_OF["output_current"])
+        if traced is None:
+            if not (r.value is not None and r.value.provenance.needs_verification):  # an unconfirmed value is nobody's requirement yet
+                out.notes.append(f"{r.id} not served by the divider: {why}")
+            continue
+        if traced.value != 0.0:
+            out.notes.append(f"{r.id} = {traced.value:.12g} A: a resistive divider cannot supply a load; VOUT does not serve it "
+                             f"(change the requirement to 0 A, choose another design, or provide the circuit yourself)")
+            continue
+        out.served.append(r.id)
+    if out.served:
+        nets = [n.model_copy(update={"serves_requirements": [*n.serves_requirements, *out.served]}) if n is vout else n for n in ir.nets]
+        out.changes.append(DesignChange(
+            description=f"VOUT serves {', '.join(out.served)} (0 A: a high-impedance reference)", target="nets", operation="set", payload=nets,
+            rationale=f"template {DividerTemplate.id} v{TEMPLATE_VERSION}: output_current = 0 A stated after the build is served by the unloaded output",
+        ))
+        out.notes.append(f"{', '.join(out.served)} = 0 A stated after the build: VOUT is a high-impedance reference and is proposed to serve it")
+    return out
+
+
 def design_from_requirements(
     ir: CircuitIR,
     library: KicadLibrary,
@@ -462,6 +532,8 @@ __all__ = [
     "DividerTemplate",
     "LedTemplate",
     "RcLowpassTemplate",
+    "LateLoad",
     "design_from_requirements",
+    "late_load_changes",
     "template_keys_text",
 ]

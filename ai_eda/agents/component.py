@@ -96,6 +96,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
+from ai_eda.agents.keys import CONFIRM_FACTS_KEY, CONFIRM_PARTS_KEY, EXTRACT_FACTS_KEY, FACTS_FILE_KEY
 from ai_eda.ir import (
     CircuitIR,
     Component,
@@ -136,10 +137,8 @@ from ai_eda.tools.sources import ArchivedDocument, DocumentArchive
 from ai_eda.validation.fit import FIT_CHECK, FIT_CRITERIA  # the fit check id and the spec's criteria live with the validator that judges them
 
 #: answer keys the agent reads (never requirements)
-CONFIRM_PARTS_KEY = "confirm_parts"
-CONFIRM_FACTS_KEY = "confirm_facts"
-FACTS_FILE_KEY = "datasheet_facts_file"
-EXTRACT_FACTS_KEY = "extract_datasheet_facts"
+#: the control keys this agent answers to (``confirm_parts``, ``confirm_facts``, ``datasheet_facts_file``, ``extract_datasheet_facts``)
+#: are defined once in :mod:`ai_eda.agents.keys` and imported above
 CANDIDATES_CHECK = "component.candidates"
 #: model replies for candidate parts, keyed by :func:`candidate_key`, under the workdir
 CANDIDATE_CACHE_FILE = Path("parts") / "candidates.json"

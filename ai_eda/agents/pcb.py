@@ -30,7 +30,7 @@ Invariants this agent keeps:
   :data:`PLACEMENT_KEY` (``--answer pcb.placement=skip`` proposes nothing;
   any other value is noted as not understood and placement proceeds); the
   key never becomes a requirement (``CONTROL_KEYS`` in
-  :mod:`ai_eda.agents.requirement`).
+  :mod:`ai_eda.agents.keys`).
 
 The PLACEMENT stage runs before IR_BUILD, so this agent may see an
 inconsistent IR (a net naming a component that does not exist). It walks
@@ -43,14 +43,15 @@ with ``unconnected_items`` until someone routes it.
 from __future__ import annotations
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
+from ai_eda.agents.keys import PLACEMENT_KEY
 from ai_eda.errors import CompileError
 from ai_eda.ir import CircuitIR, PCBDesign
 from ai_eda.llm.router import TaskKind
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, LibraryLookupError
 from ai_eda.tools.placement.grid import COLUMNS, MARGIN_MM, PLACER_ID, PLACER_VERSION, SPACING_MM, grid_placement
 
-#: ``--answer pcb.placement=skip`` makes the agent propose nothing (a control key, never a requirement)
-PLACEMENT_KEY = "pcb.placement"
+#: ``--answer pcb.placement=skip`` makes the agent propose nothing (``PLACEMENT_KEY``: a control key, never a requirement,
+#: defined in :mod:`ai_eda.agents.keys` and imported above)
 SKIP_ANSWER = "skip"
 
 

@@ -5,8 +5,10 @@ or an authoritative source states; a model's extraction or assumption is
 never a design input. A typed answer becomes a number only through
 :func:`ai_eda.tools.calc.quantity.parse_answer` (the whole text is one
 quantity in the key's unit; ``'12 V max'``, ranges and ``'5V 2A'`` are
-unusable, with the reason), and two confirmed requirements under one
-canonical key that state different numbers are *ambiguous*, never a pick.
+unusable, with the reason; so is a number that overflows a float, ``'1e309 V'``
+or ``1e300 GHz`` - the IR holds no infinity), and two confirmed requirements
+under one canonical key that state different numbers are *ambiguous*, never a
+pick.
 The copied value keeps the requirement's provenance kind, records the
 requirement id in ``derived_from`` and starts its note with
 :data:`PARSED_NOTE_PREFIX`, so a later run can prove the parameter is still
@@ -15,6 +17,7 @@ the requirement (:func:`~ai_eda.design.checks.check_inputs_vs_requirements`).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from ai_eda.ir import CircuitIR, Provenance, Requirement, Traced
@@ -91,6 +94,8 @@ def read_value(req: Requirement, unit: str) -> tuple[Traced | None, str | None]:
         if q.unit != unit:
             return None, f"{req.id}: {raw!r} is a {q.unit} quantity, not {unit}"
         number = q.value
+        if not math.isfinite(number):
+            return None, f"{req.id}: {raw!r} is not a finite number"
         note = f"{PARSED_NOTE_PREFIX}{req.id}: {raw!r} -> {number:.12g} {unit}"
     elif isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None, f"{req.id}: value {raw!r} is not one number"
@@ -101,6 +106,8 @@ def read_value(req: Requirement, unit: str) -> tuple[Traced | None, str | None]:
         if parsed is None or parsed[0] != unit:
             return None, f"{req.id}: unit {value.unit!r} is not {unit}"
         number = float(raw) * 10.0 ** parsed[1]
+        if not math.isfinite(number):
+            return None, f"{req.id}: {raw!r} {value.unit} is not a finite number in {unit}"
         note = f"{PARSED_NOTE_PREFIX}{req.id}: {raw!r} {value.unit} -> {number:.12g} {unit}"
     traced = Traced(value=number, unit=unit, provenance=Provenance(kind=prov.kind, source=prov.source, derived_from=[req.id], note=note))
     return traced, None

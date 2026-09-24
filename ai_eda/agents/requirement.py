@@ -74,10 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
-from ai_eda.agents.circuit import CONFIRM_DESIGN_KEY
-from ai_eda.agents.component import CONFIRM_FACTS_KEY, CONFIRM_PARTS_KEY, EXTRACT_FACTS_KEY, FACTS_FILE_KEY
-from ai_eda.agents.pcb import PLACEMENT_KEY
-from ai_eda.agents.regulatory import ACCEPT_REGS_KEY, PROPOSE_REGS_KEY, REJECT_REGS_KEY
+from ai_eda.agents.keys import CONTROL_KEYS
 from ai_eda.ir import (
     CircuitIR,
     Jurisdiction,
@@ -129,11 +126,8 @@ BASELINE_QUESTIONS: list[MissingInformation] = [
 
 EXTRACTION_CHECK = "requirements.extraction"
 
-#: answer keys that steer an agent (this one, the component, regulatory, circuit-design and PCB agents) and are never requirements themselves
-CONTROL_KEYS: frozenset[str] = frozenset({
-    CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY, CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY, ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY,
-    PLACEMENT_KEY, CONFIRM_DESIGN_KEY,
-})
+#: the answer keys that steer an agent (this one, the component, regulatory, circuit-design and PCB agents) are never
+#: requirements: ``CONTROL_KEYS`` is defined once in :mod:`ai_eda.agents.keys` and re-exported here
 
 
 def _split_codes(answer: str) -> list[str]:
@@ -183,6 +177,27 @@ def _answerable(ir: CircuitIR, key: str) -> bool:
     return existing is None or from_extraction(existing)
 
 
+def _kept_notes(ir: CircuitIR, answers: dict[str, str]) -> list[str]:
+    """One note per typed answer that is dropped because its key already holds a typed value (both values named).
+
+    The earlier typed answer is kept (it is the user's own value, not an
+    extraction); the user learns that the new one did nothing and how to
+    change the requirement instead of looping on the same question.
+    """
+    out: list[str] = []
+    for key, given in answers.items():
+        if _answerable(ir, key):
+            continue
+        existing = ir.requirements.get(key)
+        assert existing is not None
+        held = existing.value.value if existing.value is not None else None
+        out.append(
+            f"{key}: answer {given!r} not applied - {existing.id} already holds your earlier answer {held!r}, which is kept; "
+            f"to change it edit that requirement in the IR"
+        )
+    return out
+
+
 def _superseded_ids(ir: CircuitIR, answer_reqs: list[Requirement], notes: list[str]) -> set[str]:
     """Ids of the extraction-derived requirements a typed answer replaces (noted)."""
     keys = {a.key for a in answer_reqs}
@@ -228,9 +243,10 @@ class RequirementAgent(Agent):
         reject = set(_split_codes(ctx.answers.get(REJECT_KEY, "")))
         # Answers the user gave become explicit requirements with user_requirement provenance (regulatory scope answers as such).
         # A typed answer wins over what a model extracted, assumed or had confirmed for the same key (the item is replaced);
-        # an answer the user typed earlier is kept.
+        # an answer the user typed earlier is kept, and a note names both values so the dropped one is not a silent no-op.
         scope_keys = regulatory_scope_keys(ctx)
         answer_reqs = [_answer_requirement(k, v, scope_keys) for k, v in answers.items() if _answerable(ir, k)]
+        notes: list[str] = _kept_notes(ir, answers)
         answer_jurisdictions = [
             Jurisdiction(code=code, name=code, provided_by_user=True)
             for k, v in answers.items() if k == "jurisdiction" and _answerable(ir, k)  # the same rule as the requirement row
@@ -238,9 +254,8 @@ class RequirementAgent(Agent):
             if not any(j.code == code for j in ir.regulatory.jurisdictions)
         ]
         if ctx.llm is not None and ir.requirements.raw_input.strip():
-            return self._with_llm(ir, ctx.llm, answers, confirm_answer, accept, reject, answer_reqs, answer_jurisdictions)
+            return self._with_llm(ir, ctx.llm, answers, confirm_answer, accept, reject, answer_reqs, answer_jurisdictions, notes)
         proposals: list[IRProposal] = []
-        notes: list[str] = []
         proposals.extend(_answer_proposals(ir, answer_reqs, notes))
         for j in answer_jurisdictions:
             proposals.append(IRProposal(description=f"add jurisdiction {j.code}", target="regulatory.jurisdictions", operation="append", payload=j))
@@ -267,9 +282,9 @@ class RequirementAgent(Agent):
         reject: set[str],
         answer_reqs: list[Requirement],
         answer_jurisdictions: list[Jurisdiction],
+        notes: list[str],
     ) -> AgentResult:
         proposals: list[IRProposal] = []
-        notes: list[str] = []
 
         # 1. corrections: an answer to the confirmation question that says what is wrong extends the request
         corrections = list(ir.requirements.corrections)
