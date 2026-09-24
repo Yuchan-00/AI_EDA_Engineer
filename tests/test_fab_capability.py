@@ -53,7 +53,7 @@ from ai_eda.ir import (
     user_requirement,
 )
 from ai_eda.ir.provenance import design_data
-from ai_eda.parts.datasheet_facts import DatasheetFact, ground_facts
+from ai_eda.parts.datasheet_facts import DatasheetFact, ground_facts, searchable_document
 from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.security import ApprovalGate
 from ai_eda.tools.kicad import cli as kicad_cli
@@ -70,7 +70,7 @@ from ai_eda.tools.manufacturing import (
     relocate_limits,
 )
 from ai_eda.tools.manufacturing.capability import GEOMETRY_ROWS, NOT_COMPARED, REPAIR
-from ai_eda.tools.manufacturing.capability_file import page_from_section
+from ai_eda.tools.manufacturing.capability_file import _stored_value_mismatch, page_from_section
 from ai_eda.tools.sources import DocumentArchive, NetworkPolicy
 from ai_eda.workflow import Orchestrator, SessionError, Stage, open_session
 from ai_eda.workflow.stages import STAGE_ORDER
@@ -174,7 +174,7 @@ def test_load_capability_file(tmp_path: Path):
     bad(lambda d: d.__setitem__("limitz", []), "limitz")  # unknown top-level key: refused, never guessed
     bad(lambda d: d["limits"][0].__setitem__("pages", 1), "pages")  # unknown limit key
     bad(lambda d: d["limits"][0].pop("page"), "limits.0.page")  # missing page
-    bad(lambda d: d["limits"][0].__setitem__("value", [1, 2]), "limits[0] (min_track_width_mm): value must be a number")  # list for a mm key
+    bad(lambda d: d["limits"][0].__setitem__("value", [1, 2]), "limits[0] (min_track_width_mm): value must be a finite number")  # list for a mm key
     bad(lambda d: d["limits"][5].__setitem__("value", 4), "limits[5] (layer_count_options): value must be a list")
     bad(lambda d: d["source"].__setitem__("file", "x.html"), "exactly one of 'url' or 'file'")
     bad(lambda d: d.__setitem__("source", {"title": "t"}), "exactly one of 'url' or 'file'")
@@ -184,6 +184,14 @@ def test_load_capability_file(tmp_path: Path):
     (tmp_path / "notjson.json").write_text("{", encoding="utf-8")
     with pytest.raises(CapabilityFileError):
         load_capability_file(tmp_path / "notjson.json")
+    # a file nested past the JSON parser's depth is "not JSON", never a RecursionError traceback
+    (tmp_path / "nested.json").write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    with pytest.raises(CapabilityFileError, match="is not JSON"):
+        load_capability_file(tmp_path / "nested.json")
+    # a value that overflows to inf is not a number the grounding could compare
+    (tmp_path / "inf.json").write_text(json.dumps(base).replace("0.09", "1e400", 1), encoding="utf-8")
+    with pytest.raises(CapabilityFileError, match=r"limits\[0\] \(min_track_width_mm\): value must be a finite number"):
+        load_capability_file(tmp_path / "inf.json")
     with pytest.raises(CapabilityFileError):
         load_capability_file(tmp_path / "missing.json")
 
@@ -480,6 +488,69 @@ def test_without_a_file_the_agent_reverifies_the_ir_limits(tmp_path: Path):
     assert res.validation == [] and res.notes == [NO_FILE_NOTE]
 
 
+def test_reverification_re_reads_the_number_and_reports_an_edited_value(tmp_path: Path):
+    """A limit whose value was edited in ir.json (note, page hash and quote intact) is value_mismatch: agent NOT_VERIFIED, reviewer FAIL, never 're-verified'."""
+    archive, doc = _page(tmp_path)
+    file = load_capability_file(_write_file(tmp_path, source=FILE_SOURCE))
+    ir = _board_ir(tmp_path)
+    ir.pcb.manufacturing = ground_capability(doc, file).constraints()
+    ir.pcb.tracks = [Track(net="N", layer="F.Cu", start=(1, 1), end=(5, 1), width_mm=0.05)]  # below the page's 0.09 mm
+    assert _rows(check_capability(ir))["min_track_width_mm"]["status"] == "FAIL"
+    honest = {c.key: c for c in relocate_limits(ir.pcb.manufacturing, archive)}
+    assert all(c.status == "ok" and "re-read as" in c.reason for c in honest.values())
+    p = tmp_path / "ir.json"
+    ir.save(p)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data["pcb"]["manufacturing"]["min_track_width_mm"]["value"] = 0.04  # only the number
+    data["pcb"]["manufacturing"]["layer_count_options"]["value"] = [1, 2, 4, 6, 8]
+    data["pcb"]["manufacturing"]["copper_weight_oz"]["value"] = 2
+    data["pcb"]["manufacturing"]["min_clearance_mm"]["unit"] = "um"  # only the unit
+    p.write_text(json.dumps(data), encoding="utf-8")
+    edited = CircuitIR.load(p)
+    t = edited.pcb.manufacturing.min_track_width_mm
+    assert t.value == 0.04 and t.provenance.kind is ProvenanceKind.AUTHORITATIVE and quote_from_note(t.provenance.note) == "Min trace width\n0.09 mm"
+    checks = {c.key: c for c in relocate_limits(edited.pcb.manufacturing, archive)}
+    assert {k: c.status for k, c in checks.items()} == {**{k: "ok" for k in CAPABILITY_KEYS}, "min_track_width_mm": "value_mismatch", "layer_count_options": "value_mismatch",
+                                                          "copper_weight_oz": "value_mismatch", "min_clearance_mm": "value_mismatch"}
+    assert "0.04 mm" in checks["min_track_width_mm"].reason and "0.09" in checks["min_track_width_mm"].reason and checks["min_track_width_mm"].document == doc.sha256
+    assert "[1, 2, 4, 6, 8]" in checks["layer_count_options"].reason and "[1, 2, 4, 6]" in checks["layer_count_options"].reason
+    assert "2.0 oz" in checks["copper_weight_oz"].reason and "1 oz" in checks["copper_weight_oz"].reason
+    assert "0.09 um" in checks["min_clearance_mm"].reason and "0.09 mm" in checks["min_clearance_mm"].reason
+    # the agent (no file): NOT_VERIFIED naming the mismatch, not a PASS 're-verified'
+    src = FabCapabilityAgent().run(edited, AgentContext(workdir=tmp_path, tools={"archive": archive})).validation[0]
+    assert src.check_id == "mfg.capability_source" and src.status is S.NOT_VERIFIED and "4 not: copper_weight_oz: value_mismatch" in src.message and src.message.startswith("4 authoritative")
+    assert {c["key"]: c["status"] for c in src.details["reverified"]}["min_track_width_mm"] == "value_mismatch"
+    # the stored mfg.capability reads the IR's provenance (a grounded PASS against the edited number); the reviewer's re-verification is the gate: FAIL, a human looks
+    edited.validation.extend(ManufacturingAgent().run(edited, AgentContext(workdir=tmp_path, tools={})).validation)
+    assert _rows(edited.validation.latest("mfg.capability"))["min_track_width_mm"]["status"] == "PASS"
+    r = {x.check_id: x for x in IndependentReviewer(tools={"archive": archive}).review(edited, tmp_path).results}[ReviewArea.MANUFACTURING_CAPABILITIES]
+    assert r.status is S.FAIL and r.details["repair"] == "human" and "min_track_width_mm: value_mismatch" in r.message and "0.04 mm" in r.message
+    assert "re-verified" not in r.message and {c["key"] for c in r.details["sources"] if c["status"] == "value_mismatch"} == {"min_track_width_mm", "layer_count_options", "copper_weight_oz", "min_clearance_mm"}
+    # a value of a shape the grounding rules do not accept (the IR schema refuses it in ir.json; a Traced built in-process holds it) is a mismatch, not a traceback
+    sdoc = searchable_document(doc)
+    hit = sdoc.find_quote("Min trace width 0.09 mm", 1)[0]
+    assert "shape" in _stored_value_mismatch("min_track_width_mm", authoritative([0.09], DS, "mm"), sdoc, hit)
+    assert _stored_value_mismatch("min_track_width_mm", authoritative(0.09, DS, "mm"), sdoc, hit) is None
+
+
+def test_a_page_number_that_overflows_is_rejected_not_a_crash(tmp_path: Path):
+    html = CAPABILITY_HTML.replace("Min trace width</td><td>0.09 mm", "Min trace width</td><td>1e400 mm")
+    archive, doc = _page(tmp_path, html)
+    lim = {"key": "min_track_width_mm", "value": 0.09, "unit": "mm", "page": 1, "quote": "Min trace width 1e400 mm"}
+    file = load_capability_file(_write_file(tmp_path, source=FILE_SOURCE, limits=[lim]))
+    g = ground_capability(doc, file)
+    assert g.accepted == {} and g.rejected == [("min_track_width_mm", "the page states a non-finite length ('1e400 mm')")]
+    ir = _board_ir(tmp_path)
+    session = _session(tmp_path, ir, None, online=False, file=file.path)
+    try:
+        res = _run_agent(ir, session)  # a result, not a ValidationError from authoritative(inf)
+    finally:
+        session.close()
+    src = res.validation[0]
+    assert src.status is S.NOT_VERIFIED and src.details["rejected"] == [{"key": "min_track_width_mm", "reason": "the page states a non-finite length ('1e400 mm')"}]
+    assert all(getattr(pr.payload, k) is None for pr in res.proposals for k in CAPABILITY_KEYS)  # the merge may name the fab; no limit enters the IR
+
+
 # --------------------------------------------------------------------------- check_capability
 
 
@@ -527,6 +598,24 @@ def test_check_capability_matrix(tmp_path: Path, monkeypatch):
     assert res.status is S.NOT_VERIFIED and rows["min_clearance_mm"]["status"] == "NOT_VERIFIED" and "no min_clearance_mm" in rows["min_clearance_mm"]["message"]
     assert rows["min_via_drill_mm"]["status"] == "NOT_APPLICABLE" and rows["min_via_diameter_mm"]["status"] == "NOT_APPLICABLE"  # no vias
     assert set(res.details["not_compared"]) == set(NOT_COMPARED) and "board_thickness_mm" in res.message and "copper_weight_oz" in res.message
+    # a placed, unrouted board: nothing to compare is NOT_APPLICABLE, never a vacuous PASS, and not counted as "met"
+    ir = _board_ir(tmp_path, **_full_limits())
+    assert ir.pcb.tracks == [] and ir.pcb.zones == [] and ir.pcb.vias == [] and len(ir.pcb.layers) == 2
+    res = check_capability(ir)
+    rows = _rows(res)
+    assert rows["min_track_width_mm"]["status"] == "NOT_APPLICABLE" and rows["min_track_width_mm"]["message"] == "no tracks in the IR"
+    assert rows["min_clearance_mm"]["status"] == "NOT_APPLICABLE" and rows["min_clearance_mm"]["message"] == "no zones with a clearance in the IR"
+    assert rows["min_hole_to_edge_mm"]["status"] == "NOT_APPLICABLE" and rows["min_hole_to_edge_mm"]["message"] == "no vias in the IR"
+    assert rows["min_via_drill_mm"]["status"] == rows["min_via_diameter_mm"]["status"] == "NOT_APPLICABLE"
+    assert [r["limit"] for r in res.details["compared"] if r["status"] == "PASS"] == ["layer_count_options"]  # the layer list is always compared
+    assert rows["layer_count_options"]["message"] == "every copper layer count in the options [1, 2] in the IR" and res.message.startswith("1 limit(s) met in the IR")
+    ir.pcb.zones = [Zone(net="GND", layer="B.Cu", polygon=[(0, 0), (1, 0), (1, 1)], clearance_mm=None)]  # a zone without a clearance compares nothing
+    assert _rows(check_capability(ir))["min_clearance_mm"]["status"] == "NOT_APPLICABLE"
+    ir = _board_ir(tmp_path, **_full_limits(layer_count_options=None))
+    res = check_capability(ir)
+    assert res.status is S.NOT_VERIFIED and not [r for r in res.details["compared"] if r["status"] == "PASS"] and res.message.startswith("0 limit(s) met in the IR")
+    ir.pcb.outline = None  # no vias and no outline: still nothing to measure, the outline is not the reason
+    assert _rows(check_capability(ir))["min_hole_to_edge_mm"]["status"] == "NOT_APPLICABLE"
     # a user_requirement limit is compared for FAIL but can not PASS
     ir = _board_ir(tmp_path, **_full_limits(min_track_width_mm=user_requirement(0.127, "mm")))
     ir.pcb.tracks = [Track(net="A", layer="F.Cu", start=(1, 1), end=(2, 1), width_mm=0.2)]
@@ -609,6 +698,14 @@ def test_check_capability_matrix(tmp_path: Path, monkeypatch):
     assert check_capability(ir).status is S.PASS
     Path(ir.artifacts[ArtifactKind.KICAD_PROJECT].path).write_text("{}", encoding="utf-8")
     assert "kicad_pro on disk does not match" in _rows(check_capability(ir))["clearance_between_items"]["message"]
+    # ... a hand-edited board file on disk (DRC ran on the compiled bytes, not these)
+    drc = _synthetic_drc(ir, tmp_path)
+    assert check_capability(ir).status is S.PASS
+    Path(ir.artifacts[ArtifactKind.PCB].path).write_text("(kicad_pcb (edited))", encoding="utf-8")
+    res = check_capability(ir)
+    rows = _rows(res)
+    assert res.status is S.NOT_VERIFIED and res.details["drc_proof"] == "kicad_pcb on disk does not match its recorded hash"
+    assert all(rows[name]["status"] == "NOT_VERIFIED" and rows[name]["message"] == "kicad_pcb on disk does not match its recorded hash" for name in GEOMETRY_ROWS)
     # ... a stale project file (design changed after it was compiled)
     drc = _synthetic_drc(ir, tmp_path)
     ir.pcb.tracks.append(Track(net="A", layer="F.Cu", start=(3, 1), end=(4, 1), width_mm=0.2))

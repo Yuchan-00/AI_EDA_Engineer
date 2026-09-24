@@ -81,12 +81,16 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   the compiler wrote.
 * ``review.manufacturing_capabilities`` recomputes
   :func:`~ai_eda.tools.manufacturing.check_capability` live, re-verifies
-  every ``authoritative`` limit's archived page (hash) and quote (re-located
-  on the recorded page, :func:`~ai_eda.tools.manufacturing.relocate_limits`)
-  and FAILs when the stored ``mfg.capability`` verdict disagrees with the
-  live one or a limit's quote is no longer on its page; a stored result
-  without a tool is an opinion (NOT_VERIFIED), one stamped for another IR
-  version is not evidence about this one.
+  every ``authoritative`` limit's archived page (hash), quote (re-located
+  on the recorded page) and number (the quote re-read with the grounding
+  step and compared with the stored value,
+  :func:`~ai_eda.tools.manufacturing.relocate_limits`) and FAILs when the
+  stored ``mfg.capability`` verdict disagrees with the live one, a limit's
+  quote is no longer on its page or does not state the stored value
+  (``value_mismatch``: an edited number - the live check reads the IR's
+  provenance and can not see it); a stored result without a tool is an
+  opinion (NOT_VERIFIED), one stamped for another IR version is not
+  evidence about this one.
 """
 
 from __future__ import annotations
@@ -120,6 +124,9 @@ from ai_eda.tools.manufacturing.capability_file import relocate_limits
 from ai_eda.tools.manufacturing.csv_cells import bom_cell_text
 from ai_eda.tools.manufacturing.outputs import OUTPUT_CHECKS
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK_ID, read_results
+
+#: a limit source check that contradicts the IR (the page was altered, the quote is gone, or the quote does not state the stored number): FAIL, a human looks
+WRONG_LIMIT_SOURCE_STATUSES: frozenset[str] = frozenset({"tampered", "quote_missing", "value_mismatch"})
 
 Check = Callable[[CircuitIR, Path], ValidationResult]
 
@@ -298,8 +305,8 @@ class IndependentReviewer:
         checks = relocate_limits(ir.pcb.manufacturing, open_archive(self.tools, workdir)) if ir.pcb is not None else []
         details["sources"] = [c.model_dump(mode="json") for c in checks]
         evidence = [Evidence(description=f"archived capability page grounding {c.key}", content_hash=c.document) for c in checks if c.status == "ok" and c.document]
-        wrong = [c for c in checks if c.status in ("tampered", "quote_missing")]
-        unlocated = [c for c in checks if c.status not in ("ok", "tampered", "quote_missing")]
+        wrong = [c for c in checks if c.status in WRONG_LIMIT_SOURCE_STATUSES]
+        unlocated = [c for c in checks if c.status != "ok" and c.status not in WRONG_LIMIT_SOURCE_STATUSES]
         if wrong:
             details["repair"] = "human"
             return ValidationResult(check_id="", status=ValidationStatus.FAIL, evidence=evidence, details=details,

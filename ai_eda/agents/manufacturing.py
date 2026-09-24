@@ -22,9 +22,12 @@ Invariants:
   (NOT_VERIFIED, "nothing to lay out"); rejected limits never enter the IR.
 * Without a file, the agent re-verifies the ``authoritative`` limits the IR
   already holds against the archive (page re-hashed, quote re-located, the
+  number re-read from the quote and compared with the stored value - the
   reviewer's own check) and emits a fresh ``mfg.capability_source``, so a
   later run without ``--fab-capability`` re-produces its evidence instead
-  of carrying an old PASS; with nothing to verify it notes the missing file.
+  of carrying an old PASS; any check that is not ``ok`` (``tampered``,
+  ``quote_missing``, ``value_mismatch``, ...) makes it NOT_VERIFIED; with
+  nothing to verify it notes the missing file.
 * The stage sits after PLACEMENT (which may create ``ir.pcb``) and before
   IR_BUILD: the limits are design content, so they must be in the IR before
   any validator hash, project file, board or DRC is produced.

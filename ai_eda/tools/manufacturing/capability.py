@@ -9,14 +9,23 @@ the latest ``kicad.drc`` result, never a session tool):
   A limit whose provenance is not ``authoritative`` - an assumption, a model
   value, a derived number, and also a ``user_requirement`` (the user asserted
   it; the vendor page did not) - is compared for a FAIL but its row can only
-  be NOT_VERIFIED ("not grounded on the vendor page"), never PASS.
+  be NOT_VERIFIED ("not grounded on the vendor page"), never PASS. The
+  provenance is read as the IR states it: this check does not open the
+  archive, so a limit whose *value* was edited after grounding is caught by
+  the FAB_CAPABILITY agent's re-verification and the reviewer
+  (:func:`~ai_eda.tools.manufacturing.capability_file.relocate_limits`,
+  ``value_mismatch``), whose verdicts gate the stored ``mfg.capability``.
 * IR comparisons are exact (mm, no tolerance) and need no KiCad: a track
   narrower than ``min_track_width_mm``, a via drill / diameter below the
   minimum, a copper layer count outside ``layer_count_options``, a zone
   clearance below ``min_clearance_mm``, an IR via hole closer to the outline
   than ``min_hole_to_edge_mm`` - each a FAIL row naming the items, and the
   result carries ``details["repair"] = "fab_capability_shortfall"`` (a human
-  decides; the repair loop never touches copper).
+  decides; the repair loop never touches copper). A row PASSes only when
+  something was compared: with no tracks, no zones carrying a clearance or
+  no vias in the IR the row is NOT_APPLICABLE ("no tracks in the IR", ...)
+  and is not counted among the "limit(s) met"; the copper layer list is
+  always compared.
 * Geometry the IR does not state - the clearance *between* items and the
   copper of library footprints - is provable only by DRC run with the fab
   minimums as rules. Those rows PASS only when the latest ``kicad.drc`` is
@@ -118,16 +127,22 @@ def _grounded(traced: Traced | None) -> bool:
     return traced is not None and traced.provenance.kind is ProvenanceKind.AUTHORITATIVE
 
 
-def _compared_row(limit: str, traced: Traced, offenders: list[str], what: str) -> dict[str, Any]:
-    """FAIL when ``offenders`` is non-empty; else PASS for an authoritative limit and NOT_VERIFIED for one nobody grounded."""
+def _compared_row(limit: str, traced: Traced, offenders: list[str], what: str, *, compared: int, none: str, met: str = "at or above", unmet: str = "below") -> dict[str, Any]:
+    """FAIL when ``offenders`` is non-empty; NOT_APPLICABLE (``none``) when nothing was compared; else PASS for an authoritative limit and NOT_VERIFIED for one nobody grounded.
+
+    ``met`` / ``unmet`` are the words for the comparison (``at or above`` /
+    ``below`` for a minimum; ``in the options`` / ``not in`` for the layer list).
+    """
     value = traced.value
     if offenders:
-        return _row(limit, ValidationStatus.FAIL, f"{len(offenders)} {what} below the {limit} limit {value}: {', '.join(offenders[:8])}" + (" ..." if len(offenders) > 8 else ""),
+        return _row(limit, ValidationStatus.FAIL, f"{len(offenders)} {what} {unmet} the {limit} limit {value}: {', '.join(offenders[:8])}" + (" ..." if len(offenders) > 8 else ""),
                     limit_value=value, offenders=offenders, grounded=_grounded(traced))
+    if compared == 0:
+        return _row(limit, ValidationStatus.NOT_APPLICABLE, none, limit_value=value, offenders=[], grounded=_grounded(traced))
     if not _grounded(traced):
-        return _row(limit, ValidationStatus.NOT_VERIFIED, f"{what} at or above {value} in the IR, but the limit is not grounded on the vendor page ({traced.provenance.kind})",
+        return _row(limit, ValidationStatus.NOT_VERIFIED, f"{what} {met} {value} in the IR, but the limit is not grounded on the vendor page ({traced.provenance.kind})",
                     limit_value=value, offenders=[], grounded=False)
-    return _row(limit, ValidationStatus.PASS, f"every {what} at or above {value} in the IR", limit_value=value, offenders=[], grounded=True)
+    return _row(limit, ValidationStatus.PASS, f"every {what} {met} {value} in the IR", limit_value=value, offenders=[], grounded=True)
 
 
 def _missing_row(limit: str, why: str) -> dict[str, Any]:
@@ -231,7 +246,8 @@ def check_capability(ir: CircuitIR) -> ValidationResult:
     if t is None:
         rows.append(_missing_row("min_track_width_mm", "track widths not judged"))
     else:
-        rows.append(_compared_row("min_track_width_mm", t, [f"track[{i}:{tr.net}] width {tr.width_mm:g}" for i, tr in enumerate(ir.pcb.tracks) if tr.width_mm < float(t.value)], "track width(s)"))
+        rows.append(_compared_row("min_track_width_mm", t, [f"track[{i}:{tr.net}] width {tr.width_mm:g}" for i, tr in enumerate(ir.pcb.tracks) if tr.width_mm < float(t.value)], "track width(s)",
+                                  compared=len(ir.pcb.tracks), none="no tracks in the IR"))
     if not ir.pcb.vias:
         rows.append(_row("min_via_drill_mm", ValidationStatus.NOT_APPLICABLE, "no vias in the IR", limit_value=None if m.min_via_drill_mm is None else m.min_via_drill_mm.value))
         rows.append(_row("min_via_diameter_mm", ValidationStatus.NOT_APPLICABLE, "no vias in the IR", limit_value=None if m.min_via_diameter_mm is None else m.min_via_diameter_mm.value))
@@ -240,28 +256,35 @@ def check_capability(ir: CircuitIR) -> ValidationResult:
         if t is None:
             rows.append(_missing_row("min_via_drill_mm", "via drills not judged"))
         else:
-            rows.append(_compared_row("min_via_drill_mm", t, [f"via[{i}:{v.net}] drill {v.drill_mm:g}" for i, v in enumerate(ir.pcb.vias) if v.drill_mm < float(t.value)], "via drill(s)"))
+            rows.append(_compared_row("min_via_drill_mm", t, [f"via[{i}:{v.net}] drill {v.drill_mm:g}" for i, v in enumerate(ir.pcb.vias) if v.drill_mm < float(t.value)], "via drill(s)",
+                                      compared=len(ir.pcb.vias), none="no vias in the IR"))
         t = m.min_via_diameter_mm
         if t is None:
             rows.append(_missing_row("min_via_diameter_mm", "via diameters not judged"))
         else:
-            rows.append(_compared_row("min_via_diameter_mm", t, [f"via[{i}:{v.net}] diameter {v.diameter_mm:g}" for i, v in enumerate(ir.pcb.vias) if v.diameter_mm < float(t.value)], "via diameter(s)"))
+            rows.append(_compared_row("min_via_diameter_mm", t, [f"via[{i}:{v.net}] diameter {v.diameter_mm:g}" for i, v in enumerate(ir.pcb.vias) if v.diameter_mm < float(t.value)], "via diameter(s)",
+                                      compared=len(ir.pcb.vias), none="no vias in the IR"))
     t = m.layer_count_options
     if t is not None:
         count = len(ir.pcb.layers)
-        rows.append(_compared_row("layer_count_options", t, [] if count in list(t.value) else [f"{count} copper layer(s) not in {list(t.value)}"], "copper layer count"))
+        rows.append(_compared_row("layer_count_options", t, [] if count in list(t.value) else [f"{count} copper layer(s) not in {list(t.value)}"], "copper layer count",
+                                  compared=1, none="", met="in the options", unmet="not in"))
     t = m.min_clearance_mm
     if t is None:
         rows.append(_missing_row("min_clearance_mm", "zone clearances not judged"))
     else:
-        rows.append(_compared_row("min_clearance_mm", t, [f"zone[{i}:{z.net}] clearance {z.clearance_mm:g}" for i, z in enumerate(ir.pcb.zones) if z.clearance_mm is not None and z.clearance_mm < float(t.value)], "zone clearance(s)"))
+        with_clearance = [(i, z) for i, z in enumerate(ir.pcb.zones) if z.clearance_mm is not None]
+        rows.append(_compared_row("min_clearance_mm", t, [f"zone[{i}:{z.net}] clearance {z.clearance_mm:g}" for i, z in with_clearance if z.clearance_mm < float(t.value)], "zone clearance(s)",
+                                  compared=len(with_clearance), none="no zones with a clearance in the IR"))
     t = m.min_hole_to_edge_mm
     if t is not None:
         offenders = _hole_to_edge_offenders(ir, float(t.value))
-        if offenders is None:
+        if not ir.pcb.vias:
+            rows.append(_row("min_hole_to_edge_mm", ValidationStatus.NOT_APPLICABLE, "no vias in the IR", limit_value=t.value, offenders=[], grounded=_grounded(t)))
+        elif offenders is None:
             rows.append(_row("min_hole_to_edge_mm", ValidationStatus.NOT_VERIFIED, "ir.pcb.outline is None: hole-to-edge distances can not be measured", limit_value=t.value, grounded=_grounded(t)))
         else:
-            rows.append(_compared_row("min_hole_to_edge_mm", t, offenders, "IR via hole-to-edge distance(s)"))
+            rows.append(_compared_row("min_hole_to_edge_mm", t, offenders, "IR via hole-to-edge distance(s)", compared=len(ir.pcb.vias), none="no vias in the IR"))
     # --- geometry only DRC proves ---------------------------------------------------
     rules, reason, drc = _drc_proof(ir)
     for name, keys in GEOMETRY_ROWS.items():
@@ -284,7 +307,7 @@ def check_capability(ir: CircuitIR) -> ValidationResult:
     elif status is ValidationStatus.PASS:
         message = f"board compared against the fab minimums of {m.fab or 'the fab'} ({', '.join(passed)}); not compared: {', '.join(NOT_COMPARED)}"
     else:
-        message = f"{len(passed)} limit(s) met in the IR, {len(unverified)} not proven: " + "; ".join(unverified[:4]) + (" ..." if len(unverified) > 4 else "") + f"; not compared: {', '.join(NOT_COMPARED)}"
+        message = f"{len(passed)} limit(s) met in the IR (NOT_APPLICABLE rows not counted), {len(unverified)} not proven: " + "; ".join(unverified[:4]) + (" ..." if len(unverified) > 4 else "") + f"; not compared: {', '.join(NOT_COMPARED)}"
     return ValidationResult(status=status, message=message, details=details, **stamp)
 
 

@@ -1395,6 +1395,8 @@ def test_62_authoritative_fab_limits_without_a_comparison_are_not_a_pass(tmp_pat
     r = ManufacturingAgent().run(ir, AgentContext(workdir=tmp_path, tools={})).validation[0]
     assert r.check_id == "mfg.capability" and r.status is S.NOT_VERIFIED and r.is_tool_backed and r.ir_hash == ir.content_hash()
     rows = {row["limit"]: row for row in r.details["compared"]}
-    assert rows["min_track_width_mm"]["status"] == "PASS" and rows["min_clearance_mm"]["status"] == "PASS"  # ... the IR comparisons hold (no copper) ...
+    # ... no copper to compare is NOT_APPLICABLE (never a vacuous PASS: 2026-09-24 fab review) ...
+    assert rows["min_track_width_mm"]["status"] == "NOT_APPLICABLE" and rows["min_track_width_mm"]["message"] == "no tracks in the IR"
+    assert rows["min_clearance_mm"]["status"] == "NOT_APPLICABLE" and rows["min_clearance_mm"]["message"] == "no zones with a clearance in the IR" and r.message.startswith("0 limit(s) met")
     assert rows["clearance_between_items"]["status"] == "NOT_VERIFIED" and "kicad.drc has not been run" in rows["clearance_between_items"]["message"]
     assert "kicad.drc has not been run" in r.message and r.details["limits"] == "PASS"  # ... but the geometry only DRC proves is not proven

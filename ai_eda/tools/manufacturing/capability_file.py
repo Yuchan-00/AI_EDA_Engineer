@@ -33,6 +33,17 @@ the fab):
   (``min_clearance_mm`` with the quote of the via drill would ground): the
   key attribution is the user's assertion, shown with quote and page in
   ``mfg.capability_source`` details so a person can see it.
+* Re-verification (:func:`relocate_limits`, the agent without a file and the
+  reviewer) re-runs the *same* grounding step on the re-located quote and
+  compares the number and unit it reads with the ``Traced`` the IR stores:
+  a limit whose value was edited after grounding (note, page hash and quote
+  intact) is ``value_mismatch``, never ``ok``. :func:`~ai_eda.tools.manufacturing.capability.check_capability`
+  reads the IR's provenance as it stands; the agent's and the reviewer's
+  verdicts are the gate that catches an edited number.
+* Numbers are finite: a page token that overflows (``1e400 mm``) or a
+  non-finite file value is rejected with the reason, and a capability file
+  that does not parse (including one nested past the JSON parser's depth)
+  is a :class:`CapabilityFileError`, never a traceback.
 """
 
 from __future__ import annotations
@@ -40,6 +51,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -52,7 +64,7 @@ from ai_eda.ir import Evidence, ManufacturingConstraints, ProvenanceKind, Source
 from ai_eda.llm.extraction import _mismatch, _model_quantity, _request_quantity, find_directive
 from ai_eda.parts.datasheet_facts import searchable_document
 from ai_eda.tools.calc.quantity import PREFIX_EXPONENTS, Quantity, format_quantity
-from ai_eda.tools.sources import ArchivedDocument, DocumentArchive
+from ai_eda.tools.sources import ArchivedDocument, DocumentArchive, QuoteHit
 
 #: bumped when the grounding rules or the file schema change
 CAPABILITY_FILE_VERSION = "0.1"
@@ -142,7 +154,7 @@ def load_capability_file(path: Path | str) -> FabCapabilityFile:
         data = json.loads(raw_bytes.decode("utf-8"))
     except OSError as e:
         raise CapabilityFileError(f"capability file {p} unreadable: {e}") from e
-    except (ValueError, UnicodeDecodeError) as e:
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
         raise CapabilityFileError(f"capability file {p} is not JSON: {e}") from e
     if not isinstance(data, dict):
         raise CapabilityFileError(f"capability file {p}: expected an object with fab / source / limits")
@@ -161,8 +173,8 @@ def load_capability_file(path: Path | str) -> FabCapabilityFile:
     for i, lim in enumerate(loaded.limits):
         # the value's shape follows the key; an unknown key is left to grounding, which rejects it with the reason
         if lim.key in MM_KEYS or lim.key == OZ_KEY:
-            if not _is_number(lim.value):
-                raise CapabilityFileError(f"capability file {p}: limits[{i}] ({lim.key}): value must be a number, got {lim.value!r}")
+            if not _is_number(lim.value) or not math.isfinite(lim.value):
+                raise CapabilityFileError(f"capability file {p}: limits[{i}] ({lim.key}): value must be a finite number, got {lim.value!r}")
         elif lim.key == LAYER_KEY and not isinstance(lim.value, list):
             raise CapabilityFileError(f"capability file {p}: limits[{i}] ({lim.key}): value must be a list of layer counts, got {lim.value!r}")
     return loaded
@@ -268,12 +280,7 @@ def ground_capability(doc: ArchivedDocument, file: FabCapabilityFile, *, propose
             continue
         hit = hits[0]
         source = doc.source_ref(title=file.source.title, section=hit.section, authority=file.source.authority)
-        if key in MM_KEYS:
-            grounded, reason = _ground_mm(key, lim, sdoc.pages[hit.page - 1], (hit.offset, hit.offset + len(hit.matched)))
-        elif key == LAYER_KEY:
-            grounded, reason = _ground_layers(lim, hit.matched)
-        else:
-            grounded, reason = _ground_oz(lim, hit.matched)
+        grounded, reason = _ground_hit(key, lim, sdoc, hit)
         if grounded is None:
             out.rejected.append((key, str(reason)))
             continue
@@ -285,9 +292,25 @@ def ground_capability(doc: ArchivedDocument, file: FabCapabilityFile, *, propose
     return out
 
 
+def _ground_hit(key: str, lim: CapabilityLimit, sdoc: ArchivedDocument, hit: QuoteHit) -> tuple[tuple[Any, str | None, str] | None, str | None]:
+    """The one grounding step per key kind on a located quote: ``((value, unit, parsed text), None)`` or ``(None, reason)``.
+
+    Grounding and re-verification both go through here, so what
+    :func:`relocate_limits` re-reads is exactly what :func:`ground_capability`
+    stored.
+    """
+    if key in MM_KEYS:
+        return _ground_mm(key, lim, sdoc.pages[hit.page - 1], (hit.offset, hit.offset + len(hit.matched)))
+    if key == LAYER_KEY:
+        return _ground_layers(lim, hit.matched)
+    return _ground_oz(lim, hit.matched)
+
+
 def _ground_mm(key: str, lim: CapabilityLimit, page_text: str, span: tuple[int, int]) -> tuple[tuple[Any, str | None, str] | None, str | None]:
     if not _is_number(lim.value):
         return None, f"{key} is a length; got {lim.value!r}"
+    if not math.isfinite(lim.value):
+        return None, f"{key} must be a finite length; got {lim.value!r}"
     if not lim.unit or not lim.unit.strip():
         return None, f"{key} needs the unit as written in the quote"
     model_q = _model_quantity(float(lim.value), lim.unit, None)
@@ -302,6 +325,8 @@ def _ground_mm(key: str, lim: CapabilityLimit, page_text: str, span: tuple[int, 
         return None, f"quote states a range or tolerance ({format_quantity(parsed)}), not one limit"
     if parsed.unit != "m":
         return None, f"the page states {format_quantity(parsed)} there, which is not a length"
+    if not math.isfinite(parsed.value):
+        return None, f"the page states a non-finite length ({parsed.original!r})"
     reason = _mismatch(model_q, parsed)
     if reason is not None:
         return None, reason.replace("model", "file")
@@ -309,6 +334,8 @@ def _ground_mm(key: str, lim: CapabilityLimit, page_text: str, span: tuple[int, 
         mm = mm_from_token(parsed.original)
     except ValueError as e:
         return None, str(e)
+    if not math.isfinite(mm):
+        return None, f"the page states a non-finite length ({parsed.original!r})"
     return (mm, "mm", f"{mm:g} mm"), None
 
 
@@ -390,7 +417,7 @@ def capability_source_result(
 
 class LimitSourceCheck(BaseModel):
     key: str
-    status: str  # ok | unarchived | missing | tampered | quote_missing
+    status: str  # ok | unarchived | missing | tampered | quote_missing | value_mismatch
     reason: str
     document: str | None = None
     page: int | None = None
@@ -398,12 +425,16 @@ class LimitSourceCheck(BaseModel):
 
 
 def relocate_limits(constraints: ManufacturingConstraints, archive: DocumentArchive | None) -> list[LimitSourceCheck]:
-    """Re-verify every ``authoritative`` limit: its archived page re-hashed and its quote re-located on the recorded page.
+    """Re-verify every ``authoritative`` limit: its archived page re-hashed, its quote re-located on the recorded page and its number re-read.
 
-    ``ok`` only when the archive holds the page under the recorded hash and
-    the quote from the note stands on ``page N`` of the re-extracted text;
-    ``unarchived`` / ``missing`` / ``tampered`` as :func:`~ai_eda.parts.identity.locate_source`
-    reports; ``quote_missing`` when the page is there but the quote is not.
+    ``ok`` only when the archive holds the page under the recorded hash, the
+    quote from the note stands on ``page N`` of the re-extracted text **and**
+    the grounding step run again on that quote (:func:`_ground_hit`) reads
+    exactly the value and unit the IR stores; ``unarchived`` / ``missing`` /
+    ``tampered`` as :func:`~ai_eda.parts.identity.locate_source` reports;
+    ``quote_missing`` when the page is there but the quote is not;
+    ``value_mismatch`` (both numbers in the reason) when the quote is there
+    but does not state the stored value - an edited ``ir.json``.
     """
     from ai_eda.parts.identity import locate_source
 
@@ -426,12 +457,56 @@ def relocate_limits(constraints: ManufacturingConstraints, archive: DocumentArch
         if quote is None or page is None:
             out.append(LimitSourceCheck(key=key, status="quote_missing", reason="the limit's note records no quote / page to re-locate", document=doc.sha256, page=page, quote=quote))
             continue
-        if not searchable_document(doc).find_quote(quote, page):
+        sdoc = searchable_document(doc)
+        hits = sdoc.find_quote(quote, page)
+        if not hits:
             out.append(LimitSourceCheck(key=key, status="quote_missing", reason=f"quote {quote!r} not found on page {page} of the archived page {doc.sha256[:19]}… at review time",
                                         document=doc.sha256, page=page, quote=quote))
             continue
-        out.append(LimitSourceCheck(key=key, status="ok", reason=reason, document=doc.sha256, page=page, quote=quote))
+        mismatch = _stored_value_mismatch(key, traced, sdoc, hits[0])
+        if mismatch is not None:
+            out.append(LimitSourceCheck(key=key, status="value_mismatch", reason=mismatch, document=doc.sha256, page=page, quote=quote))
+            continue
+        out.append(LimitSourceCheck(key=key, status="ok", reason=f"{reason}; quote re-read as {_stored_text(traced)}", document=doc.sha256, page=page, quote=quote))
     return out
+
+
+def _stored_text(traced: Traced) -> str:
+    return f"{traced.value!r}" + (f" {traced.unit}" if traced.unit else "")
+
+
+def _stored_value_mismatch(key: str, traced: Traced, sdoc: ArchivedDocument, hit: QuoteHit) -> str | None:
+    """The reason the stored ``Traced`` is not what the re-located quote states, else ``None`` (the same grounding step as :func:`ground_capability`)."""
+    stored = _stored_text(traced)
+    try:
+        lim = CapabilityLimit(key=key, value=traced.value, unit=traced.unit, page=hit.page, quote=hit.matched)
+    except ValidationError as e:
+        return f"stored value {stored} has a shape the grounding rules do not accept: {e.errors()[0].get('msg', e) if e.errors() else e}"
+    grounded, reason = _ground_hit(key, lim, sdoc, hit)
+    if grounded is None:
+        states = _quote_states(key, sdoc, hit)
+        return f"stored value {stored} but the quote {hit.matched!r} states {states}: {reason}" if states else f"stored value {stored} does not re-ground on the quote {hit.matched!r}: {reason}"
+    value, unit, parsed_text = grounded
+    if value != traced.value or (unit or None) != (traced.unit or None):
+        return f"stored value {stored} but the quote {hit.matched!r} re-reads as {parsed_text} ({value!r} {unit or ''})".rstrip()
+    return None
+
+
+def _quote_states(key: str, sdoc: ArchivedDocument, hit: QuoteHit) -> str | None:
+    """What the located quote states, in the words grounding would have stored (``0.09 mm``, ``1, 2, 4, 6 layers``, ``1 oz``); ``None`` when it does not read as one number."""
+    if key in MM_KEYS:
+        parsed, _ = _request_quantity(sdoc.pages[hit.page - 1], (hit.offset, hit.offset + len(hit.matched)))
+        if not isinstance(parsed, Quantity) or parsed.plus_minus or parsed.unit != "m" or not math.isfinite(parsed.value):
+            return None
+        try:
+            return f"{mm_from_token(parsed.original):g} mm"
+        except ValueError:
+            return None
+    if key == LAYER_KEY:
+        tokens = re.findall(r"\d+", hit.matched)
+        return ", ".join(tokens) + " layers" if tokens else None
+    oz = _OZ_TOKEN_RE.findall(hit.matched)
+    return f"{oz[0]} oz" if len(oz) == 1 else None
 
 
 __all__ = [

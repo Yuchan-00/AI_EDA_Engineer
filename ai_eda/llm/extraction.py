@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import unicodedata
 from typing import Any, Literal
@@ -536,6 +537,9 @@ def is_correction(answer: str | None) -> bool:
 
 
 def _agree(a: float, b: float) -> bool:
+    """Relative agreement within ``REL_TOL``; a non-finite side never agrees (``inf`` would otherwise agree with anything under a relative tolerance)."""
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return False
     return abs(a - b) <= REL_TOL * max(abs(a), abs(b))
 
 
