@@ -64,6 +64,20 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   applicability; a quote missing from the official text is FAIL (the
   curated list is wrong). PASS is source provenance and applicability only -
   every message says that compliance is not assessed.
+* ``review.drc`` additionally requires, when the IR registers a
+  ``KICAD_PROJECT`` artifact, that it is fresh and unchanged on disk (else
+  FAIL ``regenerate`` ``kicad_pro``) and that the DRC report was produced
+  beside exactly that file (``details["project_hash"]``; else FAIL
+  ``rerun_tool``) - a stale or hand-edited project file is not the rules
+  the compiler wrote.
+* ``review.manufacturing_capabilities`` recomputes
+  :func:`~ai_eda.tools.manufacturing.check_capability` live, re-verifies
+  every ``authoritative`` limit's archived page (hash) and quote (re-located
+  on the recorded page, :func:`~ai_eda.tools.manufacturing.relocate_limits`)
+  and FAILs when the stored ``mfg.capability`` verdict disagrees with the
+  live one or a limit's quote is no longer on its page; a stored result
+  without a tool is an opinion (NOT_VERIFIED), one stamped for another IR
+  version is not evidence about this one.
 """
 
 from __future__ import annotations
@@ -90,6 +104,8 @@ from ai_eda.review.areas import ReviewArea
 from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters
 from ai_eda.tools.kicad.board import BoardFootprint, read_board_footprints
 from ai_eda.tools.kicad.geometry import normalize_angle
+from ai_eda.tools.manufacturing.capability import CHECK_ID as CAPABILITY_CHECK_ID, check_capability
+from ai_eda.tools.manufacturing.capability_file import relocate_limits
 from ai_eda.tools.manufacturing.csv_cells import bom_cell_text
 from ai_eda.tools.manufacturing.outputs import OUTPUT_CHECKS
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK_ID, read_results
@@ -152,7 +168,7 @@ class IndependentReviewer:
             ReviewArea.DRC: self._tool_result_fresh("kicad.drc", ArtifactKind.PCB),
             ReviewArea.REGULATORY_PROVENANCE: self.check_regulatory_provenance,
             ReviewArea.COMPONENT_PROVENANCE: self.check_component_provenance,
-            ReviewArea.MANUFACTURING_CAPABILITIES: self._latest_status("mfg.capability"),
+            ReviewArea.MANUFACTURING_CAPABILITIES: self.check_manufacturing_capabilities,
         }
 
     def review(self, ir: CircuitIR, workdir: Path) -> ReviewReport:
@@ -223,6 +239,10 @@ class IndependentReviewer:
                 return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{check_id} result is not tool-backed evidence about the current {on_kind} (no tool or no artifact hash)")
             if res.artifact_hash != art.content_hash:
                 return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"{check_id} report is stale (ran on a different {on_kind})", details={"tool_check": check_id, "repair": "rerun_tool"})
+            if check_id == "kicad.drc":
+                project_problem = self._project_problem(ir, res)
+                if project_problem is not None:
+                    return project_problem
             details: dict = {}
             if res.status is ValidationStatus.FAIL:
                 # a violation in the design (error or warning) is not something regeneration fixes
@@ -233,6 +253,61 @@ class IndependentReviewer:
                 }
             return ValidationResult(check_id="", status=res.status, message=f"{check_id}: {res.message}", evidence=res.evidence, details=details)
         return check
+
+    @staticmethod
+    def _project_problem(ir: CircuitIR, drc: ValidationResult) -> ValidationResult | None:
+        """FAIL when the registered ``.kicad_pro`` is stale / edited (regenerate it) or the DRC report did not read it (re-run DRC); ``None`` when no project artifact is registered or all is well."""
+        pro = ir.artifacts.get(ArtifactKind.KICAD_PROJECT)
+        if pro is None:
+            return None
+        if pro.is_stale(ir.content_hash()):
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"{ArtifactKind.KICAD_PROJECT} (design rules) was generated from a different IR version; DRC must re-read the regenerated project file",
+                                    details={"artifacts": [str(ArtifactKind.KICAD_PROJECT)], "repair": "regenerate", "then": "rerun_tool", "tool_check": "kicad.drc"})
+        if not pro.matches_disk():
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"{ArtifactKind.KICAD_PROJECT} on disk does not match its recorded hash (edited after it was compiled); regenerate it and re-run DRC",
+                                    details={"artifacts": [str(ArtifactKind.KICAD_PROJECT)], "repair": "regenerate", "then": "rerun_tool", "tool_check": "kicad.drc"})
+        if drc.details.get("project_hash") != pro.content_hash:
+            why = drc.details.get("project_reason") or "the report records another project file"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"kicad.drc report was not produced beside the fresh {ArtifactKind.KICAD_PROJECT} ({why}); re-run DRC",
+                                    details={"tool_check": "kicad.drc", "repair": "rerun_tool"})
+        return None
+
+    def check_manufacturing_capabilities(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
+        """The board against the fab limits, recomputed here, with every limit's source re-verified (module docstring)."""
+        from ai_eda.parts.identity import open_archive
+
+        stored = ir.validation.latest(CAPABILITY_CHECK_ID)
+        live = check_capability(ir)
+        details: dict[str, Any] = {"live": {"status": str(live.status), "message": live.message, "compared": live.details.get("compared", []), "drc_proof": live.details.get("drc_proof")},
+                                   "stored": None if stored is None else {"status": str(stored.status), "message": stored.message, "tool": stored.tool, "ir_hash": stored.ir_hash}}
+        if stored is None:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"no {CAPABILITY_CHECK_ID} result; live check: {live.message}", details=details)
+        if not stored.is_tool_backed:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{CAPABILITY_CHECK_ID} result carries no tool: an opinion, not evidence; live check: {live.message}", details=details)
+        checks = relocate_limits(ir.pcb.manufacturing, open_archive(self.tools, workdir)) if ir.pcb is not None else []
+        details["sources"] = [c.model_dump(mode="json") for c in checks]
+        evidence = [Evidence(description=f"archived capability page grounding {c.key}", content_hash=c.document) for c in checks if c.status == "ok" and c.document]
+        wrong = [c for c in checks if c.status in ("tampered", "quote_missing")]
+        unlocated = [c for c in checks if c.status not in ("ok", "tampered", "quote_missing")]
+        if wrong:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, evidence=evidence, details=details,
+                                    message="fab limit(s) claim a vendor page that does not say so at review time: " + "; ".join(f"{c.key}: {c.status}: {c.reason}" for c in wrong))
+        if stored.status is not live.status:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, evidence=evidence, details=details,
+                                    message=f"stored {CAPABILITY_CHECK_ID} is {stored.status} but the live check gives {live.status}: {live.message}")
+        if stored.ir_hash and stored.ir_hash != ir.content_hash():
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, evidence=evidence, details=details,
+                                    message=f"{CAPABILITY_CHECK_ID} was produced for another IR version; live check: {live.message}")
+        if unlocated:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, evidence=evidence, details=details,
+                                    message="fab limit source(s) not re-verifiable: " + "; ".join(f"{c.key}: {c.status}: {c.reason}" for c in unlocated) + f"; live check: {live.message}")
+        if live.status is ValidationStatus.FAIL:
+            details["repair"] = live.details.get("repair", "human")
+        return ValidationResult(check_id="", status=live.status, evidence=evidence, details=details,
+                                message=f"{live.message}" + (f"; {len(checks)} limit source(s) re-verified" if checks else ""))
 
     def _tool_result_present(self, check_id: str, kind: ArtifactKind) -> Check:
         def check(ir: CircuitIR, workdir: Path) -> ValidationResult:

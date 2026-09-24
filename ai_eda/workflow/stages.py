@@ -8,6 +8,7 @@ class Stage(StrEnum):
     ARCHITECTURE = "architecture"
     COMPONENT_SELECTION = "component_selection"
     PLACEMENT = "placement"
+    FAB_CAPABILITY = "fab_capability"
     IR_BUILD = "ir_build"
     CALCULATION = "calculation"
     SPICE = "spice"

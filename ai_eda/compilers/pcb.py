@@ -36,9 +36,12 @@ What the file contains (verified with kicad-cli 10.0.6 ``pcb drc
   without one kicad-cli applies its built-in defaults (clearance 0.2 mm, track
   0.2 mm, copper to edge 0.5 mm). :func:`design_rules` maps the authoritative
   ``ir.pcb.manufacturing`` values onto the ``.kicad_pro``
-  ``board.design_settings.rules`` keys for a future project-file writer; the
-  only fab value that *is* representable in the board file, the board
-  thickness, is written to ``(general (thickness ..))``.
+  ``board.design_settings.rules`` keys; :class:`~ai_eda.compilers.project.ProjectFileCompiler`
+  writes them into ``<project.id>.kicad_pro`` beside the schematic and the
+  board (SCHEMATIC stage), and ``ai_eda.tools.kicad.cli`` records which
+  project file ERC / DRC ran beside. The only fab value that *is*
+  representable in the board file, the board thickness, is written to
+  ``(general (thickness ..))``.
 * Footprints (sorted by layer then uuid, as KiCad writes them): the library
   ``(footprint ...)`` tree with the modifications KiCad makes when embedding -
   library ``(version)``/``(generator)`` dropped, ``(layer)`` + ``(uuid)`` +
@@ -208,8 +211,8 @@ def design_rules(ir: CircuitIR) -> dict[str, float]:
 
     Only :data:`MANUFACTURING_RULE_KEYS` are mapped; values whose provenance is
     not authoritative / user-required are left out so an unverified limit never
-    becomes a rule. The PCB compiler does not write a project file (yet), so
-    this is exposed for the stage that will.
+    becomes a rule. :class:`~ai_eda.compilers.project.ProjectFileCompiler`
+    writes the result into the ``.kicad_pro`` project file.
     """
     if ir.pcb is None:
         return {}

@@ -11,6 +11,7 @@ from ai_eda.compilers.pcb import PCBCompiler
 from ai_eda.compilers.bom import BOMCompiler, CPLCompiler, TEXT_PREFIX, bom_cell_text, free_text_cell
 from ai_eda.compilers.spice import SpiceNetlistCompiler
 from ai_eda.compilers.gerber import DrillExporter, GerberExporter
+from ai_eda.compilers.project import ProjectFileCompiler
 
 __all__ = [
     "Compiler",
@@ -25,4 +26,5 @@ __all__ = [
     "SpiceNetlistCompiler",
     "GerberExporter",
     "DrillExporter",
+    "ProjectFileCompiler",
 ]

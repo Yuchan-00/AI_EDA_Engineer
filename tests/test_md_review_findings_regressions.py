@@ -1389,11 +1389,12 @@ def test_61_a_pass_carried_over_from_an_earlier_run_without_an_ir_version_is_not
 
 def test_62_authoritative_fab_limits_without_a_comparison_are_not_a_pass(tmp_path: Path):
     limits = ManufacturingConstraints(fab="X", min_track_width_mm=authoritative(0.127, DS, "mm"), min_clearance_mm=authoritative(0.127, DS, "mm"))
-    cap = FabCapability(fab="X", constraints=limits, source=DS)
-    assert cap.verification_status() is S.PASS  # the data is authoritative ...
     ir = CircuitIR(project=ProjectMeta(id="p", name="p", workdir=str(tmp_path)))
-    for tools in ({"fab_capability": cap}, {}):
-        r = ManufacturingAgent().run(ir, AgentContext(workdir=tmp_path, tools=tools)).validation[0]
-        assert r.check_id == "mfg.capability" and r.status is S.NOT_VERIFIED and r.details["compared"] is False  # ... but nothing was compared
-    r = ManufacturingAgent().run(ir, AgentContext(workdir=tmp_path, tools={"fab_capability": cap})).validation[0]
-    assert "not compared" in r.message and r.details["limits"] is S.PASS
+    ir.pcb = PCBDesign(manufacturing=limits)  # the limits are design content, read from the IR (never from a session tool)
+    assert FabCapability.from_ir(ir).verification_status() is S.PASS  # the data is authoritative ...
+    r = ManufacturingAgent().run(ir, AgentContext(workdir=tmp_path, tools={})).validation[0]
+    assert r.check_id == "mfg.capability" and r.status is S.NOT_VERIFIED and r.is_tool_backed and r.ir_hash == ir.content_hash()
+    rows = {row["limit"]: row for row in r.details["compared"]}
+    assert rows["min_track_width_mm"]["status"] == "PASS" and rows["min_clearance_mm"]["status"] == "PASS"  # ... the IR comparisons hold (no copper) ...
+    assert rows["clearance_between_items"]["status"] == "NOT_VERIFIED" and "kicad.drc has not been run" in rows["clearance_between_items"]["message"]
+    assert "kicad.drc has not been run" in r.message and r.details["limits"] == "PASS"  # ... but the geometry only DRC proves is not proven

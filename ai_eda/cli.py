@@ -34,6 +34,10 @@
                                          (--catalog-authority / --catalog-supplier label it); backs sourcing
                                          values, never an identity
         --regulatory-candidates PATH     a candidate list other than the packaged one
+        --fab-capability FILE            your JSON file naming the fab's capability page (url, or a saved
+                                         file + retrieved_at) and the limits it states (key, value, unit,
+                                         page, quote); the URL is trusted exactly, every limit is grounded
+                                         verbatim on the archived page and recorded in ir.pcb.manufacturing
     ai-eda review IR.json    run only the independent reviewer (exit 1 on any FAIL)
 
 Without ``--llm`` the pipeline is exactly what it was before the LLM stage;
@@ -197,7 +201,7 @@ def parse_answers(items: list[str] | None) -> dict[str, str]:
 
 def build_source_session(args: argparse.Namespace, ir, workdir: Path, library):
     """The run's :class:`~ai_eda.workflow.session.SourceSession` from the ``--online`` / ``--trust-host`` / ``--datasheet-url`` /
-    ``--source-url`` / ``--sources-dir`` / ``--catalog*`` / ``--regulatory-candidates`` flags (``SessionError`` for a usage error)."""
+    ``--source-url`` / ``--sources-dir`` / ``--catalog*`` / ``--regulatory-candidates`` / ``--fab-capability`` flags (``SessionError`` for a usage error)."""
     from ai_eda.security.approval import default_gate
     from ai_eda.workflow.session import open_session, parse_key_urls
 
@@ -209,7 +213,7 @@ def build_source_session(args: argparse.Namespace, ir, workdir: Path, library):
         sources_dir=getattr(args, "sources_dir", None),
         catalog=getattr(args, "catalog", None), catalog_date=getattr(args, "catalog_date", None),
         catalog_authority=getattr(args, "catalog_authority", None), catalog_supplier=getattr(args, "catalog_supplier", None),
-        candidates=getattr(args, "regulatory_candidates", None), gate=default_gate(),
+        candidates=getattr(args, "regulatory_candidates", None), fab_capability=getattr(args, "fab_capability", None), gate=default_gate(),
     )
 
 
@@ -390,6 +394,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--catalog-authority", metavar="TEXT", help="who produced the catalog data, e.g. 'JLCPCB export'")
     r.add_argument("--catalog-supplier", metavar="NAME", help="the supplier label for sourcing entries, e.g. JLCPCB")
     r.add_argument("--regulatory-candidates", metavar="PATH", help="a regulatory candidate list other than the packaged ai_eda/regulatory/candidates.json")
+    r.add_argument("--fab-capability", metavar="FILE", help="JSON file naming the fab's capability page (source.url, or source.file + retrieved_at for a saved page) and its limits (key, value, unit, page, quote); the URL is trusted exactly, the limits are grounded verbatim on the archived page")
     r.set_defaults(fn=cmd_run)
 
     v = sub.add_parser("review", help="independent review only")

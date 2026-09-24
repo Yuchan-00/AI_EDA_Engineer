@@ -57,8 +57,10 @@ from ai_eda.ir import (
 )
 from ai_eda.repair import RepairLoop
 from ai_eda.review import IndependentReviewer, ReviewArea
+from ai_eda.compilers.pcb import design_rules
 from ai_eda.tools.calc import parallel_resistance, recompute_parameters, voltage_divider_output
 from ai_eda.tools.kicad import KicadCli, KicadLibrary
+from ai_eda.tools.kicad.cli import PROJECT_RULES_MEASURED_VERSIONS
 from ai_eda.tools.routing import route_naive
 from ai_eda.tools.spice import NgspiceShared
 from ai_eda.workflow import Orchestrator, PipelineState, Stage
@@ -173,8 +175,9 @@ def test_pipeline_runs_the_slice_with_real_tools(tmp_path: Path):
     assert "mfg.gerber PASS" in outcomes[Stage.MANUFACTURING_OUTPUTS].message
     assert "mfg.drill PASS" in outcomes[Stage.MANUFACTURING_OUTPUTS].message
 
-    # artifacts: all eight, all fresh, all on disk, schematic and board are siblings with the project stem
-    kinds = {ArtifactKind.SPICE_NETLIST, ArtifactKind.SPICE_RESULT, ArtifactKind.SCHEMATIC, ArtifactKind.PCB, ArtifactKind.BOM, ArtifactKind.CPL, ArtifactKind.GERBER, ArtifactKind.DRILL}
+    # artifacts: all nine, all fresh, all on disk, schematic and board are siblings with the project stem
+    kinds = {ArtifactKind.SPICE_NETLIST, ArtifactKind.SPICE_RESULT, ArtifactKind.SCHEMATIC, ArtifactKind.PCB, ArtifactKind.BOM, ArtifactKind.CPL, ArtifactKind.GERBER, ArtifactKind.DRILL,
+             ArtifactKind.KICAD_PROJECT}
     assert kinds <= set(ir.artifacts)
     ir_hash = ir.content_hash()
     for kind in kinds:
@@ -182,6 +185,7 @@ def test_pipeline_runs_the_slice_with_real_tools(tmp_path: Path):
         assert art.generated_from_ir_hash == ir_hash and art.matches_disk(), kind
     sch, pcb = Path(ir.artifacts[ArtifactKind.SCHEMATIC].path), Path(ir.artifacts[ArtifactKind.PCB].path)
     assert sch == tmp_path / f"{PROJECT_ID}.kicad_sch" and pcb == tmp_path / f"{PROJECT_ID}.kicad_pcb"
+    assert Path(ir.artifacts[ArtifactKind.KICAD_PROJECT].path) == tmp_path / f"{PROJECT_ID}.kicad_pro"  # no fab limits in this IR: empty rules, KiCad defaults
     gerber = ir.artifacts[ArtifactKind.GERBER]
     assert Path(gerber.path).name == f"{PROJECT_ID}-job.gbrjob" and Path(gerber.path).parent == tmp_path / "gerber"
     assert len(gerber.files) == 10 and all(Path(f).is_file() for f in gerber.files)
@@ -196,6 +200,10 @@ def test_pipeline_runs_the_slice_with_real_tools(tmp_path: Path):
     assert drc.details["schematic_hash"] == ir.artifacts[ArtifactKind.SCHEMATIC].content_hash
     assert drc.details["schematic_parity"] == [] and drc.details["unconnected_items"] == []
     assert "error" in drc.details["included_severities"]
+    # ERC and DRC ran beside the fresh project file and did not rewrite it
+    for res in (erc, drc):
+        assert res.details["project_present"] is True and res.details["project_rewritten"] is False and res.details["project_hash"] == ir.artifacts[ArtifactKind.KICAD_PROJECT].content_hash
+    assert drc.details["design_rules"] == {} and ir.artifacts[ArtifactKind.KICAD_PROJECT].matches_disk()
     report = json.loads(Path(drc.evidence[0].path).read_text(encoding="utf-8"))
     assert report["schematic_parity"] == [] and report["source"] == pcb.name
     for check in ("mfg.gerber", "mfg.drill"):
@@ -266,8 +274,10 @@ def test_design_change_is_detected_and_repaired_by_regeneration_only(tmp_path: P
         assert review[area].status is S.FAIL and review[area].details["repair"] == "regenerate", area
     assert review[ReviewArea.PCB_VS_BOM].details["only_in_ir"] == ["R3"]
     assert review[ReviewArea.SPICE_VS_REQUIREMENTS].details["artifact"] == ArtifactKind.SPICE_NETLIST
-    # ERC/DRC ran on the (still current) old artifacts, so those reports are not stale *yet*
-    assert review[ReviewArea.ERC].status is S.PASS and review[ReviewArea.DRC].status is S.PASS
+    # ERC ran on the (still current) old schematic, so that report is not stale *yet*; the DRC report read the project file,
+    # which the design change made stale: the review asks for the project file to be regenerated (the DRC re-run follows)
+    assert review[ReviewArea.ERC].status is S.PASS
+    assert review[ReviewArea.DRC].status is S.FAIL and review[ReviewArea.DRC].details["repair"] == "regenerate" and review[ReviewArea.DRC].details["artifacts"] == ["kicad_pro"]
 
     outcome = RepairLoop(tools=ctx.tools).run(ir, tmp_path)
     print(outcome.summary())
@@ -285,6 +295,7 @@ def test_design_change_is_detected_and_repaired_by_regeneration_only(tmp_path: P
     assert descriptions.index("regenerate spice_netlist from IR") < descriptions.index("re-run spice")
     assert any(d.startswith("regenerate kicad_sch") for d in descriptions)
     assert any(d.startswith("regenerate gerber, drill") for d in descriptions)
+    assert "regenerate kicad_pro from IR" in descriptions
     assert 1 < outcome.iterations <= 3
 
     final = {r.check_id: r for r in outcome.final_review.results}
@@ -293,7 +304,10 @@ def test_design_change_is_detected_and_repaired_by_regeneration_only(tmp_path: P
     for kind, old in before.items():
         art = ir.artifacts[kind]
         assert art.generated_from_ir_hash == changed_hash and art.matches_disk()
-        assert art.content_hash != old, f"{kind} was not regenerated"
+        if kind is ArtifactKind.KICAD_PROJECT:
+            assert art.content_hash == old  # regenerated from the changed IR, but the rules did not change: same bytes
+        else:
+            assert art.content_hash != old, f"{kind} was not regenerated"
     # the regenerated design is real: R3 is in the schematic, the board, the BOM, the CPL and the netlist ngspice ran
     assert "R3" in Path(ir.artifacts[ArtifactKind.BOM].path).read_text(encoding="utf-8")
     assert "R3" in Path(ir.artifacts[ArtifactKind.CPL].path).read_text(encoding="utf-8")
@@ -307,6 +321,7 @@ def test_design_change_is_detected_and_repaired_by_regeneration_only(tmp_path: P
     drc = ir.validation.latest("kicad.drc")
     assert drc.status is S.PASS and drc.details["errors"] == [] and drc.details["warnings"] == []
     assert drc.details["schematic_parity_checked"] and drc.details["schematic_hash"] == ir.artifacts[ArtifactKind.SCHEMATIC].content_hash
+    assert drc.details["project_hash"] == ir.artifacts[ArtifactKind.KICAD_PROJECT].content_hash
     assert ir.validation.latest("kicad.erc").artifact_hash == ir.artifacts[ArtifactKind.SCHEMATIC].content_hash
 
 
@@ -331,3 +346,86 @@ def test_missing_sibling_schematic_never_passes_parity(tmp_path: Path):
     review = _review(ir, tmp_path, ctx.tools)
     assert review[ReviewArea.SCHEMATIC_VS_PCB].status is S.NOT_VERIFIED
     assert "not evaluated" in review[ReviewArea.SCHEMATIC_VS_PCB].message
+
+
+# --------------------------------------------------------------------------- fab capability (needs the Windows measurement)
+
+
+CAPABILITY_URL = "https://fab.example.com/capabilities"
+
+
+def _capability_file(tmp_path: Path) -> Path:
+    """A capability file the slice satisfies (0.25 mm naive tracks, no vias, 2 layers), served by the loopback fake."""
+    limits = [
+        {"key": "min_track_width_mm", "value": 0.127, "unit": "mm", "page": 1, "quote": "Min trace width 0.127 mm"},
+        {"key": "min_clearance_mm", "value": 0.127, "unit": "mm", "page": 1, "quote": "Min spacing 0.127 mm"},
+        {"key": "min_via_drill_mm", "value": 0.3, "unit": "mm", "page": 1, "quote": "Min via hole size 0.3 mm"},
+        {"key": "min_via_diameter_mm", "value": 0.5, "unit": "mm", "page": 1, "quote": "Min via diameter 0.5 mm"},
+        {"key": "layer_count_options", "value": [1, 2, 4], "unit": None, "page": 1, "quote": "Layers 1, 2, 4"},
+        {"key": "copper_weight_oz", "value": 1, "unit": "oz", "page": 1, "quote": "Copper weight 1 oz"},
+        {"key": "board_thickness_mm", "value": 1.6, "unit": "mm", "page": 1, "quote": "Board thickness 1.6 mm"},
+    ]
+    p = tmp_path / "fab.json"
+    p.write_text(json.dumps({"fab": "Example Fab", "source": {"url": CAPABILITY_URL, "title": "Example Fab capabilities", "authority": "Example Fab"}, "limits": limits}), encoding="utf-8")
+    return p
+
+
+CAPABILITY_HTML = (
+    "<html><head><title>Example Fab capabilities</title></head><body><table>"
+    "<tr><td>Min trace width</td><td>0.127 mm</td></tr><tr><td>Min spacing</td><td>0.127 mm</td></tr>"
+    "<tr><td>Min via hole size</td><td>0.3 mm</td></tr><tr><td>Min via diameter</td><td>0.5 mm</td></tr>"
+    "<tr><td>Layers</td><td>1, 2, 4</td></tr><tr><td>Copper weight</td><td>1 oz</td></tr><tr><td>Board thickness</td><td>1.6 mm</td></tr>"
+    "</table></body></html>"
+)
+
+
+@pytest.mark.skipif(not (kicad.available() and kicad.version() in PROJECT_RULES_MEASURED_VERSIONS),
+                    reason="kicad-cli's application of sibling .kicad_pro rules is not measured for this version (PROJECT_RULES_MEASURED_VERSIONS)")
+def test_fab_capability_limits_become_drc_rules_and_pass(tmp_path: Path):
+    """With a grounded capability file the project file carries the fab minimums, DRC runs with them, mfg.capability PASSes on that
+    evidence; a track narrowed below the limit is a fab_capability_shortfall (human) and the release FAILs."""
+    from ai_eda.security import ApprovalGate
+    from ai_eda.workflow import open_session
+    from tests.fake_sources import FakeSources
+
+    cap = _capability_file(tmp_path)
+    with FakeSources() as fake:
+        fake.add_html(CAPABILITY_URL, CAPABILITY_HTML)
+        ir = _routed_ir(tmp_path)
+        session = open_session(workdir=tmp_path, ir=ir, library=LIB, online=True, fab_capability=cap, gate=ApprovalGate(), client=fake.client())
+        try:
+            ctx = AgentContext(workdir=tmp_path, tools={"kicad_cli": kicad, "kicad_library": LIB, "spice": ngspice, **session.tools()},
+                               answers={"application": "bench voltage divider", "jurisdiction": "EU"})
+            state = Orchestrator(ctx).run(ir)
+        finally:
+            session.close()
+        for o in state.outcomes:
+            print(f"{o.stage:<24} {o.status:<14} {o.message}")
+        assert not state.blocked and state.outcome(Stage.FAB_CAPABILITY).status is S.PASS
+        assert ir.pcb.manufacturing.min_track_width_mm.value == 0.127 and ir.pcb.manufacturing.min_clearance_mm.value == 0.127
+        pro = ir.artifacts[ArtifactKind.KICAD_PROJECT]
+        assert Path(pro.path) == tmp_path / f"{PROJECT_ID}.kicad_pro" and pro.matches_disk() and pro.generated_from_ir_hash == ir.content_hash()
+        drc = ir.validation.latest("kicad.drc")
+        assert drc.status is S.PASS and drc.details["project_hash"] == pro.content_hash
+        assert drc.details["design_rules"] == design_rules(ir) == {"min_track_width": 0.127, "min_clearance": 0.127, "min_via_diameter": 0.5, "min_through_hole_diameter": 0.3}
+        cap_res = ir.validation.latest("mfg.capability")
+        assert cap_res.status is S.PASS, cap_res.message
+        assert cap_res.ir_hash == ir.content_hash() and cap_res.details["drc_artifact_hash"] == ir.artifacts[ArtifactKind.PCB].content_hash
+        assert "(thickness 1.6)" in Path(ir.artifacts[ArtifactKind.PCB].path).read_text(encoding="utf-8")
+        review = _review(ir, tmp_path, ctx.tools)
+        assert review[ReviewArea.MANUFACTURING_CAPABILITIES].status is S.PASS and review[ReviewArea.DRC].status is S.PASS
+        assert state.outcome(Stage.RELEASE).status is S.NOT_VERIFIED and "mfg.capability" not in _blocking(state.outcome(Stage.RELEASE).message)
+
+        # a track below the fab minimum: the IR comparison FAILs (human), DRC with the fab rules FAILs too, the release FAILs
+        ir.pcb.tracks[0].width_mm = 0.1
+        session = open_session(workdir=tmp_path, ir=ir, library=LIB, online=False, fab_capability=cap, gate=ApprovalGate())
+        try:
+            ctx = AgentContext(workdir=tmp_path, tools={"kicad_cli": kicad, "kicad_library": LIB, "spice": ngspice, **session.tools()},
+                               answers={"application": "bench voltage divider", "jurisdiction": "EU"})
+            state = Orchestrator(ctx).run(ir)
+        finally:
+            session.close()
+        cap_res = ir.validation.latest("mfg.capability")
+        assert cap_res.status is S.FAIL and cap_res.details["repair"] == "fab_capability_shortfall" and "track[0:" in cap_res.message
+        assert ir.validation.latest("kicad.drc").status is S.FAIL
+        assert state.outcome(Stage.RELEASE).status is S.FAIL and "mfg.capability" in state.outcome(Stage.RELEASE).message

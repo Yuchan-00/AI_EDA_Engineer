@@ -319,7 +319,8 @@ def test_proposed_board_compiles_with_the_existing_compiler(tmp_path: Path, lib:
 
 def test_placement_stage_runs_before_ir_build_and_keeps_validator_hashes_fresh(tmp_path: Path, lib: KicadLibrary):
     assert STAGE_ORDER.index(Stage.PLACEMENT) == STAGE_ORDER.index(Stage.COMPONENT_SELECTION) + 1
-    assert STAGE_ORDER.index(Stage.PLACEMENT) == STAGE_ORDER.index(Stage.IR_BUILD) - 1
+    # FAB_CAPABILITY sits between PLACEMENT (which may create ir.pcb) and IR_BUILD, so the grounded fab limits land in the placed board
+    assert STAGE_ORDER.index(Stage.PLACEMENT) == STAGE_ORDER.index(Stage.FAB_CAPABILITY) - 1 == STAGE_ORDER.index(Stage.IR_BUILD) - 2
     ir = parts_ir(tmp_path, lib)
     state = Orchestrator(_ctx(tmp_path, lib)).run(ir)
     assert not state.blocked and [o.stage for o in state.outcomes] == list(Stage)

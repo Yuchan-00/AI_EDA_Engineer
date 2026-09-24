@@ -34,6 +34,24 @@ excluded or not - is FAIL. KiCad's severity is advisory; hiding warnings
 behind PASS would hide unknowns, and ``lib_symbol_mismatch`` /
 ``lib_footprint_mismatch`` warnings are compiler defects. The counts stay in
 the message and the lists in ``details``.
+
+Project file (``<stem>.kicad_pro`` beside the schematic / board): KiCad keeps
+the design rules there, so :meth:`KicadCli.run_erc` / :meth:`KicadCli.run_drc`
+record whether one sat beside the checked file (``details["project_present"]``,
+``project_path``, the hash of what was there at run time ``project_disk_hash``
+and whether kicad-cli rewrote it ``project_rewritten``), and
+:func:`run_erc_for` / :func:`run_drc_for` add ``project_hash`` +
+``design_rules`` **only** when that file *is* the IR's fresh
+``KICAD_PROJECT`` artifact (same path, generated from the current IR,
+unchanged on disk before and after the run) - otherwise ``project_reason``
+and no rules, so a stale or hand-edited project file can never pass as the
+compiler's. Whether kicad-cli 10 actually *applies* the sibling project's
+``board.design_settings.rules`` is NOT measured yet:
+:data:`PROJECT_RULES_MEASURED_VERSIONS` lists the kicad-cli versions for
+which ``tests/test_kicad_cli.py`` has demonstrated it (a 5 mm
+``min_track_width`` produces ``track_width`` violations on the vertical-slice
+board, 0.127 mm none, ERC output unchanged, project file not rewritten) and
+is empty until that run is recorded; the capability check reads it.
 """
 
 from __future__ import annotations
@@ -64,6 +82,11 @@ NON_COPPER_GERBER_LAYERS: tuple[str, ...] = (
 DEFAULT_GERBER_LAYERS: tuple[str, ...] = ("F.Cu", "B.Cu", *NON_COPPER_GERBER_LAYERS)
 
 WARNING_POLICY = "any violation (error or warning, excluded or not) is FAIL; counts in message, lists in details"
+
+#: kicad-cli versions measured to apply ``board.design_settings.rules`` of the sibling ``.kicad_pro`` in ``pcb drc``
+#: (``tests/test_kicad_cli.py`` canary). Empty until the measurement is recorded: an unmeasured version can not
+#: prove the fab minimums (``ai_eda.tools.manufacturing.capability``).
+PROJECT_RULES_MEASURED_VERSIONS: frozenset[str] = frozenset()
 
 
 def gerber_layers(copper: Iterable[str]) -> tuple[str, ...]:
@@ -125,6 +148,37 @@ def sibling_schematic(pcb: Path) -> Path:
     return pcb.with_suffix(".kicad_sch")
 
 
+def sibling_project(path: Path) -> Path:
+    """The project file KiCad looks for beside a schematic or board: ``<stem>.kicad_pro``."""
+    return path.with_suffix(".kicad_pro")
+
+
+def project_rules(path: Path) -> dict[str, float] | None:
+    """``board.design_settings.rules`` of a ``.kicad_pro`` as floats (non-numeric entries left out); ``None`` when absent or unreadable."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    rules = data.get("board", {}).get("design_settings", {}).get("rules") if isinstance(data, dict) else None
+    if not isinstance(rules, dict):
+        return None
+    return {str(k): float(v) for k, v in rules.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+
+def _project_snapshot(checked: Path) -> dict:
+    """What sits beside ``checked`` before kicad-cli runs: presence, path and hash of ``<stem>.kicad_pro``."""
+    pro = sibling_project(checked)
+    present = pro.is_file()
+    return {"project_present": present, "project_path": str(pro), "project_disk_hash": _file_hash(pro) if present else None}
+
+
+def _project_after(snapshot: dict) -> dict:
+    """The snapshot plus whether kicad-cli rewrote (or created) the project file during the run."""
+    pro = Path(snapshot["project_path"])
+    now = _file_hash(pro) if pro.is_file() else None
+    return {**snapshot, "project_rewritten": now != snapshot["project_disk_hash"]}
+
+
 class KicadCli:
     tool_id = "kicad-cli"
 
@@ -155,8 +209,11 @@ class KicadCli:
 
     def run_erc(self, schematic: Path, report_path: Path) -> ValidationResult:
         report_path.parent.mkdir(parents=True, exist_ok=True)
+        project = _project_snapshot(schematic)
         self._run(["sch", "erc", "--format", "json", "--severity-all", "-o", str(report_path), str(schematic)])
-        return self._report_to_result("kicad.erc", schematic, report_path, "sheets")
+        res = self._report_to_result("kicad.erc", schematic, report_path, "sheets")
+        res.details.update(_project_after(project))
+        return res
 
     def run_drc(self, pcb: Path, report_path: Path, schematic_parity: bool = False, refill_zones: bool = True) -> ValidationResult:
         """DRC on ``pcb``; with ``schematic_parity`` the sibling ``<stem>.kicad_sch`` must exist.
@@ -180,12 +237,14 @@ class KicadCli:
         if schematic_parity:
             args.append("--schematic-parity")
         args.append(str(pcb))
+        project = _project_snapshot(pcb)
         proc = self._run(args)
         if schematic_parity and proc.stderr.strip():
             # kicad-cli exits 0 and writes schematic_parity: [] when the schematic could not be netlisted;
             # the only sign is a localized stderr message, so do not match on its text.
             raise ToolExecutionError("schematic parity did not run: " + proc.stderr.strip()[-500:])
         res = self._report_to_result("kicad.drc", pcb, report_path, None)
+        res.details.update(_project_after(project))
         res.details["zones_refilled"] = refill_zones
         res.details["schematic_parity_checked"] = schematic_parity
         if schematic_parity:
@@ -342,10 +401,48 @@ def fresh_artifact(ir: CircuitIR, kind: ArtifactKind) -> ArtifactRef:
     return art
 
 
+def project_details(ir: CircuitIR, res: ValidationResult) -> None:
+    """Add ``project_hash`` + ``design_rules`` to an ERC / DRC result only when the project file it ran beside *is* the fresh ``KICAD_PROJECT`` artifact.
+
+    The artifact must name the sibling path, be generated from the current
+    IR, match its recorded hash on disk before the run (``project_disk_hash``)
+    and still after it (kicad-cli must not have rewritten it); otherwise
+    ``project_reason`` says why and no rules are recorded - a tool that ran
+    beside some other project file proves nothing about the compiler's rules.
+    """
+    art = ir.artifacts.get(ArtifactKind.KICAD_PROJECT)
+    sibling = Path(str(res.details.get("project_path") or ""))
+    if art is None:
+        res.details["project_reason"] = "no kicad_pro artifact registered for the IR"
+        return
+    if not res.details.get("project_present"):
+        res.details["project_reason"] = f"no {sibling.name} beside the checked file"
+        return
+    if Path(art.path).resolve() != sibling.resolve():
+        res.details["project_reason"] = f"kicad_pro artifact {art.path} is not {sibling.name} beside the checked file"
+        return
+    if art.is_stale(ir.content_hash()):
+        res.details["project_reason"] = f"kicad_pro artifact was generated from IR {art.generated_from_ir_hash} but the IR is now {ir.content_hash()}"
+        return
+    if res.details.get("project_disk_hash") != art.content_hash:
+        res.details["project_reason"] = "the project file beside the checked file does not match the kicad_pro artifact's recorded hash (edited after it was compiled)"
+        return
+    if res.details.get("project_rewritten") or not art.matches_disk():
+        res.details["project_reason"] = "kicad-cli rewrote the project file during the run"
+        return
+    rules = project_rules(sibling)
+    if rules is None:
+        res.details["project_reason"] = "the project file carries no board.design_settings.rules"
+        return
+    res.details["project_hash"] = art.content_hash
+    res.details["design_rules"] = rules
+
+
 def run_erc_for(ir: CircuitIR, kicad: KicadCli, workdir: Path) -> ValidationResult:
     """ERC on the fresh ``ir.artifacts[SCHEMATIC]`` (see :func:`fresh_artifact`); the result is stamped with the IR hash."""
     art = fresh_artifact(ir, ArtifactKind.SCHEMATIC)
     res = kicad.run_erc(Path(art.path), workdir / "reports" / "erc.json")
+    project_details(ir, res)
     res.ir_hash = ir.content_hash()
     return res
 
@@ -378,5 +475,6 @@ def run_drc_for(ir: CircuitIR, kicad: KicadCli, workdir: Path) -> ValidationResu
     res = kicad.run_drc(Path(art.path), workdir / "reports" / "drc.json", schematic_parity=sch is not None)
     if sch is None:
         res.details["schematic_parity_reason"] = reason
+    project_details(ir, res)
     res.ir_hash = ir.content_hash()
     return res

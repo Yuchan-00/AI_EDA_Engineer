@@ -9,8 +9,13 @@ What the orchestrator does *not* do: it never places, routes or otherwise
 changes the design itself to make a stage pass. The PLACEMENT stage applies
 the ``PCBAgent``'s deterministic grid proposal like any other proposal
 (through :meth:`Orchestrator.apply_proposals`, before IR_BUILD so every
-validator hash is about the placed design) and the compilers / DRC judge it;
-routing stays whatever the IR contains. The orchestrator compiles what the
+validator hash is about the placed design), the FAB_CAPABILITY stage right
+after it records the fab limits the ``FabCapabilityAgent`` grounded on the
+archived vendor page into ``ir.pcb.manufacturing`` (merged, never replacing
+what the user wrote; before IR_BUILD for the same reason - the limits feed
+the ``.kicad_pro`` design rules written in the SCHEMATIC stage and the board
+thickness), and the compilers / DRC judge it; routing stays whatever the IR
+contains. The orchestrator compiles what the
 IR contains (``ir.pcb.tracks`` included) and lets the tools judge it. A stage whose input
 does not exist yet (no components, no ``ir.pcb``, no board to export) is
 NOT_VERIFIED; a stage whose input is inconsistent (pins that do not match
@@ -32,6 +37,7 @@ from ai_eda.agents import (
     IRProposal,
     CircuitDesignAgent,
     ComponentAgent,
+    FabCapabilityAgent,
     ManufacturingAgent,
     PCBAgent,
     RegulatoryAgent,
@@ -47,6 +53,7 @@ from ai_eda.compilers import (
     DrillExporter,
     GerberExporter,
     PCBCompiler,
+    ProjectFileCompiler,
     SchematicCompiler,
     SpiceNetlistCompiler,
 )
@@ -156,6 +163,7 @@ class Orchestrator:
                 ArtifactKind.SPICE_NETLIST: SpiceNetlistCompiler(),
                 ArtifactKind.GERBER: GerberExporter(),
                 ArtifactKind.DRILL: DrillExporter(),
+                ArtifactKind.KICAD_PROJECT: ProjectFileCompiler(),
             },
         )
         # One library instance for the schematic / PCB compilers (parsed libraries are cached per instance).
@@ -167,6 +175,7 @@ class Orchestrator:
             Stage.ARCHITECTURE: self._agent_stage(CircuitDesignAgent()),
             Stage.COMPONENT_SELECTION: self._agent_stage(ComponentAgent()),
             Stage.PLACEMENT: self._agent_stage(PCBAgent()),
+            Stage.FAB_CAPABILITY: self._agent_stage(FabCapabilityAgent()),
             Stage.IR_BUILD: self._ir_validate,
             Stage.CALCULATION: self._calculation,
             Stage.SPICE: self._agent_stage(SimulationAgent()),
@@ -262,9 +271,10 @@ class Orchestrator:
         def fn(ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
             result: AgentResult = agent.run(ir, ctx)
             self.apply_proposals(ir, result.proposals)
-            # An agent's results were computed on the IR *before* its proposals, about the part of the design it
-            # owns and proposes; they carry no ir_hash (neither hash would be honest) and count as evidence only
-            # in the run that produced them (see _release).
+            # The results of an agent that proposes were computed on the IR *before* its proposals, about the part
+            # of the design it owns and proposes; they carry no ir_hash (neither hash would be honest) and count as
+            # evidence only in the run that produced them (see _release). An agent that proposes nothing and judges
+            # the IR as it stands (ManufacturingAgent's mfg.capability) stamps the hash itself.
             ir.validation.extend(result.validation)
             notes = list(result.notes)
             if result.blocked_on_user:
@@ -310,6 +320,7 @@ class Orchestrator:
             "circuit_design": Stage.ARCHITECTURE,
             "component": Stage.COMPONENT_SELECTION,
             "pcb": Stage.PLACEMENT,
+            "fab_capability": Stage.FAB_CAPABILITY,
             "simulation": Stage.SPICE,
             "manufacturing": Stage.MANUFACTURABILITY,
             "review": Stage.INDEPENDENT_REVIEW,
@@ -371,6 +382,16 @@ class Orchestrator:
 
         def fn(ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
             status, message = self._compile(ir, ctx, kind)
+            if kind == ArtifactKind.SCHEMATIC:
+                # the project file (fab limits as KiCad design rules) is written beside the schematic once there is
+                # one, so ERC and DRC of this run read one project file; the schematic's message stays the stage
+                # message verbatim, the project note is appended, its status folds in
+                if status is ValidationStatus.PASS:
+                    p_status, p_message = self._compile(ir, ctx, ArtifactKind.KICAD_PROJECT)
+                    status = worst_status([status, p_status])
+                    message = f"{message}; project file: {p_message}"
+                else:
+                    ir.artifacts.pop(ArtifactKind.KICAD_PROJECT, None)  # an older project file would be stale evidence
             return StageOutcome(stage=stage, status=status, message=message)
         return fn
 

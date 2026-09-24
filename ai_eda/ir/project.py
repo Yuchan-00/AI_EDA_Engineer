@@ -63,6 +63,8 @@ def strip_wall_clock(obj):
 class ArtifactKind(StrEnum):
     SCHEMATIC = "kicad_sch"
     PCB = "kicad_pcb"
+    #: the KiCad project file beside the schematic / board: ``board.design_settings.rules`` from the fab limits (deterministic JSON)
+    KICAD_PROJECT = "kicad_pro"
     SPICE_NETLIST = "spice_netlist"
     SPICE_RESULT = "spice_result"
     BOM = "bom"

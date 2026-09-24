@@ -18,6 +18,13 @@ here, so they agree):
 * **A catalog is the user's file with the user's date.** ``--catalog`` needs
   ``--catalog-date``; the file's sha256 becomes the source of every sourcing
   value it backs, never of an identity.
+* **A fab capability file names one page.** ``--fab-capability FILE`` is
+  loaded here (an invalid file is a :class:`SessionError`); its
+  ``source.url`` is trusted as exactly that URL under the key
+  :data:`FAB_CAPABILITY_KEY` - never its host wholesale - and the parsed file
+  reaches the FAB_CAPABILITY stage as ``tools["fab_capability_file"]``. A
+  ``source.file`` page is archived by that stage with the user's
+  ``retrieved_at`` (the ``--catalog-date`` rule).
 """
 
 from __future__ import annotations
@@ -34,8 +41,12 @@ from ai_eda.parts.pointers import locate_datasheet
 from ai_eda.regulatory.candidates import CandidateList, load_candidates
 from ai_eda.security.approval import ApprovalGate
 from ai_eda.tools.kicad.library import KicadLibrary
+from ai_eda.tools.manufacturing.capability_file import CapabilityFileError, FabCapabilityFile, load_capability_file
 from ai_eda.tools.sources.archive import DocumentArchive
 from ai_eda.tools.sources.policy import NetworkPolicy, host_key
+
+#: the user-URL key of the capability page (``ai_eda.agents.manufacturing.FAB_CAPABILITY_KEY`` names the same key)
+FAB_CAPABILITY_KEY = "fab_capability"
 
 
 class SessionError(AiEdaError):
@@ -78,6 +89,7 @@ class SourceSession:
     candidates: CandidateList
     sources_dir: Path
     catalog: CatalogSource | None = None
+    fab_capability_file: FabCapabilityFile | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -85,16 +97,19 @@ class SourceSession:
         return self.policy.approved
 
     def tools(self) -> dict[str, Any]:
-        """The ``AgentContext.tools`` entries the agents read (``archive``, ``policy``, ``regulatory_candidates`` and, when loaded, ``catalog``)."""
+        """The ``AgentContext.tools`` entries the agents read (``archive``, ``policy``, ``regulatory_candidates`` and, when loaded, ``catalog`` / ``fab_capability_file``)."""
         tools: dict[str, Any] = {"archive": self.archive, "policy": self.policy, "regulatory_candidates": self.candidates}
         if self.catalog is not None:
             tools["catalog"] = self.catalog
+        if self.fab_capability_file is not None:
+            tools["fab_capability_file"] = self.fab_capability_file
         return tools
 
     def describe(self) -> dict[str, Any]:
         return {
             "online": self.online, "sources_dir": str(self.sources_dir), "policy": self.policy.describe(),
             "catalog": self.catalog.describe() if self.catalog is not None else None,
+            "fab_capability": self.fab_capability_file.describe() if self.fab_capability_file is not None else None,
             "candidates": self.candidates.describe(), "notes": list(self.notes),
         }
 
@@ -103,6 +118,9 @@ class SourceSession:
         line = f"sources: {self.sources_dir} - {mode}; trusted hosts: {len(self.policy.trusted_hosts)}; user URLs: {len(self.policy.user_urls)}"
         if self.catalog is not None:
             line += f"; catalog: {self.catalog.path.name} ({len(self.catalog.rows)} rows, exported {self.catalog.retrieved_at})"
+        if self.fab_capability_file is not None:
+            f = self.fab_capability_file
+            line += f"; fab capability: {f.path.name} ({f.fab}, {len(f.limits)} limit(s), {f.source.url or f.source.file})"
         return line
 
     def close(self) -> None:
@@ -124,6 +142,7 @@ def open_session(
     catalog_authority: str | None = None,
     catalog_supplier: str | None = None,
     candidates: CandidateList | Path | str | None = None,
+    fab_capability: Path | str | None = None,
     gate: ApprovalGate | None = None,
     client: Any = None,
     approved_by: str = "cli --online",
@@ -146,6 +165,16 @@ def open_session(
         if key in user_urls and user_urls[key] != url:
             raise SessionError(f"--datasheet-url and --source-url both name {key!r} with different URLs")
         user_urls[key] = url
+    capability: FabCapabilityFile | None = None
+    if fab_capability is not None:
+        try:
+            capability = load_capability_file(fab_capability)
+        except CapabilityFileError as e:
+            raise SessionError(f"--fab-capability: {e}") from e
+        if capability.source.url:
+            if FAB_CAPABILITY_KEY in user_urls and user_urls[FAB_CAPABILITY_KEY] != capability.source.url:
+                raise SessionError(f"--fab-capability names {capability.source.url!r} but --datasheet-url/--source-url already name {FAB_CAPABILITY_KEY!r} as {user_urls[FAB_CAPABILITY_KEY]!r}")
+            user_urls[FAB_CAPABILITY_KEY] = capability.source.url  # trusted as exactly this URL, never its host
     policy = NetworkPolicy.from_cli(bool(online), user_urls=user_urls, gate=gate, approved_by=approved_by)
     for key, why in policy.invalid_user_urls.items():
         notes.append(f"user URL for {key!r} is unusable and will not be fetched: {why}")
@@ -177,7 +206,10 @@ def open_session(
             archive.close()
             raise SessionError(f"--catalog: {e}") from e
         notes.extend(f"catalog: {n}" for n in loaded.notes)
-    return SourceSession(policy=policy, archive=archive, candidates=cands, sources_dir=root, catalog=loaded, notes=notes)
+    if capability is not None and capability.source.url and FAB_CAPABILITY_KEY in policy.invalid_user_urls:
+        archive.close()
+        raise SessionError(f"--fab-capability: source.url is unusable: {policy.invalid_user_urls[FAB_CAPABILITY_KEY]}")
+    return SourceSession(policy=policy, archive=archive, candidates=cands, sources_dir=root, catalog=loaded, fab_capability_file=capability, notes=notes)
 
 
-__all__ = ["SessionError", "SourceSession", "kicad_datasheet_hosts", "open_session", "parse_key_urls"]
+__all__ = ["FAB_CAPABILITY_KEY", "SessionError", "SourceSession", "kicad_datasheet_hosts", "open_session", "parse_key_urls"]
