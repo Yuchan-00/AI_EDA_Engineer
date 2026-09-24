@@ -11,7 +11,9 @@ from __future__ import annotations
 import pytest
 
 from ai_eda.tools.calc import (
+    PREFIXABLE_UNITS,
     PREFIX_EXPONENTS,
+    QUANTITY_VERSION,
     UNITS,
     Quantity,
     QuantityRange,
@@ -84,6 +86,14 @@ from ai_eda.tools.calc import (
         ("85 degC", 85.0, "degC"),
         ("85 deg C", 85.0, "degC"),
         ("85℃", 85.0, "degC"),
+        # thermal resistance: K/W and the degC/W spellings datasheets use (matched before the plain degC forms)
+        ("62 K/W", 62.0, "K/W"),
+        ("62 °C/W", 62.0, "K/W"),
+        ("62°C/W", 62.0, "K/W"),
+        ("62 ℃/W", 62.0, "K/W"),
+        ("62 degC/W", 62.0, "K/W"),
+        ("62 deg C/W", 62.0, "K/W"),
+        ("62 °C / W", 62.0, "K/W"),
         # AC/DC suffix, numbers
         ("12VDC", 12.0, "V"),
         ("230 V AC", 230.0, "V"),
@@ -172,7 +182,8 @@ def test_prefix_and_unit_tables_are_explicit() -> None:
     assert PREFIX_EXPONENTS["m"] == -3
     assert PREFIX_EXPONENTS["K"] == PREFIX_EXPONENTS["k"] == 3
     assert PREFIX_EXPONENTS["u"] == PREFIX_EXPONENTS["µ"] == PREFIX_EXPONENTS["μ"] == -6
-    assert {"V", "A", "W", "ohm", "F", "H", "Hz", "s", "m", "g", "degC", "percent"} <= set(UNITS)
+    assert {"V", "A", "W", "ohm", "F", "H", "Hz", "s", "m", "g", "degC", "K/W", "percent"} <= set(UNITS)
+    assert set(UNITS["K/W"]) == {"K/W", "°C/W", "℃/W", "degC/W", "deg C/W"} and "K/W" not in PREFIXABLE_UNITS
     assert "볼트" in UNITS["V"] and "옴" in UNITS["ohm"]
 
 
@@ -300,6 +311,9 @@ def test_find_spans_do_not_overlap_and_are_ordered() -> None:
         ("uF", ("F", -6)),
         ("%", ("percent", 0)),
         ("°C", ("degC", 0)),
+        ("°C/W", ("K/W", 0)),
+        ("K/W", ("K/W", 0)),
+        ("K", None),
         ("volts", ("V", 0)),
         ("k", None),
         ("C", None),
@@ -323,3 +337,13 @@ def test_models_are_frozen() -> None:
     assert isinstance(q, Quantity)
     with pytest.raises(Exception):
         q.value = 5.0  # type: ignore[misc]
+
+
+def test_a_thermal_resistance_is_never_read_as_a_temperature() -> None:
+    """Regression: ``62 °C/W`` used to parse as 62 degC (``/`` may follow a unit, so ``°C`` matched and ``/W`` was dropped);
+    a t_ datasheet key could then have been grounded from a thermal-resistance quote. The K/W forms now win."""
+    assert [(q.value, q.unit) for _, q in find_quantities("R_thJA 62 °C/W max, T_J 150 °C")] == [(62.0, "K/W"), (150.0, "degC")]
+    assert parse_quantity("62 °C/W") == Quantity(value=62.0, unit="K/W", original="62 °C/W")
+    assert format_quantity(parse_quantity("62 °C/W")) == "62 K/W"  # type: ignore[arg-type]
+    assert parse_quantity("5 K/Wh") is None and parse_quantity("62 k/W") is None  # the kelvin is capital; no prefix, no other unit
+    assert QUANTITY_VERSION == "0.2"  # the unit table changed: cached extractions re-ground (the fingerprint carries this)

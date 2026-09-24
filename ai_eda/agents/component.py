@@ -1,14 +1,17 @@
 """Component Agent: existence checks, datasheet grounding and - with an LLM - candidate parts and datasheet facts the user confirms.
 
 Selection order (from the spec): electrical -> safety -> regulatory ->
-environment -> reliability -> manufacturability -> sourcing -> cost. **None
-of these criteria is evaluated by this version**: the agent checks that a
-part exists (library entry, archived datasheet, MPN in it, catalog row) and
-grounds facts, it does not judge whether the part *fits* the design. It says
-so with one ``component.fit`` result that is always ``NOT_VERIFIED`` and
-names the criteria not evaluated - a model's rationale in the candidate
-table is prose for a human, never evidence. The agent never decides part
-truth; deterministic tools do, and the user chooses.
+environment -> reliability -> manufacturability -> sourcing -> cost. **This
+agent evaluates none of these criteria**: it checks that a part exists
+(library entry, archived datasheet, MPN in it, catalog row) and grounds
+facts, it does not judge whether the part *fits* the design. Electrical
+stress is judged after SPICE by the ``component.fit`` validator
+(:mod:`ai_eda.validation.fit`: op voltage / dissipation against the
+grounded ``v_max`` / ``power_rating``); the other seven criteria are not
+evaluated anywhere, and that validator's result names them. A model's
+rationale in the candidate table is prose for a human, never evidence. The
+agent never decides part truth; deterministic tools do, and the user
+chooses.
 
 Without an LLM (``ctx.llm is None``):
 
@@ -130,6 +133,7 @@ from ai_eda.parts.existence import TOOL as EXISTENCE_TOOL
 from ai_eda.parts.existence import ExistenceReport, examine_component
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError
 from ai_eda.tools.sources import ArchivedDocument, DocumentArchive
+from ai_eda.validation.fit import FIT_CHECK, FIT_CRITERIA  # the fit check id and the spec's criteria live with the validator that judges them
 
 #: answer keys the agent reads (never requirements)
 CONFIRM_PARTS_KEY = "confirm_parts"
@@ -137,7 +141,6 @@ CONFIRM_FACTS_KEY = "confirm_facts"
 FACTS_FILE_KEY = "datasheet_facts_file"
 EXTRACT_FACTS_KEY = "extract_datasheet_facts"
 CANDIDATES_CHECK = "component.candidates"
-FIT_CHECK = "component.fit"
 #: model replies for candidate parts, keyed by :func:`candidate_key`, under the workdir
 CANDIDATE_CACHE_FILE = Path("parts") / "candidates.json"
 #: model replies for datasheet facts, keyed by :func:`facts_key`, under the workdir
@@ -150,8 +153,6 @@ CANDIDATE_NOTE_PREFIX = "candidate proposed by "
 CONFIRMED_MARK = "; confirmed as the user's choice (identity not yet grounded in a datasheet)"
 #: how the component provenance of a confirmed choice starts
 CHOSEN_NOTE_PREFIX = "part chosen by the user"
-#: the selection criteria of the spec that nothing in this version evaluates (see the module docstring)
-FIT_CRITERIA: tuple[str, ...] = ("electrical stress", "safety", "regulatory", "environment", "reliability", "manufacturability", "sourcing", "cost")
 
 
 class _Strict(BaseModel):
@@ -458,13 +459,7 @@ class ComponentAgent(Agent):
             if r.status is not ValidationStatus.PASS:
                 notes.append(f"{r.check_id} {r.status}: {r.message}")
         notes.insert(0, f"existence checked for {len(checked)} component(s): " + ", ".join(f"{k} {v}" for k, v in sorted(by_status.items())))
-        validation.append(ValidationResult(
-            check_id=FIT_CHECK, status=ValidationStatus.NOT_VERIFIED,
-            message=("part fit not evaluated: this version checks that each part exists (library entry, archived datasheet, MPN, catalog row) and grounds "
-                     "facts, but no criterion of the selection order is compared with the requirements or the simulated operating point ("
-                     + ", ".join(FIT_CRITERIA) + "); a model's rationale is prose, not evidence"),
-            details={"refs": [c.ref for c in updated], "criteria_not_evaluated": list(FIT_CRITERIA), "criteria_evaluated": []},
-        ))
+        # part fit is not this agent's verdict: the component.fit validator judges electrical stress once an op exists
         return self._result(proposals=proposals, questions=questions, validation=validation, notes=notes)
 
     # ------------------------------------------------------------------ existence -> proposals

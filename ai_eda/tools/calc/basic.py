@@ -16,12 +16,14 @@ import math
 
 from ai_eda.ir.provenance import Traced, derived
 
-CALC_VERSION = "0.3"
+CALC_VERSION = "0.4"
 
 #: tool id -> input roles, in the calculator's parameter order
 ROLES: dict[str, tuple[str, ...]] = {
     "calc.ohms_law.I": ("v", "r"),
     "calc.power.P": ("v", "i"),
+    "calc.power.P_VR": ("v", "r"),
+    "calc.thermal.T_j": ("t_a", "p", "theta_ja"),
     "calc.divider.ratio": ("r1", "r2"),
     "calc.divider.v_out": ("v_in", "r1", "r2"),
     "calc.rc.tau": ("r", "c"),
@@ -36,6 +38,8 @@ ROLES: dict[str, tuple[str, ...]] = {
 ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.ohms_law.I": ("V", "ohm"),
     "calc.power.P": ("V", "A"),
+    "calc.power.P_VR": ("V", "ohm"),
+    "calc.thermal.T_j": ("degC", "W", "K/W"),
     "calc.divider.ratio": ("ohm", "ohm"),
     "calc.divider.v_out": ("V", "ohm", "ohm"),
     "calc.rc.tau": ("ohm", "F"),
@@ -62,6 +66,22 @@ def current_from_voltage_resistance(v: Traced[float], r: Traced[float], ids: tup
 
 def power_from_voltage_current(v: Traced[float], i: Traced[float], ids: tuple[str, str] = ("v", "i")) -> Traced[float]:
     return _derived(v.value * i.value, "calc.power.P", ids, "W", "P = V * I")
+
+
+def power_from_voltage_resistance(v: Traced[float], r: Traced[float], ids: tuple[str, str] = ("v", "r")) -> Traced[float]:
+    """Dissipation of a resistance ``r`` with the voltage ``v`` across it: P = V^2 / R."""
+    if r.value == 0:
+        raise ZeroDivisionError("resistance is zero")
+    return _derived(v.value * v.value / r.value, "calc.power.P_VR", ids, "W", "P = V^2 / R")
+
+
+def junction_temperature(t_a: Traced[float], p: Traced[float], theta_ja: Traced[float], ids: tuple[str, str, str] = ("t_a", "p", "theta_ja")) -> Traced[float]:
+    """Steady-state junction temperature at ambient ``t_a`` (degC) with dissipation ``p`` (W) through ``theta_ja`` (K/W): Tj = Ta + P * theta_ja."""
+    if p.value < 0:
+        raise ValueError("dissipation must not be negative")
+    if theta_ja.value < 0:
+        raise ValueError("thermal resistance must not be negative")
+    return _derived(t_a.value + p.value * theta_ja.value, "calc.thermal.T_j", ids, "degC", "Tj = Ta + P * theta_ja")
 
 
 def voltage_divider_ratio(r1: Traced[float], r2: Traced[float], ids: tuple[str, str] = ("r1", "r2")) -> Traced[float]:

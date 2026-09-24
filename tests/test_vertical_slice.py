@@ -168,7 +168,7 @@ def test_pipeline_runs_the_slice_with_real_tools(tmp_path: Path):
     # v_out, v_out_mid and the two expectation nominals that are copies of them (a JSON round trip makes them independent)
     assert outcomes[Stage.CALCULATION].message == "4 value(s) recomputed"
     assert outcomes[Stage.SPICE].message.startswith("2 analysis(es) run [op (op, 1 pt), dc_vin (dc vvin 0 12 1, 13 pt)], 2 expectation(s): 2 PASS")
-    assert "re-validated: domain.analog.bias PASS" in outcomes[Stage.SPICE].message
+    assert "re-validated: " in outcomes[Stage.SPICE].message and "domain.analog.bias PASS" in outcomes[Stage.SPICE].message
     assert outcomes[Stage.DRC].message.startswith("0 error(s), 0 warning(s); schematic parity: 0 issue(s)")
     assert "mfg.gerber PASS" in outcomes[Stage.MANUFACTURING_OUTPUTS].message
     assert "mfg.drill PASS" in outcomes[Stage.MANUFACTURING_OUTPUTS].message

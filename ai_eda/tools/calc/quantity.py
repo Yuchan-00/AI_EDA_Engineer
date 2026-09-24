@@ -21,7 +21,9 @@ volt(s), 볼트), ``A`` (A, amp(s), ampere(s), 암페어), ``W`` (W, watt(s), �
 ``ohm`` (Ω U+03A9, Ω U+2126, ohm(s), 옴), ``F`` (F, farad(s), 패럿), ``H`` (H,
 henry, henries, 헨리), ``Hz`` (Hz, hz, hertz, 헤르츠), ``s`` (s, sec,
 second(s)), ``m`` (m, meter(s), metre(s), 미터), ``g`` (g, gram(s), 그램),
-``degC`` (°C, ℃, degC, deg C - no prefix), ``percent`` (%, percent, 퍼센트 -
+``degC`` (°C, ℃, degC, deg C - no prefix), ``K/W`` (K/W, °C/W, ℃/W, degC/W,
+deg C/W - a thermal resistance; no prefix, and matched before the degC forms
+so ``62 °C/W`` is 62 K/W, never 62 degC), ``percent`` (%, percent, 퍼센트 -
 no prefix, value kept as written: ``90%`` is 90, not 0.9).
 
 Ambiguity rules (each one is pinned by ``tests/test_quantity.py``):
@@ -74,7 +76,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict
 
-QUANTITY_VERSION = "0.1"
+QUANTITY_VERSION = "0.2"
 
 #: SI prefix letter -> decimal exponent (engineering text: ``M`` is mega)
 PREFIX_EXPONENTS: dict[str, int] = {
@@ -134,8 +136,9 @@ _KOREAN: dict[str, str] = {
     "그램": "g",
     "퍼센트": "percent",
 }
-#: units that never take a prefix; the regex below spells their forms
-_PLAIN: dict[str, str] = {"%": "percent", "percent": "percent", "degc": "degC", "℃": "degC"}
+#: units that never take a prefix; the regex below spells their forms (the thermal resistance first: its
+#: spellings start with a degC spelling, and the longer match must win)
+_PLAIN: dict[str, str] = {"%": "percent", "percent": "percent", "K/W": "K/W", "degc": "degC", "℃": "degC"}
 
 #: canonical unit -> every accepted spelling (documentation and tests)
 UNITS: dict[str, tuple[str, ...]] = {}
@@ -144,6 +147,7 @@ for _table in (_SYMBOLS, _WORDS, _KOREAN, _PLAIN):
         UNITS.setdefault(_canon, ())
         UNITS[_canon] = (*UNITS[_canon], _spelling)
 UNITS["degC"] = (*UNITS["degC"], "°C", "deg C")
+UNITS["K/W"] = (*UNITS["K/W"], "°C/W", "℃/W", "degC/W", "deg C/W")
 #: units that may carry a prefix
 PREFIXABLE_UNITS: frozenset[str] = frozenset({"V", "A", "W", "ohm", "F", "H", "Hz", "s", "m", "g"})
 
@@ -184,7 +188,10 @@ _VA = "|".join(re.escape(s) for s in ("V", "v", "A"))
 _SYM = _alternation({s: c for s, c in _SYMBOLS.items() if s not in ("V", "v", "A")})
 _WORD = _alternation(_WORDS)
 _KWORD = _alternation(_KOREAN)
-_PLAIN_RE = r"%|(?i:percent)|°\s?[Cc]|℃|(?i:deg\s?c)"
+#: the K/W forms stand before the degC forms: an alternation takes the first branch that matches, and
+#: ``°C`` alone would match inside ``°C/W`` (``/`` may follow a unit) and read a thermal resistance as a temperature
+_DEGC_RE = r"°\s?[Cc]|℃|(?i:deg\s?c)"
+_PLAIN_RE = rf"%|(?i:percent)|K/W|(?:{_DEGC_RE})\s?/\s?W|{_DEGC_RE}"
 
 
 def _num(tag: str) -> str:
@@ -233,6 +240,8 @@ def _unit_of(m: re.Match[str], tag: str) -> tuple[str, int]:
     plain = m.group(f"plain{tag}")
     if plain == "%" or plain.lower() == "percent":
         return "percent", 0
+    if plain.endswith("W"):
+        return "K/W", 0
     return "degC", 0
 
 

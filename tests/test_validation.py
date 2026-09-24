@@ -58,5 +58,7 @@ def test_component_provenance_flags_llm_mpn(divider_ir: CircuitIR, tmp_path: Pat
 
 
 def test_domain_validators_never_pass_without_backend(divider_ir: CircuitIR, tmp_path: Path):
-    for r in default_registry.get("domain.analog.bias").validate(divider_ir, ValidationContext(workdir=tmp_path)):
-        assert r.status == S.NOT_VERIFIED
+    """No SPICE run attached: every op-reading validator is NOT_VERIFIED and says what it needs (never PASS, never an exception)."""
+    for check in ("domain.analog.bias", "domain.power.thermal", "component.fit"):
+        for r in default_registry.get(check).validate(divider_ir, ValidationContext(workdir=tmp_path)):
+            assert r.status == S.NOT_VERIFIED and r.check_id == check, (check, r.message)

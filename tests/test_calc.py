@@ -64,6 +64,8 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
     sample = {
         "calc.ohms_law.I": (user_requirement(12.0), authoritative(1e3, DS)),
         "calc.power.P": (user_requirement(12.0), user_requirement(0.5)),
+        "calc.power.P_VR": (user_requirement(6.0), authoritative(1e4, DS)),
+        "calc.thermal.T_j": (user_requirement(85.0), user_requirement(3.6e-3), authoritative(100.0, DS)),
         "calc.divider.ratio": (authoritative(1e3, DS), authoritative(1e3, DS)),
         "calc.divider.v_out": (user_requirement(12.0), authoritative(1e3, DS), authoritative(1e3, DS)),
         "calc.rc.tau": (authoritative(1e3, DS), authoritative(1e-6, DS)),

@@ -48,9 +48,11 @@ from ai_eda.tools.calc.basic import (
     ROLE_UNITS,
     ROLES,
     current_from_voltage_resistance,
+    junction_temperature,
     led_series_resistor,
     parallel_resistance,
     power_from_voltage_current,
+    power_from_voltage_resistance,
     rc_lowpass_magnitude,
     rc_lowpass_phase_deg,
     rc_step_response,
@@ -70,6 +72,8 @@ Calculator = Callable[..., Traced]
 CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     "calc.ohms_law.I": (current_from_voltage_resistance, ROLES["calc.ohms_law.I"]),
     "calc.power.P": (power_from_voltage_current, ROLES["calc.power.P"]),
+    "calc.power.P_VR": (power_from_voltage_resistance, ROLES["calc.power.P_VR"]),
+    "calc.thermal.T_j": (junction_temperature, ROLES["calc.thermal.T_j"]),
     "calc.divider.ratio": (voltage_divider_ratio, ROLES["calc.divider.ratio"]),
     "calc.divider.v_out": (voltage_divider_output, ROLES["calc.divider.v_out"]),
     "calc.rc.tau": (rc_time_constant, ROLES["calc.rc.tau"]),
@@ -80,13 +84,19 @@ CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     "calc.led.R": (led_series_resistor, ROLES["calc.led.R"]),
 }
 
-_UNIT_ALIASES = {"ω": "ohm", "ohms": "ohm", "ohm": "ohm", "r": "ohm", "volt": "v", "volts": "v", "sec": "s", "secs": "s", "farad": "f", "hz": "hz"}
+#: lower-cased unit spelling -> the key a role's expected unit lower-cases to. A thermal resistance is written
+#: degC/W (or with the degree sign) in most datasheets and K/W in the calculator roles: the same unit.
+_UNIT_ALIASES = {
+    "ω": "ohm", "ohms": "ohm", "ohm": "ohm", "r": "ohm", "volt": "v", "volts": "v", "sec": "s", "secs": "s", "farad": "f", "hz": "hz",
+    "k/w": "k/w", "degc/w": "k/w", "°c/w": "k/w", "℃/w": "k/w", "deg c/w": "k/w",
+    "degc": "degc", "°c": "degc", "℃": "degc", "deg c": "degc",
+}
 
 
 def _unit_key(unit: str | None) -> str | None:
     if unit is None:
         return None
-    u = unit.strip().lower()
+    u = " ".join(unit.strip().lower().split())
     return _UNIT_ALIASES.get(u, u)
 
 
@@ -229,4 +239,7 @@ def recompute_parameters(ir: CircuitIR) -> ValidationResult:
     return ValidationResult(check_id=CHECK_ID, status=ValidationStatus.PASS, message=f"{recomputed} value(s) recomputed", tool=TOOL_ID, tool_version=CALC_VERSION, details=details)
 
 
-__all__ = ["CALCULATORS", "CHECK_ID", "REL_TOL", "TOOL_ID", "derived_values", "recompute_parameters"]
+__all__ = ["CALCULATORS", "CHECK_ID", "REL_TOL", "TOOL_ID", "derived_values", "recompute_parameters", "unit_key"]
+
+#: public name of :func:`_unit_key` for the validators that compare a rating's unit with a role's (``K/W`` == ``degC/W``)
+unit_key = _unit_key

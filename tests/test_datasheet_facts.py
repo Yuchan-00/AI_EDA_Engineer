@@ -252,3 +252,27 @@ def test_schema_is_strict():
         DatasheetFacts(facts=[], not_found=[], notes="no")
     parsed = DatasheetFacts.model_validate({"facts": [{"key": "v_max", "value": 200, "unit": "V", "page": 2, "quote": "200 V"}], "not_found": ["i_max"]})
     assert parsed.facts[0].value == 200 and parsed.not_found == ["i_max"]
+
+
+def test_thermal_keys_have_their_unit_families_and_ground_from_a_degc_per_watt_quote(doc):
+    """theta_ja is K/W (datasheets write °C/W - the same unit, and never a temperature), t_j_max degC; thermal_resistance* keys are
+    K/W too so the ``_resistance`` suffix never types them as ohms; both thermal keys are asked for by default."""
+    from ai_eda.parts.datasheet_facts import DEFAULT_FACT_KEYS, FACTS_VERSION, KEY_UNITS
+
+    assert expected_unit("theta_ja") == "K/W" and expected_unit("t_j_max") == "degC" and expected_unit("junction_temperature") == "degC"
+    assert expected_unit("thermal_resistance") == expected_unit("thermal_resistance_ja") == expected_unit("thermal_resistance_jc") == "K/W"
+    assert expected_unit("r_th_ja") == "ohm"  # the r_ prefix rule: use theta_ja for the junction-to-ambient thermal resistance
+    assert KEY_UNITS["theta_ja"] == "K/W" and {"theta_ja", "t_j_max"} <= set(DEFAULT_FACT_KEYS) and FACTS_VERSION == "0.3"
+    thermal = doc.model_copy(update={"pages": [*doc.pages, "Thermal resistance junction to ambient 62 °C/W\nMaximum junction temperature 150 °C"]})
+    g = ground_facts(thermal, [
+        fact("theta_ja", 62, "°C/W", 4, "62 °C/W"),
+        fact("t_j_max", 150, "°C", 4, "150 °C"),
+        fact("t_j_wrong", 62, "°C/W", 4, "62 °C/W"),  # a thermal resistance under a temperature key
+        fact("theta_ja_wrong", 150, "°C", 4, "150 °C"),  # a temperature under a K/W key (the theta_ prefix is no rule: exact key only)
+    ])
+    by = {a.key: a for a in g.accepted}
+    assert by["theta_ja"].traced.value == 62.0 and by["theta_ja"].traced.unit == "K/W" and by["theta_ja"].parsed == "62 K/W"
+    assert by["t_j_max"].traced.value == 150.0 and by["t_j_max"].traced.unit == "degC"
+    reasons = dict(g.rejected)
+    assert reasons["t_j_wrong"] == "unit mismatch: key 't_j_wrong' expects degC, got '°C/W' (62 K/W)"
+    assert reasons["theta_ja_wrong"].startswith("no unit family is known for key 'theta_ja_wrong'")

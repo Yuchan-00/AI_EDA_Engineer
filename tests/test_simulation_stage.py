@@ -114,7 +114,7 @@ def test_divider_spice_stage_passes_with_real_evidence(tmp_path: Path):
     assert state.outcome(Stage.CALCULATION).status is S.PASS and "4 value(s) recomputed" in state.outcome(Stage.CALCULATION).message
     spice_stage = state.outcome(Stage.SPICE)
     assert spice_stage.status is S.PASS, spice_stage.message
-    assert "re-validated: domain.analog.bias PASS" in spice_stage.message
+    assert "re-validated: " in spice_stage.message and "domain.analog.bias PASS" in spice_stage.message  # component.fit is listed too (registry order)
 
     netlist = ir.artifacts[ArtifactKind.SPICE_NETLIST]
     results = ir.artifacts[ArtifactKind.SPICE_RESULT]
