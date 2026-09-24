@@ -65,6 +65,11 @@ def _stamp(results: list[ValidationResult], ir: CircuitIR) -> None:
             r.ir_hash = r.ir_hash or h
 
 
+def _neutralised_summary(notes: list[str]) -> str:
+    """``'N cell(s) neutralised (R1.Value, ...)'`` from compiler notes of the form ``'<where>: <why>; ...'`` (one line per stage)."""
+    return f"{len(notes)} cell(s) neutralised ({', '.join(n.split(':', 1)[0] for n in notes)})"
+
+
 def _field_annotation(model: Any, name: str) -> Any:
     """The declared type of field ``name`` on a pydantic model instance (``Any`` when it is not a model field)."""
     if isinstance(model, BaseModel):
@@ -348,7 +353,11 @@ class Orchestrator:
             ir.validation.add(ValidationResult(status=ValidationStatus.FAIL, message=message, details={"repair": "human"}, **stamp))
             return ValidationStatus.FAIL, message
         art = ir.artifacts[kind]
-        ir.validation.add(ValidationResult(status=ValidationStatus.PASS, message=f"compiled {art.path}", artifact_hash=art.content_hash, **stamp))
+        # a cell the compiler neutralised (BOM free text written with a leading apostrophe) is reported, never hidden:
+        # the full notes in the details, a count + the cells in the message
+        details = {"neutralised": list(art.notes)} if art.notes else {}
+        message = f"compiled {art.path}" + (f"; {_neutralised_summary(art.notes)}" if art.notes else "")
+        ir.validation.add(ValidationResult(status=ValidationStatus.PASS, message=message, artifact_hash=art.content_hash, details=details, **stamp))
         return ValidationStatus.PASS, str(art.path)
 
     def _compile_stage(self, kind: ArtifactKind) -> StageFn:
@@ -391,9 +400,12 @@ class Orchestrator:
         for kind in (ArtifactKind.BOM, ArtifactKind.CPL):
             # a BOM cell the compiler refuses (a formula-shaped identity) is a verdict on the IR, not a defect
             status, message = self._compile(ir, ctx, kind)
+            art = ir.artifacts.get(kind)
             if status is not ValidationStatus.PASS:
                 statuses.append(status)
                 notes.append(f"{kind}: {message}")
+            elif art is not None and art.notes:
+                notes.append(f"{kind}: {_neutralised_summary(art.notes)}")
         notes.insert(0, "BOM/CPL compiled" if not statuses else "BOM/CPL: see below")
         if ArtifactKind.PCB not in ir.artifacts:
             notes.append("gerber/drill skipped (no PCB)")

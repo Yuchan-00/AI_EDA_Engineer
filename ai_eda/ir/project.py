@@ -100,6 +100,12 @@ class ArtifactRef(BaseModel):
     ``path`` then points at the file a human opens first (the ``.gbrjob``
     manifest) and ``content_hash`` covers the whole set via
     :func:`hash_file_set`.
+
+    ``notes`` lists what the generator altered or left out while writing the
+    file (a BOM free-text cell written with a leading apostrophe); it is
+    bookkeeping outside the design view, never design content. Files without
+    the key load (it defaults); a file that carries it is refused by code
+    older than the key (``load`` drops no unknown key), by design.
     """
 
     kind: ArtifactKind
@@ -110,6 +116,8 @@ class ArtifactRef(BaseModel):
     generator_version: str | None = None
     #: member files of a multi-file artifact (absolute paths); empty for a single file
     files: list[str] = Field(default_factory=list)
+    #: what the generator altered or left out while writing the file, for a human (e.g. BOM cells neutralised); bookkeeping, never design content
+    notes: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def is_stale(self, ir_hash: str) -> bool:

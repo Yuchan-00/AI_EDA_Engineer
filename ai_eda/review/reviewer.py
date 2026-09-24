@@ -10,8 +10,12 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   unchanged on disk, the board artifact must be fresh and unchanged, and the
   rows are compared with the footprints read from the compiled
   ``.kicad_pcb`` (reference, value, footprint id for the BOM; reference,
-  position, rotation, side for the CPL). Without a board there is nothing
-  to compare with: NOT_VERIFIED, never PASS.
+  position, rotation, side for the CPL). The BOM ``Value`` cell is decoded
+  with :func:`ai_eda.tools.manufacturing.csv_cells.bom_cell_text` (one
+  leading apostrophe removed) before it is compared with the board's
+  value, so a neutralised ``-12V`` still matches and a board whose value
+  is literally ``'-12V`` does not. Without a board there is nothing to
+  compare with: NOT_VERIFIED, never PASS.
 * ``review.erc`` / ``review.drc``: the latest tool result must have run on
   the current artifact; its status is passed through (any KiCad violation,
   warning included, is FAIL - ``ai_eda.tools.kicad.cli``).
@@ -86,6 +90,7 @@ from ai_eda.review.areas import ReviewArea
 from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters
 from ai_eda.tools.kicad.board import BoardFootprint, read_board_footprints
 from ai_eda.tools.kicad.geometry import normalize_angle
+from ai_eda.tools.manufacturing.csv_cells import bom_cell_text
 from ai_eda.tools.manufacturing.outputs import OUTPUT_CHECKS
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK_ID, read_results
 
@@ -423,8 +428,12 @@ class IndependentReviewer:
             if fp is None:
                 mismatches.append(f"{row['Reference']}: in BOM, not on the board")
                 continue
-            if row["Value"] != fp.value:
-                mismatches.append(f"{fp.ref}: value BOM {row['Value']!r} vs board {fp.value!r}")
+            # the BOM writes free text through ``free_text_cell`` (a leading apostrophe when the value would execute);
+            # the comparison is on the design's words, decoded by the single decoder, and names the cell when it differs
+            value = bom_cell_text(row["Value"])
+            if value != fp.value:
+                cell = f" (BOM cell {row['Value']!r})" if row["Value"] != value else ""
+                mismatches.append(f"{fp.ref}: value BOM {value!r} vs board {fp.value!r}{cell}")
             if row["Footprint"] != fp.lib_id:
                 mismatches.append(f"{fp.ref}: footprint BOM {row['Footprint']!r} vs board {fp.lib_id!r}")
         for ref in sorted(set(on_board) - {row["Reference"] for row in rows}):

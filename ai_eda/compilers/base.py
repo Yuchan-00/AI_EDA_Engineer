@@ -5,6 +5,7 @@ import math
 import hashlib
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Iterable
 
 from ai_eda.errors import CompileError
 from pydantic import BaseModel, Field
@@ -48,7 +49,8 @@ class Compiler(ABC):
 
     # helper --------------------------------------------------------------------
 
-    def _write(self, ir: CircuitIR, path: Path, content: str | bytes) -> ArtifactRef:
+    def _write(self, ir: CircuitIR, path: Path, content: str | bytes, notes: Iterable[str] = ()) -> ArtifactRef:
+        """Write ``content`` and return its stamped reference; ``notes``: what the compiler altered while writing (a human reads them in ``compile.<kind>``)."""
         path.parent.mkdir(parents=True, exist_ok=True)
         data = content.encode("utf-8") if isinstance(content, str) else content
         path.write_bytes(data)
@@ -59,4 +61,5 @@ class Compiler(ABC):
             generated_from_ir_hash=ir.content_hash(),
             generator=self.id,
             generator_version=self.version,
+            notes=list(notes),
         )
