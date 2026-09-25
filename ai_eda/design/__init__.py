@@ -24,7 +24,7 @@ from ai_eda.design.base import (
 from ai_eda.design.checks import INPUTS_CHECK, check_inputs_vs_requirements
 from ai_eda.design.inputs import KEY_ALIASES, PARSED_NOTE_PREFIX, UNIT_OF, DesignInput, canonical_key, is_template_input, read_inputs, read_value
 from ai_eda.design.library_parts import TemplateRefusal, library_component, pin_by_name
-from ai_eda.design.templates import TEMPLATES, DividerTemplate, LateLoad, LedTemplate, RcLowpassTemplate, design_from_requirements, late_load_changes, template_keys_text
+from ai_eda.design.templates import TEMPLATES, AstableTemplate, DividerTemplate, LateLoad, LedTemplate, RcLowpassTemplate, design_from_requirements, late_load_changes, template_keys_text
 
 __all__ = [
     "CHOICE_NOTE_PREFIX",
@@ -39,6 +39,7 @@ __all__ = [
     "TEMPLATE_VERSION",
     "TOOL_ID",
     "UNIT_OF",
+    "AstableTemplate",
     "Choice",
     "DesignChange",
     "DesignInput",

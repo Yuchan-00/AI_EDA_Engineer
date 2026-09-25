@@ -163,17 +163,18 @@ class Stimulus(BaseModel):
     serves_requirements: list[str] = Field(default_factory=list)
 
 
-#: parameter names each analysis kind accepts (``dc.source`` is a stimulus id)
+#: parameter names each analysis kind accepts (``dc.source`` is a stimulus id; tran ``uic`` is a bool: skip the
+#: operating point and start the transient from the elements' ``ic`` params - ngspice's ``uic`` keyword)
 ANALYSIS_PARAMS: dict[SpiceAnalysis, tuple[str, ...]] = {
     SpiceAnalysis.OP: (),
     SpiceAnalysis.DC: ("source", "start", "stop", "step"),
-    SpiceAnalysis.TRAN: ("step", "stop", "start"),
+    SpiceAnalysis.TRAN: ("step", "stop", "start", "uic"),
     SpiceAnalysis.AC: ("variation", "points", "fstart", "fstop"),
 }
 ANALYSIS_OPTIONAL_PARAMS: dict[SpiceAnalysis, tuple[str, ...]] = {
     SpiceAnalysis.OP: (),
     SpiceAnalysis.DC: (),
-    SpiceAnalysis.TRAN: ("start",),
+    SpiceAnalysis.TRAN: ("start", "uic"),
     SpiceAnalysis.AC: (),
 }
 AC_VARIATIONS: tuple[str, ...] = ("dec", "oct", "lin")
@@ -182,9 +183,10 @@ AC_VARIATIONS: tuple[str, ...] = ("dec", "oct", "lin")
 class AnalysisSpec(BaseModel):
     """One ngspice analysis; ``kind`` reuses :class:`ai_eda.tools.spice.SpiceAnalysis`.
 
-    ``params``: tran ``step``, ``stop``, [``start``]; dc ``source`` (stimulus id),
-    ``start``, ``stop``, ``step``; ac ``variation`` (``dec`` | ``oct`` | ``lin``),
-    ``points``, ``fstart``, ``fstop``; op none.
+    ``params``: tran ``step``, ``stop``, [``start``], [``uic``] (a bool: skip
+    the operating point, start from the elements' ``ic`` params); dc
+    ``source`` (stimulus id), ``start``, ``stop``, ``step``; ac ``variation``
+    (``dec`` | ``oct`` | ``lin``), ``points``, ``fstart``, ``fstop``; op none.
     """
 
     id: str
@@ -204,6 +206,15 @@ class Reduce(StrEnum):
     FINAL = "final"
     MAX = "max"
     MIN = "min"
+    #: the mean frequency of the rising mid-level crossings of a transient vector over the saved window,
+    #: f = (N - 1) / (t_N - t_1) for N >= 3 crossings (:func:`ai_eda.tools.spice.measure.rising_edge_frequency`).
+    #: Crossings are detected with hysteresis: armed once a sample is at or below vmin + 0.25 * swing, counted at the
+    #: first later sample at or above vmin + 0.75 * swing, the crossing time interpolated linearly at the mid level
+    #: vmin + 0.5 * swing between the two samples that bracket it. Fewer than 3 crossings, a swing within the engine's
+    #: own resolution (ngspice's ``reltol`` * level + ``vntol`` / ``abstol``: numerical ripple is not an oscillation),
+    #: non-finite samples or a time scale that steps backwards give no number ("no oscillation detected"), which the
+    #: stage reports as FAIL, never PASS. Only on a tran analysis (the compiler refuses it elsewhere).
+    FREQUENCY = "frequency"
 
 
 class Expectation(BaseModel):

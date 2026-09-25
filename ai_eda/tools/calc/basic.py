@@ -17,7 +17,7 @@ import math
 
 from ai_eda.ir.provenance import Traced, derived
 
-CALC_VERSION = "0.5"
+CALC_VERSION = "0.6"
 
 #: tool id -> input roles, in the calculator's parameter order
 ROLES: dict[str, tuple[str, ...]] = {
@@ -38,6 +38,12 @@ ROLES: dict[str, tuple[str, ...]] = {
     "calc.rc.r_for_cutoff": ("f_c", "c"),
     "calc.rc.ac_fstart": ("f_c",),
     "calc.rc.ac_fstop": ("f_c",),
+    "calc.astable.c_for_frequency": ("f_osc", "r_b", "v_cc", "v_be"),
+    "calc.astable.f": ("r_b", "c", "v_cc", "v_be"),
+    "calc.astable.tran_step": ("f_osc",),
+    "calc.astable.tran_stop": ("f_osc",),
+    "calc.astable.tran_start": ("f_osc",),
+    "calc.astable.v_be_reverse": ("v_cc", "v_be"),
 }
 #: tool id -> the unit each role's input is expected to carry (``None``: any); an input whose unit is set
 #: and differs is refused by the recompute (a swapped voltage / resistance would otherwise be computed)
@@ -59,6 +65,12 @@ ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.rc.r_for_cutoff": ("Hz", "F"),
     "calc.rc.ac_fstart": ("Hz",),
     "calc.rc.ac_fstop": ("Hz",),
+    "calc.astable.c_for_frequency": ("Hz", "ohm", "V", "V"),
+    "calc.astable.f": ("ohm", "F", "V", "V"),
+    "calc.astable.tran_step": ("Hz",),
+    "calc.astable.tran_stop": ("Hz",),
+    "calc.astable.tran_start": ("Hz",),
+    "calc.astable.v_be_reverse": ("V", "V"),
 }
 
 
@@ -199,3 +211,80 @@ def rc_ac_fstop(f_c: Traced[float], ids: tuple[str] = ("f_c",)) -> Traced[float]
     if f_c.value <= 0:
         raise ValueError("cutoff frequency must be positive")
     return _derived(f_c.value * 100.0, "calc.rc.ac_fstop", ids, "Hz", "f_stop = f_c * 100 (two decades above the corner)")
+
+
+# --------------------------------------------------------------------------- BJT astable multivibrator
+#
+# The period of a symmetric collector-coupled astable (two equal base resistors R_b and timing capacitors C, supply
+# V_cc) is 2 * R_b * C * ln((2 V_cc - V_BE) / (V_cc - V_BE)): each capacitor charges through R_b from about -(V_cc - V_BE)
+# towards V_cc until the base reaches V_BE. The textbook 1.386 R C is the V_BE = 0 limit of the same expression.
+
+#: periods of the oscillation the transient saves (the window ends at tran_stop = TRAN_STOP_PERIODS / f)
+TRAN_STOP_PERIODS = 20.0
+#: periods skipped before the window is saved (tran_start = TRAN_START_PERIODS / f: the start-up settles first)
+TRAN_START_PERIODS = 10.0
+#: time steps per period (tran_step = 1 / (TRAN_STEPS_PER_PERIOD * f))
+TRAN_STEPS_PER_PERIOD = 200.0
+
+
+def _astable_log_term(v_cc: Traced[float], v_be: Traced[float]) -> float:
+    """ln((2 V_cc - V_BE) / (V_cc - V_BE)); refuses the inputs for which the expression has no meaning."""
+    if v_be.value < 0:
+        raise ValueError("base-emitter voltage must not be negative")
+    if v_cc.value <= v_be.value:
+        raise ValueError("supply voltage must exceed the base-emitter voltage (the period's log argument must be > 1)")
+    return math.log((2.0 * v_cc.value - v_be.value) / (v_cc.value - v_be.value))
+
+
+def astable_c_for_frequency(f_osc: Traced[float], r_b: Traced[float], v_cc: Traced[float], v_be: Traced[float], ids: tuple[str, str, str, str] = ("f_osc", "r_b", "v_cc", "v_be")) -> Traced[float]:
+    """The timing capacitor that makes a symmetric BJT astable with base resistors ``r_b`` oscillate at ``f_osc``: C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE)))."""
+    if f_osc.value <= 0:
+        raise ValueError("oscillation frequency must be positive")
+    if r_b.value <= 0:
+        raise ValueError("base resistance must be positive")
+    denominator = 2.0 * f_osc.value * r_b.value * _astable_log_term(v_cc, v_be)
+    if denominator == 0:
+        raise ValueError("calc.astable.c_for_frequency underflows: 2 f R_b ln(...) is zero in float arithmetic for these inputs")
+    return _derived(1.0 / denominator, "calc.astable.c_for_frequency", ids, "F", "C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE)))")
+
+
+def astable_frequency(r_b: Traced[float], c: Traced[float], v_cc: Traced[float], v_be: Traced[float], ids: tuple[str, str, str, str] = ("r_b", "c", "v_cc", "v_be")) -> Traced[float]:
+    """The oscillation frequency of a symmetric BJT astable: f = 1 / (2 R_b C ln((2 V_cc - V_BE) / (V_cc - V_BE)))."""
+    if r_b.value <= 0:
+        raise ValueError("base resistance must be positive")
+    if c.value <= 0:
+        raise ValueError("capacitance must be positive")
+    denominator = 2.0 * r_b.value * c.value * _astable_log_term(v_cc, v_be)
+    if denominator == 0:
+        raise ValueError("calc.astable.f underflows: 2 R_b C ln(...) is zero in float arithmetic for these inputs")
+    return _derived(1.0 / denominator, "calc.astable.f", ids, "Hz", "f = 1 / (2 R_b C ln((2 V_cc - V_BE) / (V_cc - V_BE)))")
+
+
+def astable_tran_step(f_osc: Traced[float], ids: tuple[str] = ("f_osc",)) -> Traced[float]:
+    """Transient time step for an oscillation at ``f_osc``: 1 / (200 f), 200 points per period."""
+    if f_osc.value <= 0:
+        raise ValueError("oscillation frequency must be positive")
+    return _derived(1.0 / (TRAN_STEPS_PER_PERIOD * f_osc.value), "calc.astable.tran_step", ids, "s", "tran_step = 1 / (200 f) (200 points per period)")
+
+
+def astable_tran_stop(f_osc: Traced[float], ids: tuple[str] = ("f_osc",)) -> Traced[float]:
+    """End of the transient for an oscillation at ``f_osc``: 20 / f (20 periods)."""
+    if f_osc.value <= 0:
+        raise ValueError("oscillation frequency must be positive")
+    return _derived(TRAN_STOP_PERIODS / f_osc.value, "calc.astable.tran_stop", ids, "s", "tran_stop = 20 / f (20 periods)")
+
+
+def astable_tran_start(f_osc: Traced[float], ids: tuple[str] = ("f_osc",)) -> Traced[float]:
+    """Start of the saved transient window for an oscillation at ``f_osc``: 10 / f (the first 10 periods settle the start-up)."""
+    if f_osc.value <= 0:
+        raise ValueError("oscillation frequency must be positive")
+    return _derived(TRAN_START_PERIODS / f_osc.value, "calc.astable.tran_start", ids, "s", "tran_start = 10 / f (the first 10 periods are start-up)")
+
+
+def astable_v_be_reverse(v_cc: Traced[float], v_be: Traced[float], ids: tuple[str, str] = ("v_cc", "v_be")) -> Traced[float]:
+    """The reverse voltage each base-emitter junction of the astable sees once per period: V_cc - V_BE (the other transistor's base swings that far negative when its capacitor's collector side switches)."""
+    if v_be.value < 0:
+        raise ValueError("base-emitter voltage must not be negative")
+    if v_cc.value <= v_be.value:
+        raise ValueError("supply voltage must exceed the base-emitter voltage")
+    return _derived(v_cc.value - v_be.value, "calc.astable.v_be_reverse", ids, "V", "V_BE_reverse = V_cc - V_BE")

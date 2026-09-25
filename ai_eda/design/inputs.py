@@ -31,6 +31,7 @@ KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "cutoff_frequency": ("cutoff_frequency", "corner_frequency", "f_c", "fc"),
     "led_forward_voltage": ("led_forward_voltage", "forward_voltage", "v_f", "vf"),
     "led_forward_current": ("led_forward_current", "forward_current", "led_current", "i_f", "if"),
+    "oscillation_frequency": ("oscillation_frequency", "output_frequency", "frequency", "f_osc", "fosc"),
 }
 #: canonical key -> the unit its value must carry
 UNIT_OF: dict[str, str] = {
@@ -40,6 +41,7 @@ UNIT_OF: dict[str, str] = {
     "cutoff_frequency": "Hz",
     "led_forward_voltage": "V",
     "led_forward_current": "A",
+    "oscillation_frequency": "Hz",
 }
 #: how the note of a value copied from a requirement starts (followed by the requirement id)
 PARSED_NOTE_PREFIX = "parsed from "

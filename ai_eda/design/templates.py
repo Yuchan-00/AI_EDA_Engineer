@@ -1,4 +1,4 @@
-"""The three verified circuit templates and the closed-world selection between them.
+"""The four verified circuit templates and the closed-world selection between them.
 
 Invariant: a template is selected only by *confirmed* requirement values
 (:mod:`ai_eda.design.inputs`), computes every number with a registered
@@ -33,7 +33,16 @@ Templates:
   excluded from the netlist - a modelling choice the user confirms) and the
   expectation measures the current through that ideal source;
 * ``rc_lowpass`` - first-order RC low-pass from ``cutoff_frequency`` (C
-  chosen, R computed), checked by an ac sweep at the corner.
+  chosen, R computed), checked by an ac sweep at the corner;
+* ``astable`` - collector-coupled BJT astable multivibrator from
+  ``oscillation_frequency`` and ``input_voltage`` (R_c, R_b, V_BE and a
+  generic NPN model chosen, C computed), checked by a transient run
+  (``tran ... uic``, one capacitor's ``ic`` breaks the ideal circuit's
+  symmetry) whose output frequency is *measured* from the rising edges of
+  v(OUT) (``Reduce.FREQUENCY``) and whose swing is checked against the
+  supply; the supply (3..6 V, the reverse base-emitter rating of small
+  NPNs) and the frequency (100 Hz..20 kHz, non-polar timing capacitors and
+  the model's missing switching times) are validity conditions.
 """
 
 from __future__ import annotations
@@ -64,6 +73,12 @@ from ai_eda.ir import (
     Traced,
 )
 from ai_eda.tools.calc.basic import (
+    astable_c_for_frequency,
+    astable_frequency,
+    astable_tran_start,
+    astable_tran_step,
+    astable_tran_stop,
+    astable_v_be_reverse,
     divider_r1_for_v_out,
     led_current,
     led_series_resistor,
@@ -87,6 +102,9 @@ CAPACITOR = (("Device", "C"), ("Capacitor_SMD", "C_0603_1608Metric"))
 LED = (("Device", "LED"), ("LED_SMD", "LED_0603_1608Metric"))
 HEADER_2 = (("Connector_Generic", "Conn_01x02"), ("Connector_PinHeader_2.54mm", "PinHeader_1x02_P2.54mm_Vertical"))
 HEADER_3 = (("Connector_Generic", "Conn_01x03"), ("Connector_PinHeader_2.54mm", "PinHeader_1x03_P2.54mm_Vertical"))
+NPN = (("Transistor_BJT", "2N3904"), ("Package_TO_SOT_THT", "TO-92_Inline"))
+RESISTOR_THT = (("Device", "R"), ("Resistor_THT", "R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"))
+CAPACITOR_THT = (("Device", "C"), ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm"))
 
 
 def _value_text(value: float) -> str:
@@ -265,15 +283,7 @@ class LedTemplate(Template):
         plan = Plan(template=t, title=self.title)
         missing = [k for k in self.needs if k not in inputs]
         if missing:
-            for k in missing:
-                if k in unusable:
-                    plan.notes.append(f"{k} not usable: {unusable[k]}")
-                else:
-                    plan.questions.append(MissingInformation(
-                        key=k, question=f"The LED indicator template needs {k} in {UNIT_OF[k]}: answer {k}=<value {UNIT_OF[k]}> (e.g. {k}=\"{_example(k)}\")",
-                        rationale="template input",
-                    ))
-            return _refused(plan, f"input(s) {missing} missing")
+            return _missing_inputs(plan, "The LED indicator template", missing, unusable)
         v_in, v_f, i_f = inputs["input_voltage"], inputs["led_forward_voltage"], inputs["led_forward_current"]
         plan.inputs = {"input_voltage": v_in, "led_forward_voltage": v_f, "led_forward_current": i_f}
         params: dict[str, Traced] = {"v_in": v_in.traced, "v_f": v_f.traced, "i_f": i_f.traced}
@@ -336,7 +346,20 @@ class LedTemplate(Template):
 
 
 def _example(key: str) -> str:
-    return {"input_voltage": "5 V", "led_forward_voltage": "2 V", "led_forward_current": "10 mA"}.get(key, f"<value {UNIT_OF[key]}>")
+    return {"input_voltage": "5 V", "led_forward_voltage": "2 V", "led_forward_current": "10 mA", "oscillation_frequency": "1 kHz"}.get(key, f"<value {UNIT_OF[key]}>")
+
+
+def _missing_inputs(plan: Plan, who: str, missing: list[str], unusable: dict[str, str]) -> Plan:
+    """A template input no requirement states is a required question; one stated but unreadable is a note (the requirement must change)."""
+    for k in missing:
+        if k in unusable:
+            plan.notes.append(f"{k} not usable: {unusable[k]}")
+        else:
+            plan.questions.append(MissingInformation(
+                key=k, question=f"{who} needs {k} in {UNIT_OF[k]}: answer {k}=<value {UNIT_OF[k]}> (e.g. {k}=\"{_example(k)}\")",
+                rationale="template input",
+            ))
+    return _refused(plan, f"input(s) {missing} missing")
 
 
 # --------------------------------------------------------------------------- RC low-pass
@@ -433,7 +456,261 @@ class RcLowpassTemplate(Template):
         return plan
 
 
-TEMPLATES: list[Template] = [DividerTemplate(), LedTemplate(), RcLowpassTemplate()]
+# --------------------------------------------------------------------------- BJT astable multivibrator
+
+
+class AstableTemplate(Template):
+    """Collector-coupled BJT astable multivibrator: a square wave at ``oscillation_frequency`` from ``input_voltage``.
+
+    Q1 / Q2 are ``Transistor_BJT:2N3904`` (TO-92) wired by pin *name* (``E`` /
+    ``B`` / ``C``, refused when the library spells them differently); R1 / R2
+    are the collector loads (``r_c``), R3 / R4 the base resistors (``r_b``),
+    C1 / C2 the timing capacitors (``c``, solved from the frequency). The
+    simulation is a transient with ``uic`` started by C2's initial voltage
+    (``c2_ic``): the ideal symmetric circuit has a metastable both-on state
+    and a real one starts on mismatch and noise, so the start is a confirmed
+    choice, never a hidden fact. The frequency expectation is *measured*
+    (``Reduce.FREQUENCY`` on v(OUT)); the swing is judged by v(OUT)'s max
+    against the supply and its min against 0 V (a saturated collector).
+
+    Validity: 3 V <= ``input_voltage`` <= 6 V and 100 Hz <=
+    ``oscillation_frequency`` <= 20 kHz. Below 3 V the drops V_BE / V_CE(sat)
+    are no longer small against Vcc (neither the period expression nor the
+    saturation margin holds); above 6 V the reverse base-emitter voltage
+    Vcc - V_BE approaches the 6 V V_EBO absolute maximum that small-signal
+    NPNs such as the 2N3904 specify (it exceeds it from 6.7 V; the template
+    stops at 6 V for margin) - a family rating the template asserts
+    conservatively, not a datasheet fact grounded in this IR - and the
+    generic model has no B-E breakdown, so a passing simulation above it
+    would not be evidence. Below 100 Hz C exceeds ~0.65 uF while seeing both
+    polarities (non-polar parts only): impractical; above 20 kHz the
+    transistors' switching time, absent from the model, and their storage
+    time (its ``TR``) become a visible share of the period.
+
+    The model is ngspice's default Gummel-Poon NPN with one storage-time
+    parameter, ``TR = 200 ns``: with ``TR = 0`` (no charge storage) the
+    saturated transistor turns off instantly and the regenerative switching
+    of the ideal circuit is an algebraic jump that ngspice-42 cannot always
+    integrate ("Timestep too small" at, measured, 3 V / 100 Hz, 6 V / 100 Hz,
+    6 V / 200 Hz, 3 V / 200 Hz - at other points of the same range it
+    completed), so the design's own verification could not run inside the
+    stated validity. The storage time gives the switching a finite duration.
+    Measured on ngspice-42 with it, over the 70-point grid
+    {3, 3.5, 4, 4.5, 5, 5.5, 6} V x {100, 150, 200, 300, 500, 1k, 2k, 5k,
+    10k, 20k} Hz: every transient completes with the template's own step
+    (1 / (200 f)) and the measured frequency is within +1.6 % (6 V, 20 kHz)
+    .. +4.9 % (3 V, 100 Hz) of the period expression, changing by less than
+    0.05 % with a 10x finer step; the deviation grows as Vcc falls (V_CE(sat)
+    is a larger share of the base swing) and shrinks as f rises (the storage
+    time delays the edges). ``tol_rel`` = 10 % is chosen from that range:
+    the worst admitted point uses half of it. The grid is what was measured;
+    the range between grid points is stated as valid on the strength of the
+    monotone behaviour across it, not measured pointwise.
+    """
+
+    id = "astable"
+    title = "BJT astable multivibrator"
+    triggers = ("oscillation_frequency",)
+    needs = ("oscillation_frequency", "input_voltage")
+    serves = ("oscillation_frequency", "input_voltage")
+
+    R_C_OHM = 1_000.0
+    R_B_OHM = 10_000.0
+    V_BE_V = 0.7
+    #: measured on ngspice-42 over the validity range: +1.6 % (6 V, 20 kHz) .. +4.9 % (3 V, 100 Hz); 10 % leaves the worst point half
+    TOL_REL = 0.10
+    #: the largest measured deviation of the simulated frequency from the period expression inside the validity range
+    MEASURED_DEVIATION_MAX = 0.049
+    C2_IC_V = -1.0
+    SWING_TOL_ABS_V = 0.25
+    V_IN_MIN, V_IN_MAX = 3.0, 6.0
+    F_MIN, F_MAX = 100.0, 20_000.0
+    #: the family V_EBO rating the supply bound is asserted against (conservative, not a datasheet fact in the IR)
+    V_EBO_V = 6.0
+    MODEL_NAME = "QNPN"
+    MODEL_TR_S = 200e-9
+    MODEL_CARD = ".model QNPN NPN (TR=200n)"
+    MODEL = (
+        "generic Gummel-Poon NPN with ngspice's default parameters plus a storage time (`.model QNPN NPN (TR=200n)`: IS = 1e-16 A, "
+        "BF = 100, no junction capacitance, no B-E breakdown; TR = 200 ns is the reverse transit time of the small-signal switching "
+        "class, not a datasheet fact) - not a 2N3904 vendor model; without TR the saturated transistor turns off instantly and "
+        "ngspice-42 aborts the transient at some points of the validity range ('Timestep too small'), with it every point measured "
+        "completes; the period depends on the model only through V_BE, V_CE(sat) and TR, and OUT's low level is its saturated "
+        "collector (nominal 0 V)"
+    )
+
+    def build(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str], library: KicadLibrary, *, confirmed: bool) -> Plan:
+        t = self.id
+        plan = Plan(template=t, title=self.title)
+        missing = [k for k in self.needs if k not in inputs]
+        if missing:
+            return _missing_inputs(plan, "The BJT astable multivibrator template", missing, unusable)
+        f_osc, v_in = inputs["oscillation_frequency"], inputs["input_voltage"]
+        plan.inputs = {"oscillation_frequency": f_osc, "input_voltage": v_in}
+        req_f, req_v = f_osc.requirement.id, v_in.requirement.id
+        v, f = v_in.traced.value, f_osc.traced.value
+        if not self.V_IN_MIN <= v <= self.V_IN_MAX:
+            reverse = v - self.V_BE_V  # what calc.astable.v_be_reverse would report for this supply
+            verb = "exceeds" if reverse > self.V_EBO_V else "approaches"
+            return _refused(plan, (
+                f"supply {v:.12g} V ({req_v}) is outside {self.V_IN_MIN:.12g}..{self.V_IN_MAX:.12g} V: below {self.V_IN_MIN:.12g} V the drops V_BE / V_CE(sat) are not small "
+                f"against Vcc (the period expression and the saturation margin do not hold); above {self.V_IN_MAX:.12g} V the reverse base-emitter voltage Vcc - V_BE "
+                f"(here {reverse:.12g} V) {verb} the {self.V_EBO_V:.12g} V V_EBO absolute maximum of small-signal NPNs such as the 2N3904 (exceeded from "
+                f"{self.V_EBO_V + self.V_BE_V:.12g} V; the template stops at {self.V_IN_MAX:.12g} V for margin; a family rating asserted conservatively, not a datasheet fact "
+                f"in this IR), and B-E breakdown is not in the model"
+            ))
+        if not self.F_MIN <= f <= self.F_MAX:
+            return _refused(plan, (
+                f"oscillation frequency {f:.12g} Hz ({req_f}) is outside {self.F_MIN:.12g}..{self.F_MAX:.12g} Hz: below {self.F_MIN:.12g} Hz the timing capacitor exceeds "
+                f"~0.65 uF while seeing both polarities (non-polar parts only) - impractical; above {self.F_MAX:.12g} Hz the transistors' switching and storage times, "
+                f"absent from the generic model, become a visible share of the period"
+            ))
+        r_c_choice, r_c = _choice(t, "r_c", self.R_C_OHM, "ohm", "collector load; sets the output drive and the ~Vcc/R_c saturation current", confirmed)
+        r_b_choice, r_b = _choice(t, "r_b", self.R_B_OHM, "ohm", "base resistor, 10 x R_c so a transistor with beta >= 30 saturates with margin (forced beta ~10); C is solved from it and the frequency", confirmed)
+        v_be_choice, v_be = _choice(t, "v_be", self.V_BE_V, "V", "base-emitter drop the period expression assumes for the switching threshold", confirmed)
+        tol_choice, tol = _choice(t, "tol_rel", self.TOL_REL, None, (
+            "relative tolerance of the frequency expectation: the expression neglects V_CE(sat), whose share of the base swing grows as Vcc falls, and "
+            "the model's storage time, whose share of the period grows with f; measured on ngspice-42 over the validity range (3..6 V x 100 Hz..20 kHz, "
+            "70-point grid) +1.6 % (6 V, 20 kHz) .. +4.9 % (3 V, 100 Hz), so 10 % leaves the worst admitted point half the tolerance"
+        ), confirmed)
+        model_choice = Choice("npn_model", self.MODEL)
+        model_prov = choice_provenance(t, f"npn_model: {self.MODEL}", confirmed)
+        ic_choice, c2_ic = _choice(t, "c2_ic", self.C2_IC_V, "V", "initial voltage across C2 for the transient start (uic: the run starts from the elements' initial conditions instead of the operating point, which would sit in the both-on state): breaks the symmetry of the ideal circuit so the simulated oscillation starts deterministically; a real circuit starts from mismatch and noise", confirmed)
+        uic = Traced(value=True, provenance=c2_ic.provenance)  # the same confirmed decision as c2_ic: the flag is what makes the ic act
+        swing_choice, swing_tol = _choice(t, "swing_tol_abs", self.SWING_TOL_ABS_V, "V", "absolute tolerance of the OUT high / low level expectations", confirmed)
+        plan.choices = [r_c_choice, r_b_choice, v_be_choice, tol_choice, model_choice, ic_choice, swing_choice]
+        params: dict[str, Traced] = {"v_in": v_in.traced, "f_osc": f_osc.traced, "r_c": r_c, "r_b": r_b, "v_be": v_be}
+        try:
+            params["c"] = astable_c_for_frequency(params["f_osc"], params["r_b"], params["v_in"], params["v_be"], ("f_osc", "r_b", "v_in", "v_be"))
+            params["f_osc_design"] = astable_frequency(params["r_b"], params["c"], params["v_in"], params["v_be"], ("r_b", "c", "v_in", "v_be"))
+            params["tran_step"] = astable_tran_step(params["f_osc"], ("f_osc",))
+            params["tran_stop"] = astable_tran_stop(params["f_osc"], ("f_osc",))
+            params["tran_start"] = astable_tran_start(params["f_osc"], ("f_osc",))
+            params["v_be_reverse"] = astable_v_be_reverse(params["v_in"], params["v_be"], ("v_in", "v_be"))
+        except (ValueError, ZeroDivisionError) as e:
+            return _refused(plan, f"{e} ({req_f} = {f:.12g} Hz, {req_v} = {v:.12g} V)")
+        params["tol_rel"] = tol
+        params["c2_ic"] = c2_ic
+        params["swing_tol_abs"] = swing_tol
+        plan.computed = [(k, params[k]) for k in ("c", "f_osc_design", "tran_step", "tran_stop", "tran_start", "v_be_reverse")]
+        c_text = _value_text(params["c"].value)
+        try:
+            q1 = library_component(library, "Q1", "2N3904", "NPN switching transistor", *NPN, structural_provenance(t, "first switching transistor"), [req_f])
+            q2 = library_component(library, "Q2", "2N3904", "NPN switching transistor", *NPN, structural_provenance(t, "second switching transistor"), [req_f])
+            r1 = library_component(library, "R1", _value_text(r_c.value), "Q1 collector load", *RESISTOR_THT, structural_provenance(t, "collector load"), [req_f])
+            r2 = library_component(library, "R2", _value_text(r_c.value), "Q2 collector load (drives OUT)", *RESISTOR_THT, structural_provenance(t, "collector load"), [req_f])
+            r3 = library_component(library, "R3", _value_text(r_b.value), "Q1 base resistor", *RESISTOR_THT, structural_provenance(t, "base resistor"), [req_f])
+            r4 = library_component(library, "R4", _value_text(r_b.value), "Q2 base resistor", *RESISTOR_THT, structural_provenance(t, "base resistor"), [req_f])
+            c1 = library_component(library, "C1", c_text, "timing capacitor Q1 collector to Q2 base", *CAPACITOR_THT, structural_provenance(t, "timing capacitor"), [req_f])
+            c2 = library_component(library, "C2", c_text, "timing capacitor Q2 collector to Q1 base", *CAPACITOR_THT, structural_provenance(t, "timing capacitor"), [req_f])
+            j1 = library_component(library, "J1", "Conn_01x03", "VCC / OUT / GND header", *HEADER_3, structural_provenance(t, "board header"), [req_v])
+            r1a, r1b = two_terminals(r1)
+            r2a, r2b = two_terminals(r2)
+            r3a, r3b = two_terminals(r3)
+            r4a, r4b = two_terminals(r4)
+            c1a, c1b = two_terminals(c1)
+            c2a, c2b = two_terminals(c2)
+            require_pins(j1, ("1", "2", "3"))
+        except TemplateRefusal as e:
+            return _refused(plan, str(e))
+        q_pins: dict[str, tuple[str, str, str]] = {}
+        for q in (q1, q2):
+            found = tuple(pin_by_name(q, name) for name in ("C", "B", "E"))
+            if any(n is None for n in found) or len(q.pins) != 3:
+                return _refused(plan, f"{NPN[0][0]}:{NPN[0][1]} pins are not named C / B / E in this library (pins: {[(p.number, p.name) for p in q.pins]}); the template will not guess the transistor's pinout")
+            q_pins[q.ref] = found  # type: ignore[assignment]
+        for r, key in ((r1, "r_c"), (r2, "r_c"), (r3, "r_b"), (r4, "r_b")):
+            r.electrical["resistance"] = params[key]
+            r.spice = SpiceBinding(device=SpiceDevice.R, value=params[key], pin_order=[p.number for p in r.pins], provenance=structural_provenance(t, "ideal resistor at the design value"))
+        for cap in (c1, c2):
+            cap.electrical["capacitance"] = params["c"]
+        c1.spice = SpiceBinding(device=SpiceDevice.C, value=params["c"], pin_order=[p.number for p in c1.pins], provenance=structural_provenance(t, "ideal capacitor at the design value"))
+        c2.spice = SpiceBinding(
+            device=SpiceDevice.C, value=params["c"], pin_order=[p.number for p in c2.pins], params={"ic": params["c2_ic"]},
+            provenance=structural_provenance(t, "ideal capacitor at the design value; its initial condition starts the transient (uic)"),
+        )
+        card = Traced(value=self.MODEL_CARD, provenance=model_prov)
+        for q in (q1, q2):
+            q.spice = SpiceBinding(
+                device=SpiceDevice.Q, model_name=self.MODEL_NAME, model_card=card, pin_order=list(q_pins[q.ref]),
+                provenance=structural_provenance(t, "NPN on the confirmed generic model; SPICE node order C B E from the library pin names"),
+            )
+        j1.spice = SpiceBinding(exclude=True, exclude_reason="connector, no electrical model", provenance=structural_provenance(t, "header excluded from the netlist"))
+        (q1c, q1b, q1e), (q2c, q2b, q2e) = q_pins["Q1"], q_pins["Q2"]
+        nets = [
+            _net("VCC", NetKind.POWER, [("J1", "1"), ("R1", r1a), ("R2", r2a), ("R3", r3a), ("R4", r4a)], t, [req_v]),
+            _net("Q1_C", NetKind.SIGNAL, [("R1", r1b), ("Q1", q1c), ("C1", c1a)], t),
+            _net("Q2_B", NetKind.SIGNAL, [("C1", c1b), ("R4", r4b), ("Q2", q2b)], t),
+            _net("OUT", NetKind.SIGNAL, [("R2", r2b), ("Q2", q2c), ("C2", c2a), ("J1", "2")], t, [req_f]),
+            _net("Q1_B", NetKind.SIGNAL, [("C2", c2b), ("R3", r3b), ("Q1", q1b)], t),
+            _net("GND", NetKind.GROUND, [("J1", "3"), ("Q1", q1e), ("Q2", q2e)], t),
+        ]
+        sim = SimulationSetup(
+            stimuli=[Stimulus(id="VIN", source="voltage", net="VCC", reference_net="GND", kind=StimulusKind.DC, value=params["v_in"], provenance=structural_provenance(t, "the supply at v_in"), serves_requirements=[req_v])],
+            analyses=[AnalysisSpec(
+                id="tran", kind=SpiceAnalysis.TRAN,
+                params={"step": params["tran_step"], "stop": params["tran_stop"], "start": params["tran_start"], "uic": uic},
+                provenance=structural_provenance(t, "transient of 20 periods, the last 10 saved, 200 points per period"),
+            )],
+            expectations=[
+                Expectation(
+                    id="f_osc", analysis_id="tran", vector="v(OUT)", reduce=Reduce.FREQUENCY, nominal=params["f_osc_design"], tol_rel=params["tol_rel"], requirement_id=req_f,
+                    provenance=structural_provenance(t, f"the frequency measured from v(OUT)'s rising mid-level crossings over the saved window verifies {req_f}"),
+                ),
+                Expectation(
+                    id="out_high", analysis_id="tran", vector="v(OUT)", reduce=Reduce.MAX, nominal=params["v_in"], tol_abs=params["swing_tol_abs"], requirement_id=req_v,
+                    provenance=structural_provenance(t, f"OUT's high level is the supply through R2 (Q2 off); verifies {req_v}"),
+                ),
+                Expectation(
+                    id="out_low", analysis_id="tran", vector="v(OUT)", reduce=Reduce.MIN, nominal=Traced(value=0.0, unit="V", provenance=model_prov), tol_abs=params["swing_tol_abs"],
+                    provenance=structural_provenance(t, "OUT's low level is Q2's saturated collector (nominal 0 V per the confirmed model choice; no requirement states it)"),
+                ),
+            ],
+        )
+        topology = Topology(
+            name="BJT astable multivibrator", domains=[CircuitDomain.ANALOG],
+            rationale="collector-coupled astable: two cross-coupled saturating NPN switches with RC timing; f = 1 / (2 R_b C ln((2 Vcc - V_BE) / (Vcc - V_BE))), C solved from the confirmed frequency",
+            provenance=structural_provenance(t, "selected by oscillation_frequency with input_voltage"),
+            blocks=[Block(
+                id="astable", function="collector-coupled astable multivibrator", domain=CircuitDomain.ANALOG,
+                component_refs=["Q1", "Q2", "R1", "R2", "R3", "R4", "C1", "C2"], input_nets=["VCC"], output_nets=["OUT"], provenance=structural_provenance(t, "block"),
+            )],
+        )
+        constraints = [
+            Constraint(
+                id="c.astable.reverse_vbe", kind=ConstraintKind.ELECTRICAL, target="astable", parameters={"reverse_voltage": params["v_be_reverse"]},
+                description=(
+                    f"each base-emitter junction is reverse biased to about Vcc - V_BE = {params['v_be_reverse'].value:.12g} V once per period; the generic model does not simulate "
+                    f"B-E breakdown; the fitted transistor's V_EBO rating must exceed it - not verified here"
+                ),
+                provenance=structural_provenance(t, "template validity condition"),
+            ),
+            Constraint(
+                id="c.astable.startup", kind=ConstraintKind.ELECTRICAL, target="astable",
+                description="the ideal symmetric circuit has a metastable both-on state; the simulation is started by the C2 initial condition (uic), real circuits start on mismatch and noise",
+                provenance=structural_provenance(t, "what the simulated start-up means"),
+            ),
+            Constraint(
+                id="c.astable.nonpolar_caps", kind=ConstraintKind.ELECTRICAL, target="astable",
+                description="C1 / C2 see both polarities every period: non-polar ceramic / film parts only",
+                provenance=structural_provenance(t, "part selection condition"),
+            ),
+        ]
+        components = [q1, q2, r1, r2, r3, r4, c1, c2, j1]
+        plan.parts = [_part_line(x) for x in components]
+        plan.nets = [_net_line(n) for n in nets]
+        plan.simulation = [
+            f"stimulus VIN: dc {v:.12g} V on VCC; Q1 / Q2 on {self.MODEL_CARD!r}; C2 ic = {self.C2_IC_V:.12g} V; "
+            f"analysis tran {params['tran_step'].value:.12g} {params['tran_stop'].value:.12g} {params['tran_start'].value:.12g} uic (s)",
+            f"expectation f_osc: frequency of v(OUT) rising edges = {params['f_osc_design'].value:.12g} Hz +/- {self.TOL_REL:.0%} verifies {req_f} (fewer than 3 edges is 'no oscillation detected', FAIL)",
+            f"expectation out_high: max v(OUT) = {v:.12g} V +/- {self.SWING_TOL_ABS_V:.12g} V verifies {req_v}",
+            f"expectation out_low: min v(OUT) = 0 V +/- {self.SWING_TOL_ABS_V:.12g} V (saturated collector, no requirement)",
+        ]
+        plan.changes = _changes(t, self.title, topology, components, nets, params, sim, constraints)
+        return plan
+
+
+TEMPLATES: list[Template] = [DividerTemplate(), LedTemplate(), RcLowpassTemplate(), AstableTemplate()]
 
 
 def template_keys_text() -> str:
@@ -524,11 +801,15 @@ def design_from_requirements(
 
 __all__ = [
     "CAPACITOR",
+    "CAPACITOR_THT",
     "HEADER_2",
     "HEADER_3",
     "LED",
+    "NPN",
     "RESISTOR",
+    "RESISTOR_THT",
     "TEMPLATES",
+    "AstableTemplate",
     "DividerTemplate",
     "LedTemplate",
     "RcLowpassTemplate",

@@ -47,6 +47,12 @@ from ai_eda.tools.calc.basic import (
     CALC_VERSION,
     ROLE_UNITS,
     ROLES,
+    astable_c_for_frequency,
+    astable_frequency,
+    astable_tran_start,
+    astable_tran_step,
+    astable_tran_stop,
+    astable_v_be_reverse,
     current_from_voltage_resistance,
     divider_r1_for_v_out,
     junction_temperature,
@@ -92,6 +98,12 @@ CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     "calc.rc.r_for_cutoff": (rc_r_for_cutoff, ROLES["calc.rc.r_for_cutoff"]),
     "calc.rc.ac_fstart": (rc_ac_fstart, ROLES["calc.rc.ac_fstart"]),
     "calc.rc.ac_fstop": (rc_ac_fstop, ROLES["calc.rc.ac_fstop"]),
+    "calc.astable.c_for_frequency": (astable_c_for_frequency, ROLES["calc.astable.c_for_frequency"]),
+    "calc.astable.f": (astable_frequency, ROLES["calc.astable.f"]),
+    "calc.astable.tran_step": (astable_tran_step, ROLES["calc.astable.tran_step"]),
+    "calc.astable.tran_stop": (astable_tran_stop, ROLES["calc.astable.tran_stop"]),
+    "calc.astable.tran_start": (astable_tran_start, ROLES["calc.astable.tran_start"]),
+    "calc.astable.v_be_reverse": (astable_v_be_reverse, ROLES["calc.astable.v_be_reverse"]),
 }
 
 #: lower-cased unit spelling -> the key a role's expected unit lower-cases to. A thermal resistance is written

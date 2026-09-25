@@ -79,6 +79,12 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
         "calc.rc.r_for_cutoff": (user_requirement(1e3), user_requirement(1e-7)),
         "calc.rc.ac_fstart": (user_requirement(1e3),),
         "calc.rc.ac_fstop": (user_requirement(1e3),),
+        "calc.astable.c_for_frequency": (user_requirement(1e3), user_requirement(1e4), user_requirement(5.0), user_requirement(0.7)),
+        "calc.astable.f": (user_requirement(1e4), user_requirement(72e-9), user_requirement(5.0), user_requirement(0.7)),
+        "calc.astable.tran_step": (user_requirement(1e3),),
+        "calc.astable.tran_stop": (user_requirement(1e3),),
+        "calc.astable.tran_start": (user_requirement(1e3),),
+        "calc.astable.v_be_reverse": (user_requirement(5.0), user_requirement(0.7)),
     }
     assert set(CALCULATORS) == set(sample) == set(ROLES) == set(ROLE_UNITS)
     for tool, (fn, keys) in CALCULATORS.items():

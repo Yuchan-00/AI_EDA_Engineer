@@ -38,11 +38,18 @@ Invariants this module enforces:
   assumption as NOT_VERIFIED.
 * **A tolerance must be a tolerance.** An expectation whose ``nominal`` is 0
   needs ``tol_abs``: ``tol_rel`` alone would be a zero tolerance.
+* **A reduction must fit its analysis.** ``reduce=value`` only on ``op``,
+  ``at`` / ``final`` / ``max`` / ``min`` only on a sweep, and
+  ``reduce=frequency`` (rising mid-level crossings over time) only on a
+  ``tran`` analysis: a dc or ac sweep has no time axis to count edges on.
 * **No analysis in the netlist.** No ``.control`` block and no
   ``.op``/``.dc``/``.ac``/``.tran`` cards: :func:`analysis_command` renders
   an :class:`AnalysisSpec` as the interactive command the runner issues
-  (``"op"``, ``"dc VVIN 0 12 1"``, ``"tran 1e-5 5m"``, ``"ac dec 10 1 1meg"``),
-  numbers formatted by :func:`ai_eda.tools.calc.si.format_spice_number` so
+  (``"op"``, ``"dc VVIN 0 12 1"``, ``"tran 1e-5 5m"``, ``"ac dec 10 1 1meg"``;
+  the tran grammar is ``tran <step> <stop> [<start>] [uic]`` where ``uic``
+  comes from the bool param of that name - ``True`` appends the keyword,
+  ``False`` emits nothing, anything else is a ``CompileError``), numbers
+  formatted by :func:`ai_eda.tools.calc.si.format_spice_number` so
   ngspice reads them back as the IR value; the few it would still read one
   ULP off (or that the model cannot vouch for) are listed by
   :func:`build_report` as ``inexact_numbers`` / ``unmodelled_numbers``.
@@ -451,6 +458,12 @@ def _analysis_command(spec: AnalysisSpec, setup: SimulationSetup | None, ledger:
             if start < 0 or start >= stop:
                 raise CompileError(f"{what}: tran start must satisfy 0 <= start < stop, got {start}")
             cmd += f" {fmt(start, 'start')}"
+        if "uic" in p:
+            uic = p["uic"].value
+            if not isinstance(uic, bool):
+                raise CompileError(f"{what} param uic must be a bool (True appends 'uic', False emits nothing), got {type(uic).__name__} {uic!r}")
+            if uic:
+                cmd += " uic"
         return cmd
     if spec.kind == SpiceAnalysis.AC:
         variation = p["variation"].value
@@ -544,6 +557,8 @@ def _check_expectation(exp: Expectation, ir: CircuitIR, setup: SimulationSetup, 
         raise CompileError(f"{what}: reduce=value is for op results; use at/final/max/min on a {analysis.kind.value} analysis")
     if exp.reduce != Reduce.VALUE and analysis.kind == SpiceAnalysis.OP:
         raise CompileError(f"{what}: an op result is a single point; use reduce=value")
+    if exp.reduce == Reduce.FREQUENCY and analysis.kind != SpiceAnalysis.TRAN:
+        raise CompileError(f"{what}: reduce=frequency counts rising edges over time, which only a tran analysis produces ({exp.analysis_id} is {analysis.kind.value})")
     for label, traced in (("nominal", exp.nominal), ("tol_abs", exp.tol_abs), ("tol_rel", exp.tol_rel), ("at", exp.at)):
         if traced is not None:
             ledger.accept(traced, f"{what} {label}")
