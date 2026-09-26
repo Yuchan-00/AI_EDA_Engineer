@@ -7,15 +7,19 @@ where the design is and why.
 
 What the orchestrator does *not* do: it never places, routes or otherwise
 changes the design itself to make a stage pass. The PLACEMENT stage applies
-the ``PCBAgent``'s deterministic grid proposal like any other proposal
-(through :meth:`Orchestrator.apply_proposals`, before IR_BUILD so every
-validator hash is about the placed design), the FAB_CAPABILITY stage right
-after it records the fab limits the ``FabCapabilityAgent`` grounded on the
-archived vendor page into ``ir.pcb.manufacturing`` (merged, never replacing
-what the user wrote; before IR_BUILD for the same reason - the limits feed
-the ``.kicad_pro`` design rules written in the SCHEMATIC stage and the board
-thickness), and the compilers / DRC judge it; routing stays whatever the IR
-contains. The orchestrator compiles what the
+the ``PCBAgent``'s one deterministic proposal - the grid placement plus the
+tracks and vias ``routing.maze`` derived from it (or the placement alone
+when a net is unroutable or ``--answer pcb.routing=skip`` was given) - like
+any other proposal (through :meth:`Orchestrator.apply_proposals`, before
+IR_BUILD so every validator hash is about the placed, routed design and the
+``pcb.routing.*`` IR-geometry checks judge that copper there), the
+FAB_CAPABILITY stage right after it records the fab limits the
+``FabCapabilityAgent`` grounded on the archived vendor page into
+``ir.pcb.manufacturing`` (merged, never replacing what the user wrote;
+before IR_BUILD for the same reason - the limits feed the ``.kicad_pro``
+design rules written in the SCHEMATIC stage and the board thickness), and
+the compilers / DRC judge it. Copper the IR already carries is never
+replaced by a proposal. The orchestrator compiles what the
 IR contains (``ir.pcb.tracks`` included) and lets the tools judge it. A stage whose input
 does not exist yet (no components, no ``ir.pcb``, no board to export) is
 NOT_VERIFIED; a stage whose input is inconsistent (pins that do not match

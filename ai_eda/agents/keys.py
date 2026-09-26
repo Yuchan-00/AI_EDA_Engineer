@@ -29,8 +29,10 @@ EXTRACT_FACTS_KEY = "extract_datasheet_facts"
 ACCEPT_REGS_KEY = "accept_regulations"
 REJECT_REGS_KEY = "reject_regulations"
 PROPOSE_REGS_KEY = "propose_regulations"
-#: PCB agent: ``--answer pcb.placement=skip`` proposes no placement
+#: PCB agent: ``--answer pcb.placement=skip`` proposes no placement (and hence no routing); ``--answer pcb.routing=skip``
+#: proposes the placement without copper
 PLACEMENT_KEY = "pcb.placement"
+ROUTING_KEY = "pcb.routing"
 
 #: the answer keys that decide on something the requirement extraction showed: they can turn a model's value into the
 #: user's within one run, so a design confirmation given beside them refers to a table that was never shown
@@ -41,7 +43,7 @@ CONTROL_KEYS: frozenset[str] = frozenset({
     CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY,
     CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY,
     ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY,
-    PLACEMENT_KEY, CONFIRM_DESIGN_KEY,
+    PLACEMENT_KEY, ROUTING_KEY, CONFIRM_DESIGN_KEY,
 })
 
 __all__ = [
@@ -59,4 +61,5 @@ __all__ = [
     "REJECT_KEY",
     "REJECT_REGS_KEY",
     "REQUIREMENT_DECISION_KEYS",
+    "ROUTING_KEY",
 ]

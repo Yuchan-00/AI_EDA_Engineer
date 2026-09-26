@@ -105,7 +105,7 @@ def _blocking(release_message: str) -> list[str]:
 
 def _routed_ir(tmp_path: Path) -> CircuitIR:
     ir = divider_with_connector_ir(tmp_path, LIB)
-    ir.pcb.tracks = route_naive(ir, LIB)  # the orchestrator compiles what the IR contains; it never routes
+    ir.pcb.tracks = route_naive(ir, LIB)  # copper of its own: the PLACEMENT stage then leaves the board alone (it never replaces copper)
     return ir
 
 
