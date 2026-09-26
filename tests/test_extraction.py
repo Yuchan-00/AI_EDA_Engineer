@@ -20,6 +20,8 @@ from ai_eda.llm.extraction import (
     DIRECTIVE_PHRASES,
     GroundedExtraction,
     RequirementExtraction,
+    _agree,
+    _mismatch,
     build_extraction_messages,
     canonical_key,
     confirmation_question,
@@ -31,6 +33,7 @@ from ai_eda.llm.extraction import (
     request_hash,
     upgrade_confirmed,
 )
+from ai_eda.tools.calc.quantity import parse_quantity
 
 MODEL = "test/model"
 RAW = "12V 입력을 5V 2A로 변환하는 회로, 효율 90% 이상, EU에서 판매"
@@ -128,6 +131,16 @@ def test_equivalent_unit_spellings_agree() -> None:
     )
     assert g.demoted == [] and g.dropped == []
     assert [(r.value.value, r.value.unit) for r in g.requirements] == [(0.5, "A"), (10000.0, "ohm"), (4.7e-6, "F")]  # type: ignore[union-attr]
+
+
+def test_a_non_finite_number_never_agrees_with_the_quote() -> None:
+    # a relative tolerance holds for inf (|inf - x| <= tol * inf), so agreement must be refused explicitly on either side
+    assert not _agree(float("inf"), 0.09) and not _agree(0.09, float("inf")) and not _agree(float("inf"), float("inf")) and not _agree(float("nan"), float("nan"))
+    assert _agree(0.09, 0.09) and _agree(0.0, 0.0)
+    file_q, page_q = parse_quantity("0.09 mm"), parse_quantity("1e400 mm")
+    assert page_q is not None and page_q.value == float("inf")
+    assert _mismatch(file_q, page_q) == "number mismatch: model 9e-05 m vs quote inf m" and _mismatch(page_q, file_q) is not None and _mismatch(page_q, page_q) is not None
+    assert _mismatch(file_q, file_q) is None
 
 
 def test_unknown_model_unit_is_demoted() -> None:

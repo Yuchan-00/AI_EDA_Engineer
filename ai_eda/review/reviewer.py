@@ -10,8 +10,12 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   unchanged on disk, the board artifact must be fresh and unchanged, and the
   rows are compared with the footprints read from the compiled
   ``.kicad_pcb`` (reference, value, footprint id for the BOM; reference,
-  position, rotation, side for the CPL). Without a board there is nothing
-  to compare with: NOT_VERIFIED, never PASS.
+  position, rotation, side for the CPL). The BOM ``Value`` cell is decoded
+  with :func:`ai_eda.tools.manufacturing.csv_cells.bom_cell_text` (one
+  leading apostrophe removed) before it is compared with the board's
+  value, so a neutralised ``-12V`` still matches and a board whose value
+  is literally ``'-12V`` does not. Without a board there is nothing to
+  compare with: NOT_VERIFIED, never PASS.
 * ``review.erc`` / ``review.drc``: the latest tool result must have run on
   the current artifact; its status is passed through (any KiCad violation,
   warning included, is FAIL - ``ai_eda.tools.kicad.cli``).
@@ -25,13 +29,22 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   verify a requirement whose numeric value it does not agree with** (a 6 V
   requirement is not verified by an expectation whose nominal is 4 V: the
   nominal must match the requirement's value, same unit, within the
-  expectation's tolerance); NOT_VERIFIED when an expectation is traced to a
+  expectation's tolerance; a requirement whose value is the user's typed
+  text is read with :func:`~ai_eda.tools.calc.quantity.parse_answer` - the
+  whole text must be one quantity, ``'12 V max'`` is not comparable - and
+  ``details["quantity_version"]`` names the parser; for a ``reduce == AT``
+  expectation whose nominal is unit-less (an ac magnitude ratio) the sweep
+  point ``at`` is what is compared with the requirement, in the
+  requirement's unit); NOT_VERIFIED when an expectation is traced to a
   requirement without a comparable numeric value ("traced but not
   compared"), or when the netlist rests on an assumption; PASS only when
   every expectation of the current run passed and agrees with its
   requirement, with the rawfiles and ``results.json`` as evidence
   (expectations without a ``requirement_id`` are listed under
-  ``details["untraced"]``). Every verdict says it holds at nominal component
+  ``details["untraced"]``; components excluded from the netlist that serve
+  a verified requirement are listed under ``details["excluded_serving"]``
+  and named in the message - a verdict about an ideal source that replaces
+  a part says so). Every verdict says it holds at nominal component
   values and one temperature only (``details["conditions"]``).
 * ``review.calculations_vs_design``: the reviewer recomputes every derived
   value itself (:func:`ai_eda.tools.calc.recompute_parameters`, the same
@@ -60,6 +73,24 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   applicability; a quote missing from the official text is FAIL (the
   curated list is wrong). PASS is source provenance and applicability only -
   every message says that compliance is not assessed.
+* ``review.drc`` additionally requires, when the IR registers a
+  ``KICAD_PROJECT`` artifact, that it is fresh and unchanged on disk (else
+  FAIL ``regenerate`` ``kicad_pro``) and that the DRC report was produced
+  beside exactly that file (``details["project_hash"]``; else FAIL
+  ``rerun_tool``) - a stale or hand-edited project file is not the rules
+  the compiler wrote.
+* ``review.manufacturing_capabilities`` recomputes
+  :func:`~ai_eda.tools.manufacturing.check_capability` live, re-verifies
+  every ``authoritative`` limit's archived page (hash), quote (re-located
+  on the recorded page) and number (the quote re-read with the grounding
+  step and compared with the stored value,
+  :func:`~ai_eda.tools.manufacturing.relocate_limits`) and FAILs when the
+  stored ``mfg.capability`` verdict disagrees with the live one, a limit's
+  quote is no longer on its page or does not state the stored value
+  (``value_mismatch``: an edited number - the live check reads the IR's
+  provenance and can not see it); a stored result without a tool is an
+  opinion (NOT_VERIFIED), one stamped for another IR version is not
+  evidence about this one.
 """
 
 from __future__ import annotations
@@ -77,17 +108,25 @@ from ai_eda.ir import (
     CircuitIR,
     Evidence,
     ProvenanceKind,
+    Reduce,
     SourceRef,
     ValidationResult,
     ValidationStatus,
     worst_status,
 )
 from ai_eda.review.areas import ReviewArea
+from ai_eda.tools.calc.quantity import QUANTITY_VERSION, parse_answer
 from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters
 from ai_eda.tools.kicad.board import BoardFootprint, read_board_footprints
 from ai_eda.tools.kicad.geometry import normalize_angle
+from ai_eda.tools.manufacturing.capability import CHECK_ID as CAPABILITY_CHECK_ID, check_capability
+from ai_eda.tools.manufacturing.capability_file import relocate_limits
+from ai_eda.tools.manufacturing.csv_cells import bom_cell_text
 from ai_eda.tools.manufacturing.outputs import OUTPUT_CHECKS
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK_ID, read_results
+
+#: a limit source check that contradicts the IR (the page was altered, the quote is gone, or the quote does not state the stored number): FAIL, a human looks
+WRONG_LIMIT_SOURCE_STATUSES: frozenset[str] = frozenset({"tampered", "quote_missing", "value_mismatch"})
 
 Check = Callable[[CircuitIR, Path], ValidationResult]
 
@@ -147,7 +186,7 @@ class IndependentReviewer:
             ReviewArea.DRC: self._tool_result_fresh("kicad.drc", ArtifactKind.PCB),
             ReviewArea.REGULATORY_PROVENANCE: self.check_regulatory_provenance,
             ReviewArea.COMPONENT_PROVENANCE: self.check_component_provenance,
-            ReviewArea.MANUFACTURING_CAPABILITIES: self._latest_status("mfg.capability"),
+            ReviewArea.MANUFACTURING_CAPABILITIES: self.check_manufacturing_capabilities,
         }
 
     def review(self, ir: CircuitIR, workdir: Path) -> ReviewReport:
@@ -213,8 +252,15 @@ class IndependentReviewer:
             art = ir.artifacts.get(on_kind)
             if res is None or art is None:
                 return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{check_id} has not been run")
+            if not res.is_tool_backed or not res.artifact_hash or not art.content_hash:
+                # a result nobody's tool produced, or one that does not say which file it ran on, is an opinion
+                return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{check_id} result is not tool-backed evidence about the current {on_kind} (no tool or no artifact hash)")
             if res.artifact_hash != art.content_hash:
                 return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"{check_id} report is stale (ran on a different {on_kind})", details={"tool_check": check_id, "repair": "rerun_tool"})
+            if check_id == "kicad.drc":
+                project_problem = self._project_problem(ir, res)
+                if project_problem is not None:
+                    return project_problem
             details: dict = {}
             if res.status is ValidationStatus.FAIL:
                 # a violation in the design (error or warning) is not something regeneration fixes
@@ -226,11 +272,68 @@ class IndependentReviewer:
             return ValidationResult(check_id="", status=res.status, message=f"{check_id}: {res.message}", evidence=res.evidence, details=details)
         return check
 
+    @staticmethod
+    def _project_problem(ir: CircuitIR, drc: ValidationResult) -> ValidationResult | None:
+        """FAIL when the registered ``.kicad_pro`` is stale / edited (regenerate it) or the DRC report did not read it (re-run DRC); ``None`` when no project artifact is registered or all is well."""
+        pro = ir.artifacts.get(ArtifactKind.KICAD_PROJECT)
+        if pro is None:
+            return None
+        if pro.is_stale(ir.content_hash()):
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"{ArtifactKind.KICAD_PROJECT} (design rules) was generated from a different IR version; DRC must re-read the regenerated project file",
+                                    details={"artifacts": [str(ArtifactKind.KICAD_PROJECT)], "repair": "regenerate", "then": "rerun_tool", "tool_check": "kicad.drc"})
+        if not pro.matches_disk():
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"{ArtifactKind.KICAD_PROJECT} on disk does not match its recorded hash (edited after it was compiled); regenerate it and re-run DRC",
+                                    details={"artifacts": [str(ArtifactKind.KICAD_PROJECT)], "repair": "regenerate", "then": "rerun_tool", "tool_check": "kicad.drc"})
+        if drc.details.get("project_hash") != pro.content_hash:
+            why = drc.details.get("project_reason") or "the report records another project file"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"kicad.drc report was not produced beside the fresh {ArtifactKind.KICAD_PROJECT} ({why}); re-run DRC",
+                                    details={"tool_check": "kicad.drc", "repair": "rerun_tool"})
+        return None
+
+    def check_manufacturing_capabilities(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
+        """The board against the fab limits, recomputed here, with every limit's source re-verified (module docstring)."""
+        from ai_eda.parts.identity import open_archive
+
+        stored = ir.validation.latest(CAPABILITY_CHECK_ID)
+        live = check_capability(ir)
+        details: dict[str, Any] = {"live": {"status": str(live.status), "message": live.message, "compared": live.details.get("compared", []), "drc_proof": live.details.get("drc_proof")},
+                                   "stored": None if stored is None else {"status": str(stored.status), "message": stored.message, "tool": stored.tool, "ir_hash": stored.ir_hash}}
+        if stored is None:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"no {CAPABILITY_CHECK_ID} result; live check: {live.message}", details=details)
+        if not stored.is_tool_backed:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{CAPABILITY_CHECK_ID} result carries no tool: an opinion, not evidence; live check: {live.message}", details=details)
+        checks = relocate_limits(ir.pcb.manufacturing, open_archive(self.tools, workdir)) if ir.pcb is not None else []
+        details["sources"] = [c.model_dump(mode="json") for c in checks]
+        evidence = [Evidence(description=f"archived capability page grounding {c.key}", content_hash=c.document) for c in checks if c.status == "ok" and c.document]
+        wrong = [c for c in checks if c.status in WRONG_LIMIT_SOURCE_STATUSES]
+        unlocated = [c for c in checks if c.status != "ok" and c.status not in WRONG_LIMIT_SOURCE_STATUSES]
+        if wrong:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, evidence=evidence, details=details,
+                                    message="fab limit(s) claim a vendor page that does not say so at review time: " + "; ".join(f"{c.key}: {c.status}: {c.reason}" for c in wrong))
+        if stored.status is not live.status:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, evidence=evidence, details=details,
+                                    message=f"stored {CAPABILITY_CHECK_ID} is {stored.status} but the live check gives {live.status}: {live.message}")
+        if stored.ir_hash and stored.ir_hash != ir.content_hash():
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, evidence=evidence, details=details,
+                                    message=f"{CAPABILITY_CHECK_ID} was produced for another IR version; live check: {live.message}")
+        if unlocated:
+            details["repair"] = "human"
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, evidence=evidence, details=details,
+                                    message="fab limit source(s) not re-verifiable: " + "; ".join(f"{c.key}: {c.status}: {c.reason}" for c in unlocated) + f"; live check: {live.message}")
+        if live.status is ValidationStatus.FAIL:
+            details["repair"] = live.details.get("repair", "human")
+        return ValidationResult(check_id="", status=live.status, evidence=evidence, details=details,
+                                message=f"{live.message}" + (f"; {len(checks)} limit source(s) re-verified" if checks else ""))
+
     def _tool_result_present(self, check_id: str, kind: ArtifactKind) -> Check:
         def check(ir: CircuitIR, workdir: Path) -> ValidationResult:
             res = ir.validation.latest(check_id)
             if res is None:
                 return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"no {check_id} result")
+            if not res.is_tool_backed:
+                return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message=f"{check_id} result carries no tool: an opinion, not evidence")
             return ValidationResult(check_id="", status=res.status, message=res.message)
         return check
 
@@ -273,7 +376,12 @@ class IndependentReviewer:
                 message=f"{len(unverified)} model-inferred / assumed requirement(s) not yet accepted by the user; they are neither enforced nor counted as served",
                 details={"unverified": unverified, "served_but_unverified": sorted(set(unverified) & served)},
             )
-        return ValidationResult(check_id="", status=ValidationStatus.PASS)
+        traced = [r.id for r in authoritative if r.category in design_categories]
+        if not traced:
+            # nothing to trace is not a traced design: an IR with no design requirement (or no component / net) proves nothing here
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no design-level requirement to trace to a component or net",
+                                    details={"categories": sorted({r.category for r in authoritative})})
+        return ValidationResult(check_id="", status=ValidationStatus.PASS, message=f"{len(traced)} design requirement(s) traced to components / nets", details={"traced": traced})
 
     def check_schematic_vs_pcb(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
         """Schematic <-> PCB consistency from the real ``kicad-cli pcb drc --schematic-parity`` evidence.
@@ -290,6 +398,8 @@ class IndependentReviewer:
         drc = ir.validation.latest("kicad.drc")
         if drc is None:
             return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="kicad.drc has not been run")
+        if not drc.is_tool_backed or not drc.artifact_hash or not pcb.content_hash:
+            return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="kicad.drc result is not tool-backed evidence about the current board (no tool or no artifact hash)")
         if drc.artifact_hash != pcb.content_hash:
             return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="kicad.drc ran on a different board than the current PCB artifact", details={"tool_check": "kicad.drc", "repair": "rerun_tool"})
         if not drc.details.get("schematic_parity_checked"):
@@ -411,8 +521,12 @@ class IndependentReviewer:
             if fp is None:
                 mismatches.append(f"{row['Reference']}: in BOM, not on the board")
                 continue
-            if row["Value"] != fp.value:
-                mismatches.append(f"{fp.ref}: value BOM {row['Value']!r} vs board {fp.value!r}")
+            # the BOM writes free text through ``free_text_cell`` (a leading apostrophe when the value would execute);
+            # the comparison is on the design's words, decoded by the single decoder, and names the cell when it differs
+            value = bom_cell_text(row["Value"])
+            if value != fp.value:
+                cell = f" (BOM cell {row['Value']!r})" if row["Value"] != value else ""
+                mismatches.append(f"{fp.ref}: value BOM {value!r} vs board {fp.value!r}{cell}")
             if row["Footprint"] != fp.lib_id:
                 mismatches.append(f"{fp.ref}: footprint BOM {row['Footprint']!r} vs board {fp.lib_id!r}")
         for ref in sorted(set(on_board) - {row["Reference"] for row in rows}):
@@ -522,11 +636,19 @@ class IndependentReviewer:
                 elif problem is not None:
                     not_compared.append(f"{exp.id}: {problem}")
         assumptions = list(spice.details.get("assumptions") or [])
+        # a part left out of the netlist whose requirement an expectation verified: the verdict is about what replaced it
+        verified_ids = {rid for rid in verified.values() if rid is not None}
+        excluded_serving: list[dict] = []
+        for entry in spice.details.get("excluded") or []:
+            c = ir.component(str(entry.get("ref"))) if isinstance(entry, dict) else None
+            if c is not None and set(c.serves_requirements) & verified_ids:
+                excluded_serving.append({"ref": c.ref, "reason": str(entry.get("reason", "")), "requirements": [rid for rid in c.serves_requirements if rid in verified_ids]})
         details: dict = {
-            "verified": verified, "untraced": untraced, "not_compared": not_compared, "assumptions": assumptions,
+            "verified": verified, "untraced": untraced, "not_compared": not_compared, "assumptions": assumptions, "excluded_serving": excluded_serving,
             "conditions": spice.details.get("conditions"), "engine": data.get("engine"), "engine_version": data.get("engine_version"),
-            "netlist_hash": netlist.content_hash,
+            "netlist_hash": netlist.content_hash, "quantity_version": QUANTITY_VERSION,
         }
+        excluded_note = "".join(f"; verified with {e['ref']} excluded: {e['reason']}" for e in excluded_serving)
         if spice.status is ValidationStatus.FAIL and not failed:
             failed.append(f"spice: {spice.message}")
         if failed or missing or unknown_req or disagree:
@@ -561,6 +683,7 @@ class IndependentReviewer:
             message=(
                 f"{len(verified)} expectation(s) verified by {data.get('engine')} {data.get('engine_version')} on the current netlist "
                 f"({traced} traced to requirements, nominals agree with the requirement values) - at nominal component values and one temperature only"
+                + excluded_note
             ),
             details=details,
             evidence=evidence,
@@ -573,24 +696,48 @@ class IndependentReviewer:
         ``(None, True)`` when they agree within the expectation's tolerance;
         ``(why, True)`` when both are numbers in the same unit and disagree;
         ``(why, False)`` when the requirement has no numeric value or another
-        unit, so nothing can be compared.
+        unit, so nothing can be compared. A requirement whose value is the
+        user's typed text (``'5 V'``) is read with
+        :func:`~ai_eda.tools.calc.quantity.parse_answer`: the whole text must
+        be that one quantity (``'5 V typ'`` or a range is not comparable).
+        For a ``reduce == AT`` expectation whose nominal carries no unit (an ac
+        magnitude ratio) and whose sweep point ``at`` is in the requirement's
+        unit, it is ``at`` that must be the requirement's value (the cutoff
+        frequency the ratio is checked at); a unit-ful nominal keeps the
+        nominal comparison.
         """
         value = req.value
         if value is None:
             return f"requirement {req.id} has no value to compare the nominal with", False
-        if isinstance(value.value, bool) or not isinstance(value.value, (int, float)):
-            return f"requirement {req.id} value {value.value!r} is not a number", False
-        unit_e, unit_r = (exp.nominal.unit or "").strip().lower(), (value.unit or "").strip().lower()
+        raw = value.value
+        if isinstance(raw, str):
+            q = parse_answer(raw)
+            if q is None:
+                return f"requirement {req.id} value {raw!r} is not one whole quantity with a unit", False
+            target, unit_req = q.value, q.unit
+        elif isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return f"requirement {req.id} value {raw!r} is not a number", False
+        else:
+            target, unit_req = float(raw), value.unit
+        unit_e, unit_r = (exp.nominal.unit or "").strip().lower(), (unit_req or "").strip().lower()
+        if exp.reduce == Reduce.AT and exp.at is not None and not unit_e:
+            unit_at = (exp.at.unit or "").strip().lower()
+            if unit_at and unit_r and unit_at == unit_r:
+                at = float(exp.at.value)
+                limit = abs(float(exp.tol_rel.value)) * abs(target) if exp.tol_rel is not None and target != 0.0 else 1e-9 * max(1.0, abs(target))
+                if abs(at - target) <= limit:
+                    return None, True
+                return f"sweep point {at:.6g} {unit_req} is not requirement {req.id}'s {target:.6g} {unit_req} (+/- {limit:.3g} {unit_req})", True
         if unit_e and unit_r and unit_e != unit_r:
-            return f"nominal unit {exp.nominal.unit!r} is not the requirement's {value.unit!r}", False
-        nominal, target = float(exp.nominal.value), float(value.value)
+            return f"nominal unit {exp.nominal.unit!r} is not the requirement's {unit_req!r}", False
+        nominal = float(exp.nominal.value)
         limits = [abs(float(exp.tol_abs.value))] if exp.tol_abs is not None else []
         if exp.tol_rel is not None and target != 0.0:
             limits.append(abs(float(exp.tol_rel.value)) * abs(target))
         limit = max(limits) if limits else 1e-9 * max(1.0, abs(target))
         if abs(nominal - target) <= limit:
             return None, True
-        unit = f" {value.unit}" if value.unit else ""
+        unit = f" {unit_req}" if unit_req else ""
         return f"nominal {nominal:.6g}{unit} is not requirement {req.id}'s {target:.6g}{unit} (+/- {limit:.3g}{unit})", True
 
     def check_calculations_vs_design(self, ir: CircuitIR, workdir: Path) -> ValidationResult:

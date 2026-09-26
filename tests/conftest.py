@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import ai_eda.report.stages as _stages
 from ai_eda.ir import (
     CircuitDomain,
     CircuitIR,
@@ -25,7 +26,31 @@ from ai_eda.ir import (
 )
 
 DS = SourceRef(title="Generic resistor datasheet", authority="Vendor", content_hash="sha256:abc")
+
+
+def rawfile_command_ok(command: str, version: str) -> bool:
+    """KiCad's ngspice-46 stamps ``Command: ngspice-46, Build ...`` into every rawfile; Debian/Ubuntu ``libngspice0``
+    (ngspice-42) writes no ``Command:`` line at all, so the parsed command is empty (measured 2026-09-23). The line is
+    evidence of the writer, not data."""
+    if version == "ngspice-42":
+        return command == ""
+    return command.startswith(version + ", Build ")
 AUTH = Provenance(kind=ProvenanceKind.AUTHORITATIVE, source=DS)
+
+
+@pytest.fixture(autouse=True)
+def stage_reports_find_no_browser(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stage-report writer discovers no browser in a test unless the test is marked ``browser``.
+
+    A headless print costs about 1.5 s per report and every ``ai-eda run``
+    that reaches RELEASE writes seven; the runs across the suite are not
+    about PDFs. Only the writer's discovery (``ai_eda.report.stages.find_browser``)
+    is disabled: ``ai_eda.report.pdf.find_browser`` itself, ``doctor`` and an
+    explicit ``browser=`` / ``--browser`` are untouched, and a test marked
+    ``@pytest.mark.browser`` gets the real discovery.
+    """
+    if request.node.get_closest_marker("browser") is None:
+        monkeypatch.setattr(_stages, "find_browser", lambda: None)
 
 
 def _pin(n: str) -> Pin:

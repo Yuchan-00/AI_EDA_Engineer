@@ -39,8 +39,10 @@ Invariants enforced here:
   ``Retry-After`` capped at ``backoff_cap`` seconds; ``408`` / ``5xx`` /
   transport failures (and a ``429`` that persists) fall back to the next
   :meth:`~ai_eda.llm.router.ModelRouter.candidates` entry; ``400`` / ``401``
-  / ``402`` / ``403`` / ``404`` are never retried and never fall back - a bad
-  key or an empty account is not something another model fixes.
+  / ``402`` / ``403`` / ``404`` / ``405`` / ``413`` / ``422``
+  (:data:`TERMINAL_STATUSES`) are never retried and never fall back - a bad
+  key, an empty account or an oversized request is not something another
+  model fixes.
 * **A schema failure gets one feedback turn.** :meth:`structured` validates
   the reply with pydantic; an unparseable, truncated (``finish_reason ==
   "length"``) or invalid reply is fed back once (the error text, never a

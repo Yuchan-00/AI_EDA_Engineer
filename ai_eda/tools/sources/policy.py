@@ -32,7 +32,11 @@ Invariants this module enforces:
 Hosts compare case-insensitively with a leading ``www.`` ignored
 (``www.ti.com`` and ``ti.com`` are one origin); other subdomains are
 distinct (``assets.nexperia.com`` is not ``www.nexperia.com``), so an
-allow-list must name each one.
+allow-list must name each one. The port is part of the origin: a trusted
+host is its default https origin (443; an explicit ``:443`` / ``http://…:80``
+is normalised away), and a URL on any other port is fetched or followed
+only when it is exactly a user-supplied URL. IPv6 literal hosts keep their
+brackets through :func:`normalise_url`.
 """
 
 from __future__ import annotations
@@ -92,14 +96,28 @@ def normalise_url(url: str) -> tuple[str, str | None]:
     host = (parts.hostname or "").lower()
     if not host:
         raise ValueError(f"URL has no host: {raw!r}")
-    netloc = host
-    if parts.port is not None and parts.port != 443:
-        netloc = f"{host}:{parts.port}"
+    try:
+        port = parts.port  # ``ValueError`` for a non-numeric / out-of-range port
+    except ValueError as e:
+        raise ValueError(f"URL has an unusable port: {raw!r} ({e})") from None
+    netloc = f"[{host}]" if ":" in host else host  # an IPv6 literal keeps its brackets (urlsplit strips them)
+    if port is not None and port != 443 and not (scheme == "http" and port == 80):
+        # an explicit default port (``https://h:443``, ``http://h:80``) is the default; any other port stays and is
+        # fetched only as an exact user-supplied URL (``NetworkPolicy.trusted_origin``)
+        netloc = f"{netloc}:{port}"
     if parts.username or parts.password:
         raise ValueError("credentials in URLs are not supported")
     path = parts.path or "/"
     out = urlunsplit(("https", netloc, path, parts.query, ""))
     return out, ("; ".join(notes) or None)
+
+
+def port_of(url: str) -> int | None:
+    """The explicit port of ``url`` (``None`` for the default); ``-1`` when it is unusable."""
+    try:
+        return urlsplit(url).port
+    except ValueError:
+        return -1
 
 
 class NetworkPolicy:
@@ -175,20 +193,35 @@ class NetworkPolicy:
         return self._user_urls.get(normalised_url)
 
     def trusted_origin(self, normalised_url: str) -> tuple[str | None, str | None]:
-        """``(origin host key, why)`` when ``normalised_url`` may be fetched, else ``(None, why not)``."""
+        """``(origin host key, why)`` when ``normalised_url`` may be fetched, else ``(None, why not)``.
+
+        A trusted *host* means its default https origin (port 443): a URL on
+        another port is fetched only as an exact user-supplied URL.
+        """
         host = host_key(host_of(normalised_url))
-        if host in self.trust_reasons:
-            return host, self.trust_reasons[host]
         key = self._user_urls.get(normalised_url)
         if key is not None:
             return host, f"URL supplied by the user under key {key!r}"
+        port = port_of(normalised_url)
+        if port not in (None, 443):
+            return None, f"host {host!r} on port {port} is not a trusted origin (a trusted host is its default https origin only; give the exact URL to fetch it)"
+        if host in self.trust_reasons:
+            return host, self.trust_reasons[host]
         return None, f"host {host!r} is not a trusted origin (not a KiCad library datasheet host, not in the official-domain allow-list, not a user-supplied URL)"
 
     def redirect_allowed(self, origin: str, target_url: str) -> str | None:
-        """``None`` when a redirect from ``origin`` to ``target_url`` may be followed, else the reason it may not."""
+        """``None`` when a redirect from ``origin`` to ``target_url`` may be followed, else the reason it may not.
+
+        The target must be on the same origin or another trusted host, on the
+        default https port: a port is part of the origin, so ``host:9999`` is
+        not ``host``.
+        """
         target = host_key(host_of(target_url))
         if not target:
             return f"redirect target has no host: {target_url!r}"
+        port = port_of(target_url)
+        if port not in (None, 443):
+            return f"redirect to {target!r} on port {port} refused (a trusted origin is the default https port only)"
         if target == host_key(origin) or target in self.trust_reasons:
             return None
         return f"redirect to untrusted host {target!r} (from origin {host_key(origin)!r}) refused"
@@ -218,4 +251,4 @@ class NetworkPolicy:
         }
 
 
-__all__ = ["ONLINE_SESSION_DETAIL", "NetworkPolicy", "host_key", "host_of", "normalise_url"]
+__all__ = ["ONLINE_SESSION_DETAIL", "NetworkPolicy", "host_key", "host_of", "normalise_url", "port_of"]

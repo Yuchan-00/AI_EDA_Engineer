@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -11,11 +13,12 @@ from typing import Iterable
 
 from pydantic import BaseModel, Field
 
+from ai_eda.errors import IRSchemaError
 from ai_eda.ir.components import Component
 from ai_eda.ir.constraints import Constraint
 from ai_eda.ir.nets import Net, PinRef
 from ai_eda.ir.pcb import PCBDesign
-from ai_eda.ir.provenance import Traced
+from ai_eda.ir.provenance import DESIGN_VIEW, Traced, design_data, drop_in_design_view
 from ai_eda.ir.regulatory import RegulatoryState
 from ai_eda.ir.requirements import RequirementSet
 from ai_eda.ir.simulation import SimulationSetup
@@ -34,6 +37,32 @@ NON_DESIGN_REQUIREMENT_FIELDS: tuple[str, ...] = ("extraction_cache",)
 WALL_CLOCK_KEYS: frozenset[str] = frozenset({"created_at"})
 
 
+def unknown_keys(raw, dumped, path: str = "") -> list[str]:
+    """Dotted paths of keys present in ``raw`` (loaded JSON) that ``dumped`` (the validated model dumped back) lacks."""
+    out: list[str] = []
+    if isinstance(raw, dict) and isinstance(dumped, dict):
+        for k, v in raw.items():
+            here = f"{path}.{k}" if path else str(k)
+            if k not in dumped:
+                out.append(here)
+            else:
+                out.extend(unknown_keys(v, dumped[k], here))
+    elif isinstance(raw, list) and isinstance(dumped, list):
+        for i, (a, b) in enumerate(zip(raw, dumped)):
+            out.extend(unknown_keys(a, b, f"{path}[{i}]"))
+    return out
+
+
+def _mode_for(path: Path) -> int:
+    """Permission bits a fresh write of ``path`` gets: the existing file's, else the process default (0o666 under the umask)."""
+    try:
+        return path.stat().st_mode & 0o7777
+    except OSError:
+        umask = os.umask(0)
+        os.umask(umask)
+        return 0o666 & ~umask
+
+
 def strip_wall_clock(obj):
     """``obj`` (JSON-able data) without any :data:`WALL_CLOCK_KEYS` entry at any depth."""
     if isinstance(obj, dict):
@@ -46,6 +75,8 @@ def strip_wall_clock(obj):
 class ArtifactKind(StrEnum):
     SCHEMATIC = "kicad_sch"
     PCB = "kicad_pcb"
+    #: the KiCad project file beside the schematic / board: ``board.design_settings.rules`` from the fab limits (deterministic JSON)
+    KICAD_PROJECT = "kicad_pro"
     SPICE_NETLIST = "spice_netlist"
     SPICE_RESULT = "spice_result"
     BOM = "bom"
@@ -83,6 +114,12 @@ class ArtifactRef(BaseModel):
     ``path`` then points at the file a human opens first (the ``.gbrjob``
     manifest) and ``content_hash`` covers the whole set via
     :func:`hash_file_set`.
+
+    ``notes`` lists what the generator altered or left out while writing the
+    file (a BOM free-text cell written with a leading apostrophe); it is
+    bookkeeping outside the design view, never design content. Files without
+    the key load (it defaults); a file that carries it is refused by code
+    older than the key (``load`` drops no unknown key), by design.
     """
 
     kind: ArtifactKind
@@ -93,6 +130,8 @@ class ArtifactRef(BaseModel):
     generator_version: str | None = None
     #: member files of a multi-file artifact (absolute paths); empty for a single file
     files: list[str] = Field(default_factory=list)
+    #: what the generator altered or left out while writing the file, for a human (e.g. BOM cells neutralised); bookkeeping, never design content
+    notes: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def is_stale(self, ir_hash: str) -> bool:
@@ -122,6 +161,8 @@ class ProjectMeta(BaseModel):
     description: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     workdir: str | None = None
+
+    _design = drop_in_design_view(*NON_DESIGN_PROJECT_FIELDS)
 
 
 class CircuitIR(BaseModel):
@@ -168,23 +209,25 @@ class CircuitIR(BaseModel):
     _NON_DESIGN_FIELDS = ("validation", "artifacts")
 
     def design_dict(self) -> dict:
-        """The design content as JSON-able data: what :meth:`content_hash` hashes.
+        """The design content as JSON-able data: what :meth:`content_hash` hashes (the *design view*).
 
-        Excludes ``validation`` / ``artifacts`` (state about the design),
-        ``project.workdir`` / ``project.created_at`` (where and when it was
-        built), ``requirements.extraction_cache`` (what a model said, not
-        what the design is) and every ``created_at`` timestamp, so the same
-        design built twice - in another folder, at another time, or loaded
-        from disk - hashes the same. ``SourceRef.retrieved_at`` stays: which
-        retrieval of a datasheet was used is design provenance, and it is
-        never filled in by a clock default.
+        Left out, each by the model that owns it (:func:`~ai_eda.ir.provenance.drop_in_design_view`):
+        ``validation`` / ``artifacts`` (state about the design);
+        ``project.workdir`` / ``project.created_at`` (where and when it was built);
+        ``requirements.extraction_cache`` (what a model said, not what the design is) and
+        ``requirements.presented`` (which question texts the user has been shown - bookkeeping of the dialogue);
+        every ``Provenance.created_at`` (a clock default);
+        the locators ``SourceRef.document_path``, ``LibraryRef.library_path`` and
+        ``RegulatoryProvenance.source_document`` (where a copy lives - the hashes that pin the copies stay);
+        and the regulatory verification outcomes (``RegulatoryRequirement.status`` / ``source_status``,
+        ``RegulatoryProvenance.verification_status``, ``GroundedQuote.found`` / ``page`` / ``context``), which an
+        offline and an online run of the same design fill in differently.
+        So the same design built twice - in another folder, at another time, against another KiCad install, or
+        loaded from disk - hashes the same. ``SourceRef.retrieved_at`` and ``content_hash`` stay: which document
+        version was used is design provenance, and neither is filled in by a clock default. A user parameter that
+        happens to be called ``created_at`` is design content and is hashed.
         """
-        data = self.model_dump(mode="json", exclude=set(self._NON_DESIGN_FIELDS))
-        for key in NON_DESIGN_PROJECT_FIELDS:
-            data["project"].pop(key, None)
-        for key in NON_DESIGN_REQUIREMENT_FIELDS:
-            data["requirements"].pop(key, None)
-        return strip_wall_clock(data)
+        return self.model_dump(mode="json", exclude=set(self._NON_DESIGN_FIELDS), context={"view": DESIGN_VIEW})
 
     def content_hash(self) -> str:
         """Stable hash of the design content (see :meth:`design_dict` for what is excluded)."""
@@ -194,11 +237,65 @@ class CircuitIR(BaseModel):
     # --- persistence ---------------------------------------------------------
 
     def save(self, path: str | Path) -> Path:
+        """Write the IR to ``path`` atomically: a reader never sees a half-written ir.json.
+
+        The text is written to a temporary file in the same directory and
+        moved over ``path`` with :func:`os.replace`, so ``ai-eda serve`` (which
+        re-reads ir.json on every request while ``ai-eda run`` saves it) reads
+        either the previous complete file or the new one. The bytes are the
+        same as a plain text write of ``model_dump_json(indent=2)`` (platform
+        newlines, UTF-8), and an existing file keeps its permission bits.
+        """
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        fd, tmp_name = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:  # text mode: the same newline translation as write_text
+                f.write(self.model_dump_json(indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, _mode_for(p))
+            os.replace(tmp, p)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         return p
 
     @classmethod
+    def loads(cls, raw: bytes | str, source: str = "<ir>") -> "CircuitIR":
+        """The IR serialised in ``raw`` (the bytes or text of one ir.json), with every check :meth:`load` makes.
+
+        ``source`` names the file in error messages. A caller that must also
+        hash what it parsed (the report's ``ir_file_sha256``) reads the bytes
+        once and passes them here, so the hash and the content can never come
+        from two different versions of a file being rewritten.
+        """
+        def constant(token: str):  # Python's json accepts the non-standard Infinity / NaN tokens; the IR holds no such number
+            raise IRSchemaError(f"{source}: JSON token {token} is not a number the IR can hold")
+
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        data = json.loads(text, parse_constant=constant)
+        if not isinstance(data, dict):
+            raise IRSchemaError(f"{source}: not an IR object")
+        version = data.get("schema_version")
+        if version != IR_SCHEMA_VERSION:
+            raise IRSchemaError(f"{source}: schema_version {version!r} is not {IR_SCHEMA_VERSION!r} (this code reads no other version)")
+        ir = cls.model_validate(data)
+        unknown = unknown_keys(data, ir.model_dump(mode="json"))
+        if unknown:
+            raise IRSchemaError(f"{source}: unknown key(s) the IR models would drop: {', '.join(unknown)}")
+        return ir
+
+    @classmethod
     def load(cls, path: str | Path) -> "CircuitIR":
-        return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
+        """The IR saved at ``path``, or :class:`~ai_eda.errors.IRSchemaError` when it is not one this code can read faithfully.
+
+        Pydantic ignores keys a model does not declare, so a misspelled key in
+        a hand-edited file (``serves_requirement``) would silently delete
+        design or traceability data and the truncated IR would then be treated
+        as the design; likewise a file written by another schema version. Both
+        are refused with the offending paths named. The file is read exactly
+        once; :meth:`loads` does the checking.
+        """
+        return cls.loads(Path(path).read_bytes(), source=str(path))

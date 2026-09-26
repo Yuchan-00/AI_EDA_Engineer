@@ -38,11 +38,18 @@ Invariants this module enforces:
   assumption as NOT_VERIFIED.
 * **A tolerance must be a tolerance.** An expectation whose ``nominal`` is 0
   needs ``tol_abs``: ``tol_rel`` alone would be a zero tolerance.
+* **A reduction must fit its analysis.** ``reduce=value`` only on ``op``,
+  ``at`` / ``final`` / ``max`` / ``min`` only on a sweep, and
+  ``reduce=frequency`` (rising mid-level crossings over time) only on a
+  ``tran`` analysis: a dc or ac sweep has no time axis to count edges on.
 * **No analysis in the netlist.** No ``.control`` block and no
   ``.op``/``.dc``/``.ac``/``.tran`` cards: :func:`analysis_command` renders
   an :class:`AnalysisSpec` as the interactive command the runner issues
-  (``"op"``, ``"dc VVIN 0 12 1"``, ``"tran 1e-5 5m"``, ``"ac dec 10 1 1meg"``),
-  numbers formatted by :func:`ai_eda.tools.calc.si.format_spice_number` so
+  (``"op"``, ``"dc VVIN 0 12 1"``, ``"tran 1e-5 5m"``, ``"ac dec 10 1 1meg"``;
+  the tran grammar is ``tran <step> <stop> [<start>] [uic]`` where ``uic``
+  comes from the bool param of that name - ``True`` appends the keyword,
+  ``False`` emits nothing, anything else is a ``CompileError``), numbers
+  formatted by :func:`ai_eda.tools.calc.si.format_spice_number` so
   ngspice reads them back as the IR value; the few it would still read one
   ULP off (or that the model cannot vouch for) are listed by
   :func:`build_report` as ``inexact_numbers`` / ``unmodelled_numbers``.
@@ -88,6 +95,7 @@ accepted provenance kinds, the analysis commands and the vector names).
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,11 +140,11 @@ _VECTOR = re.compile(r"^\s*([vViI])([pPrRiI]?)\s*\(\s*([^()\s]+)\s*\)\s*$")
 _COMPLEX_SUFFIX = {"p": ".phase_deg", "r": ".real", "i": ".imag"}
 _CARD_DEF = re.compile(r"^\.(model|subckt)\s+(\S+)(.*)$", re.IGNORECASE)
 #: card lines that would make the netlist non-self-contained or smuggle an analysis in
-_FORBIDDEN_CARD_TOKENS = frozenset(
-    {
-        ".include", ".lib", ".control", ".endc", ".end", ".title", ".op", ".dc", ".ac", ".tran",
-        ".save", ".probe", ".print", ".plot", ".meas", ".measure", ".options", ".option", ".temp",
-    }
+#: dot-card prefixes a model card may never carry, matched the way ngspice matches them (``.inc`` is ``.include``,
+#: ``.opt`` is ``.options``): files, control blocks, analyses, output control, initial conditions, options, globals
+_FORBIDDEN_CARD_PREFIXES: tuple[str, ...] = (
+    ".inc", ".lib", ".control", ".endc", ".end", ".title", ".op", ".dc", ".ac", ".tran", ".tf", ".noise", ".pz", ".sens", ".disto",
+    ".sp", ".save", ".probe", ".print", ".plot", ".meas", ".opt", ".temp", ".ic", ".nodeset", ".global", ".four", ".width",
 )
 
 
@@ -244,7 +252,7 @@ def _nodes(ir: CircuitIR) -> _Nodes:
             # mangles or drops the others), so the compiler must refuse them first
             raise CompileError(
                 f"net {n.name!r} is not usable as a SPICE node name: ngspice keeps only "
-                f"[A-Za-z0-9_./+-:#@[]] intact (the runner would reject the netlist)"
+                f"A-Z a-z 0-9 _ . / + - : # @ [ ] intact (the runner would reject the netlist)"
             )
         low = n.name.lower()
         if low in seen:
@@ -294,10 +302,32 @@ def _normalise_card(text: str, what: str) -> str:
         lines.pop()
     if not lines:
         raise CompileError(f"{what}: model_card is empty")
+    # a whitelist, not a blacklist: a model card is ``.model`` / ``.subckt`` ... ``.ends`` text and nothing else.
+    # Inside a subcircuit element lines, nested ``.model`` and ``.param`` are the body; outside one, an element
+    # line would add a part the IR does not have, and any other dot card (``.inc`` - ngspice matches the prefix of
+    # ``.include`` -, ``.opt``, ``.ic``, ``.nodeset``, ``.global``, ``.tf`` ...) would change what is simulated
+    # without appearing in the report
+    depth = 0
     for ln in lines:
-        first = ln.split()[0].lower() if ln.split() else ""
-        if first in _FORBIDDEN_CARD_TOKENS:
-            raise CompileError(f"{what}: model_card line {ln.strip()!r} is not allowed (cards must be self-contained .model/.subckt text)")
+        s = ln.strip()
+        if not s or s[0] in "*+":
+            continue
+        first = s.split()[0].lower()
+        if first.startswith("."):
+            if first == ".subckt":
+                depth += 1
+            elif first == ".ends":
+                depth = max(0, depth - 1)
+            elif first == ".model" or (first == ".param" and depth > 0):
+                pass
+            elif any(first.startswith(tok) for tok in _FORBIDDEN_CARD_PREFIXES):
+                raise CompileError(f"{what}: model_card line {s!r} is not allowed (cards must be self-contained .model/.subckt text)")
+            else:
+                raise CompileError(f"{what}: model_card line {s!r} is not allowed (only .model, .subckt/.ends and, inside a subcircuit, .param and element lines)")
+        elif depth == 0:
+            raise CompileError(f"{what}: model_card line {s!r} is an element outside any .subckt (a card adds models, never parts)")
+    if depth != 0:
+        raise CompileError(f"{what}: model_card has an unclosed .subckt")
     return "\n".join(lines)
 
 
@@ -428,6 +458,12 @@ def _analysis_command(spec: AnalysisSpec, setup: SimulationSetup | None, ledger:
             if start < 0 or start >= stop:
                 raise CompileError(f"{what}: tran start must satisfy 0 <= start < stop, got {start}")
             cmd += f" {fmt(start, 'start')}"
+        if "uic" in p:
+            uic = p["uic"].value
+            if not isinstance(uic, bool):
+                raise CompileError(f"{what} param uic must be a bool (True appends 'uic', False emits nothing), got {type(uic).__name__} {uic!r}")
+            if uic:
+                cmd += " uic"
         return cmd
     if spec.kind == SpiceAnalysis.AC:
         variation = p["variation"].value
@@ -521,11 +557,13 @@ def _check_expectation(exp: Expectation, ir: CircuitIR, setup: SimulationSetup, 
         raise CompileError(f"{what}: reduce=value is for op results; use at/final/max/min on a {analysis.kind.value} analysis")
     if exp.reduce != Reduce.VALUE and analysis.kind == SpiceAnalysis.OP:
         raise CompileError(f"{what}: an op result is a single point; use reduce=value")
+    if exp.reduce == Reduce.FREQUENCY and analysis.kind != SpiceAnalysis.TRAN:
+        raise CompileError(f"{what}: reduce=frequency counts rising edges over time, which only a tran analysis produces ({exp.analysis_id} is {analysis.kind.value})")
     for label, traced in (("nominal", exp.nominal), ("tol_abs", exp.tol_abs), ("tol_rel", exp.tol_rel), ("at", exp.at)):
         if traced is not None:
             ledger.accept(traced, f"{what} {label}")
-            if not _is_number(traced.value):
-                raise CompileError(f"{what} {label} must be a number")
+            if not _is_number(traced.value) or not math.isfinite(float(traced.value)):
+                raise CompileError(f"{what} {label} must be a finite number")
     if float(exp.nominal.value) == 0.0 and exp.tol_abs is None and exp.tol_rel is not None:
         raise CompileError(f"{what}: nominal is 0 and only tol_rel is given - a relative tolerance on zero is no tolerance; give tol_abs")
     return vector
@@ -575,6 +613,8 @@ def _compile(ir: CircuitIR) -> _Compiled:
     title = ir.project.id
     if not title.strip() or any(ch in title for ch in _BAD_TITLE_CHARS):
         raise CompileError(f"project.id {title!r} cannot be the netlist title line (empty, or contains one of $ ' \" ` or a newline)")
+    if not title.isascii():
+        raise CompileError(f"project.id {title!r} must be ASCII: it is the SPICE netlist's title line and ngspice rewrites non-ASCII text (create the project with an ASCII id)")
     if not any(c.spice is not None for c in ir.components):
         first = min(c.ref for c in ir.components)
         raise NothingToCompileError(f"no SPICE binding for {first} (no component has one: the SPICE model mapping has not been made yet)")
@@ -638,6 +678,9 @@ def _compile(ir: CircuitIR) -> _Compiled:
             if ir_pin.number in b.pin_order:
                 continue
             connected = (c.ref, ir_pin.number) in nodes.of_pin
+            if ir_pin.number in b.ignored_pins and not connected:
+                raise CompileError(f"{c.ref}.{ir_pin.number} is listed in ignored_pins but is in no net; ignored_pins is for a connected pin the element does not use - connect it or mark it no_connect")
+
             if ir_pin.number in b.ignored_pins:
                 if not b.ignored_pins[ir_pin.number].strip():
                     raise CompileError(f"{c.ref}.{ir_pin.number} is in ignored_pins without a reason")
@@ -660,6 +703,10 @@ def _compile(ir: CircuitIR) -> _Compiled:
             if b.value is None and b.model_name is None:
                 raise CompileError(f"{c.ref}: a {dev.value} element needs a value (or a model_name)")
             if b.value is not None:
+                if dev in (SpiceDevice.R, SpiceDevice.C, SpiceDevice.L) and _is_number(b.value.value) and float(b.value.value) <= 0.0:
+                    # ngspice simulates R=0 as ~1 mΩ and a negative passive without a word (measured on ngspice-42);
+                    # a 0 V / negative V or I source is an ordinary source (a current probe, a negative rail)
+                    raise CompileError(f"{c.ref}: a {dev.value} value must be positive; got {b.value.value!r} (ngspice would silently simulate a different part)")
                 rest.append(_number(ledger.accept(b.value, f"{c.ref} value"), f"{c.ref} value", ledger))
                 value_sources[name] = _reconcile_value(c, b.value, dev)
         else:

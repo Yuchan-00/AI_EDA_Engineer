@@ -26,6 +26,7 @@ the library); footprint pads are in the footprint frame with **Y down**
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -326,6 +327,19 @@ def _flatten(child: list, parent: list) -> list:
 # --------------------------------------------------------------------------- footprint parsing helpers
 
 
+def _finite(atom: Any, what: str, name: str) -> float:
+    """``atom`` as a finite float; ``nan`` / ``inf`` (which ``float`` and KiCad's reader accept) are :class:`LibraryFormatError` naming the footprint.
+
+    A non-finite coordinate or size has no geometry: ``min`` / ``max`` drop a
+    NaN silently and an infinite pad is everywhere, so a later extent or DRC
+    would be computed on a footprint that is not the one on disk.
+    """
+    value = sexpr.to_float(atom)
+    if not math.isfinite(value):
+        raise LibraryFormatError(f"footprint {name!r}: {what} is not a finite number ({atom!r}); refusing the footprint")
+    return value
+
+
 def _parse_pads(fp: list) -> list[Pad]:
     name = str(fp[1])
     pads: list[Pad] = []
@@ -352,11 +366,11 @@ def _parse_pads(fp: list) -> list[Pad]:
                 number=str(pad[1]),
                 pad_type=str(pad[2]),
                 shape=str(pad[3]),
-                x=sexpr.to_float(at[1]),
-                y=sexpr.to_float(at[2]),
-                rotation=sexpr.to_float(at[3]) if len(at) > 3 else 0.0,
-                size_w=sexpr.to_float(size[1]),
-                size_h=sexpr.to_float(size[2]),
+                x=_finite(at[1], f"pad {str(pad[1])!r} (at x)", name),
+                y=_finite(at[2], f"pad {str(pad[1])!r} (at y)", name),
+                rotation=_finite(at[3], f"pad {str(pad[1])!r} (at angle)", name) if len(at) > 3 else 0.0,
+                size_w=_finite(size[1], f"pad {str(pad[1])!r} (size w)", name),
+                size_h=_finite(size[2], f"pad {str(pad[1])!r} (size h)", name),
                 drill=drill,
                 layers=[str(layer) for layer in sexpr.args(layers)],
                 roundrect_rratio=sexpr.to_float(rr) if rr is not None else None,
@@ -369,13 +383,17 @@ _COURTYARD_LAYERS = frozenset({"F.CrtYd", "B.CrtYd"})
 
 
 def _courtyard_bbox(fp: list) -> BBox | None:
+    name = str(fp[1])
     xs: list[float] = []
     ys: list[float] = []
 
+    def num(atom: Any, what: str) -> float:
+        return _finite(atom, f"courtyard {what}", name)
+
     def add(node: list | None) -> None:
         if node is not None and len(node) >= 3:
-            xs.append(sexpr.to_float(node[1]))
-            ys.append(sexpr.to_float(node[2]))
+            xs.append(num(node[1], f"({node[0]} x)"))
+            ys.append(num(node[2], f"({node[0]} y)"))
 
     for item in fp:
         if not isinstance(item, list) or not item or sexpr.get(item, "layer") not in _COURTYARD_LAYERS:
@@ -391,8 +409,8 @@ def _courtyard_bbox(fp: list) -> BBox | None:
             center = sexpr.find(item, "center")
             end = sexpr.find(item, "end")
             if center is not None and end is not None and len(center) >= 3 and len(end) >= 3:
-                cx, cy = sexpr.to_float(center[1]), sexpr.to_float(center[2])
-                r = ((sexpr.to_float(end[1]) - cx) ** 2 + (sexpr.to_float(end[2]) - cy) ** 2) ** 0.5
+                cx, cy = num(center[1], "(center x)"), num(center[2], "(center y)")
+                r = ((num(end[1], "(end x)") - cx) ** 2 + (num(end[2], "(end y)") - cy) ** 2) ** 0.5
                 xs += [cx - r, cx + r]
                 ys += [cy - r, cy + r]
         elif kind == "fp_poly":
@@ -522,6 +540,8 @@ class KicadLibrary:
                 library_path=str(path),
             )
         except sexpr.SExprError as exc:
+            raise LibraryFormatError(f"{path}: {exc}") from exc
+        except LibraryFormatError as exc:  # a malformed pad / courtyard (a non-finite number ...): the file is named too
             raise LibraryFormatError(f"{path}: {exc}") from exc
         self._footprint_cache[key] = fp
         return fp

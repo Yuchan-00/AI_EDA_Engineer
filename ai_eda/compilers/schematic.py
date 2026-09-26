@@ -150,8 +150,10 @@ class SchematicCompiler(Compiler):
 
     def compile(self, ir: CircuitIR, ctx: CompileContext) -> ArtifactRef:
         library = ctx.tools.get("kicad_library")
-        if not isinstance(library, KicadLibrary):
+        if library is None:
             library = KicadLibrary()
+        elif not isinstance(library, KicadLibrary):
+            raise CompileError(f"ctx.tools['kicad_library'] is not a KicadLibrary: {type(library).__name__}")
         node = self.build(ir, library)
         path = ctx.workdir / f"{ir.project.id}.kicad_sch"
         return self._write(ir, path, sexpr.dumps(node))
@@ -270,6 +272,8 @@ class SchematicCompiler(Compiler):
         out: dict[tuple[str, str], _PlacedPin] = {}
         for ref, ps in placed.items():
             for pin in ps.symbol.pins:
+                if (ref, pin.number) in out:
+                    raise CompileError(f"{ref}: library symbol {ps.symbol.lib_id!r} repeats pin number {pin.number!r} (stacked pins); unsupported - one physical pin per number")
                 pos = pin_position(ps.x, ps.y, ps.rotation, ps.mirror, pin)
                 out[(ref, pin.number)] = _PlacedPin(ref, pin, pos, pin_body_direction(ps.rotation, ps.mirror, pin.angle))
         return out

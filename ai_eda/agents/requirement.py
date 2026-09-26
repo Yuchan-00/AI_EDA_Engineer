@@ -74,8 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
-from ai_eda.agents.component import CONFIRM_FACTS_KEY, CONFIRM_PARTS_KEY, EXTRACT_FACTS_KEY, FACTS_FILE_KEY
-from ai_eda.agents.regulatory import ACCEPT_REGS_KEY, PROPOSE_REGS_KEY, REJECT_REGS_KEY
+from ai_eda.agents.keys import CONTROL_KEYS
 from ai_eda.ir import (
     CircuitIR,
     Jurisdiction,
@@ -127,10 +126,8 @@ BASELINE_QUESTIONS: list[MissingInformation] = [
 
 EXTRACTION_CHECK = "requirements.extraction"
 
-#: answer keys that steer an agent (this one, the component agent, the regulatory agent) and are never requirements themselves
-CONTROL_KEYS: frozenset[str] = frozenset({
-    CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY, CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY, ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY,
-})
+#: the answer keys that steer an agent (this one, the component, regulatory, circuit-design and PCB agents) are never
+#: requirements: ``CONTROL_KEYS`` is defined once in :mod:`ai_eda.agents.keys` and re-exported here
 
 
 def _split_codes(answer: str) -> list[str]:
@@ -174,6 +171,67 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _answerable(ir: CircuitIR, key: str) -> bool:
+    """Whether a typed answer for ``key`` enters the IR: no requirement yet, or one the extraction produced (a typed answer wins)."""
+    existing = ir.requirements.get(key)
+    return existing is None or from_extraction(existing)
+
+
+def _kept_notes(ir: CircuitIR, answers: dict[str, str]) -> list[str]:
+    """One note per typed answer that is dropped because its key already holds a typed value (both values named).
+
+    The earlier typed answer is kept (it is the user's own value, not an
+    extraction); the user learns that the new one did nothing and how to
+    change the requirement instead of looping on the same question.
+    """
+    out: list[str] = []
+    for key, given in answers.items():
+        if _answerable(ir, key):
+            continue
+        existing = ir.requirements.get(key)
+        assert existing is not None
+        held = existing.value.value if existing.value is not None else None
+        out.append(
+            f"{key}: answer {given!r} not applied - {existing.id} already holds your earlier answer {held!r}, which is kept; "
+            f"to change it edit that requirement in the IR"
+        )
+    return out
+
+
+def _superseded_ids(ir: CircuitIR, answer_reqs: list[Requirement], notes: list[str]) -> set[str]:
+    """Ids of the extraction-derived requirements a typed answer replaces (noted)."""
+    keys = {a.key for a in answer_reqs}
+    out = {r.id for r in ir.requirements.requirements if r.key in keys}
+    for r in ir.requirements.requirements:
+        if r.id in out:
+            notes.append(f"{r.key}: the user's answer takes precedence over the extraction ({r.id} replaced)")
+    return out
+
+
+def _answer_proposals(ir: CircuitIR, answer_reqs: list[Requirement], notes: list[str]) -> list[IRProposal]:
+    """Proposals that record typed answers: appended when new, or the list rewritten when one replaces an extraction item."""
+    if not answer_reqs:
+        return []
+    superseded = _superseded_ids(ir, answer_reqs, notes)
+    if superseded:
+        merged = [r for r in ir.requirements.requirements if r.id not in superseded] + answer_reqs
+        return [IRProposal(description="record user answers (replacing extraction items of the same key)", target="requirements.requirements", operation="set", payload=merged)]
+    return [IRProposal(description=f"record user answer for {req.key}", target="requirements.requirements", operation="append", payload=req) for req in answer_reqs]
+
+
+def _unique_ids(items: list[Requirement], notes: list[str]) -> list[Requirement]:
+    """``items`` with a duplicate id dropped (the first kept, noted): ids are how conflicts, reviewers and confirmations refer to them."""
+    seen: set[str] = set()
+    out: list[Requirement] = []
+    for r in items:
+        if r.id in seen:
+            notes.append(f"{r.id}: a second requirement with this id was dropped (the first kept)")
+            continue
+        seen.add(r.id)
+        out.append(r)
+    return out
+
+
 class RequirementAgent(Agent):
     name = "requirement"
     task = TaskKind.REQUIREMENT_ANALYSIS
@@ -184,23 +242,28 @@ class RequirementAgent(Agent):
         accept = set(_split_codes(ctx.answers.get(ACCEPT_KEY, "")))
         reject = set(_split_codes(ctx.answers.get(REJECT_KEY, "")))
         # Answers the user gave become explicit requirements with user_requirement provenance (regulatory scope answers as such).
+        # A typed answer wins over what a model extracted, assumed or had confirmed for the same key (the item is replaced);
+        # an answer the user typed earlier is kept, and a note names both values so the dropped one is not a silent no-op.
         scope_keys = regulatory_scope_keys(ctx)
-        answer_reqs = [_answer_requirement(k, v, scope_keys) for k, v in answers.items() if ir.requirements.get(k) is None]
+        answer_reqs = [_answer_requirement(k, v, scope_keys) for k, v in answers.items() if _answerable(ir, k)]
+        notes: list[str] = _kept_notes(ir, answers)
         answer_jurisdictions = [
             Jurisdiction(code=code, name=code, provided_by_user=True)
-            for k, v in answers.items() if k == "jurisdiction" and ir.requirements.get(k) is None
+            for k, v in answers.items() if k == "jurisdiction" and _answerable(ir, k)  # the same rule as the requirement row
             for code in _split_codes(v)
             if not any(j.code == code for j in ir.regulatory.jurisdictions)
         ]
         if ctx.llm is not None and ir.requirements.raw_input.strip():
-            return self._with_llm(ir, ctx.llm, answers, confirm_answer, accept, reject, answer_reqs, answer_jurisdictions)
+            return self._with_llm(ir, ctx.llm, answers, confirm_answer, accept, reject, answer_reqs, answer_jurisdictions, notes)
         proposals: list[IRProposal] = []
-        for req in answer_reqs:
-            proposals.append(IRProposal(description=f"record user answer for {req.key}", target="requirements.requirements", operation="append", payload=req))
+        proposals.extend(_answer_proposals(ir, answer_reqs, notes))
         for j in answer_jurisdictions:
             proposals.append(IRProposal(description=f"add jurisdiction {j.code}", target="regulatory.jurisdictions", operation="append", payload=j))
-        questions = [q for q in BASELINE_QUESTIONS if q.key not in answers and ir.requirements.get(q.key) is None]
-        notes = []
+        # a jurisdiction recorded on ir.regulatory (an earlier answer, or a confirmed extraction) is answered: do not ask again
+        questions = [
+            q for q in BASELINE_QUESTIONS
+            if q.key not in answers and ir.requirements.get(q.key) is None and not (q.key == "jurisdiction" and ir.regulatory.jurisdictions)
+        ]
         if ctx.llm is None:
             notes.append("no LLM configured: free-text parsing skipped, baseline checklist only")
         else:
@@ -219,9 +282,9 @@ class RequirementAgent(Agent):
         reject: set[str],
         answer_reqs: list[Requirement],
         answer_jurisdictions: list[Jurisdiction],
+        notes: list[str],
     ) -> AgentResult:
         proposals: list[IRProposal] = []
-        notes: list[str] = []
 
         # 1. corrections: an answer to the confirmation question that says what is wrong extends the request
         corrections = list(ir.requirements.corrections)
@@ -235,6 +298,8 @@ class RequirementAgent(Agent):
                     correction_added = True
                     proposals.append(IRProposal(description="append user correction to the request", target="requirements.corrections", operation="set", payload=corrections))
                     notes.append("correction appended; extraction re-run on the corrected request")
+                else:
+                    notes.append(f"correction {text!r} is already part of the request: reply yes to confirm the table, or describe a new change")
             else:
                 notes.append(
                     f"answer {confirm_answer.strip()!r} to {CONFIRM_KEY} not understood: reply yes to confirm, or describe what is wrong "
@@ -294,7 +359,8 @@ class RequirementAgent(Agent):
         # 5./6. proposals
         existing = list(ir.requirements.requirements)
         if confirmed_before:
-            merged = existing + answer_reqs
+            superseded = _superseded_ids(ir, answer_reqs, notes)
+            merged = [r for r in existing if r.id not in superseded] + answer_reqs
             decided = False
             if new_decisions:
                 inferred_keys = {r.key for r in merged if is_inferred(r)}
@@ -313,15 +379,15 @@ class RequirementAgent(Agent):
             taken = {r.key for r in kept} | {r.key for r in answer_reqs}
             items = list(grounded.requirements)
             app = application_requirement(grounded)
-            if app is not None:
-                items.append(app)
+            if app is not None and not any(r.key == "application" for r in items):
+                items.append(app)  # an explicit item keyed ``application`` already carries the user's words: one req.application
             new_items: list[Requirement] = []
             for r in items:
                 if r.key in taken:
                     notes.append(f"{r.key}: the user's answer takes precedence over the extraction")
                     continue
                 new_items.append(r)
-            merged = kept + answer_reqs + new_items
+            merged = _unique_ids(kept + answer_reqs + new_items, notes)
             if all_accept or all_reject:
                 inferred_keys = {r.key for r in merged if is_inferred(r)}
                 merged, dnotes = decide_inferred(merged, all_accept, all_reject)
@@ -485,11 +551,13 @@ class RequirementAgent(Agent):
         error: Exception,
     ) -> AgentResult:
         """The model could not be called: report it honestly and fall back to the deterministic checklist."""
-        for req in answer_reqs:
-            proposals.append(IRProposal(description=f"record user answer for {req.key}", target="requirements.requirements", operation="append", payload=req))
+        proposals.extend(_answer_proposals(ir, answer_reqs, notes))
         for j in answer_jurisdictions:
             proposals.append(IRProposal(description=f"add jurisdiction {j.code}", target="regulatory.jurisdictions", operation="append", payload=j))
-        questions = [q for q in BASELINE_QUESTIONS if q.key not in answers and ir.requirements.get(q.key) is None]
+        questions = [
+            q for q in BASELINE_QUESTIONS
+            if q.key not in answers and ir.requirements.get(q.key) is None and not (q.key == "jurisdiction" and ir.regulatory.jurisdictions)
+        ]
         kind = type(error).__name__
         result = ValidationResult(
             check_id=EXTRACTION_CHECK,

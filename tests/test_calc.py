@@ -64,6 +64,8 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
     sample = {
         "calc.ohms_law.I": (user_requirement(12.0), authoritative(1e3, DS)),
         "calc.power.P": (user_requirement(12.0), user_requirement(0.5)),
+        "calc.power.P_VR": (user_requirement(6.0), authoritative(1e4, DS)),
+        "calc.thermal.T_j": (user_requirement(85.0), user_requirement(3.6e-3), authoritative(100.0, DS)),
         "calc.divider.ratio": (authoritative(1e3, DS), authoritative(1e3, DS)),
         "calc.divider.v_out": (user_requirement(12.0), authoritative(1e3, DS), authoritative(1e3, DS)),
         "calc.rc.tau": (authoritative(1e3, DS), authoritative(1e-6, DS)),
@@ -72,6 +74,17 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
         "calc.rc.lowpass_phase_deg": (user_requirement(150.0), user_requirement(1e-3)),
         "calc.parallel.R": (authoritative(1e3, DS), authoritative(1e3, DS)),
         "calc.led.R": (user_requirement(5.0), authoritative(2.0, DS), authoritative(0.01, DS)),
+        "calc.divider.r1_for_v_out": (user_requirement(12.0), user_requirement(5.0), user_requirement(1e4)),
+        "calc.led.I": (user_requirement(5.0), authoritative(2.0, DS), user_requirement(300.0)),
+        "calc.rc.r_for_cutoff": (user_requirement(1e3), user_requirement(1e-7)),
+        "calc.rc.ac_fstart": (user_requirement(1e3),),
+        "calc.rc.ac_fstop": (user_requirement(1e3),),
+        "calc.astable.c_for_frequency": (user_requirement(1e3), user_requirement(1e4), user_requirement(5.0), user_requirement(0.7)),
+        "calc.astable.f": (user_requirement(1e4), user_requirement(72e-9), user_requirement(5.0), user_requirement(0.7)),
+        "calc.astable.tran_step": (user_requirement(1e3),),
+        "calc.astable.tran_stop": (user_requirement(1e3),),
+        "calc.astable.tran_start": (user_requirement(1e3),),
+        "calc.astable.v_be_reverse": (user_requirement(5.0), user_requirement(0.7)),
     }
     assert set(CALCULATORS) == set(sample) == set(ROLES) == set(ROLE_UNITS)
     for tool, (fn, keys) in CALCULATORS.items():

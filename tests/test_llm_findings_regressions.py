@@ -437,7 +437,7 @@ def test_22_cache_entry_from_another_extraction_version_or_prompt_is_stale(tmp_p
     _run(ir, svc, tmp_path)
     key = request_hash(RAW)
     entry = ir.requirements.extraction_cache[key]
-    assert {k: entry[k] for k in ("extraction_version", "prompt_hash", "schema_hash")} == extraction_fingerprint()
+    assert {k: entry[k] for k in extraction_fingerprint()} == extraction_fingerprint()
     assert entry["extraction_version"] == EXTRACTION_VERSION
     entry["extraction_version"] = "0.0"
     entry["confirmed"] = True  # a confirmation given under other rules is not carried over

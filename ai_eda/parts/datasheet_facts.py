@@ -21,7 +21,8 @@ Invariants (the same trust model as the requirement stage,
   cut out of ``-40 to 125 degC`` is a fragment of a range and is rejected;
   (2) carry the unit family its key demands (:func:`expected_unit`:
   ``v_*`` volts, ``i_*`` amperes, ``power_rating`` watts, ``tolerance``
-  percent, ``operating_temperature`` degC, ...) - a key with no known family
+  percent, ``operating_temperature`` / ``t_j_max`` degC, ``theta_ja`` K/W
+  (written °C/W in datasheets), ...) - a key with no known family
   can not be checked and is rejected; (3) agree with the parse in the
   proposer's ``value``/``unit`` (relative tolerance
   :data:`~ai_eda.llm.extraction.REL_TOL`, canonical unit: ``100 mW`` agrees
@@ -83,8 +84,8 @@ from ai_eda.llm.service import LLMService
 from ai_eda.tools.calc.quantity import format_quantity
 from ai_eda.tools.sources import ArchivedDocument
 
-#: bumped when the grounding rules or the schema change
-FACTS_VERSION = "0.2"
+#: bumped when the grounding rules, the default keys or the schema change
+FACTS_VERSION = "0.3"
 TOOL = "parts.datasheet_facts"
 CHECK_PREFIX = "component.facts."
 
@@ -93,15 +94,19 @@ RESERVED_KEYS: frozenset[str] = frozenset({"mpn", "ref", "value", "datasheet", "
 #: text facts that target a ``Component`` field rather than ``electrical``
 IDENTITY_KEYS: frozenset[str] = frozenset({"manufacturer", "package"})
 #: keys a model is asked for by default (any other canonical key with a known unit family is accepted too)
-DEFAULT_FACT_KEYS: tuple[str, ...] = ("manufacturer", "package", "v_max", "i_max", "power_rating", "tolerance", "operating_temperature")
+DEFAULT_FACT_KEYS: tuple[str, ...] = ("manufacturer", "package", "v_max", "i_max", "power_rating", "tolerance", "operating_temperature", "theta_ja", "t_j_max")
 
-#: canonical unit (of :mod:`ai_eda.tools.calc.quantity`) a numeric fact key must carry: exact keys, then prefixes, then suffixes
+#: canonical unit (of :mod:`ai_eda.tools.calc.quantity`) a numeric fact key must carry: exact keys, then prefixes, then suffixes.
+#: ``theta_ja`` (junction-to-ambient thermal resistance, K/W - datasheets write °C/W, the same unit) and ``t_j_max``
+#: (degC) are what ``domain.power.thermal`` reads; ``thermal_resistance*`` keys are typed K/W too so the ``_resistance``
+#: suffix never types them as ohms, but nothing reads them.
 KEY_UNITS: dict[str, str] = {
     "power_rating": "W", "tolerance": "percent", "operating_temperature": "degC", "storage_temperature": "degC", "junction_temperature": "degC",
     "resistance": "ohm", "capacitance": "F", "inductance": "H", "frequency": "Hz", "voltage": "V", "current": "A", "power": "W", "temperature": "degC",
     "esr": "ohm", "rds_on": "ohm", "quiescent_current": "A", "dropout_voltage": "V",
+    "theta_ja": "K/W", "t_j_max": "degC",
 }
-KEY_PREFIX_UNITS: dict[str, str] = {"v_": "V", "i_": "A", "p_": "W", "r_": "ohm", "c_": "F", "l_": "H", "f_": "Hz", "t_": "degC"}
+KEY_PREFIX_UNITS: dict[str, str] = {"thermal_resistance": "K/W", "v_": "V", "i_": "A", "p_": "W", "r_": "ohm", "c_": "F", "l_": "H", "f_": "Hz", "t_": "degC"}
 KEY_SUFFIX_UNITS: dict[str, str] = {
     "_voltage": "V", "_current": "A", "_power": "W", "_temperature": "degC", "_resistance": "ohm", "_capacitance": "F", "_inductance": "H",
     "_frequency": "Hz", "_tolerance": "percent", "_percent": "percent",
@@ -321,7 +326,7 @@ def ground_facts(
                 if not mpn or not str(mpn).strip():
                     out.rejected.append((key, "package is not tied to the part: the component has no MPN to find in the quoted row"))
                     continue
-                if find_quote(str(mpn).translate(_ASCII_LOWER), hit.matched.translate(_ASCII_LOWER)) is None:
+                if find_quote(str(mpn).translate(_ASCII_LOWER), hit.matched.translate(_ASCII_LOWER), identifier=True) is None:
                     out.rejected.append((key, f"package is not tied to the part: the quote {hit.matched!r} does not contain the MPN {mpn!r} "
                                               "(quote the ordering row that names this part number and its package)"))
                     continue

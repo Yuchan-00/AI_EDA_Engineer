@@ -271,8 +271,8 @@ def _ground_quotes(candidate: RegulatoryCandidate, docs: dict[str, DocumentResul
         dres = docs.get(key)
         if dres is None or not dres.usable:
             reason = dres.reason if dres is not None else "document not obtained"
-            out.append(GroundedQuote(section=q.section, quote=q.quote, found=False, reason=f"{dres.status if dres else 'unresolved'}: {reason}",
-                                     source_url=dres.final_url if dres else None, content_hash=dres.sha256 if dres else None))
+            # no archived document was looked in: the URL a 404 / interstitial came from is this run's story, not a document
+            out.append(GroundedQuote(section=q.section, quote=q.quote, found=False, reason=f"{dres.status if dres else 'unresolved'}: {reason}"))
             continue
         assert dres.document is not None
         hits = dres.document.find_quote(q.quote)
@@ -304,13 +304,6 @@ def _source_status(candidate: RegulatoryCandidate, docs: list[DocumentResult], q
         f"official text archived ({'fetched in this run' if fresh else 'hash-verified copy from an earlier run'}) and all {len(quotes)} quote(s) found")
 
 
-def _first_grounded(quotes: list[GroundedQuote]) -> GroundedQuote | None:
-    for q in quotes:
-        if q.found:
-            return q
-    return None
-
-
 def research_candidate(candidate: RegulatoryCandidate, candidates: CandidateList, archive: DocumentArchive | None, online: bool,
                        answers: dict[str, str], requirements: Any, env: dict[str, str] | None = None) -> CandidateResult:
     """One candidate: applicability from the inputs, documents through the archive, quotes grounded, requirement built."""
@@ -332,15 +325,15 @@ def research_candidate(candidate: RegulatoryCandidate, candidates: CandidateList
     found_sections = {q.section for q in quotes if q.found}
     evidence_grounded = all(label in found_sections for label in ev.evidence)
     official = by_url.get(candidate.official_url)
-    first = _first_grounded(quotes)
-    section = f"{first.section} (page {first.page})" if first is not None else None
+    # the section the decision cites is the claim; where (page) and whether it was found are this run's verdict (GroundedQuote)
+    section = ", ".join(ev.evidence) if ev.evidence else (candidate.grounding_quotes[0].section if candidate.grounding_quotes else None)
     rationale = f"rule: {ev.rationale}"
     if ev.inputs_used:
         rationale += "; inputs: " + ", ".join(f"{k} = {v}" for k, v in ev.inputs_used.items())
     if ev.missing:
         rationale += "; missing: " + ", ".join(f"{m.key} ({m.reason})" for m in ev.missing)
     if ev.evidence:
-        rationale += "; evidence: " + ", ".join(f"{label} ({'grounded' if label in found_sections else 'not grounded'})" for label in ev.evidence)
+        rationale += "; evidence: " + ", ".join(ev.evidence)  # grounded or not is GroundedQuote.found / regulatory.sources, not the design
     if candidate.not_evaluated:
         rationale += f"; not evaluated: {candidate.not_evaluated}"
     retrieved = None

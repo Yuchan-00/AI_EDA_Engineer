@@ -1,0 +1,18 @@
+{
+  "fab": "Example Fab",
+  "source": {
+    "url": "https://fab.example.com/capabilities",
+    "title": "Example Fab PCB capabilities",
+    "authority": "Example Fab"
+  },
+  "limits": [
+    {"key": "min_track_width_mm", "value": 0.09, "unit": "mm", "page": 1, "quote": "Min trace width 0.09 mm"},
+    {"key": "min_clearance_mm", "value": 0.09, "unit": "mm", "page": 1, "quote": "Min spacing 0.09mm"},
+    {"key": "min_via_drill_mm", "value": 0.2, "unit": "mm", "page": 1, "quote": "Min via hole size 0.2 mm"},
+    {"key": "min_via_diameter_mm", "value": 0.4, "unit": "mm", "page": 1, "quote": "Min via diameter 0.4mm"},
+    {"key": "min_hole_to_edge_mm", "value": 0.5, "unit": "mm", "page": 1, "quote": "Hole to board edge 0.5mm"},
+    {"key": "layer_count_options", "value": [1, 2, 4, 6], "unit": null, "page": 1, "quote": "Layers 1, 2, 4, 6"},
+    {"key": "copper_weight_oz", "value": 1, "unit": "oz", "page": 1, "quote": "Copper weight 1 oz"},
+    {"key": "board_thickness_mm", "value": 1.6, "unit": "mm", "page": 1, "quote": "Board thickness 1.6 mm"}
+  ]
+}

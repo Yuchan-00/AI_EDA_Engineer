@@ -21,7 +21,9 @@ volt(s), 볼트), ``A`` (A, amp(s), ampere(s), 암페어), ``W`` (W, watt(s), �
 ``ohm`` (Ω U+03A9, Ω U+2126, ohm(s), 옴), ``F`` (F, farad(s), 패럿), ``H`` (H,
 henry, henries, 헨리), ``Hz`` (Hz, hz, hertz, 헤르츠), ``s`` (s, sec,
 second(s)), ``m`` (m, meter(s), metre(s), 미터), ``g`` (g, gram(s), 그램),
-``degC`` (°C, ℃, degC, deg C - no prefix), ``percent`` (%, percent, 퍼센트 -
+``degC`` (°C, ℃, degC, deg C - no prefix), ``K/W`` (K/W, °C/W, ℃/W, degC/W,
+deg C/W - a thermal resistance; no prefix, and matched before the degC forms
+so ``62 °C/W`` is 62 K/W, never 62 degC), ``percent`` (%, percent, 퍼센트 -
 no prefix, value kept as written: ``90%`` is 90, not 0.9).
 
 Ambiguity rules (each one is pinned by ``tests/test_quantity.py``):
@@ -66,6 +68,13 @@ Ambiguity rules (each one is pinned by ``tests/test_quantity.py``):
 * :func:`parse_quantity` answers only for an unambiguous phrase: exactly one
   quantity and no other digit anywhere else (``12V 입력`` -> 12 V;
   ``5V 2A``, ``12-5V`` and ``LM7805 at 12V`` -> ``None``).
+* :func:`parse_answer` is stricter still, for a value that becomes a design
+  input or a review target: the whole stripped text must be that one
+  quantity (not a range, not a ``±`` tolerance), with nothing beside it but
+  the AC / DC words (``12 V DC``, ``DC 12 V``, ``12 V (DC)``, ``직류 12 V``).
+  A qualifier is not read away: ``12 V max``, ``min 5 V``, ``12 V rms``,
+  ``12V 입력`` and ``not more than 12 V`` -> ``None`` - a stated limit is not
+  a nominal value.
 """
 
 from __future__ import annotations
@@ -74,7 +83,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict
 
-QUANTITY_VERSION = "0.1"
+QUANTITY_VERSION = "0.2"
 
 #: SI prefix letter -> decimal exponent (engineering text: ``M`` is mega)
 PREFIX_EXPONENTS: dict[str, int] = {
@@ -134,8 +143,9 @@ _KOREAN: dict[str, str] = {
     "그램": "g",
     "퍼센트": "percent",
 }
-#: units that never take a prefix; the regex below spells their forms
-_PLAIN: dict[str, str] = {"%": "percent", "percent": "percent", "degc": "degC", "℃": "degC"}
+#: units that never take a prefix; the regex below spells their forms (the thermal resistance first: its
+#: spellings start with a degC spelling, and the longer match must win)
+_PLAIN: dict[str, str] = {"%": "percent", "percent": "percent", "K/W": "K/W", "degc": "degC", "℃": "degC"}
 
 #: canonical unit -> every accepted spelling (documentation and tests)
 UNITS: dict[str, tuple[str, ...]] = {}
@@ -144,6 +154,7 @@ for _table in (_SYMBOLS, _WORDS, _KOREAN, _PLAIN):
         UNITS.setdefault(_canon, ())
         UNITS[_canon] = (*UNITS[_canon], _spelling)
 UNITS["degC"] = (*UNITS["degC"], "°C", "deg C")
+UNITS["K/W"] = (*UNITS["K/W"], "°C/W", "℃/W", "degC/W", "deg C/W")
 #: units that may carry a prefix
 PREFIXABLE_UNITS: frozenset[str] = frozenset({"V", "A", "W", "ohm", "F", "H", "Hz", "s", "m", "g"})
 
@@ -184,7 +195,10 @@ _VA = "|".join(re.escape(s) for s in ("V", "v", "A"))
 _SYM = _alternation({s: c for s, c in _SYMBOLS.items() if s not in ("V", "v", "A")})
 _WORD = _alternation(_WORDS)
 _KWORD = _alternation(_KOREAN)
-_PLAIN_RE = r"%|(?i:percent)|°\s?[Cc]|℃|(?i:deg\s?c)"
+#: the K/W forms stand before the degC forms: an alternation takes the first branch that matches, and
+#: ``°C`` alone would match inside ``°C/W`` (``/`` may follow a unit) and read a thermal resistance as a temperature
+_DEGC_RE = r"°\s?[Cc]|℃|(?i:deg\s?c)"
+_PLAIN_RE = rf"%|(?i:percent)|K/W|(?:{_DEGC_RE})\s?/\s?W|{_DEGC_RE}"
 
 
 def _num(tag: str) -> str:
@@ -233,6 +247,8 @@ def _unit_of(m: re.Match[str], tag: str) -> tuple[str, int]:
     plain = m.group(f"plain{tag}")
     if plain == "%" or plain.lower() == "percent":
         return "percent", 0
+    if plain.endswith("W"):
+        return "K/W", 0
     return "degC", 0
 
 
@@ -281,6 +297,36 @@ def parse_quantity(text: str) -> Quantity | QuantityRange | None:
     (start, end), found = hits[0]
     rest = text[:start] + text[end:]
     if any(ch.isdigit() for ch in rest):
+        return None
+    return found
+
+
+#: what may stand beside the one quantity of an answer: the AC / DC words (``DC 12 V``, ``12 V (DC)``, ``직류 12 V``),
+#: the same spellings :mod:`ai_eda.regulatory.applicability` reads next to a voltage; anything else is a qualifier
+_ACDC_WORDS_RE = re.compile(r"^\s*(?:\(?\s*(?:AC|DC|ac|dc|Ac|Dc|교류|직류)\s*\)?\s*)*$")
+
+
+def parse_answer(text: str) -> Quantity | None:
+    """The one quantity ``text`` states *as a whole*, or ``None``.
+
+    Unlike :func:`parse_quantity` the quantity must be the entire stripped
+    text - only the AC / DC words may stand beside it - and it must be a
+    single value (no range, no ``±`` tolerance). ``'12 V'``, ``'12 V DC'``,
+    ``'DC 12 V'``, ``'12 V (DC)'`` and ``'10 mA'`` parse; ``'12 V max'``,
+    ``'min 5 V'``, ``'12 V rms'``, ``'12V 입력'``, ``'3.3~5V'``, ``'5V 2A'``,
+    ``'±5%'`` and ``'10k'`` do not. Used wherever a typed answer becomes a
+    number the design rests on (:mod:`ai_eda.design.inputs`) or a value a
+    verdict is compared with (the reviewer), so the two cannot drift.
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"expected str, got {type(text).__name__}")
+    hits = find_quantities(text)
+    if len(hits) != 1:
+        return None
+    (start, end), found = hits[0]
+    if not isinstance(found, Quantity) or found.plus_minus:
+        return None
+    if _ACDC_WORDS_RE.fullmatch(text[:start] + " " + text[end:]) is None:
         return None
     return found
 
@@ -357,6 +403,7 @@ __all__ = [
     "QuantityRange",
     "find_quantities",
     "format_quantity",
+    "parse_answer",
     "parse_quantity",
     "parse_unit",
 ]

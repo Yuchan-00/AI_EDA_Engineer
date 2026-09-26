@@ -12,11 +12,40 @@ The five kinds map directly to the project spec:
 from __future__ import annotations
 
 import hashlib
+import math
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializationInfo, SerializerFunctionWrapHandler, field_validator, model_serializer
+
+#: ``model_dump(context={"view": DESIGN_VIEW})`` renders a model as *design content*: the models below drop their
+#: wall-clock, locator and verification-outcome fields in that view, and :meth:`ai_eda.ir.CircuitIR.design_dict`
+#: hashes exactly that view. A field is excluded because of what it is, never because of what a key is called.
+DESIGN_VIEW = "design"
+
+
+def in_design_view(info: SerializationInfo) -> bool:
+    ctx = info.context
+    return isinstance(ctx, dict) and ctx.get("view") == DESIGN_VIEW
+
+
+def design_data(model: BaseModel) -> dict:
+    """``model`` as JSON-able design content (the design view)."""
+    return model.model_dump(mode="json", context={"view": DESIGN_VIEW})
+
+
+def drop_in_design_view(*names: str):
+    """A ``model_serializer`` that leaves ``names`` out of the design view (they are not design content)."""
+
+    def _serialize(self, handler: SerializerFunctionWrapHandler, info: SerializationInfo):
+        data = handler(self)
+        if in_design_view(info):
+            for name in names:
+                data.pop(name, None)
+        return data
+
+    return model_serializer(mode="wrap")(_serialize)
 
 
 class ProvenanceKind(StrEnum):
@@ -43,9 +72,13 @@ class SourceRef(BaseModel):
     url: str | None = None
     authority: str | None = None  # manufacturer, regulator, distributor, ...
     section: str | None = None
-    document_path: str | None = None  # local archived copy
+    #: local archived copy - a locator, not design content: the same design archived under another workdir hashes
+    #: the same; ``content_hash`` (which stays) pins the document
+    document_path: str | None = None
     content_hash: str | None = None  # sha256 of the archived document
-    retrieved_at: datetime | None = None
+    retrieved_at: datetime | None = None  # when it was fetched: a clock, not the design (out of the design view)
+
+    _design = drop_in_design_view("document_path", "retrieved_at")
 
     @staticmethod
     def hash_bytes(data: bytes) -> str:
@@ -80,6 +113,8 @@ class Provenance(BaseModel):
     #: wall-clock bookkeeping; excluded from :meth:`ai_eda.ir.CircuitIR.content_hash` (it is not design content)
     created_at: datetime = Field(default_factory=_now)
 
+    _design = drop_in_design_view("created_at")
+
     @property
     def is_authoritative(self) -> bool:
         return self.kind in (ProvenanceKind.USER_REQUIREMENT, ProvenanceKind.AUTHORITATIVE)
@@ -92,6 +127,26 @@ class Provenance(BaseModel):
 T = TypeVar("T")
 
 
+def _non_finite(v: Any) -> bool:
+    """Whether ``v`` is, or contains, a float that is not a number JSON can carry (``inf`` / ``nan``)."""
+    if isinstance(v, float):
+        return not math.isfinite(v)
+    if isinstance(v, (list, tuple)):
+        return any(_non_finite(x) for x in v)
+    if isinstance(v, dict):
+        return any(_non_finite(x) for x in v.values())
+    return False
+
+
+def _jsonish(v: Any) -> Any:
+    """``v`` with tuples turned into lists at any depth (what JSON would make of them)."""
+    if isinstance(v, (list, tuple)):
+        return [_jsonish(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _jsonish(x) for k, x in v.items()}
+    return v
+
+
 class Traced(BaseModel, Generic[T]):
     """A value plus its unit and provenance.
 
@@ -102,6 +157,26 @@ class Traced(BaseModel, Generic[T]):
     value: T
     unit: str | None = None
     provenance: Provenance
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _honest_value(cls, v: Any) -> Any:
+        """No silent coercion into a numeric fact, and JSON-shaped containers.
+
+        ``Traced[float]`` / ``Traced[int]`` refuse a ``str`` (``"5"``) and a
+        ``bool`` (``True`` would read as 1.0): a number that arrives as text
+        from a model or a hand edit is not a measured value with this
+        provenance. Tuples become lists so a value compares and hashes the
+        same before and after a JSON round trip. ``inf`` / ``nan`` are refused
+        at any depth: JSON has no token for them, so ``save`` would write
+        ``null`` and the project would not load again.
+        """
+        annotation = cls.model_fields["value"].annotation
+        if annotation in (float, int) and isinstance(v, (bool, str)):
+            raise ValueError(f"{annotation.__name__} value must be a number, not {type(v).__name__} {v!r}")
+        if _non_finite(v):
+            raise ValueError(f"a traced number must be finite; got {v!r}")
+        return _jsonish(v)
 
     def __str__(self) -> str:  # pragma: no cover - display only
         unit = f" {self.unit}" if self.unit else ""

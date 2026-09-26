@@ -34,14 +34,55 @@
                                          (--catalog-authority / --catalog-supplier label it); backs sourcing
                                          values, never an identity
         --regulatory-candidates PATH     a candidate list other than the packaged one
+        --fab-capability FILE            your JSON file naming the fab's capability page (url, or a saved
+                                         file + retrieved_at) and the limits it states (key, value, unit,
+                                         page, quote); the URL is trusted exactly, every limit is grounded
+                                         verbatim on the archived page and recorded in ir.pcb.manufacturing
+        As the run passes ARCHITECTURE (once the design exists), COMPONENT_SELECTION, PCB and RELEASE it
+        writes the Korean stage reports <workdir>/reports/01..04_*.md + .html (inline SVG figures) and,
+        when a headless Chromium / Chrome / Edge is found (--browser PATH names one, --no-pdf skips it),
+        .pdf (views like report.html: no status computed, not artifacts, not hashed; a report that cannot
+        be built is printed on stderr and never aborts the run); after RELEASE all four are re-written
+        with the full run record. Each write prints "  report written: reports/<name> (+ .html, .pdf)"
+        or "(+ .html; pdf not produced: <reason>)".
     ai-eda review IR.json    run only the independent reviewer (exit 1 on any FAIL)
+    ai-eda report IR.json [-o FILE]
+                             write one self-contained HTML file (default <workdir>/report.html) showing
+                             what ir.json and <workdir>/pipeline.json record: every status is copied, none
+                             is computed, nothing is saved (exit 0 written, 2 usage/IR error; never 1 -
+                             the report is not a verdict)
+    ai-eda serve IR.json [--port N]
+                             serve that report on 127.0.0.1 only (default port 8765; 0 = a free port,
+                             printed), GET / only, re-rendered on every request so a later `run` shows on
+                             refresh; there is no --host flag on purpose
+    ai-eda stage-reports IR.json [--dir DIR] [--no-pdf] [--browser PATH]
+                             re-write the four Korean stage reports (theory, parts, circuit, final) as .md,
+                             .html and .pdf from the saved ir.json and <workdir>/pipeline.json without
+                             re-running anything (default folder <workdir>/reports; a missing run record
+                             makes the reports say so; --no-pdf writes no PDF, --browser names the headless
+                             browser to print with, else it is discovered - none found means .md + .html
+                             only and the reason is printed); exit 0 written, 2 usage/IR error - never 1
+    ai-eda doctor also prints "browser (pdf): <path or NOT FOUND>" - the Chromium / Chrome / Edge the
+                             stage reports are printed with ($AI_EDA_BROWSER, PATH, a Playwright install,
+                             the Windows / macOS install paths)
 
 Without ``--llm`` the pipeline is exactly what it was before the LLM stage;
-without ``--online`` it opens no socket. The budget flags are the user's
-approval of paid calls and ``--online`` the approval of network fetches:
-both are recorded in the approval gate's audit log. The IR is saved (and
-the LLM usage printed) whatever happens after the pipeline starts, so a
-paid extraction or an archived fetch is never lost to a later crash.
+without ``--online`` no code of ours opens a socket, and the headless
+browser that ``run`` / ``stage-reports`` print the stage reports with runs
+with name resolution and the proxy switched off
+(``ai_eda.report.pdf.PRINT_FLAGS``), so it cannot reach any host either
+(measured: no ``connect()`` at all; ``--no-pdf`` skips the browser
+altogether). ``serve`` is the one command
+that opens a socket without a flag: a loopback *listening* socket on
+127.0.0.1 that answers only requests whose Host header names this machine -
+no outbound connection is ever made, so no ``ExternalAction`` is involved.
+The budget flags are the user's approval of paid calls and ``--online`` the
+approval of network fetches: both are recorded in the approval gate's audit
+log. The IR is saved (and the LLM usage printed) whatever happens after the
+pipeline starts, so a paid extraction or an archived fetch is never lost to
+a later crash; ``run`` then records its stage outcomes in
+``<workdir>/pipeline.json`` (a run log like ``ir.validation``: not an
+artifact, not hashed) for ``report`` / ``serve``.
 """
 
 from __future__ import annotations
@@ -52,6 +93,7 @@ import sys
 from pathlib import Path
 
 from ai_eda import __version__
+from ai_eda.errors import IRSchemaError
 
 FAKE_PREFIX = "fake:"
 
@@ -70,7 +112,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     shared = NgspiceShared()
     if shared.available():
         try:
-            info = f"  ({shared.version()}, build {shared.build()}, code models {'loaded' if shared.codemodels_loaded else 'NOT loaded'})"
+            reset = "" if shared.engine_info()["reset_supported"] else ", no ngSpice_Reset: a ControlledExit is not recoverable"
+            info = f"  ({shared.version()}, build {shared.build()}, code models {'loaded' if shared.codemodels_loaded else 'NOT loaded'}{reset})"
         except ToolUnavailableError as e:
             info = f"  (UNUSABLE: {e})"
         print(f"ngspice dll: {shared.dll_path}{info}")
@@ -78,6 +121,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("ngspice dll: NOT FOUND (set NGSPICE_DLL or install KiCad, whose bin/ngspice.dll is used)")
     batch = NgspiceRunner()
     print(f"ngspice exe: {batch.binary or 'not on PATH (optional; the shared library is the engine used)'}")
+    print(_browser_line())
     key_set = OpenRouterClient.key_present()
     print(f"LLM key   : {'set' if key_set else 'OPENROUTER_API_KEY not set'}")
     if key_set and getattr(args, "online", False):
@@ -109,10 +153,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _browser_line() -> str:
+    """``browser (pdf): <path>  (<version>)`` or ``NOT FOUND`` with what would make one found (the stage reports are then .md + .html only)."""
+    from ai_eda.report.pdf import BROWSER_ENV, browser_version, find_browser
+
+    browser = find_browser()
+    if browser is None:
+        return f"browser (pdf): NOT FOUND (chromium / chrome / edge on PATH, a Playwright install, or {BROWSER_ENV}; stage reports are written as .md + .html only)"
+    version = browser_version(browser)
+    return f"browser (pdf): {browser}" + (f"  ({version})" if version else "")
+
+
+def _browser_option(args: argparse.Namespace) -> tuple[Path | None, bool] | None:
+    """``(browser, pdf)`` from ``--browser`` / ``--no-pdf``; ``None`` after printing why when ``--browser`` names no file (a usage error, exit 2)."""
+    chosen = getattr(args, "browser", None)
+    if chosen and not Path(chosen).is_file():
+        print(f"--browser {chosen}: not a file", file=sys.stderr)
+        return None
+    return (Path(chosen) if chosen else None), not getattr(args, "no_pdf", False)
+
+
 def cmd_new(args: argparse.Namespace) -> int:
     from ai_eda.ir import CircuitIR, ProjectMeta
 
-    workdir = Path(args.dir or f"projects/{args.name}")
+    # recorded absolute: a relative workdir would be resolved against whatever directory a later `run` / `review`
+    # is started from, and the artifacts, the archive and the parts cache would land away from ir.json
+    workdir = Path(args.dir or f"projects/{args.name}").resolve()
     ir = CircuitIR(project=ProjectMeta(id=args.name, name=args.name, workdir=str(workdir)))
     ir.requirements.raw_input = args.request or ""
     path = ir.save(workdir / "ir.json")
@@ -124,6 +190,32 @@ def _load(path: str):
     from ai_eda.ir import CircuitIR
 
     return CircuitIR.load(path)
+
+
+def project_workdir(ir, ir_path: str | Path) -> Path:
+    """The project's working directory for ``run`` / ``review`` (artifacts, sources, the parts cache).
+
+    ``project.workdir`` when it is absolute (``new`` records it so); the
+    ir.json's own directory when the IR records none. A *relative* workdir
+    (an ir.json written before ``new`` recorded absolute paths, or a hand
+    edit) is never resolved against the caller's cwd - that put the outputs
+    wherever the command happened to be started. It is accepted only when
+    the ir.json's directory ends with it (the layout ``new`` created:
+    ``<workdir>/ir.json``), otherwise refused as ambiguous.
+    """
+    here = Path(ir_path).resolve().parent
+    if not ir.project.workdir:
+        return here
+    workdir = Path(ir.project.workdir)
+    if workdir.is_absolute():
+        return workdir
+    parts = workdir.parts
+    if not parts or here.parts[-len(parts):] == parts:
+        return here
+    raise IRSchemaError(
+        f"{ir_path}: project.workdir {ir.project.workdir!r} is relative and does not name this ir.json's directory ({here}); "
+        "record an absolute path (ai-eda new does) or remove it to use the ir.json's directory"
+    )
 
 
 def build_llm_service(args: argparse.Namespace):
@@ -167,7 +259,7 @@ def parse_answers(items: list[str] | None) -> dict[str, str]:
 
 def build_source_session(args: argparse.Namespace, ir, workdir: Path, library):
     """The run's :class:`~ai_eda.workflow.session.SourceSession` from the ``--online`` / ``--trust-host`` / ``--datasheet-url`` /
-    ``--source-url`` / ``--sources-dir`` / ``--catalog*`` / ``--regulatory-candidates`` flags (``SessionError`` for a usage error)."""
+    ``--source-url`` / ``--sources-dir`` / ``--catalog*`` / ``--regulatory-candidates`` / ``--fab-capability`` flags (``SessionError`` for a usage error)."""
     from ai_eda.security.approval import default_gate
     from ai_eda.workflow.session import open_session, parse_key_urls
 
@@ -179,7 +271,7 @@ def build_source_session(args: argparse.Namespace, ir, workdir: Path, library):
         sources_dir=getattr(args, "sources_dir", None),
         catalog=getattr(args, "catalog", None), catalog_date=getattr(args, "catalog_date", None),
         catalog_authority=getattr(args, "catalog_authority", None), catalog_supplier=getattr(args, "catalog_supplier", None),
-        candidates=getattr(args, "regulatory_candidates", None), gate=default_gate(),
+        candidates=getattr(args, "regulatory_candidates", None), fab_capability=getattr(args, "fab_capability", None), gate=default_gate(),
     )
 
 
@@ -188,7 +280,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     from ai_eda.errors import ApprovalRequiredError, ToolUnavailableError
     from ai_eda.tools.kicad import KicadCli, KicadLibrary
     from ai_eda.tools.spice import NgspiceShared
-    from ai_eda.workflow import Orchestrator, SessionError
+    from ai_eda.workflow import Orchestrator, PipelineState, SessionError
 
     try:
         answers = parse_answers(args.answer)
@@ -203,8 +295,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     except (ToolUnavailableError, ValueError, OSError) as e:
         print(f"--llm: {e}", file=sys.stderr)
         return 2
+    browser_option = _browser_option(args)
+    if browser_option is None:
+        return 2
+    browser, pdf = browser_option
     ir = _load(args.ir)
-    workdir = Path(ir.project.workdir or Path(args.ir).parent)
+    try:
+        workdir = project_workdir(ir, args.ir)
+    except IRSchemaError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     library = KicadLibrary()
     try:
         session = build_source_session(args, ir, workdir, library)
@@ -222,23 +322,33 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     if llm is not None:
         ctx.usage = llm.usage
-    state = None
+    state = PipelineState()
+    results_before = len(ir.validation.results)  # the run's starting index in ir.validation.results, recorded in pipeline.json
+    aborted: str | None = None
+    reports_written: list[Path] = []
     try:
-        state = Orchestrator(ctx).run(ir)
+        Orchestrator(ctx).run(ir, state=state, after_stage=_stage_report_writer(ir, library, workdir, reports_written, browser=browser, pdf=pdf))
+    except BaseException as e:
+        aborted = type(e).__name__  # only the type: an error text can embed a URL or a header, and it is written to disk
+        raise
     finally:
         session.close()
         # whatever happened after the pipeline started (a defect in a later stage, Ctrl-C), what the
         # requirement stage applied - a paid extraction included - is on disk, and the spend is reported
-        if state is not None:
-            for o in state.outcomes:
-                print(f"{o.stage:<24} {o.status:<20} {o.message}")
+        for o in state.outcomes:
+            print(f"{o.stage:<24} {o.status:<20} {o.message}")
         if llm is not None:
             print(f"\nLLM usage: {llm.summary()}")
+        saved = False
         try:
             ir.save(args.ir)
+            saved = True
         except Exception as e:  # noqa: BLE001 - reported, never masks the original exception
             print(f"could not save {args.ir}: {e}", file=sys.stderr)
-        if state is None:
+        _record_pipeline(state, ir, args.ir, workdir, results_before=results_before, aborted=aborted, ir_saved=saved)
+        if reports_written:
+            print(f"  stage reports: {', '.join(_report_label(p, workdir) for p in dict.fromkeys(reports_written))} (ai-eda stage-reports {args.ir} re-writes them)")
+        if aborted is not None:
             print(f"pipeline aborted by an unexpected error; IR saved to {args.ir} with what had been applied", file=sys.stderr)
             # the questions the IR now holds were meant for the user: show them, so a confirmation given
             # next time refers to a table that was actually seen
@@ -248,6 +358,58 @@ def cmd_run(args: argparse.Namespace) -> int:
         _print_questions(state.open_questions, header="\nBLOCKED - answer these to continue (pass with --answer key=value):")
     _print_questions(state.optional_questions, header="\nOPTIONAL QUESTIONS (not blocking; answer with --answer key=value to decide more):")
     return run_exit_code(state)
+
+
+def _record_pipeline(state, ir, ir_path: str, workdir: Path, *, results_before: int, aborted: str | None, ir_saved: bool) -> None:
+    """Write ``<workdir>/pipeline.json`` for ``ai-eda report``; a failure is reported on stderr and never masks the run's own outcome."""
+    from ai_eda.report.pipeline_log import PIPELINE_FILE, save_pipeline_record, sha256_of_file
+
+    try:
+        ir_file_sha256 = sha256_of_file(ir_path) if ir_saved else None
+        path = save_pipeline_record(state, ir, ir_path, workdir, results_before=results_before, ir_file_sha256=ir_file_sha256, aborted=aborted)
+    except Exception as e:  # noqa: BLE001 - reported, never masks the original exception
+        print(f"could not save {Path(workdir) / PIPELINE_FILE}: {e}", file=sys.stderr)
+        return
+    # the leading spaces keep the line out of the stage table (one line per stage, first word = stage)
+    print(f"  stage outcomes recorded in {path} (ai-eda report {ir_path} renders them)")
+
+
+def _report_label(path: Path, workdir: Path) -> str:
+    """``reports/<name>``: a stage report named relative to the workdir (the printed line never carries the absolute path)."""
+    from ai_eda.report.stages import REPORTS_DIR
+
+    return f"{REPORTS_DIR}/{path.name}"
+
+
+def _stage_report_writer(ir, library, workdir: Path, written: list[Path], *, browser: Path | None = None, pdf: bool = True):
+    """The ``after_stage`` callback of ``run``: writes the stage's report (.md, .html and, with a browser, .pdf) from the live state and prints where.
+
+    Only the stages in ``STAGE_REPORTS`` write one, ARCHITECTURE only once the
+    design exists (``ir.components``); after RELEASE all four are re-written
+    with the full record (the per-stage writes are progress views). A builder
+    that raises is reported on stderr and the pipeline continues: a report is
+    a view of the run, never a reason to abort it. ``browser`` / ``pdf`` are
+    the ``--browser`` / ``--no-pdf`` flags.
+    """
+    from ai_eda.report.stages import REPORTS_DIR, STAGE_REPORTS, write_stage_report
+    from ai_eda.workflow import Stage
+
+    def after_stage(stage, state) -> None:
+        if stage not in STAGE_REPORTS:
+            return
+        for report_stage in (list(STAGE_REPORTS) if stage is Stage.RELEASE else [stage]):
+            if report_stage is Stage.ARCHITECTURE and not ir.components:
+                continue
+            try:
+                result = write_stage_report(report_stage, ir, library, state, workdir, browser=browser, pdf=pdf)
+            except Exception as e:  # noqa: BLE001 - a report must never abort a run; the reason is printed, the run goes on
+                print(f"  could not write {REPORTS_DIR}/{STAGE_REPORTS[report_stage]}: {type(e).__name__}: {e}", file=sys.stderr)
+                continue
+            if result is not None:
+                written.append(result.markdown)
+                print(f"  report written: {_report_label(result.markdown, workdir)} {result.summary()}")  # leading spaces: not a stage line
+
+    return after_stage
 
 
 def _print_questions(questions, *, header: str) -> None:
@@ -298,7 +460,11 @@ def cmd_review(args: argparse.Namespace) -> int:
     from ai_eda.review import IndependentReviewer
 
     ir = _load(args.ir)
-    workdir = Path(ir.project.workdir or Path(args.ir).parent)
+    try:
+        workdir = project_workdir(ir, args.ir)
+    except IRSchemaError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     archive = open_archive({}, workdir)  # earlier runs' archived copies, read-only: hashes are re-verified, nothing is fetched
     tools = {"archive": archive} if archive is not None else {}
     report = IndependentReviewer(tools=tools).review(ir, workdir)
@@ -308,6 +474,90 @@ def cmd_review(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(report.model_dump(mode="json"), indent=2, default=str))
     return 0 if not report.failures else 1
+
+
+def _report_inputs(args: argparse.Namespace):
+    """``(ir, workdir, ir_sha)`` for ``report`` / ``serve`` - the IR, its workdir and the hash of the bytes the IR was parsed
+    from (one read) - or ``None`` after printing why (a usage / IR error, exit 2)."""
+    from ai_eda.report.data import load_ir_file
+
+    try:
+        ir, ir_sha = load_ir_file(Path(args.ir))
+    except (OSError, ValueError, IRSchemaError) as e:  # missing / unreadable file, not JSON or not an IR, another schema
+        print(f"{args.ir}: {e}" if isinstance(e, (OSError, ValueError)) else str(e), file=sys.stderr)
+        return None
+    try:
+        return ir, project_workdir(ir, args.ir), ir_sha
+    except IRSchemaError as e:
+        print(str(e), file=sys.stderr)
+        return None
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Write one self-contained HTML file; exit 0 written, 2 for a usage / IR error - never 1, the report is not a verdict."""
+    from ai_eda.report import build_report_data, render_html
+    from ai_eda.report.pipeline_log import PIPELINE_FILE
+
+    loaded = _report_inputs(args)
+    if loaded is None:
+        return 2
+    ir, workdir, ir_sha = loaded
+    out = Path(args.output) if args.output else workdir / "report.html"
+    # the IR is the only original design data and pipeline.json its run log: neither is ever overwritten with HTML
+    protected = {Path(args.ir).resolve(), (workdir / PIPELINE_FILE).resolve()}
+    if out.resolve() in protected:
+        print(f"refusing to write the report over {out}: pass another -o path", file=sys.stderr)
+        return 2
+    try:
+        html = render_html(build_report_data(ir, Path(args.ir), workdir, ir_sha=ir_sha))
+        out.write_text(html, encoding="utf-8", newline="\n")
+    except OSError as e:
+        print(f"could not write {out}: {e}", file=sys.stderr)
+        return 2
+    print(f"wrote {out}")
+    return 0
+
+
+def cmd_stage_reports(args: argparse.Namespace) -> int:
+    """Write the four Korean stage reports from the saved IR and pipeline.json; exit 0 written, 2 for a usage / IR error - never 1 (a report is not a verdict)."""
+    from ai_eda.report import load_pipeline_record, write_all_stage_reports
+    from ai_eda.report.pipeline_log import PipelineRecordError
+    from ai_eda.tools.kicad import KicadLibrary
+
+    loaded = _report_inputs(args)
+    if loaded is None:
+        return 2
+    ir, workdir, _ir_sha = loaded
+    try:
+        found = load_pipeline_record(workdir)
+    except PipelineRecordError as e:
+        print(f"{e} - the reports are written without a run record", file=sys.stderr)
+        found = None
+    record = found.record if found is not None else None
+    if record is None:
+        print("no run record: the reports say so where they need one (run `ai-eda run` first to record stage outcomes)", file=sys.stderr)
+    browser_option = _browser_option(args)
+    if browser_option is None:
+        return 2
+    browser, pdf = browser_option
+    reports_dir = Path(args.dir) if args.dir else None
+    try:
+        results = write_all_stage_reports(ir, KicadLibrary(), record, workdir, reports_dir=reports_dir, browser=browser, pdf=pdf)
+    except OSError as e:
+        print(f"could not write the stage reports: {e}", file=sys.stderr)
+        return 2
+    for r in results:
+        print(f"wrote {r.markdown} {r.summary()}")
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Serve the report on 127.0.0.1 (a loopback listening socket, nothing outbound); exit 0 on Ctrl-C, 2 for a usage / IR / bind error."""
+    from ai_eda.report import serve
+
+    if _report_inputs(args) is None:
+        return 2
+    return serve(Path(args.ir), args.port)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -352,12 +602,32 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--catalog-authority", metavar="TEXT", help="who produced the catalog data, e.g. 'JLCPCB export'")
     r.add_argument("--catalog-supplier", metavar="NAME", help="the supplier label for sourcing entries, e.g. JLCPCB")
     r.add_argument("--regulatory-candidates", metavar="PATH", help="a regulatory candidate list other than the packaged ai_eda/regulatory/candidates.json")
+    r.add_argument("--fab-capability", metavar="FILE", help="JSON file naming the fab's capability page (source.url, or source.file + retrieved_at for a saved page) and its limits (key, value, unit, page, quote); the URL is trusted exactly, the limits are grounded verbatim on the archived page")
+    r.add_argument("--no-pdf", action="store_true", help="write the stage reports as .md + .html only (no headless browser print)")
+    r.add_argument("--browser", metavar="PATH", help="the Chromium / Chrome / Edge binary that prints the stage reports to PDF (default: discovered - $AI_EDA_BROWSER, PATH, Playwright, install paths)")
     r.set_defaults(fn=cmd_run)
 
     v = sub.add_parser("review", help="independent review only")
     v.add_argument("ir")
     v.add_argument("--json", action="store_true")
     v.set_defaults(fn=cmd_review)
+
+    rp = sub.add_parser("report", help="write a self-contained HTML report of the IR, its validation log and the last run (read-only; no verdict)")
+    rp.add_argument("ir")
+    rp.add_argument("-o", "--output", metavar="FILE", help="where to write the HTML (default <workdir>/report.html; never the ir.json or pipeline.json)")
+    rp.set_defaults(fn=cmd_report)
+
+    sv = sub.add_parser("serve", help="serve the report on 127.0.0.1 (read-only, re-rendered on every request; no --host on purpose)")
+    sv.add_argument("ir")
+    sv.add_argument("--port", type=int, default=8765, help="TCP port on 127.0.0.1 (default 8765; 0 picks a free port and prints it)")
+    sv.set_defaults(fn=cmd_serve)
+
+    sr = sub.add_parser("stage-reports", help="re-write the four Korean stage reports (theory, parts, circuit, final) from ir.json and pipeline.json (read-only; no verdict)")
+    sr.add_argument("ir")
+    sr.add_argument("--dir", metavar="DIR", help="folder for the four reports (default <workdir>/reports)")
+    sr.add_argument("--no-pdf", action="store_true", help="write .md + .html only (no headless browser print)")
+    sr.add_argument("--browser", metavar="PATH", help="the Chromium / Chrome / Edge binary to print the PDFs with (default: discovered - $AI_EDA_BROWSER, PATH, Playwright, install paths)")
+    sr.set_defaults(fn=cmd_stage_reports)
 
     args = p.parse_args(argv)
     return args.fn(args)

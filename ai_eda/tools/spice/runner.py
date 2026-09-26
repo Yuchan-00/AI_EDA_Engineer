@@ -179,6 +179,10 @@ class SpiceResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     raw_output_path: str | None = None
     raw_output_hash: str | None = None
+    #: the batch runner simulates a copy of the netlist with the analysis card appended: its path and sha256
+    #: (``netlist_path`` / ``netlist_hash`` are the original's, which is what the copy is made from)
+    deck_path: str | None = None
+    deck_hash: str | None = None
     listing: list[str] = Field(default_factory=list)
     elapsed_s: float = 0.0
     timed_out: bool = False
@@ -302,6 +306,8 @@ def result_from_rawfile(
     command: str,
     log: str = "",
     errors: list[str] | None = None,
+    deck_path: str | None = None,
+    deck_hash: str | None = None,
 ) -> SpiceResult:
     """Build a :class:`SpiceResult` from a rawfile ngspice wrote (batch ``-r`` or ``write``).
 
@@ -324,6 +330,8 @@ def result_from_rawfile(
         engine=engine,
         engine_version=engine_version,
         netlist_path=str(netlist_path),
+        deck_path=deck_path,
+        deck_hash=deck_hash,
         netlist_hash=netlist_hash,
         analysis=SpiceAnalysis(analysis),
         command=command,
@@ -410,15 +418,19 @@ class NgspiceRunner(SpiceRunner):
             cwd=workdir,
             timeout=timeout_s,
         )
+        from ai_eda.tools.spice.ngspice_shared import INFORMATIONAL_STDERR_RE  # the same informational lines as the shared runner
+
         log = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
-        errors = [ln for ln in proc.stderr.splitlines() if ln.strip()]
+        errors = [ln for ln in proc.stderr.splitlines() if ln.strip() and not INFORMATIONAL_STDERR_RE.match(ln.strip())]
         if proc.returncode != 0:
             errors.append(f"ngspice exited {proc.returncode}")
         base = dict(
             engine=self.engine,
             engine_version=self.version(),
-            netlist_path=str(deck),
-            netlist_hash=self.netlist_hash(deck),
+            netlist_path=str(netlist_path),
+            netlist_hash=self.netlist_hash(netlist_path),
+            deck_path=str(deck),
+            deck_hash=self.netlist_hash(deck),
             analysis=analysis,
             command=cmd,
         )

@@ -73,6 +73,7 @@ these facts:
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import hashlib
 import os
 import re
@@ -95,6 +96,10 @@ CODEMODELS: tuple[str, ...] = ("spice2poly.cm", "analog.cm", "digital.cm", "xtra
 #: what KiCad sets right after ``ngSpice_Init``
 INIT_SETTINGS: tuple[str, ...] = ("unset interactive", "set noaskquit", "set nomoremode")
 BENIGN_INIT_STDERR: tuple[str, ...] = ("Warning: can't find the initialization file spinit.",)
+#: stderr lines that are information, not errors: ngspice builds other than KiCad's announce their linear solver
+#: on stderr before every analysis (Debian/Ubuntu ``libngspice0`` 42: ``Using SPARSE 1.3 as Direct Linear Solver``).
+#: They stay in the transcript (``log``) but do not fail a run.
+INFORMATIONAL_STDERR_RE = re.compile(r"^Using \S.* as Direct Linear Solver$")
 DEFAULT_TIMEOUT_S = 120.0
 
 # ------------------------------------------------------------------------------------------ sharedspice.h
@@ -168,9 +173,33 @@ class EngineDead(RuntimeError):
 # ------------------------------------------------------------------------------------------ locating the DLL
 
 
+#: where a Linux / macOS system ngspice shared library lives (Debian multiarch first), besides ``$LD_LIBRARY_PATH``
+_SYSTEM_LIB_DIRS: tuple[str, ...] = ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/lib", "/opt/homebrew/lib", "/usr/local/opt/ngspice/lib")
+
+
+def find_system_ngspice() -> Path | None:
+    """The ngspice shared library the system's loader knows (``libngspice.so.0`` from Debian's ``libngspice0``), else None.
+
+    ``ctypes.util.find_library`` gives the soname, not a path; the file is
+    looked for on ``$LD_LIBRARY_PATH`` and the usual library directories.
+    Windows KiCad installs are handled by :func:`find_ngspice_dll`.
+    """
+    if os.name == "nt":
+        return None
+    name = ctypes.util.find_library("ngspice")
+    if not name:
+        return None
+    dirs = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if d] + list(_SYSTEM_LIB_DIRS)
+    for d in dirs:
+        p = Path(d) / name
+        if p.is_file():
+            return p.resolve()
+    return None
+
+
 def find_ngspice_dll() -> Path | None:
     """``$NGSPICE_DLL`` if set (must exist), else ``ngspice.dll`` next to the ``kicad-cli`` that
-    :func:`ai_eda.tools.kicad.cli.find_kicad_cli` finds, else None."""
+    :func:`ai_eda.tools.kicad.cli.find_kicad_cli` finds, else the system library (:func:`find_system_ngspice`), else None."""
     env = os.environ.get("NGSPICE_DLL")
     if env:
         p = Path(env)
@@ -178,22 +207,31 @@ def find_ngspice_dll() -> Path | None:
     from ai_eda.tools.kicad.cli import find_kicad_cli  # lazy: kicad.cli imports ai_eda.ir, which imports this package
 
     cli = find_kicad_cli()
-    if not cli:
-        return None
-    p = Path(cli).resolve().parent / "ngspice.dll"
-    return p if p.is_file() else None
+    if cli:
+        p = Path(cli).resolve().parent / "ngspice.dll"
+        if p.is_file():
+            return p
+    return find_system_ngspice()
 
 
 def find_codemodel_dir(dll: Path | None) -> Path | None:
-    """``$NGSPICE_CODEMODEL_DIR`` if set, else ``<root>/lib/ngspice`` for a DLL at ``<root>/bin/ngspice.dll``."""
+    """``$NGSPICE_CODEMODEL_DIR`` if set, else the code model directory next to the library.
+
+    Two layouts are known: KiCad's ``<root>/lib/ngspice`` for a DLL at
+    ``<root>/bin/ngspice.dll``, and Debian/Ubuntu's ``<libdir>/ngspice`` for
+    ``<libdir>/libngspice.so.0`` (measured 2026-09-23 on Ubuntu 24.04:
+    ``/usr/lib/x86_64-linux-gnu/ngspice/*.cm``).
+    """
     env = os.environ.get("NGSPICE_CODEMODEL_DIR")
     if env:
         p = Path(env)
         return p if p.is_dir() else None
     if dll is None:
         return None
-    p = dll.parent.parent / "lib" / "ngspice"
-    return p if p.is_dir() else None
+    for p in (dll.parent.parent / "lib" / "ngspice", dll.parent / "ngspice"):
+        if p.is_dir():
+            return p
+    return None
 
 
 def check_path_for_command(path: Path) -> None:
@@ -211,16 +249,21 @@ def check_path_for_command(path: Path) -> None:
 #: characters ngspice keeps intact in a node name (measured); ``( ) { } = , ; ' "`` and non-ASCII are mangled or fatal
 NODE_RE = re.compile(r"[A-Za-z0-9_./+\-:#@\[\]]+")
 GROUND_NODES = frozenset({"0", "gnd"})
-_ANALYSIS_CARDS = (".op", ".dc", ".ac", ".tran")
 #: cards refused because they execute commands, pull in files, change the title or hide vectors
 _FORBIDDEN_CARDS: dict[str, str] = {
     ".control": "a .control block executes arbitrary ngspice commands (including shell) when the file is sourced",
     ".endc": "a .control block executes arbitrary ngspice commands (including shell) when the file is sourced",
-    ".include": ".include reads a file outside the netlist (the netlist must be self-contained)",
+    ".inc": ".include reads a file outside the netlist (the netlist must be self-contained)",
     ".lib": ".lib reads a file outside the netlist (the netlist must be self-contained)",
     ".title": "the first line is the title; a .title card would change what the plot records",
     ".save": ".save limits which vectors ngspice keeps; the runner records every vector of the plot",
+    ".opt": ".options changes the engine's numerics or temperature behind the result's back (the runner records its settings)",
+    ".ic": ".ic imposes initial conditions the IR does not state",
+    ".nodeset": ".nodeset imposes initial guesses the IR does not state",
+    ".global": ".global renames connectivity behind the netlist's back",
 }
+#: keys of :data:`_FORBIDDEN_CARDS` are matched as prefixes, the way ngspice matches ``.inc`` / ``.include`` and ``.opt`` / ``.options``
+_ANALYSIS_CARDS = (".op", ".dc", ".ac", ".tran", ".tf", ".noise", ".pz", ".sens", ".disto", ".sp", ".four")
 #: node count per element letter, for the letters where it is fixed (E/G: only the two output nodes are
 #: certain - the behavioural forms ``E1 out 0 value={...}`` have no controlling node pair)
 _ELEMENT_NODES: dict[str, int] = {
@@ -262,7 +305,7 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
     command, so a card would be inert and misleading), no ``.control`` /
     ``.include`` / ``.lib`` / ``.title`` / ``.save``; element lines with a
     name, their nodes and a value (R C L) or model (D Q J Z M); node names in
-    ``[A-Za-z0-9_./+-:#@[]]``; no duplicate element names; at least one
+    ``A-Z a-z 0-9 _ . / + - : # @ [ ]`` (:data:`NODE_RE`); no duplicate element names; at least one
     non-ground node; no two node names that collide after lowercasing.
     """
     lines = [ln.rstrip("\r") for ln in text.split("\n")]
@@ -288,8 +331,9 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
         low = s.lower()
         if s[0] == ".":
             card = low.split()[0]
-            if card in _FORBIDDEN_CARDS:
-                problems.append(f"line {i}: {_FORBIDDEN_CARDS[card]}")
+            forbidden = next((k for k in _FORBIDDEN_CARDS if card.startswith(k)), None)
+            if forbidden is not None:
+                problems.append(f"line {i}: {_FORBIDDEN_CARDS[forbidden]}")
                 if card == ".control":
                     in_control = True
                 elif card == ".endc":
@@ -356,7 +400,8 @@ class _Capture:
         return [s[7:] for s in self.chars if s.startswith("stdout ")]
 
     def stderr(self) -> list[str]:
-        return [s[7:] for s in self.chars if s.startswith("stderr ")]
+        """The engine's stderr lines since ``clear()`` minus :data:`INFORMATIONAL_STDERR_RE` (kept in ``chars``)."""
+        return [s[7:] for s in self.chars if s.startswith("stderr ") and not INFORMATIONAL_STDERR_RE.match(s[7:].strip())]
 
     def clear(self) -> None:
         self.chars.clear()
@@ -379,6 +424,21 @@ class _Vector:
 
 def _sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def bind_reset(lib) -> bool:
+    """Bind ``ngSpice_Reset`` if the library exports it (KiCad's ngspice-46 does; Debian/Ubuntu ``libngspice0`` 42 does not).
+
+    Without it a ControlledExit cannot be recovered from and marks the engine dead for the rest of the process
+    (``engine_info()["reset_supported"]`` says which case applies). Returns whether the symbol was bound.
+    """
+    try:
+        reset = lib.ngSpice_Reset
+    except AttributeError:
+        return False
+    reset.argtypes = []
+    reset.restype = c_int
+    return True
 
 
 class _Engine:
@@ -422,10 +482,9 @@ class _Engine:
             lib.ngSpice_AllVecs.restype = POINTER(c_char_p)
             lib.ngSpice_running.argtypes = []
             lib.ngSpice_running.restype = c_bool
-            lib.ngSpice_Reset.argtypes = []
-            lib.ngSpice_Reset.restype = c_int
         except AttributeError as e:
             raise ToolUnavailableError(f"{dll} does not export the ngspice shared-library API: {e}") from e
+        self.reset_supported = bind_reset(lib)
         try:
             self._init_engine()
         except EngineDead as e:
@@ -644,6 +703,8 @@ class _Engine:
         """After a ControlledExit: ``ngSpice_Reset`` + ``ngSpice_Init`` + settings + code models + self-test."""
         if self.dead:
             raise EngineDead(self.dead_reason)
+        if not self.reset_supported:
+            raise self._mark_dead(f"{self.dll_path} does not export ngSpice_Reset (ngspice < 44): the engine cannot be recovered after a ControlledExit; restart the process")
         try:
             rc = self.lib.ngSpice_Reset()
         except OSError as e:
@@ -1014,6 +1075,7 @@ class NgspiceShared(SpiceRunner):
             "version": eng.version,
             "build": eng.build,
             "dll_path": str(eng.dll_path),
+            "reset_supported": eng.reset_supported,
             "codemodel_dir": None if eng.codemodel_dir is None else str(eng.codemodel_dir),
             "codemodels_loaded": eng.codemodels_loaded,
             "codemodel_errors": list(eng.codemodel_errors),

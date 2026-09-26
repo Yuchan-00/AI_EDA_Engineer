@@ -28,7 +28,7 @@ Invariants:
   deterministic artifacts.
 * **An expectation is judged, never interpreted.** ``measured`` comes from
   the reduction the IR asked for (``value`` / ``at`` / ``final`` / ``max`` /
-  ``min``) and the verdict is ``|measured - nominal| <= max(tol_abs,
+  ``min`` / ``frequency``) and the verdict is ``|measured - nominal| <= max(tol_abs,
   tol_rel * |nominal|)`` (the limit actually used is in
   ``details["tolerance"]``). ``at`` between two samples is an interpolation
   (:meth:`~ai_eda.tools.spice.SpiceResult.interpolate`): the two bracketing
@@ -36,9 +36,19 @@ Invariants:
   when *both* neighbours are within tolerance too, FAIL only when both are
   outside on the same side, and otherwise UNRESOLVED ("the sweep grid is too
   coarse for this tolerance") - an interpolation error is never reported as
-  a design deviation. No tolerance at all is UNRESOLVED; so is ``tol_rel``
-  alone on a nominal of 0 (a relative tolerance on zero is no tolerance). A
-  vector the plot does not contain is FAIL ("vector not produced"); an
+  a design deviation. ``frequency`` is the mean rising-edge frequency of the
+  saved transient window (:func:`ai_eda.tools.spice.measure.rising_edge_frequency`):
+  the edge count, the first and last edge time, the thresholds, vmin /
+  vmax and the flatness floor go into ``details["frequency"]`` so the verdict
+  is auditable, and a waveform without three countable edges, or whose swing
+  is within the engine's own resolution (``reltol`` * level + ``vntol`` for a
+  voltage, + ``abstol`` for a current: numerical ripple is not an
+  oscillation), is FAIL ("no oscillation detected"), never PASS. No tolerance
+  at all is UNRESOLVED; so is ``tol_rel`` alone on a nominal of 0 (a relative
+  tolerance on zero is no tolerance). A vector the plot does not contain is
+  FAIL ("vector not produced"; a plot without its own scale vector is
+  "scale vector not produced", naming the scale, never the expectation's
+  vector); an
   analysis that did not succeed makes the ``spice`` summary FAIL with
   ngspice's own lines and leaves its expectations NOT_VERIFIED - unless the
   *environment* prevented the run (``SpiceResult.unverifiable``: no place
@@ -67,7 +77,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -85,7 +95,8 @@ from ai_eda.ir import (
     worst_status,
 )
 from ai_eda.tools.kicad.cli import fresh_artifact
-from ai_eda.tools.spice.runner import Interpolation, SpiceResult, SpiceRunner
+from ai_eda.tools.spice.measure import ABSTOL, VNTOL, rising_edge_frequency
+from ai_eda.tools.spice.runner import Interpolation, SpiceAnalysis, SpiceResult, SpiceRunner
 
 CHECK_ID = "spice"
 #: subdirectory of the workdir that holds ``results.json`` and one rawfile directory per analysis id
@@ -128,11 +139,31 @@ class Reduction:
     measured: float | None
     problem: str | None
     interpolation: Interpolation | None = None
+    #: what a ``frequency`` reduction measured besides the number (edge count and times, thresholds, vmin / vmax);
+    #: the stage copies it into ``details["frequency"]``
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _frequency_details(edges: list[float], **scalars: float | None) -> dict[str, Any]:
+    return {
+        "edges": len(edges),
+        "first_edge_s": edges[0] if edges else None,
+        "last_edge_s": edges[-1] if edges else None,
+        **scalars,
+    }
 
 
 def reduce_expectation(res: SpiceResult, exp: Expectation, vector: str) -> Reduction:
     """The number ``exp.reduce`` picks from ``vector`` of ``res`` (with its bracket for ``at``), or why there is none."""
     interpolation: Interpolation | None = None
+    extra: dict[str, Any] = {}
+    if exp.reduce in (Reduce.AT, Reduce.FREQUENCY) and res.scale is not None:
+        # these reductions read the scale first: a plot without its scale vector is reported as such, never as the
+        # expectation's vector being absent (that KeyError would name a vector that is present)
+        try:
+            res.scale_values()
+        except KeyError:
+            return Reduction(None, f"scale vector not produced: {res.scale!r} is not in the {res.analysis.value} plot (vectors: {sorted(res.vectors)})")
     try:
         if exp.reduce == Reduce.VALUE:
             measured = res.final(vector)
@@ -147,15 +178,36 @@ def reduce_expectation(res: SpiceResult, exp: Expectation, vector: str) -> Reduc
             measured = res.max(vector)
         elif exp.reduce == Reduce.MIN:
             measured = res.min(vector)
+        elif exp.reduce == Reduce.FREQUENCY:
+            if res.analysis != SpiceAnalysis.TRAN:
+                return Reduction(None, f"reduce=frequency needs a tran result, this is {res.analysis.value}")
+            # the flatness floor's absolute part is the engine's resolution for the vector's kind: a current vector
+            # (``i(...)``) is measured in amperes
+            abs_floor = ABSTOL if exp.vector.strip().lower().startswith("i") else VNTOL
+            edge = rising_edge_frequency(res.scale_values(), res.vector(vector), abs_floor=abs_floor)
+            extra = _frequency_details(edge.edges, low=edge.low, mid=edge.mid, high=edge.high, vmin=edge.vmin, vmax=edge.vmax, floor=edge.floor)
+            if edge.problem is not None or edge.frequency is None:
+                return Reduction(None, edge.problem or "no frequency measured", extra=extra)
+            measured = edge.frequency
         else:  # pragma: no cover - the enum is closed
             return Reduction(None, f"unknown reduce {exp.reduce!r}")
     except KeyError:
         return Reduction(None, f"vector not produced: {vector!r} is not in the {res.analysis.value} plot (vectors: {sorted(res.vectors)})")
     except ValueError as e:
         return Reduction(None, str(e))
+    # every sample must be a number: builtins.max/min skip a NaN that is not first, and a waveform with a NaN or
+    # an infinity in it is not a usable result wherever the bad sample sits
+    try:
+        samples = res.vector(vector)
+    except KeyError:
+        samples = []
+    if any(not math.isfinite(x) for x in samples):
+        return Reduction(None, f"{vector} contains non-finite samples (the simulation did not produce a usable waveform)")
+    if exp.reduce == Reduce.AT and any(not math.isfinite(x) for x in res.scale_values()):
+        return Reduction(None, "the scale vector contains non-finite samples")
     if not math.isfinite(measured):
         return Reduction(None, f"{vector} {exp.reduce.value} is not finite ({measured!r})")
-    return Reduction(float(measured), None, interpolation)
+    return Reduction(float(measured), None, interpolation, extra)
 
 
 def reduce_result(res: SpiceResult, exp: Expectation, vector: str) -> tuple[float | None, str | None]:
@@ -180,7 +232,8 @@ def judge(measured: float, exp: Expectation, interpolation: Interpolation | None
         limits.append(abs(float(exp.tol_abs.value)))
     if exp.tol_rel is not None and nominal != 0.0:
         limits.append(abs(float(exp.tol_rel.value)) * abs(nominal))
-    if not limits:
+    if not limits or any(not math.isfinite(x) for x in limits) or not math.isfinite(nominal):
+        # a tolerance that is not a number is no tolerance (inf would pass anything, nan nothing)
         return ValidationStatus.UNRESOLVED, None, deviation
     limit = max(limits)
     if interpolation is None or interpolation.exact:
@@ -303,7 +356,8 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
         return Evidence(description=f"ngspice rawfile of analysis {analysis_id} ({res.command})", path=res.raw_output_path, content_hash=res.raw_output_hash)
 
     failed_analyses: dict[str, list[str]] = {aid: list(r.errors) for aid, r in results.items() if not r.succeeded}
-    # each result may only claim the hash the runner itself computed for the file it loaded
+    # each result may only claim the hash the runner itself computed for the file it loaded (the batch runner
+    # loads a copy with the analysis card and reports the original's hash plus ``deck_hash`` of the copy)
     for aid, r in results.items():
         if r.netlist_hash != art.content_hash:
             failed_analyses.setdefault(aid, []).append(f"runner loaded a file with hash {r.netlist_hash}, the artifact records {art.content_hash}")
@@ -357,6 +411,8 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
                 else:
                     details["spice_vector"] = vector
                     reduction = reduce_expectation(res, exp, vector)
+                if exp.reduce == Reduce.FREQUENCY and reduction.extra:
+                    details["frequency"] = dict(reduction.extra)
                 if reduction.problem is not None:
                     status, message = ValidationStatus.FAIL, reduction.problem
                     details["repair"] = "human"
