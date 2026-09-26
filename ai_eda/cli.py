@@ -38,6 +38,10 @@
                                          file + retrieved_at) and the limits it states (key, value, unit,
                                          page, quote); the URL is trusted exactly, every limit is grounded
                                          verbatim on the archived page and recorded in ir.pcb.manufacturing
+        As the run passes ARCHITECTURE (once the design exists), COMPONENT_SELECTION, PCB and RELEASE it
+        writes the Korean stage reports <workdir>/reports/01..04_*.md (views like report.html: no status
+        computed, not artifacts, not hashed; a report that cannot be built is printed on stderr and never
+        aborts the run) and prints "  report written: reports/<name>" for each.
     ai-eda review IR.json    run only the independent reviewer (exit 1 on any FAIL)
     ai-eda report IR.json [-o FILE]
                              write one self-contained HTML file (default <workdir>/report.html) showing
@@ -48,6 +52,11 @@
                              serve that report on 127.0.0.1 only (default port 8765; 0 = a free port,
                              printed), GET / only, re-rendered on every request so a later `run` shows on
                              refresh; there is no --host flag on purpose
+    ai-eda stage-reports IR.json [--dir DIR]
+                             re-write the four Korean stage reports (theory, parts, circuit, final) from the
+                             saved ir.json and <workdir>/pipeline.json without re-running anything (default
+                             folder <workdir>/reports; a missing run record makes the reports say so); exit 0
+                             written, 2 usage/IR error - never 1
 
 Without ``--llm`` the pipeline is exactly what it was before the LLM stage;
 without ``--online`` ``run`` opens no socket. ``serve`` is the one command
@@ -278,8 +287,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     state = PipelineState()
     results_before = len(ir.validation.results)  # the run's starting index in ir.validation.results, recorded in pipeline.json
     aborted: str | None = None
+    reports_written: list[Path] = []
     try:
-        Orchestrator(ctx).run(ir, state=state)
+        Orchestrator(ctx).run(ir, state=state, after_stage=_stage_report_writer(ir, library, workdir, reports_written))
     except BaseException as e:
         aborted = type(e).__name__  # only the type: an error text can embed a URL or a header, and it is written to disk
         raise
@@ -298,6 +308,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         except Exception as e:  # noqa: BLE001 - reported, never masks the original exception
             print(f"could not save {args.ir}: {e}", file=sys.stderr)
         _record_pipeline(state, ir, args.ir, workdir, results_before=results_before, aborted=aborted, ir_saved=saved)
+        if reports_written:
+            print(f"  stage reports: {', '.join(_report_label(p, workdir) for p in reports_written)} (ai-eda stage-reports {args.ir} re-writes them)")
         if aborted is not None:
             print(f"pipeline aborted by an unexpected error; IR saved to {args.ir} with what had been applied", file=sys.stderr)
             # the questions the IR now holds were meant for the user: show them, so a confirmation given
@@ -322,6 +334,39 @@ def _record_pipeline(state, ir, ir_path: str, workdir: Path, *, results_before: 
         return
     # the leading spaces keep the line out of the stage table (one line per stage, first word = stage)
     print(f"  stage outcomes recorded in {path} (ai-eda report {ir_path} renders them)")
+
+
+def _report_label(path: Path, workdir: Path) -> str:
+    """``reports/<name>``: a stage report named relative to the workdir (the printed line never carries the absolute path)."""
+    from ai_eda.report.stages import REPORTS_DIR
+
+    return f"{REPORTS_DIR}/{path.name}"
+
+
+def _stage_report_writer(ir, library, workdir: Path, written: list[Path]):
+    """The ``after_stage`` callback of ``run``: writes the stage's report from the live state and prints where.
+
+    Only the stages in ``STAGE_REPORTS`` write one, ARCHITECTURE only once the
+    design exists (``ir.components``). A builder that raises is reported on
+    stderr and the pipeline continues: a report is a view of the run, never a
+    reason to abort it.
+    """
+    from ai_eda.report.stages import REPORTS_DIR, STAGE_REPORTS, write_stage_report
+    from ai_eda.workflow import Stage
+
+    def after_stage(stage, state) -> None:
+        if stage not in STAGE_REPORTS or (stage is Stage.ARCHITECTURE and not ir.components):
+            return
+        try:
+            path = write_stage_report(stage, ir, library, state, workdir)
+        except Exception as e:  # noqa: BLE001 - a report must never abort a run; the reason is printed, the run goes on
+            print(f"  could not write {REPORTS_DIR}/{STAGE_REPORTS[stage]}: {type(e).__name__}: {e}", file=sys.stderr)
+            return
+        if path is not None:
+            written.append(path)
+            print(f"  report written: {_report_label(path, workdir)}")  # leading spaces: not a stage line
+
+    return after_stage
 
 
 def _print_questions(questions, *, header: str) -> None:
@@ -430,6 +475,35 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stage_reports(args: argparse.Namespace) -> int:
+    """Write the four Korean stage reports from the saved IR and pipeline.json; exit 0 written, 2 for a usage / IR error - never 1 (a report is not a verdict)."""
+    from ai_eda.report import load_pipeline_record, write_all_stage_reports
+    from ai_eda.report.pipeline_log import PipelineRecordError
+    from ai_eda.tools.kicad import KicadLibrary
+
+    loaded = _report_inputs(args)
+    if loaded is None:
+        return 2
+    ir, workdir, _ir_sha = loaded
+    try:
+        found = load_pipeline_record(workdir)
+    except PipelineRecordError as e:
+        print(f"{e} - the reports are written without a run record", file=sys.stderr)
+        found = None
+    record = found.record if found is not None else None
+    if record is None:
+        print("no run record: the reports say so where they need one (run `ai-eda run` first to record stage outcomes)", file=sys.stderr)
+    reports_dir = Path(args.dir) if args.dir else None
+    try:
+        paths = write_all_stage_reports(ir, KicadLibrary(), record, workdir, reports_dir=reports_dir)
+    except OSError as e:
+        print(f"could not write the stage reports: {e}", file=sys.stderr)
+        return 2
+    for p in paths:
+        print(f"wrote {p}")
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Serve the report on 127.0.0.1 (a loopback listening socket, nothing outbound); exit 0 on Ctrl-C, 2 for a usage / IR / bind error."""
     from ai_eda.report import serve
@@ -498,6 +572,11 @@ def main(argv: list[str] | None = None) -> int:
     sv.add_argument("ir")
     sv.add_argument("--port", type=int, default=8765, help="TCP port on 127.0.0.1 (default 8765; 0 picks a free port and prints it)")
     sv.set_defaults(fn=cmd_serve)
+
+    sr = sub.add_parser("stage-reports", help="re-write the four Korean stage reports (theory, parts, circuit, final) from ir.json and pipeline.json (read-only; no verdict)")
+    sr.add_argument("ir")
+    sr.add_argument("--dir", metavar="DIR", help="folder for the four files (default <workdir>/reports)")
+    sr.set_defaults(fn=cmd_stage_reports)
 
     args = p.parse_args(argv)
     return args.fn(args)

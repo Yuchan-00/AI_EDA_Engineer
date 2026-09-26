@@ -287,6 +287,19 @@ def _artifacts(data: ReportData) -> str:
     return block("section", tag("h2", "Artifacts"), rows(["kind", "path", "files", "generator", "content hash", "from IR", "IR", "disk", "notes", "created"], body))
 
 
+def _stage_reports(data: ReportData) -> str:
+    """Links to the Korean stage reports that exist beside this page (relative to the workdir); nothing of their content."""
+    if not data.stage_reports:
+        return block("section", tag("h2", "Stage reports"), tag("p", "none on disk (ai-eda run writes them under reports/; ai-eda stage-reports re-writes them)", class_="note"))
+    items = [block("li", tag("a", r.name, href=r.href), tag("span", f" - after {r.stage}", class_="note")) for r in data.stage_reports]
+    return block(
+        "section",
+        tag("h2", "Stage reports"),
+        tag("p", "Korean Markdown views written by ai-eda run (links relative to the workdir; views like this page: no status computed, not artifacts).", class_="note"),
+        block("ul", *items, class_="plain"),
+    )
+
+
 def _review(data: ReportData) -> str:
     r = data.review
     body = [[x.area, Markup(status_cell(x.status)), x.message, x.freshness, x.evidence, x.timestamp] for x in r.rows]
@@ -337,6 +350,7 @@ def render_html(data: ReportData) -> str:
         _requirements(data),
         _validation(data),
         _artifacts(data),
+        _stage_reports(data),
         _review(data),
         _repair(data),
         _domain(data.regulatory),

@@ -196,11 +196,26 @@ class Orchestrator:
 
     # --- driver ------------------------------------------------------------------
 
-    def run(self, ir: CircuitIR, stop_after: Stage | None = None, *, state: PipelineState | None = None) -> PipelineState:
+    def run(
+        self,
+        ir: CircuitIR,
+        stop_after: Stage | None = None,
+        *,
+        state: PipelineState | None = None,
+        after_stage: Callable[[Stage, PipelineState], None] | None = None,
+    ) -> PipelineState:
         """Run the stages in order into ``state`` (a fresh one by default) and return it.
 
         A caller that passes its own ``state`` keeps the partial outcomes when
         a stage raises: ``state.current`` is then the stage that died.
+        ``after_stage`` is called with the stage and the state right after
+        each stage's outcome is appended (before the pipeline decides whether
+        it is blocked), so a caller can write a view of the run as it goes -
+        ``ai-eda run`` writes the stage reports through it. The callback is an
+        observer: it gets the live IR through its closure but the orchestrator
+        never reads anything back from it, and whatever it raises propagates
+        like a stage defect, so a caller whose callback must never abort the
+        run wraps it (the CLI does).
         """
         state = PipelineState() if state is None else state
         self._fresh_from = len(ir.validation.results)  # results before this index were carried over from earlier runs
@@ -208,6 +223,8 @@ class Orchestrator:
             state.current = stage
             outcome = self.stages[stage](ir, self.ctx)
             state.outcomes.append(outcome)
+            if after_stage is not None:
+                after_stage(stage, state)
             # a required question stops the pipeline even when a FAIL in the same stage outranks
             # USER_INPUT_REQUIRED in the aggregated status: the user is asked, not run past
             if outcome.status == ValidationStatus.USER_INPUT_REQUIRED or any(q.required for q in outcome.questions):

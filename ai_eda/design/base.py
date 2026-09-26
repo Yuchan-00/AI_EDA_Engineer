@@ -12,10 +12,21 @@ calculator's tool id and role map, so ``calc.recompute`` re-derives them).
 Structural decisions (which parts, which nets, which analysis) are ``derived``
 by the template tool itself (``design.template.<id>``): a pure function of
 the template id the user confirmed and of the library on disk.
+
+A template also *explains* its design for the stage reports
+(:mod:`ai_eda.report.stages`): :meth:`Template.theory` gives the circuit
+theory with the IR's own numbers substituted and :meth:`Template.part_notes`
+the role, the reason and the substitute criteria of every part. Both are
+views: they read ``ir.parameters`` (a missing key prints :data:`NO_RECORD`,
+never a guess), recompute display numbers with the formulas they show and
+write nothing into the IR. Substitute part names are suggestions the
+pipeline never verified and carry :data:`UNVERIFIED_SUBSTITUTE` on every
+line.
 """
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +45,13 @@ TOOL_ID = "design.template"
 CHOICE_NOTE_PREFIX = "design choice confirmed by user"
 #: the answer key that confirms a presented plan; a control key (never a requirement), see ``ai_eda.agents.requirement.CONTROL_KEYS``
 CONFIRM_DESIGN_KEY = "confirm_design"
+#: what a report prints for a number the IR does not hold (a report never guesses one)
+NO_RECORD = "기록 없음"
+#: the marker every substitute-part line carries: the pipeline verified nothing about that part
+UNVERIFIED_SUBSTITUTE = "(검증되지 않음: 핀 배열·정격을 데이터시트와 KiCad 라이브러리에서 확인)"
+#: IR unit spellings shown with their symbol in a report
+UNIT_DISPLAY: dict[str, str] = {"ohm": "Ω", "degC": "°C", "deg": "°", "percent": "%"}
+_SI_PREFIXES: dict[int, str] = {-12: "p", -9: "n", -6: "µ", -3: "m", 0: "", 3: "k", 6: "M", 9: "G"}
 
 #: requirement categories a template must serve or refuse (the reviewer's ``requirements_vs_ir`` design categories)
 DESIGN_CATEGORIES: frozenset[str] = frozenset({"electrical", "thermal", "mechanical", "signal_integrity", "power_integrity", "rf"})
@@ -148,6 +166,68 @@ def _fmt(value: Any) -> str:
     return f"{value:.12g}"
 
 
+@dataclass(frozen=True)
+class TheorySection:
+    """One section of a template's theory text: a title and a Markdown body (formulas as plain Unicode text, the IR's numbers substituted)."""
+
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
+class PartNote:
+    """What a template says about one of its parts for the parts report.
+
+    ``role``: what the part does in this circuit; ``why``: why this part class,
+    value and footprint; ``criteria``: what any substitute must satisfy,
+    computed from the design; ``substitutes``: candidate names the pipeline
+    did **not** verify - each line carries :data:`UNVERIFIED_SUBSTITUTE`.
+    """
+
+    role: str
+    why: str
+    criteria: list[str] = field(default_factory=list)
+    substitutes: list[str] = field(default_factory=list)
+
+
+def parameter_value(ir: CircuitIR, key: str) -> float | None:
+    """The numeric value of ``ir.parameters[key]``, or ``None`` when the key is missing or not a number (a report then prints :data:`NO_RECORD`)."""
+    t = ir.parameters.get(key)
+    if t is None or isinstance(t.value, bool) or not isinstance(t.value, (int, float)):
+        return None
+    return float(t.value)
+
+
+def quantity(value: float | None, unit: str | None = None, digits: int = 5) -> str:
+    """``value`` with an SI prefix and the unit's symbol (``6.48e-08 F`` -> ``64.817 nF``); :data:`NO_RECORD` for ``None``.
+
+    Values in [0.1, 1000) keep no prefix (``0.7 V``, ``500 Hz``); outside that
+    range the engineering exponent nearest below is used, down to pico and up
+    to giga. A unitless number is printed as ``{digits}`` significant digits.
+    """
+    if value is None:
+        return NO_RECORD
+    u = UNIT_DISPLAY.get(unit or "", unit or "")
+    if value == 0 or not math.isfinite(value) or not u:
+        text = f"{value:.{digits}g}"
+        return f"{text} {u}" if u else text
+    if 0.1 <= abs(value) < 1000:
+        return f"{value:.{digits}g} {u}"
+    e3 = int(math.floor(math.log10(abs(value)) / 3.0)) * 3
+    e3 = max(-12, min(9, e3))
+    return f"{value / 10 ** e3:.{digits}g} {_SI_PREFIXES[e3]}{u}"
+
+
+def number(value: float | None, digits: int = 6) -> str:
+    """A bare number for a formula line (``{digits}`` significant digits); :data:`NO_RECORD` for ``None``."""
+    return NO_RECORD if value is None else f"{value:.{digits}g}"
+
+
+def unverified(name: str, note: str = "") -> str:
+    """One substitute line: the candidate, an optional note and the marker that the pipeline verified nothing about it."""
+    return f"{name}{' - ' + note if note else ''} {UNVERIFIED_SUBSTITUTE}"
+
+
 class Template(ABC):
     """A verified circuit template: which confirmed requirement keys select it, which it needs, serves and may ignore."""
 
@@ -191,6 +271,17 @@ class Template(ABC):
     @abstractmethod
     def build(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str], library: KicadLibrary, *, confirmed: bool) -> Plan: ...
 
+    def theory(self, ir: CircuitIR) -> list[TheorySection]:
+        """The circuit theory of this template with ``ir``'s numbers substituted (a view: nothing is written to the IR).
+
+        Every template overrides this; the default says the template gives no theory text.
+        """
+        return [TheorySection("이론 설명 없음", f"템플릿 '{self.id}' v{self.version}은 이론 설명을 제공하지 않습니다.")]
+
+    def part_notes(self, ir: CircuitIR) -> dict[str, PartNote]:
+        """Per reference designator: role, reason, substitute criteria and unverified candidates. Default: nothing (the parts report says so per part)."""
+        return {}
+
 
 def requirement_text(r: Requirement) -> str:
     v = r.value.value if r.value is not None else None
@@ -217,15 +308,24 @@ __all__ = [
     "CONFIRM_DESIGN_KEY",
     "DESIGN_CATEGORIES",
     "IGNORED_KEYS",
+    "NO_RECORD",
     "TEMPLATE_VERSION",
     "TOOL_ID",
+    "UNIT_DISPLAY",
+    "UNVERIFIED_SUBSTITUTE",
     "Choice",
     "DesignChange",
+    "PartNote",
     "Plan",
     "Template",
+    "TheorySection",
     "choice_provenance",
+    "number",
+    "parameter_value",
+    "quantity",
     "requirement_text",
     "structural_provenance",
     "template_tool",
     "unserved_requirements",
+    "unverified",
 ]

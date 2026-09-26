@@ -4,6 +4,8 @@ Invariant: the report is a *view*. It computes no status (every one shown is
 copied from ``ir.validation`` or from the recorded ``pipeline.json``),
 registers no artifact, never saves the IR, writes nothing but the requested
 HTML file, and opens no socket except the loopback listener of ``serve``.
+The Korean stage reports (:mod:`ai_eda.report.stages`) are views under the
+same rule, written as Markdown under ``<workdir>/reports/``.
 """
 
 from __future__ import annotations
@@ -21,6 +23,18 @@ from ai_eda.report.pipeline_log import (
     save_pipeline_record,
 )
 from ai_eda.report.server import LOOPBACK, ReportServer, serve
+from ai_eda.report.stages import (
+    REPORTS_DIR,
+    STAGE_REPORTS,
+    build_stage_report,
+    circuit_report,
+    final_report,
+    parts_report,
+    template_of,
+    theory_report,
+    write_all_stage_reports,
+    write_stage_report,
+)
 
 
 def render_report_file(ir_path: Path, output: Path | None = None) -> Path:
@@ -38,17 +52,27 @@ def render_report_file(ir_path: Path, output: Path | None = None) -> Path:
 __all__ = [
     "LOOPBACK",
     "PIPELINE_FILE",
+    "REPORTS_DIR",
+    "STAGE_REPORTS",
     "LoadedPipelineRecord",
     "PipelineRecord",
     "PipelineRecordError",
     "ReportData",
     "ReportServer",
     "build_report_data",
+    "build_stage_report",
+    "circuit_report",
     "esc",
+    "final_report",
     "load_ir_file",
     "load_pipeline_record",
+    "parts_report",
     "render_html",
     "render_report_file",
     "save_pipeline_record",
     "serve",
+    "template_of",
+    "theory_report",
+    "write_all_stage_reports",
+    "write_stage_report",
 ]

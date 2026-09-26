@@ -267,6 +267,15 @@ class ReleaseSection(BaseModel):
     current: bool
 
 
+class StageReportRow(BaseModel):
+    """One Korean stage report that exists on disk under ``<workdir>/reports/`` (a link target, never content)."""
+
+    stage: str
+    name: str
+    #: ``reports/<name>``, relative to the workdir (where ``report.html`` is written by default)
+    href: str
+
+
 class ReportData(BaseModel):
     meta: MetaSection
     stages: StagesSection | None
@@ -281,6 +290,8 @@ class ReportData(BaseModel):
     components: DomainSection
     simulation: DomainSection
     release: ReleaseSection
+    #: the stage reports found on disk (:mod:`ai_eda.report.stages`), in stage order; empty when none was written
+    stage_reports: list[StageReportRow] = Field(default_factory=list)
 
 
 # --- helpers -----------------------------------------------------------------
@@ -627,4 +638,16 @@ def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: st
                            ir.simulation.model_dump(mode="json") if ir.simulation is not None else None,
                            "latest spice / domain.analog.* results; ir.simulation as stored"),
         release=_release(record, design_hash, describes),
+        stage_reports=_stage_reports(workdir),
     )
+
+
+def _stage_reports(workdir: Path) -> list[StageReportRow]:
+    """The stage reports present under ``<workdir>/reports/`` (a stat per file; their content is never read)."""
+    from ai_eda.report.stages import REPORTS_DIR, STAGE_REPORTS
+
+    out: list[StageReportRow] = []
+    for stage, name in STAGE_REPORTS.items():
+        if (Path(workdir) / REPORTS_DIR / name).is_file():
+            out.append(StageReportRow(stage=str(stage), name=name, href=f"{REPORTS_DIR}/{name}"))
+    return out
