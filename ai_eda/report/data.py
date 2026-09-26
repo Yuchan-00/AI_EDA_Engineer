@@ -268,12 +268,15 @@ class ReleaseSection(BaseModel):
 
 
 class StageReportRow(BaseModel):
-    """One Korean stage report that exists on disk under ``<workdir>/reports/`` (a link target, never content)."""
+    """One Korean stage report that exists on disk under ``<workdir>/reports/`` (link targets, never content)."""
 
     stage: str
     name: str
-    #: ``reports/<name>``, relative to the workdir (where ``report.html`` is written by default)
+    #: ``reports/<name>.md``, relative to the workdir (where ``report.html`` is written by default)
     href: str
+    #: ``reports/<name>.html`` / ``.pdf`` when those renderings exist beside the Markdown (relative like ``href``)
+    html_href: str | None = None
+    pdf_href: str | None = None
 
 
 class ReportData(BaseModel):
@@ -643,11 +646,15 @@ def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: st
 
 
 def _stage_reports(workdir: Path) -> list[StageReportRow]:
-    """The stage reports present under ``<workdir>/reports/`` (a stat per file; their content is never read)."""
+    """The stage reports present under ``<workdir>/reports/`` with their ``.html`` / ``.pdf`` renderings (a stat per file; their content is never read)."""
     from ai_eda.report.stages import REPORTS_DIR, STAGE_REPORTS
 
     out: list[StageReportRow] = []
+    folder = Path(workdir) / REPORTS_DIR
     for stage, name in STAGE_REPORTS.items():
-        if (Path(workdir) / REPORTS_DIR / name).is_file():
-            out.append(StageReportRow(stage=str(stage), name=name, href=f"{REPORTS_DIR}/{name}"))
+        md = folder / name
+        if not md.is_file():
+            continue
+        renderings = {suffix: f"{REPORTS_DIR}/{md.with_suffix(suffix).name}" for suffix in (".html", ".pdf") if md.with_suffix(suffix).is_file()}
+        out.append(StageReportRow(stage=str(stage), name=name, href=f"{REPORTS_DIR}/{name}", html_href=renderings.get(".html"), pdf_href=renderings.get(".pdf")))
     return out

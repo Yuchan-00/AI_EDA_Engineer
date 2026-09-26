@@ -25,3 +25,6 @@ include = ["ai_eda*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "browser: the test may discover and run the real headless browser for stage-report PDFs (tests/conftest.py disables that discovery otherwise)",
+]

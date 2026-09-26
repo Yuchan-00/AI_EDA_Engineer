@@ -28,6 +28,8 @@ import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+import xml.etree.ElementTree as ET
+
 import pytest
 
 from ai_eda.agents.circuit import CONFIRM_DESIGN_KEY
@@ -41,6 +43,7 @@ from ai_eda.report import (
     PIPELINE_FILE,
     REPORTS_DIR,
     STAGE_REPORTS,
+    build_stage_document,
     build_stage_report,
     circuit_report,
     final_report,
@@ -52,12 +55,23 @@ from ai_eda.report import (
     write_all_stage_reports,
     write_stage_report,
 )
+import ai_eda.report.stages as stages_module
+from ai_eda.ir import LibraryRef
+from ai_eda.report.pdf import MISSING_FIGURE, NO_BROWSER_REASON, _inline, find_browser
 from ai_eda.report.stages import (
+    NO_BOARD_FIGURE,
+    NO_CHART_IN_PARTS,
+    NO_COPPER_FIGURE,
+    NO_LIBRARY_FIGURE,
     NO_MEASUREMENT,
+    NO_PLACEMENT_FIGURE,
     NO_ROUTING,
     NO_RUN_RECORD,
     NO_TEMPLATE,
     NO_TEMPLATE_INFO,
+    NO_TOLERANCE_FIGURE,
+    NO_WAVEFORM,
+    PDF_NOT_REQUESTED,
     SUBSTITUTES_HEADING,
     copper_resistance_ohm,
     ipc2221_current_a,
@@ -101,6 +115,11 @@ def _cli(*argv: str) -> tuple[int, str, str]:
     with redirect_stdout(out), redirect_stderr(err):
         code = cli_main(list(argv))
     return code, out.getvalue(), err.getvalue()
+
+
+def _report_files(names: list[str]) -> list[str]:
+    """The ``.md`` and ``.html`` file names a write without a browser leaves for ``names``."""
+    return [n for name in names for n in (name, name.removesuffix(".md") + ".html")]
 
 
 def _table_rows(text: str, heading: str) -> list[list[str]]:
@@ -275,6 +294,7 @@ def test_non_template_design_gets_honest_fallbacks(tmp_path: Path):
     assert f"- 설계 출처: {NO_TEMPLATE}" in theory and f"{NO_TEMPLATE}: 이 설계는 템플릿이 만들지 않았으므로" in theory
     assert "| `v_out` | 6 V | 계산기 출력 | `calc.divider.v_out` v0.6 ← v_in, r1, r2 | V_out = V_in * R2 / (R1 + R2) |" in theory
     assert "제약 조건 기록 없음." in theory and "- `dc_vin`: dc (source = VIN, start = 0 V, stop = 12 V, step = 1 V)" in theory
+    assert f"{NO_TEMPLATE}: 템플릿의 이론 곡선이 없습니다." in theory and "![fig]" not in theory and NO_WAVEFORM in theory
     assert parts.count(f"{NO_TEMPLATE_INFO}: 역할·선정 이유·대체 기준은 템플릿이 만든 설계에만 있습니다.") == 3
     assert "- Description (KiCad 라이브러리 기재): R" in parts  # library facts are still listed
     assert "- MPN: RC0603FR-0710kL [공식 자료 (데이터시트 / 라이브러리)]" in parts and "https://www.example-vendor.com/ds/rc0603.pdf" in parts
@@ -283,6 +303,8 @@ def test_non_template_design_gets_honest_fallbacks(tmp_path: Path):
     assert SUBSTITUTES_HEADING not in parts.split("## R1")[1]
     circuit, final = circuit_report(ir, lib, None), final_report(ir, None)
     assert "| `R1` | `Resistor_SMD:R_0603_1608Metric` |" in circuit and NO_ROUTING in circuit and "### 배치 규칙과 그 한계" not in circuit  # hand placements, no copper
+    assert "![fig](fig:placement)" in circuit and NO_BOARD_FIGURE in circuit and NO_COPPER_FIGURE in circuit  # placed by hand, no copper
+    assert NO_CHART_IN_PARTS in parts and NO_TOLERANCE_FIGURE not in final and "![fig](fig:tolerance)" in final and NO_WAVEFORM in final
     assert "- 배치 도구 기록 없음: 위치의 출처는" in circuit and f"{NO_RUN_RECORD}: 단계 결과는" in circuit
     assert "| `v_out` |" in final and NO_MEASUREMENT in final and f"{NO_RUN_RECORD}: RELEASE 판정은" in final and "## 검증 매트릭스" in final
     for text in (theory, parts, circuit, final):
@@ -407,6 +429,9 @@ def test_circuit_report_of_an_unrouted_board_says_so(tmp_path: Path):
     assert "- `placement`: **NOT_VERIFIED** — " in text and "routing skipped by answer" in text
     assert state.outcome(Stage.RELEASE).status is S.FAIL and "- `pcb.routing.connectivity`: **FAIL**" in text
     assert ir.validation.latest("pcb.routing.connectivity").status is S.FAIL
+    # the placement figure is drawn; the routed-board figure and the copper bars are one sentence each
+    assert "![fig](fig:placement)" in text and "fig:board" not in text and "fig:copper_bars" not in text
+    assert f"{NO_BOARD_FIGURE}: IR 에 트랙·비아가 없습니다." in text and f"{NO_COPPER_FIGURE}: IR 에 트랙·비아가 없습니다." in text
     _assert_clean(text, tmp_path)
 
 
@@ -415,6 +440,7 @@ def test_circuit_report_without_a_record_or_a_board(astable, tmp_path: Path):
     text = circuit_report(ir, lib, None)
     assert f"배치 {NO_RECORD}" in text and NO_ROUTING in text and f"{NO_RUN_RECORD}: 단계 결과는" in text
     assert "- `pcb.routing.connectivity`: 기록 없음" in text  # no board yet: the IR geometry checks have not run
+    assert "![fig]" not in text and f"{NO_PLACEMENT_FIGURE}: IR 에 부품 위치가 없습니다." in text and NO_BOARD_FIGURE in text and NO_COPPER_FIGURE in text
     _assert_clean(text, tmp_path)
 
 
@@ -503,19 +529,26 @@ def test_write_stage_reports_are_views_not_artifacts(astable_release, tmp_path: 
     ir, lib, state = astable_release
     workdir = tmp_path / "out"
     before, n_results, artifacts = ir.content_hash(), len(ir.validation.results), dict(ir.artifacts)
-    paths = [write_stage_report(stage, ir, lib, state, workdir) for stage in STAGE_REPORTS]
+    results = [write_stage_report(stage, ir, lib, state, workdir) for stage in STAGE_REPORTS]
+    paths = [r.markdown for r in results]
     assert [p.name for p in paths] == list(STAGE_REPORTS.values()) and all(p.parent == workdir / REPORTS_DIR for p in paths)
+    assert [r.html for r in results] == [p.with_suffix(".html") for p in paths] and all(r.html.is_file() for r in results)
+    assert all(r.pdf is None and r.pdf_reason == NO_BROWSER_REASON for r in results)  # no browser is discovered in tests (conftest)
     for stage, p in zip(STAGE_REPORTS, paths):
         raw = p.read_bytes()
         assert b"\r" not in raw and raw.decode("utf-8") == build_stage_report(stage, ir, lib, state)
         _assert_clean(raw.decode("utf-8"), tmp_path)
+        html = p.with_suffix(".html").read_bytes()
+        assert b"\r" not in html and html.decode("utf-8") == build_stage_document(stage, ir, lib, state).html
+        _assert_clean(html.decode("utf-8"), tmp_path)
     assert ir.content_hash() == before and len(ir.validation.results) == n_results and ir.artifacts == artifacts
     assert not any(Path(a.path).parent.name == REPORTS_DIR for a in ir.artifacts.values())
     assert REPORTS_DIR not in json.dumps(ir.design_dict()) and "보고서" not in json.dumps(ir.design_dict(), ensure_ascii=False)
     again = write_all_stage_reports(ir, lib, state, workdir)
-    assert again == paths and [p.read_bytes() for p in paths] == [build_stage_report(s, ir, lib, state).encode("utf-8") for s in STAGE_REPORTS]
+    assert again == results and [p.read_bytes() for p in paths] == [build_stage_report(s, ir, lib, state).encode("utf-8") for s in STAGE_REPORTS]
     elsewhere = write_all_stage_reports(ir, lib, state, workdir, reports_dir=tmp_path / "elsewhere")
-    assert [p.parent for p in elsewhere] == [tmp_path / "elsewhere"] * 4 and [p.read_bytes() for p in elsewhere] == [p.read_bytes() for p in paths]
+    assert [r.markdown.parent for r in elsewhere] == [tmp_path / "elsewhere"] * 4 and [r.markdown.read_bytes() for r in elsewhere] == [p.read_bytes() for p in paths]
+    assert [r.html.read_bytes() for r in elsewhere] == [r.html.read_bytes() for r in results]
 
 
 def _cli_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str = "demo") -> Path:
@@ -548,14 +581,23 @@ def test_cli_run_writes_the_four_reports_and_stage_reports_rewrites_them(tmp_pat
     code, out, err = _cli("run", str(ir_path), *_answers({CONFIRM_DESIGN_KEY: "yes"}))
     assert code == 0, err
     lines = [ln for ln in out.splitlines() if "report written:" in ln]
-    assert lines == [f"  report written: {REPORTS_DIR}/{name}" for name in STAGE_REPORTS.values()]
+    names = list(STAGE_REPORTS.values())
+    # three progress views as their stages complete, then all four re-written after RELEASE with the full record; no browser in tests
+    assert lines == [f"  report written: {REPORTS_DIR}/{name} (+ .html; pdf not produced: {NO_BROWSER_REASON})" for name in names[:3] + names]
     assert all(ln.startswith(" ") for ln in lines)  # never mistaken for a stage line (first word = stage)
     summary = next(ln for ln in out.splitlines() if "stage reports:" in ln)
     assert summary.startswith("  stage reports: ") and all(f"{REPORTS_DIR}/{name}" in summary for name in STAGE_REPORTS.values())
-    assert sorted(p.name for p in reports.iterdir()) == sorted(STAGE_REPORTS.values())
+    assert summary.count(f"{REPORTS_DIR}/{names[0]}") == 1  # each report named once, although it was written twice
+    assert sorted(p.name for p in reports.iterdir()) == sorted(_report_files(names))
     run_time = {name: (reports / name).read_bytes() for name in STAGE_REPORTS.values()}
     for raw in run_time.values():
         _assert_clean(raw.decode("utf-8"), tmp_path)
+    for name in STAGE_REPORTS.values():
+        html = (reports / name).with_suffix(".html").read_text(encoding="utf-8")
+        _assert_clean(html, tmp_path)
+        # the written pages embed their figures: the theory, circuit and final reports carry <svg>, the parts report none
+        assert ("<svg" in html) == ("<figure>" in html) == (name != STAGE_REPORTS[Stage.COMPONENT_SELECTION]), name
+        assert "![fig]" not in html and MISSING_FIGURE not in html
     # the reports are not artifacts and the IR hash the run recorded is the hash of the saved IR
     ir = CircuitIR.load(ir_path)
     record = load_pipeline_record(tmp_path / "demo").record
@@ -565,7 +607,9 @@ def test_cli_run_writes_the_four_reports_and_stage_reports_rewrites_them(tmp_pat
     html = render_report_file(ir_path).read_text(encoding="utf-8")
     assert "<h2>Stage reports</h2>" in html
     for name in STAGE_REPORTS.values():
-        assert f'<a href="{REPORTS_DIR}/{name}">{name}</a>' in html
+        stem = name.removesuffix(".md")
+        assert f'<a href="{REPORTS_DIR}/{name}">{name}</a> · <a href="{REPORTS_DIR}/{stem}.html">html</a><span class="note">' in html
+        assert f"{stem}.pdf" not in html  # no PDF was written, so no link to one
     # stage-reports re-writes all four from ir.json + pipeline.json: the final report is byte-identical to the run-time file
     # (same IR, same outcomes), the earlier ones were written from earlier states and only need to exist
     ir_bytes, record_bytes = ir_path.read_bytes(), (tmp_path / "demo" / PIPELINE_FILE).read_bytes()
@@ -573,14 +617,14 @@ def test_cli_run_writes_the_four_reports_and_stage_reports_rewrites_them(tmp_pat
         (reports / name).unlink()
     code, out, err = _cli("stage-reports", str(ir_path))
     assert code == 0 and err == "", err
-    assert out.splitlines() == [f"wrote {reports / name}" for name in STAGE_REPORTS.values()]
+    assert out.splitlines() == [f"wrote {reports / name} (+ .html; pdf not produced: {NO_BROWSER_REASON})" for name in STAGE_REPORTS.values()]
     assert (reports / STAGE_REPORTS[Stage.RELEASE]).read_bytes() == run_time[STAGE_REPORTS[Stage.RELEASE]]
     for name in STAGE_REPORTS.values():
-        assert (reports / name).is_file()
+        assert (reports / name).is_file() and (reports / name).with_suffix(".html").is_file()
     assert ir_path.read_bytes() == ir_bytes and (tmp_path / "demo" / PIPELINE_FILE).read_bytes() == record_bytes  # nothing is saved
     # --dir puts the files elsewhere; a missing ir.json is a usage error (exit 2, never 1)
     code, out, _ = _cli("stage-reports", str(ir_path), "--dir", str(tmp_path / "other"))
-    assert code == 0 and sorted(p.name for p in (tmp_path / "other").iterdir()) == sorted(STAGE_REPORTS.values())
+    assert code == 0 and sorted(p.name for p in (tmp_path / "other").iterdir()) == sorted(_report_files(names))
     assert (tmp_path / "other" / STAGE_REPORTS[Stage.RELEASE]).read_bytes() == run_time[STAGE_REPORTS[Stage.RELEASE]]
     code, out, err = _cli("stage-reports", str(tmp_path / "missing.json"))
     assert code == 2 and "missing.json" in err and out == ""
@@ -608,7 +652,7 @@ def test_a_raising_builder_never_breaks_the_run(tmp_path: Path, monkeypatch: pyt
     ir_path = _cli_project(tmp_path, monkeypatch)
     _cli("run", str(ir_path), *_answers({**BASE, **ASTABLE}))
 
-    def boom(ir, record):
+    def boom(ir, record, *, figures=None):
         raise RuntimeError("builder defect")
 
     monkeypatch.setattr("ai_eda.report.stages.final_report", boom)
@@ -616,8 +660,10 @@ def test_a_raising_builder_never_breaks_the_run(tmp_path: Path, monkeypatch: pyt
     assert code == 0, err  # the run's own outcome (NOT_VERIFIED without kicad-cli) is untouched
     assert f"  could not write {REPORTS_DIR}/{STAGE_REPORTS[Stage.RELEASE]}: RuntimeError: builder defect" in err
     reports = tmp_path / "demo" / REPORTS_DIR
-    assert sorted(p.name for p in reports.iterdir()) == sorted(name for stage, name in STAGE_REPORTS.items() if stage is not Stage.RELEASE)
-    assert [ln for ln in out.splitlines() if "report written:" in ln] == [f"  report written: {REPORTS_DIR}/{name}" for stage, name in STAGE_REPORTS.items() if stage is not Stage.RELEASE]
+    others = [name for stage, name in STAGE_REPORTS.items() if stage is not Stage.RELEASE]
+    assert sorted(p.name for p in reports.iterdir()) == sorted(_report_files(others))
+    written = [ln for ln in out.splitlines() if "report written:" in ln]
+    assert written == [f"  report written: {REPORTS_DIR}/{name} (+ .html; pdf not produced: {NO_BROWSER_REASON})" for name in others + others]
     record = load_pipeline_record(tmp_path / "demo").record
     assert record.aborted is None and record.state.outcomes[-1].stage is Stage.RELEASE and not record.state.blocked
     assert "release" in {ln.split()[0] for ln in out.splitlines() if ln and not ln.startswith(" ")}
@@ -847,4 +893,297 @@ def test_cli_runs_ignore_a_kicad_cli_on_path(tmp_path: Path, monkeypatch: pytest
     assert code == 0, err
     stages = {ln.split()[0]: ln for ln in out.splitlines() if ln and not ln.startswith(" ")}
     assert "kicad-cli not available" in stages["erc"] and "kicad-cli not available" in stages["drc"] and "NOT_VERIFIED" in stages["release"]
-    assert sorted(p.name for p in (tmp_path / "demo" / REPORTS_DIR).iterdir()) == sorted(STAGE_REPORTS.values())
+    assert sorted(p.name for p in (tmp_path / "demo" / REPORTS_DIR).iterdir()) == sorted(_report_files(list(STAGE_REPORTS.values())))
+
+
+# --------------------------------------------------------------------------- figures, HTML and PDF
+
+
+def _figure_ids(md: str) -> list[str]:
+    """The figure ids of the placeholder lines of a report, in order."""
+    return re.findall(r"^!\[fig\]\(fig:([^\s()]+)\)$", md, flags=re.M)
+
+
+def _caption_after(md: str, fig_id: str) -> str:
+    """The italic caption line that follows the placeholder of ``fig_id``."""
+    after = md[md.index(f"![fig](fig:{fig_id})"):].splitlines()
+    assert after[1] == "" and after[2].startswith("*") and after[2].endswith("*") and after[2].count("*") == 2
+    return after[2]
+
+
+THEORY_FIGURE_IDS = {"astable": ["theory_vb_t", "theory_f_vs_c"], "divider": ["theory_vout_r1"], "led": ["theory_i_r"], "rc_lowpass": ["theory_h_f"]}
+
+
+@pytest.mark.parametrize(("name", "answers"), [("astable", ASTABLE), ("divider", DIVIDER), ("led", LED), ("rc_lowpass", RC)])
+def test_template_theory_figures_are_valid_deterministic_and_read_only_the_ir(tmp_path: Path, name: str, answers: dict[str, str]):
+    ir, _lib = _build(tmp_path, name, answers)
+    template = template_for(ir)
+    before = ir.content_hash()
+    figures = template.theory_figures(ir)
+    assert [f.id for f in figures] == THEORY_FIGURE_IDS[name]
+    for f in figures:
+        ET.fromstring(f.svg)  # valid XML
+        assert f.caption.endswith("이론 곡선이며 시뮬레이션 결과가 아닙니다.") and "*" not in f.caption and "\n" not in f.caption
+        assert 'class="marker"' in f.svg and ("설계점" in f.svg or "코너" in f.svg or "T_half" in f.svg)
+    assert [f.svg for f in template.theory_figures(ir)] == [f.svg for f in figures]  # deterministic
+    assert ir.content_hash() == before
+    # every number is the IR's: removing a parameter removes the curve instead of guessing
+    for key in ("c", "r1", "r_led", "h_fc"):
+        ir.parameters.pop(key, None)
+    assert template.theory_figures(ir) == []
+
+
+def test_astable_theory_figures_carry_the_design_numbers_and_name_equation_1(astable):
+    ir, _lib = astable
+    vb_t, f_vs_c = template_for(ir).theory_figures(ir)
+    c = quantity(ir.parameters["c"].value, "F")
+    assert "(식 1)" in vb_t.caption and f"C = {c}" in vb_t.caption and "V_cc = 5 V" in vb_t.caption and "V_BE = 0.7 V" in vb_t.caption
+    assert ">T_half = 500 µs<" in vb_t.svg and "V_BE = 0.7 V (스위칭 문턱)" in vb_t.svg and 'class="guide"' in vb_t.svg
+    assert f_vs_c.caption.startswith("(식 1) f = 1/(2·R_b·C·ln((2·V_cc − V_BE)/(V_cc − V_BE)))") and f"C = {c}" in f_vs_c.caption
+    assert 'data-name="f(C) (식 1)"' in f_vs_c.svg and "유효 범위 100 Hz … 20 kHz" in f_vs_c.svg and 'class="band"' in f_vs_c.svg
+    assert f"설계점 C = {c}, f = 1 kHz" in f_vs_c.svg
+    assert template_for(ir).theory_figure_vectors() == ("v(OUT)", "v(Q1_B)", "v(Q2_B)")
+
+
+def test_divider_led_rc_theory_figures_mark_their_design_points(tmp_path: Path):
+    ir, _lib = _build(tmp_path, "divider", DIVIDER)
+    (fig,) = template_for(ir).theory_figures(ir)
+    assert "V_out = V_in·R2/(R1+R2)" in fig.caption and "설계점 R1 = 14 kΩ, V_out = 5 V" in fig.svg and "목표 V_out = 5 V" in fig.svg
+    ir, _lib = _build(tmp_path, "led", LED)
+    (fig,) = template_for(ir).theory_figures(ir)
+    assert "I = (V_in − V_f)/R" in fig.caption and "설계점 R = 300 Ω, I = 10 mA" in fig.svg and "요구 I_f = 10 mA" in fig.svg
+    ir, _lib = _build(tmp_path, "rc_lowpass", RC)
+    (fig,) = template_for(ir).theory_figures(ir)
+    assert "|H(f)| = 1/√(1 + (f/f_c)²)" in fig.caption and "코너 f_c = 1 kHz, |H| = 0.70711" in fig.svg and "10 Hz … 100 kHz" in fig.caption
+
+
+def test_theory_report_embeds_the_template_curves_and_says_when_the_waveform_is_missing(astable, tmp_path: Path):
+    ir, lib = astable
+    md = theory_report(ir, lib)
+    assert _figure_ids(md) == ["theory_vb_t", "theory_f_vs_c"] and "## 이론 그림" in md
+    assert f"{NO_WAVEFORM} (waveform figure; no tool-backed spice result attached)." in md and "### 측정 파형" in md
+    caption = _caption_after(md, "theory_vb_t")
+    assert caption.startswith("*베이스 전압 회복 v_B(t) — 반주기의 유도 — ") and "(식 1)" in caption
+    doc = build_stage_document(Stage.ARCHITECTURE, ir, lib, None)
+    assert doc.markdown == md and doc.title == "이론 보고서: astable" and f"<title>{doc.title}</title>" in doc.html
+    assert doc.html.count("<figure>") == 2 and doc.html.count('<svg xmlns="http://www.w3.org/2000/svg"') == 2
+    assert "![fig]" not in doc.html and MISSING_FIGURE not in doc.html
+    # the caption appears once, as the <figcaption> (code spans rendered), never a second time as an italic paragraph
+    for fig_id in ("theory_vb_t", "theory_f_vs_c"):
+        rendered = _inline(_caption_after(md, fig_id)[1:-1])
+        assert doc.html.count(rendered) == 1 and f"<figcaption>{rendered}</figcaption>" in doc.html, fig_id
+    assert "<p><em>" not in doc.html and "`" not in doc.html.split("<figcaption>", 1)[1].split("</figcaption>", 1)[0]
+    assert "<figcaption>베이스 전압 회복 v_B(t) — 반주기의 유도 — " in doc.html and NO_WAVEFORM in doc.html
+    assert doc.html == build_stage_document(Stage.ARCHITECTURE, ir, lib, None).html
+    _assert_clean(doc.html, tmp_path)
+
+
+def test_parts_report_says_it_has_no_chart(astable):
+    ir, lib = astable
+    md = parts_report(ir, lib)
+    assert NO_CHART_IN_PARTS in md and "![fig]" not in md
+    doc = build_stage_document(Stage.COMPONENT_SELECTION, ir, lib, None)
+    assert doc.figures.figures == {} and "<figure>" not in doc.html and "<svg" not in doc.html
+
+
+def test_circuit_report_figures_placement_board_and_copper_bars(astable_release, tmp_path: Path):
+    ir, lib, state = astable_release
+    doc = build_stage_document(Stage.PCB, ir, lib, state)
+    assert _figure_ids(doc.markdown) == ["placement", "board", "copper_bars"] and doc.html.count("<figure>") == 3
+    placement, board, bars = (doc.figures.figures[k].svg for k in ("placement", "board", "copper_bars"))
+    n_pads = sum(len(lib.load_footprint(c.footprint).pads) for c in ir.components)
+    assert placement.count('class="pad"') == n_pads and placement.count('class="track"') == 0 and placement.count('class="via"') == 0
+    assert board.count('class="pad"') == n_pads and board.count('class="track"') == len(ir.pcb.tracks) and board.count('class="via"') == len(ir.pcb.vias)
+    stats = net_routing_stats(ir)
+    assert bars.count('class="bar"') == len(stats) and all(f'data-label="{s["net"]}"' in bars for s in stats)
+    assert _caption_after(doc.markdown, "board").startswith("*astable: 보드 그림 (동박 포함) — ")
+    _assert_clean(doc.html, tmp_path)
+    # without a library the board figures are one sentence each; the copper bars need no library
+    md = circuit_report(ir, None, state)
+    assert md.count(NO_LIBRARY_FIGURE) == 2 and "fig:placement" not in md and "fig:board" not in md and "![fig](fig:copper_bars)" in md
+
+
+def test_final_report_tolerance_figure_without_measurements(astable_release, tmp_path: Path):
+    ir, lib, state = astable_release
+    doc = build_stage_document(Stage.RELEASE, ir, lib, state)
+    assert _figure_ids(doc.markdown) == ["tolerance"] and NO_WAVEFORM in doc.markdown and "### 측정 파형" in doc.markdown
+    svg = doc.figures.figures["tolerance"].svg
+    assert svg.count('class="row"') == 3 and svg.count(NO_MEASUREMENT) == 3 and 'class="marker"' not in svg
+    assert 'data-label="f_osc"' in svg and 'data-label="out_high"' in svg and 'data-label="out_low"' in svg
+    assert doc.markdown.index("| `f_osc` |") < doc.markdown.index("![fig](fig:tolerance)")  # the outcome table stays a table, the chart follows it
+    assert doc.html.count("<figure>") == 1 and doc.html.count("<svg") == 1 and svg in doc.html and "![fig]" not in doc.html and MISSING_FIGURE not in doc.html
+    _assert_clean(doc.html, tmp_path)
+
+
+def test_routed_board_with_a_footprint_missing_from_the_library_says_so_in_both_slots(tmp_path: Path):
+    """The placement figure failing (a footprint not in the library) leaves the routed board's slot without a figure too: both slots get the sentence, the copper bars stay."""
+    from tests.test_report_figures import _board
+
+    ir, lib = _board(tmp_path)
+    assert ir.pcb.tracks and ir.pcb.vias
+    ir.component("R1").footprint = LibraryRef(library="Nope", name="Missing")
+    figures = stages_module.stage_figures(Stage.PCB, ir, lib)
+    assert sorted(figures.slots) == ["copper_bars"] and sorted(figures.missing) == ["board", "placement"]
+    reason = "보드 그림을 그릴 수 없습니다 (footprint Nope:Missing of 'R1' was not found in a KiCad library; refusing to guess its pads)."
+    assert figures.missing["placement"] == reason and figures.missing["board"] == reason
+    md = circuit_report(ir, lib, None)
+    placement_section = md.split("## 배치", 1)[1].split("## 배선", 1)[0]
+    routing_section = md.split("## 배선", 1)[1]
+    assert reason in placement_section and reason in routing_section and md.count(reason) == 2
+    assert "fig:placement" not in md and "fig:board" not in md and "![fig](fig:copper_bars)" in routing_section
+    assert routing_section.index(reason) < routing_section.index("![fig](fig:copper_bars)")
+    # an unrouted board with the same missing footprint keeps its own board sentence
+    ir.pcb.tracks, ir.pcb.vias = [], []
+    figures = stages_module.stage_figures(Stage.PCB, ir, lib)
+    assert figures.missing["placement"] == reason and figures.missing["board"] == f"{NO_BOARD_FIGURE}: IR 에 트랙·비아가 없습니다."
+
+
+def _fake_run(vectors: dict[str, list[float]], *, kind: str = "tran", succeeded: bool = True):
+    """A stand-in for ``fresh_spice_run``'s result: only ``.data`` (a results.json) is read by the waveform builder."""
+    class Run:
+        data = {
+            "format": "2", "engine": "test",
+            "analyses": {"tran": {"kind": kind, "command": "tran 5u 20m 10m uic", "result": {"succeeded": succeeded, "scale": "time", "vectors": vectors, "vector_types": {k: ("time" if k == "time" else "voltage") for k in vectors}, "n_points": len(vectors["time"])}}},
+        }
+
+    return Run()
+
+
+def test_a_template_hint_vector_absent_from_the_run_keeps_the_waveform_and_is_named(astable, monkeypatch: pytest.MonkeyPatch):
+    """The astable hints v(OUT), v(Q1_B), v(Q2_B); a run without q1_b (a renamed net) still draws the expectations' vector and the present hint, and says which hint is missing."""
+    ir, lib = astable
+    t = [0.01 + i * 1e-5 for i in range(1000)]
+    vectors = {"time": t, "out": [5.0 if (i // 50) % 2 else 0.0 for i in range(1000)], "q2_b": [0.7 - i * 1e-4 for i in range(1000)]}
+    assert template_for(ir).theory_figure_vectors() == ("v(OUT)", "v(Q1_B)", "v(Q2_B)")
+    monkeypatch.setattr(stages_module, "fresh_spice_run", lambda ir, *, needs: _fake_run(vectors))
+    figures = stages_module.stage_figures(Stage.ARCHITECTURE, ir, lib)
+    assert figures.slots["waveform"] == ["waveform"]
+    assert re.findall(r'data-name="([^"]+)"', figures.figures["waveform"].svg) == ["v(OUT)", "v(Q2_B)"]
+    assert figures.missing["waveform"] == "해석 `tran` 의 기록에 템플릿이 함께 그리려던 벡터 `v(Q1_B)` 이(가) 없어 기대값 벡터와 나머지 벡터만 그렸습니다."
+    md = theory_report(ir, lib)
+    section = md.split("### 측정 파형", 1)[1]
+    assert section.index("![fig](fig:waveform)") < section.index(figures.missing["waveform"]) and NO_WAVEFORM not in md
+    # both hints absent: the expectations' vector alone, both named
+    monkeypatch.setattr(stages_module, "fresh_spice_run", lambda ir, *, needs: _fake_run({"time": t, "out": vectors["out"]}))
+    figures = stages_module.stage_figures(Stage.ARCHITECTURE, ir, lib)
+    assert re.findall(r'data-name="([^"]+)"', figures.figures["waveform"].svg) == ["v(OUT)"]
+    assert figures.missing["waveform"] == "해석 `tran` 의 기록에 템플릿이 함께 그리려던 벡터 `v(Q1_B)`, `v(Q2_B)` 이(가) 없어 기대값 벡터만 그렸습니다."
+    # the expectations' own vector missing is still the reason the slot has no figure
+    monkeypatch.setattr(stages_module, "fresh_spice_run", lambda ir, *, needs: _fake_run({"time": t, "q1_b": vectors["q2_b"], "q2_b": vectors["q2_b"]}))
+    figures = stages_module.stage_figures(Stage.ARCHITECTURE, ir, lib)
+    assert "waveform" not in figures.slots and figures.missing["waveform"].startswith("파형 그림이 없습니다: 해석 `tran` 의 파형을 그릴 수 없습니다 (vector 'v(OUT)' is not in analysis 'tran'")
+
+
+@needs_dll
+def test_waveform_figure_comes_from_the_fresh_spice_run(tmp_path: Path):
+    ir, lib, state = _release(tmp_path, "astable", ASTABLE, spice=True)
+    theory = build_stage_document(Stage.ARCHITECTURE, ir, lib, state)
+    final = build_stage_document(Stage.RELEASE, ir, lib, state)
+    assert _figure_ids(theory.markdown) == ["theory_vb_t", "theory_f_vs_c", "waveform"] and _figure_ids(final.markdown) == ["tolerance", "waveform"]
+    wave = theory.figures.figures["waveform"]
+    assert wave.svg == final.figures.figures["waveform"].svg and NO_WAVEFORM not in theory.markdown and NO_WAVEFORM not in final.markdown
+    assert re.findall(r'data-name="([^"]+)"', wave.svg) == ["v(OUT)", "v(Q1_B)", "v(Q2_B)"]  # the expectations' vector, then the template's hint
+    assert "해석 `tran`" in wave.caption and "ngspice 가 기록한 그대로" in wave.caption and "waveform_i" not in theory.figures.figures  # no branch current asked for
+    tolerance = final.figures.figures["tolerance"].svg
+    assert tolerance.count('class="marker"') == 3 and NO_MEASUREMENT not in tolerance
+    for e in ir.simulation.expectations:
+        assert f'data-label="{e.id}" data-status="{ir.validation.latest(f"spice.{e.id}").status}"' in tolerance
+    for doc in (theory, final):
+        assert doc.html.count("<figure>") == len(doc.figures.figures) and "![fig]" not in doc.html
+        _assert_clean(doc.html, tmp_path)
+    # the run is evidence about the current IR only: a design change makes it stale and the sentence comes back
+    ir.parameters["extra"] = Traced(value=1.0, unit="V", provenance=Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="test"))
+    stale = theory_report(ir, lib)
+    assert "fig:waveform" not in stale and NO_WAVEFORM in stale and "different IR version" in stale
+
+
+def test_write_stage_report_without_a_browser_or_with_no_pdf_leaves_no_pdf(astable_release, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    ir, lib, state = astable_release
+    stale = tmp_path / "out" / REPORTS_DIR / STAGE_REPORTS[Stage.PCB].replace(".md", ".pdf")
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"%PDF-1.4 stale")
+    result = write_stage_report(Stage.PCB, ir, lib, state, tmp_path / "out")  # conftest: no browser is discovered
+    assert result.pdf is None and result.pdf_reason == NO_BROWSER_REASON and not stale.exists() and result.summary() == f"(+ .html; pdf not produced: {NO_BROWSER_REASON})"
+    assert result.paths == [result.markdown, result.html] and result.figure_ids == ("placement", "board", "copper_bars")
+    stale.write_bytes(b"%PDF-1.4 stale")
+    result = write_stage_report(Stage.PCB, ir, lib, state, tmp_path / "out", pdf=False)
+    assert result.pdf is None and result.pdf_reason == PDF_NOT_REQUESTED and not stale.exists()
+    # an explicit browser that fails to print: the reason is its failure, and no PDF is left behind
+    fake = _fake_browser(tmp_path / "bin", "chromium-exit-1", "import sys\nsys.stderr.write('boom\\n')\nsys.exit(1)\n")
+    result = write_stage_report(Stage.PCB, ir, lib, state, tmp_path / "out", browser=fake)
+    assert result.pdf is None and result.pdf_reason == "exit code 1: boom" and not stale.exists()
+
+
+FAKE_BROWSER = """import sys
+from pathlib import Path
+for a in sys.argv[1:]:
+    if a.startswith("--print-to-pdf="):
+        Path(a[len("--print-to-pdf="):]).write_bytes(b"%PDF-1.4\\n%fake\\n" + b"0" * 2000)
+"""
+
+
+def _fake_browser(folder: Path, name: str, body: str) -> Path:
+    """A stand-in browser: a Python script run through this interpreter (a .cmd wrapper on Windows, a shebang elsewhere)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    script = folder / f"{name}.py"
+    script.write_text(body, encoding="utf-8")
+    if sys.platform == "win32":
+        wrapper = folder / f"{name}.cmd"
+        wrapper.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+        return wrapper
+    exe = folder / name
+    exe.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return exe
+
+
+def test_cli_stage_reports_pdf_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    ir_path = _cli_project(tmp_path, monkeypatch)
+    reports = tmp_path / "demo" / REPORTS_DIR
+    _cli("run", str(ir_path), *_answers({**BASE, **ASTABLE}))
+    code, _out, err = _cli("run", str(ir_path), *_answers({CONFIRM_DESIGN_KEY: "yes"}))
+    assert code == 0, err
+    names = list(STAGE_REPORTS.values())
+    fake = _fake_browser(tmp_path / "bin", "chromium", FAKE_BROWSER)
+    # --browser PATH prints every report with that browser; report.html then links .md, .html and .pdf
+    code, out, err = _cli("stage-reports", str(ir_path), "--browser", str(fake))
+    assert code == 0 and err == "", err
+    assert out.splitlines() == [f"wrote {reports / name} (+ .html, .pdf)" for name in names]
+    for name in names:
+        pdf = (reports / name).with_suffix(".pdf")
+        assert pdf.read_bytes().startswith(b"%PDF-1.4") and pdf.stat().st_size > 2000
+    html = render_report_file(ir_path).read_text(encoding="utf-8")
+    for name in names:
+        stem = name.removesuffix(".md")
+        assert f'<a href="{REPORTS_DIR}/{name}">{name}</a> · <a href="{REPORTS_DIR}/{stem}.html">html</a> · <a href="{REPORTS_DIR}/{stem}.pdf">pdf</a>' in html
+    # --no-pdf writes none and removes the PDFs of the earlier write (a PDF beside the .md always belongs to it)
+    code, out, err = _cli("stage-reports", str(ir_path), "--no-pdf")
+    assert code == 0 and out.splitlines() == [f"wrote {reports / name} (+ .html; pdf not produced: {PDF_NOT_REQUESTED})" for name in names]
+    assert sorted(p.name for p in reports.iterdir()) == sorted(_report_files(names))
+    # a --browser that is not a file is a usage error (exit 2, nothing written)
+    (reports / names[0]).unlink()
+    code, out, err = _cli("stage-reports", str(ir_path), "--browser", str(tmp_path / "missing-browser"))
+    assert code == 2 and "missing-browser" in err and out == "" and not (reports / names[0]).exists()
+    # ai-eda run takes the same flags: --browser prints as the run goes, seven writes
+    code, out, err = _cli("run", str(ir_path), "--browser", str(fake))
+    assert code == 0, err
+    assert [ln for ln in out.splitlines() if "report written:" in ln] == [f"  report written: {REPORTS_DIR}/{name} (+ .html, .pdf)" for name in names[:3] + names]
+    assert all((reports / name).with_suffix(".pdf").is_file() for name in names)
+    code, out, err = _cli("run", str(ir_path), "--no-pdf")
+    assert code == 0 and not any((reports / name).with_suffix(".pdf").exists() for name in names), err
+
+
+@pytest.mark.browser
+@pytest.mark.skipif(find_browser() is None, reason="no headless Chromium / Chrome / Edge found")
+def test_stage_reports_are_printed_to_pdf_by_the_real_browser(astable_release, tmp_path: Path):
+    ir, lib, state = astable_release
+    before, artifacts = ir.content_hash(), dict(ir.artifacts)
+    results = write_all_stage_reports(ir, lib, state, tmp_path / "out")
+    assert [r.stage for r in results] == list(STAGE_REPORTS)
+    for r in results:
+        assert r.pdf == r.markdown.with_suffix(".pdf") and r.pdf_reason is None and r.summary() == "(+ .html, .pdf)"
+        raw = r.pdf.read_bytes()
+        assert raw.startswith(b"%PDF-") and len(raw) > 1024
+    assert ir.content_hash() == before and ir.artifacts == artifacts
+    stems = {Path(name).stem for name in STAGE_REPORTS.values()}
+    assert not any(Path(a.path).stem in stems for a in ir.artifacts.values())  # no report (.md / .html / .pdf) is an artifact

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ai_eda.ir import (
     AnalysisSpec,
@@ -116,6 +117,9 @@ from ai_eda.design.base import (
 )
 from ai_eda.design.inputs import KEY_ALIASES, UNIT_OF, DesignInput, read_inputs, read_value
 from ai_eda.design.library_parts import TemplateRefusal, library_component, pin_by_name, require_pins, two_terminals
+
+if TYPE_CHECKING:  # imported lazily in _curve_figure: the report package imports this one
+    from ai_eda.report.figures import Figure
 
 RESISTOR = (("Device", "R"), ("Resistor_SMD", "R_0603_1608Metric"))
 CAPACITOR = (("Device", "C"), ("Capacitor_SMD", "C_0603_1608Metric"))
@@ -192,6 +196,53 @@ def _sub(a: float | None, b: float | None) -> float | None:
 
 def _add(a: float | None, b: float | None) -> float | None:
     return None if a is None or b is None else a + b
+
+
+def _log_grid(lo: float, hi: float, n: int = 200) -> list[float]:
+    """``n`` log-spaced points from ``lo`` to ``hi`` inclusive (both positive) for a curve on a log axis."""
+    return [lo * (hi / lo) ** (k / (n - 1)) for k in range(n)]
+
+
+def _lin_grid(lo: float, hi: float, n: int = 200) -> list[float]:
+    """``n`` evenly spaced points from ``lo`` to ``hi`` inclusive."""
+    return [lo + (hi - lo) * k / (n - 1) for k in range(n)]
+
+
+def _curve_figure(
+    fig_id: str,
+    title: str,
+    caption: str,
+    series: list[tuple[str, list[float], list[float]]],
+    *,
+    x_label: str,
+    y_label: str,
+    log_x: bool = False,
+    log_y: bool = False,
+    bands: list[tuple[str, float, float, str]] | None = None,
+    markers: list[tuple[float, float, str]] | None = None,
+) -> Figure:
+    """One theory curve as a :class:`~ai_eda.report.figures.Figure` (a view for the theory report).
+
+    ``series`` are ``(name, xs, ys)``, ``bands`` ``(axis, lo, hi, label)`` (a
+    band with ``lo == hi`` is a labelled guide line), ``markers`` ``(x, y,
+    label)``. The figure module is imported here, not at the top: the report
+    package imports this one (``stages`` reads ``TEMPLATES``), and a top-level
+    import would close that cycle.
+    """
+    from ai_eda.report.figures import Band, Figure, Marker, Series, svg_line_chart
+
+    svg = svg_line_chart(
+        [Series(name, xs, ys) for name, xs, ys in series],
+        title=title, x_label=x_label, y_label=y_label, log_x=log_x, log_y=log_y,
+        bands=[Band(axis, lo, hi, label) for axis, lo, hi, label in (bands or [])],
+        markers=[Marker(x, y, label) for x, y, label in (markers or [])],
+        clip_id=fig_id,  # the figure id is unique per report, so several curves on one page never share a clip path
+    )
+    return Figure(fig_id, title, caption, svg)
+
+
+#: what every theory-curve caption ends with: the curve is the formula, not a measurement
+THEORY_CURVE_NOTE = "이론 곡선이며 시뮬레이션 결과가 아닙니다."
 
 
 def _model_card_text(ir: CircuitIR) -> str:
@@ -451,6 +502,24 @@ class DividerTemplate(Template):
             )),
         ]
 
+    def theory_figures(self, ir: CircuitIR) -> list[Figure]:
+        """V_out against R1 for the chosen R2 (log R1 axis) with the design point and the target output as a guide line."""
+        v_in, v_target, r1, r2, v_out = (parameter_value(ir, k) for k in ("v_in", "v_out_target", "r1", "r2", "v_out"))
+        if not _known(v_in, r1, r2, v_out) or r1 <= 0 or r2 <= 0:
+            return []
+        xs = _log_grid(min(r2 / 10.0, r1 / 2.0), max(r2 * 10.0, r1 * 2.0))
+        ys = [v_in * r2 / (x + r2) for x in xs]
+        bands = [("y", v_target, v_target, f"목표 V_out = {quantity(v_target, 'V')}")] if v_target is not None else []
+        caption = (
+            f"'동작 원리' 절의 식 V_out = V_in·R2/(R1+R2) 을 이 설계의 V_in = {quantity(v_in, 'V')}, R2 = {quantity(r2, 'ohm')} 로 R1 에 대해 그린 것(가로축 로그). "
+            f"점 = 설계점 R1 = {quantity(r1, 'ohm')} (`calc.divider.r1_for_v_out`), V_out = {quantity(v_out, 'V')} (`calc.divider.v_out`); 안내선 = 목표 출력 전압. {THEORY_CURVE_NOTE}"
+        )
+        return [_curve_figure(
+            "theory_vout_r1", f"출력 전압 대 R1 (R2 = {quantity(r2, 'ohm')})", caption, [("V_out(R1)", xs, ys)],
+            x_label="R1 (Ω)", y_label="V_out (V)", log_x=True, bands=bands,
+            markers=[(r1, v_out, f"설계점 R1 = {quantity(r1, 'ohm')}, V_out = {quantity(v_out, 'V')}")],
+        )]
+
     def part_notes(self, ir: CircuitIR) -> dict[str, PartNote]:
         v_in, v_out, r1, r2, tol = (parameter_value(ir, k) for k in ("v_in", "v_out", "r1", "r2", "tol_rel"))
         i = _div(v_in, _add(r1, r2))
@@ -584,6 +653,23 @@ class LedTemplate(Template):
                 f"동작점(op) 해석에서 i(VLED) 를 읽어 공칭값 {quantity(i_led, 'A')} 과 비교합니다.\n\n    {_judging_line(i_led, 'A', tol_rel=tol)}"
             )),
         ]
+
+    def theory_figures(self, ir: CircuitIR) -> list[Figure]:
+        """LED current against the series resistor (log R axis) with the design point and the required forward current as a guide line."""
+        v_in, v_f, i_f, r, i_led = (parameter_value(ir, k) for k in ("v_in", "v_f", "i_f", "r_led", "i_led"))
+        if not _known(v_in, v_f, r, i_led) or r <= 0:
+            return []
+        xs = _log_grid(r / 4.0, r * 4.0)
+        ys = [(v_in - v_f) / x for x in xs]
+        bands = [("y", i_f, i_f, f"요구 I_f = {quantity(i_f, 'A')}")] if i_f is not None else []
+        caption = (
+            f"'동작 원리와 식' 절의 식 I = (V_in − V_f)/R (`calc.led.I`) 을 이 설계의 V_in = {quantity(v_in, 'V')}, V_f = {quantity(v_f, 'V')} 로 R 에 대해 그린 것(가로축 로그). "
+            f"점 = 설계점 R = {quantity(r, 'ohm')} (`calc.led.R`), I = {quantity(i_led, 'A')}; 안내선 = 요구 순방향 전류. 이상적 정전압 강하 모델의 {THEORY_CURVE_NOTE}"
+        )
+        return [_curve_figure(
+            "theory_i_r", "LED 전류 대 직렬 저항", caption, [("I(R)", xs, ys)], x_label="직렬 저항 R (Ω)", y_label="LED 전류 I (A)", log_x=True, bands=bands,
+            markers=[(r, i_led, f"설계점 R = {quantity(r, 'ohm')}, I = {quantity(i_led, 'A')}")],
+        )]
 
     def part_notes(self, ir: CircuitIR) -> dict[str, PartNote]:
         v_in, v_f, i_f, r, i_led, tol = (parameter_value(ir, k) for k in ("v_in", "v_f", "i_f", "r_led", "i_led", "tol_rel"))
@@ -757,6 +843,25 @@ class RcLowpassTemplate(Template):
                 "허용치 2 % 는 100 점/decade 격자 사이의 보간 오차를 덮기 위한 선택값입니다."
             )),
         ]
+
+    def theory_figures(self, ir: CircuitIR) -> list[Figure]:
+        """|H(f)| over the ac sweep range (log f axis) with the corner marked and the −3 dB level as a guide line."""
+        f_c, c, r, h_fc, f_start, f_stop = (parameter_value(ir, k) for k in ("f_c", "c", "r", "h_fc", "ac_fstart", "ac_fstop"))
+        if not _known(f_c, h_fc) or f_c <= 0:
+            return []
+        lo = f_start if f_start is not None and f_start > 0 else f_c / 100.0
+        hi = f_stop if f_stop is not None and f_stop > 0 else f_c * 100.0
+        xs = _log_grid(lo, hi, 300)
+        ys = [1.0 / math.sqrt(1.0 + (x / f_c) ** 2) for x in xs]
+        caption = (
+            f"'주파수 응답' 절의 식 |H(f)| = 1/√(1 + (f/f_c)²) 을 이 설계의 f_c = {quantity(f_c, 'Hz')} (R = {quantity(r, 'ohm')}, C = {quantity(c, 'F')}) 로 "
+            f"ac 스위프 범위 {quantity(lo, 'Hz')} … {quantity(hi, 'Hz')} 에 걸쳐 그린 것(가로축 로그). "
+            f"점 = 코너 (f_c, |H| = {number(h_fc, 5)}: 계산기 `calc.rc.lowpass_magnitude` 의 기대값 공칭값); 안내선 = 1/√2 (−3 dB). {THEORY_CURVE_NOTE}"
+        )
+        return [_curve_figure(
+            "theory_h_f", "주파수 응답 |H(f)|", caption, [("|H(f)|", xs, ys)], x_label="주파수 f (Hz)", y_label="|H(f)|", log_x=True,
+            bands=[("y", h_fc, h_fc, "|H| = 1/√2 (−3 dB)")], markers=[(f_c, h_fc, f"코너 f_c = {quantity(f_c, 'Hz')}, |H| = {number(h_fc, 5)}")],
+        )]
 
     def part_notes(self, ir: CircuitIR) -> dict[str, PartNote]:
         f_c, c, r, tol, probe = (parameter_value(ir, k) for k in ("f_c", "c", "r", "tol_rel", "ac_probe"))
@@ -1139,6 +1244,46 @@ class AstableTemplate(Template):
                 f"그래서 허용오차를 {number(_mul(100.0, n['tol_rel']), 3)} % 로 잡았습니다(최악점도 허용치의 절반). 이 설계 자체의 측정 편차는 최종 보고서에 있습니다."
             )),
         ]
+
+    def theory_figures(self, ir: CircuitIR) -> list[Figure]:
+        """(a) the base-voltage recovery v_B(t) of the half-period derivation with the V_BE threshold and the crossing at T_half;
+        (b) f against C from (식 1) on log-log axes with the validity window shaded and the design point marked."""
+        n = self._numbers(ir)
+        v_cc, v_be, r_b, c, t_half, f_design, ln = n["v_cc"], n["v_be"], n["r_b"], n["c"], n["t_half"], n["f_design"], n["ln"]
+        out: list[Figure] = []
+        if _known(v_cc, v_be, r_b, c, t_half) and r_b > 0 and c > 0 and t_half > 0:
+            tau = r_b * c
+            xs = _lin_grid(0.0, t_half * 1.15, 400)
+            ys = [v_cc - (2.0 * v_cc - v_be) * math.exp(-t / tau) for t in xs]
+            caption = (
+                f"'반주기(half period) 유도' 절의 RC 충전 곡선 v_B(t) = V_cc − (2·V_cc − V_BE)·e^(−t/(R_b·C)) 을 이 설계의 V_cc = {quantity(v_cc, 'V')}, V_BE = {quantity(v_be, 'V')}, "
+                f"R_b = {quantity(r_b, 'ohm')}, C = {quantity(c, 'F')} 로 0 ≤ t ≤ 1.15·T_half 에 그린 것. 안내선 = 스위칭 문턱 V_BE, "
+                f"점 = 곡선이 문턱을 지나는 T_half = R_b·C·ln((2·V_cc − V_BE)/(V_cc − V_BE)) = {quantity(t_half, 's')} ((식 1) 의 반주기). {THEORY_CURVE_NOTE}"
+            )
+            out.append(_curve_figure(
+                "theory_vb_t", "베이스 전압 회복 v_B(t) — 반주기의 유도", caption, [("v_B(t)", xs, ys)], x_label="시간 t (s)", y_label="베이스 전압 v_B (V)",
+                bands=[("y", v_be, v_be, f"V_BE = {quantity(v_be, 'V')} (스위칭 문턱)")], markers=[(t_half, v_be, f"T_half = {quantity(t_half, 's')}")],
+            ))
+        c_hi = self._c_at(v_cc, self.F_MIN, r_b, v_be) if v_cc is not None else None  # the largest C of the window (at 100 Hz)
+        c_lo = self._c_at(v_cc, self.F_MAX, r_b, v_be) if v_cc is not None else None  # the smallest (at 20 kHz)
+        if _known(r_b, c, ln, f_design, c_lo, c_hi) and r_b > 0 and c > 0 and ln > 0 and f_design > 0:
+            xs = _log_grid(c_lo / 3.0, c_hi * 3.0, 200)
+            ys = [1.0 / (2.0 * r_b * x * ln) for x in xs]
+            caption = (
+                f"(식 1) f = 1/(2·R_b·C·ln((2·V_cc − V_BE)/(V_cc − V_BE))) 을 이 설계의 R_b = {quantity(r_b, 'ohm')}, V_cc = {quantity(v_cc, 'V')}, V_BE = {quantity(v_be, 'V')} 로 C 에 대해 그린 것(양축 로그). "
+                f"음영 = 템플릿 유효 범위 {quantity(self.F_MIN, 'Hz')} … {quantity(self.F_MAX, 'Hz')} 에 해당하는 C = {quantity(c_lo, 'F')} … {quantity(c_hi, 'F')}; "
+                f"점 = 설계점 C = {quantity(c, 'F')} (`calc.astable.c_for_frequency`), f = {quantity(f_design, 'Hz')} (`calc.astable.f`). {THEORY_CURVE_NOTE}"
+            )
+            out.append(_curve_figure(
+                "theory_f_vs_c", "주파수 대 타이밍 커패시터 (식 1)", caption, [("f(C) (식 1)", xs, ys)], x_label="타이밍 커패시터 C (F)", y_label="주파수 f (Hz)", log_x=True, log_y=True,
+                bands=[("x", c_lo, c_hi, f"유효 범위 {quantity(self.F_MIN, 'Hz')} … {quantity(self.F_MAX, 'Hz')}")],
+                markers=[(c, f_design, f"설계점 C = {quantity(c, 'F')}, f = {quantity(f_design, 'Hz')}")],
+            ))
+        return out
+
+    def theory_figure_vectors(self) -> tuple[str, ...]:
+        """The output and the two base nets as the SPICE compiler names them (net name, ``v(...)``); the report plots them beside v(OUT)."""
+        return ("v(OUT)", "v(Q1_B)", "v(Q2_B)")
 
     def part_notes(self, ir: CircuitIR) -> dict[str, PartNote]:
         n = self._numbers(ir)

@@ -291,11 +291,15 @@ def _stage_reports(data: ReportData) -> str:
     """Links to the Korean stage reports that exist beside this page (relative to the workdir); nothing of their content."""
     if not data.stage_reports:
         return block("section", tag("h2", "Stage reports"), tag("p", "none on disk (ai-eda run writes them under reports/; ai-eda stage-reports re-writes them)", class_="note"))
-    items = [block("li", tag("a", r.name, href=r.href), tag("span", f" - after {r.stage}", class_="note")) for r in data.stage_reports]
+    items = []
+    for r in data.stage_reports:
+        renderings = [tag("a", label, href=href) for label, href in (("html", r.html_href), ("pdf", r.pdf_href)) if href]
+        items.append(block("li", tag("a", r.name, href=r.href), *(f" · {a}" for a in renderings), tag("span", f" - after {r.stage}", class_="note")))
     return block(
         "section",
         tag("h2", "Stage reports"),
-        tag("p", "Korean Markdown views written by ai-eda run (links relative to the workdir; views like this page: no status computed, not artifacts).", class_="note"),
+        tag("p", "Korean views written by ai-eda run as Markdown, HTML (inline figures) and, when a headless browser was found, PDF "
+                 "(links relative to the workdir; views like this page: no status computed, not artifacts).", class_="note"),
         block("ul", *items, class_="plain"),
     )
 

@@ -31,12 +31,32 @@ The reference formulas of the circuit report (IPC-2221 current capacity and
 table 6-1 B2 spacing, copper resistance) are display values computed from
 the IR's own geometry, named as such, never a verdict and never written to
 the IR.
+
+Each report is delivered three ways from the one Markdown text: ``<name>.md``,
+``<name>.html`` (the Markdown rendered by :mod:`ai_eda.report.pdf` with the
+report's figures inline as SVG - :mod:`ai_eda.report.figures`: the
+template's theory curves and the measured waveform in the theory report,
+the placement, the routed board and the per-net copper length in the
+circuit report, the theory-vs-simulation tolerance chart and the waveform
+in the final report; the parts report has none and says so) and, when a
+headless Chromium / Chrome / Edge is found or given, ``<name>.pdf`` (the HTML
+printed; no browser means no PDF and a reason, never a failure). The
+Markdown holds a placeholder line ``![fig](fig:<id>)`` followed by the
+caption in italics where a figure goes, so it stays readable on its own; a
+figure whose data is missing is one Korean sentence saying what is missing
+(:class:`ReportFigures`). The waveform is read from the fresh ``SPICE_RESULT``
+artifact only through :func:`~ai_eda.tools.spice.evidence.fresh_spice_run`
+(the rule every SPICE-reading validator follows), the board from the KiCad
+library the pipeline resolved. ``.md`` and ``.html`` are deterministic; the
+PDF bytes carry the browser's own creation date and are a derived document
+like a rawfile. None of the three is an artifact or hashed.
 """
 
 from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -44,9 +64,12 @@ from ai_eda.design import TEMPLATES
 from ai_eda.design.base import CHOICE_NOTE_PREFIX, NO_RECORD, TOOL_ID, PartNote, Template, TheorySection, parameter_value, quantity
 from ai_eda.ir import CircuitIR, Component, Provenance, ProvenanceKind, Reduce, Traced, ValidationResult, ValidationStatus
 from ai_eda.parts.existence import CHECK_PREFIX as EXISTENCE_PREFIX
+from ai_eda.report.figures import Figure, bar_figure, board_figure, expectation_limit, plot_vector, tolerance_figure, tolerance_rows, waveform_figures
+from ai_eda.report.pdf import NO_BROWSER_REASON, find_browser, html_to_pdf, markdown_to_html
 from ai_eda.report.pipeline_log import PipelineRecord
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, LibraryLookupError
 from ai_eda.tools.placement.grid import PLACER_ID
+from ai_eda.tools.spice.evidence import fresh_spice_run
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK
 from ai_eda.validation.layout import CLEARANCE_CHECK, CONNECTIVITY_CHECK
 from ai_eda.workflow.orchestrator import PipelineState, StageOutcome
@@ -59,8 +82,21 @@ STAGE_REPORTS: dict[Stage, str] = {
     Stage.PCB: "03_회로_보고서.md",
     Stage.RELEASE: "04_최종_보고서.md",
 }
+#: the title of each report (its ``# `` heading and the HTML ``<title>``, followed by ``: <project name>``)
+REPORT_TITLES: dict[Stage, str] = {
+    Stage.ARCHITECTURE: "이론 보고서",
+    Stage.COMPONENT_SELECTION: "부품 선정 보고서",
+    Stage.PCB: "회로 보고서",
+    Stage.RELEASE: "최종 보고서",
+}
 #: where the reports live under the project workdir
 REPORTS_DIR = "reports"
+#: the file suffixes one report is written in (the PDF only when a browser prints it)
+REPORT_SUFFIXES: tuple[str, ...] = (".md", ".html", ".pdf")
+#: what the parts report says instead of a figure
+NO_CHART_IN_PARTS = "이 보고서에는 그림이 없습니다: 부품 선정은 표와 라이브러리 기재로 설명하며 그릴 수치 곡선이 없습니다."
+#: the reason recorded when the caller asked for no PDF
+PDF_NOT_REQUESTED = "not requested (--no-pdf)"
 #: header line for a design no template built
 NO_TEMPLATE = "템플릿 설계가 아님"
 #: what the parts report prints for a part its template says nothing about
@@ -204,6 +240,192 @@ def _header(title: str, ir: CircuitIR) -> list[str]:
     ]
 
 
+# --- figures ---------------------------------------------------------------------------
+
+#: the figure slots of the reports, in the order the text reaches them
+SLOT_THEORY = "theory"
+SLOT_WAVEFORM = "waveform"
+SLOT_PLACEMENT = "placement"
+SLOT_BOARD = "board"
+SLOT_COPPER = "copper_bars"
+SLOT_TOLERANCE = "tolerance"
+#: the missing-data sentences (one per slot; the reason, when there is one, is appended in parentheses)
+NO_WAVEFORM = "시뮬레이션 결과가 아직 없어 파형 그림이 없습니다"
+NO_PLACEMENT_FIGURE = "배치가 없어 배치도가 없습니다"
+NO_BOARD_FIGURE = "배선이 없어 보드 그림이 없습니다"
+NO_COPPER_FIGURE = "배선이 없어 넷별 동박 길이 그래프가 없습니다"
+NO_TOLERANCE_FIGURE = "기대값이 없어 이론값 대 시뮬레이션 그림이 없습니다"
+NO_LIBRARY_FIGURE = "KiCad 라이브러리를 열 수 없어 보드 그림이 없습니다"
+
+
+@dataclass
+class ReportFigures:
+    """The figures of one report, by slot: what was drawn (:class:`~ai_eda.report.figures.Figure` by id) and, per slot without a figure, the Korean sentence saying what is missing.
+
+    A builder prints a slot as the placeholder line ``![fig](fig:<id>)`` plus
+    the italic caption for every figure of the slot, then the slot's missing
+    sentence when there is one; a slot the report never filled prints nothing.
+    """
+
+    figures: dict[str, Figure] = field(default_factory=dict)
+    slots: dict[str, list[str]] = field(default_factory=dict)
+    missing: dict[str, str] = field(default_factory=dict)
+
+    def add(self, slot: str, *figures: Figure) -> None:
+        for fig in figures:
+            if fig.id in self.figures:
+                raise ValueError(f"figure id {fig.id!r} used twice in one report")
+            self.figures[fig.id] = fig
+            self.slots.setdefault(slot, []).append(fig.id)
+
+    def miss(self, slot: str, sentence: str, reason: str | None = None) -> None:
+        """Record why ``slot`` has no figure: ``sentence`` (a full Korean sentence without its final period) plus the ``reason`` in parentheses."""
+        text = f"{sentence} ({strip_paths(reason)})" if reason else sentence
+        self.missing[slot] = text.rstrip(".") + "."
+
+    def lines(self, slot: str) -> list[str]:
+        """The Markdown of ``slot``: placeholder + caption per figure, then the missing sentence; a slot nobody filled prints nothing."""
+        out: list[str] = []
+        for fig_id in self.slots.get(slot, []):
+            fig = self.figures[fig_id]
+            out += [f"![fig](fig:{fig.id})", "", f"*{_caption_line(fig)}*", ""]
+        if slot in self.missing:
+            out += [self.missing[slot], ""]
+        return out
+
+
+def _caption_line(fig: Figure) -> str:
+    """The caption as one italic Markdown line: ``title — caption``, no ``*``, no line break, no path (the HTML uses the figure's own ``<figcaption>``)."""
+    text = f"{fig.title} — {fig.caption}" if fig.caption else fig.title
+    text = strip_paths(text).replace("*", "∗").replace("\r", " ").replace("\n", " ")
+    return " ".join(text.split())
+
+
+def theory_figures_of(ir: CircuitIR, figures: ReportFigures) -> None:
+    """The template's theory curves into the ``theory`` slot; a non-template design or a template whose numbers the IR lacks gets a sentence."""
+    template = template_for(ir)
+    if template is None:
+        figures.miss(SLOT_THEORY, f"{NO_TEMPLATE}: 템플릿의 이론 곡선이 없습니다")
+        return
+    try:
+        drawn = template.theory_figures(ir)
+    except (ValueError, TypeError, ZeroDivisionError, OverflowError) as e:
+        figures.miss(SLOT_THEORY, f"템플릿 `{template.id}` 의 이론 그림을 그릴 수 없습니다", str(e))
+        return
+    if not drawn:
+        figures.miss(SLOT_THEORY, f"템플릿 `{template.id}` 의 이론 그림을 그릴 수 없습니다: 필요한 파라미터가 IR 에 없습니다 ({NO_RECORD})")
+        return
+    figures.add(SLOT_THEORY, *drawn)
+
+
+def waveform_figures_of(ir: CircuitIR, figures: ReportFigures) -> None:
+    """The measured waveforms of the fresh SPICE run into the ``waveform`` slot: per non-op analysis the expectations' vectors plus the template's :meth:`~ai_eda.design.base.Template.theory_figure_vectors`.
+
+    The run is located only through :func:`~ai_eda.tools.spice.evidence.fresh_spice_run`
+    (the latest tool-backed ``spice`` result on the netlist of the current
+    IR, results.json unchanged on disk); anything else is the reason in the
+    missing sentence. Voltages and branch currents become separate figures
+    (``waveform`` / ``waveform_i``; a second analysis gets ``waveform_<id>``;
+    more than four vectors of one kind are split over several charts). A
+    template hint that the recorded run has no vector for is left out and
+    named in a sentence after the figure; the expectations' own vectors are
+    never optional (one missing is the reason the slot has no figure).
+    """
+    sim = ir.simulation
+    if sim is None or not sim.expectations:
+        figures.miss(SLOT_WAVEFORM, f"{NO_WAVEFORM}: 시뮬레이션 설정(기대값)이 없습니다")
+        return
+    run = fresh_spice_run(ir, needs="waveform figure")
+    if isinstance(run, str):
+        figures.miss(SLOT_WAVEFORM, NO_WAVEFORM, run)
+        return
+    template = template_for(ir)
+    hints = list(template.theory_figure_vectors()) if template is not None else []
+    groups: dict[str, list[str]] = {}
+    for e in sim.expectations:
+        vectors = groups.setdefault(e.analysis_id, [])
+        if e.vector not in vectors:
+            vectors.append(e.vector)
+    reasons: list[str] = []
+    for aid, vectors in groups.items():
+        info = run.data.get("analyses", {}).get(aid) or {}
+        result = info.get("result") if isinstance(info.get("result"), dict) else {}
+        if info.get("kind") == "op":
+            reasons.append(f"해석 `{aid}` 은 동작점(op) 해석이라 시간·주파수 축 파형이 없습니다")
+            continue
+        if not result.get("succeeded") or result.get("unverifiable"):
+            reasons.append(f"해석 `{aid}` 이 완료되지 않아 파형이 없습니다")
+            continue
+        plot = result.get("vectors") if isinstance(result.get("vectors"), dict) else {}
+        extra = [h for h in hints if h not in vectors]
+        present = [h for h in extra if plot_vector(plot, h) is not None]
+        absent = [h for h in extra if plot_vector(plot, h) is None]
+        fig_id = SLOT_WAVEFORM if not figures.slots.get(SLOT_WAVEFORM) else f"{SLOT_WAVEFORM}_{aid}"
+        try:
+            figures.add(SLOT_WAVEFORM, *waveform_figures(run.data, aid, vectors + present, title=f"시뮬레이션 파형 — 해석 {aid}", fig_id=fig_id))
+        except (ValueError, TypeError, KeyError) as e:
+            reasons.append(f"해석 `{aid}` 의 파형을 그릴 수 없습니다 ({strip_paths(str(e))})")
+            continue
+        if absent:
+            reasons.append(f"해석 `{aid}` 의 기록에 템플릿이 함께 그리려던 벡터 {', '.join(f'`{h}`' for h in absent)} 이(가) 없어 기대값 벡터{'와 나머지 벡터' if present else ''}만 그렸습니다")
+    if reasons:
+        figures.miss(SLOT_WAVEFORM, "; ".join(reasons) if figures.slots.get(SLOT_WAVEFORM) else f"파형 그림이 없습니다: {'; '.join(reasons)}")
+
+
+def board_figures_of(ir: CircuitIR, library: KicadLibrary | None, figures: ReportFigures) -> None:
+    """The placement figure (no copper), the routed board and the per-net copper length bars into their slots; each missing input is a sentence."""
+    pcb = ir.pcb
+    if pcb is None or not pcb.placements:
+        figures.miss(SLOT_PLACEMENT, f"{NO_PLACEMENT_FIGURE}: IR 에 부품 위치가 없습니다")
+        figures.miss(SLOT_BOARD, f"{NO_BOARD_FIGURE}: IR 에 보드가 없습니다")
+        figures.miss(SLOT_COPPER, f"{NO_COPPER_FIGURE}: IR 에 보드가 없습니다")
+        return
+    routed = bool(pcb.tracks or pcb.vias)
+    if library is None:
+        figures.miss(SLOT_PLACEMENT, NO_LIBRARY_FIGURE)
+        figures.miss(SLOT_BOARD, NO_LIBRARY_FIGURE)
+    else:
+        try:
+            figures.add(SLOT_PLACEMENT, board_figure(ir, library, copper=False))
+            if routed:
+                figures.add(SLOT_BOARD, board_figure(ir, library, copper=True))
+        except (ValueError, LibraryLookupError, LibraryFormatError) as e:
+            # every slot left without a figure gets the sentence: the placement figure failing (a footprint not in the library)
+            # would fail the routed board figure the same way, and a routed board's slot is never filled by the branch below
+            for slot in ((SLOT_PLACEMENT, SLOT_BOARD) if routed else (SLOT_PLACEMENT,)):
+                if slot not in figures.slots:
+                    figures.miss(slot, "보드 그림을 그릴 수 없습니다", str(e))
+    if not routed:
+        figures.miss(SLOT_BOARD, f"{NO_BOARD_FIGURE}: IR 에 트랙·비아가 없습니다")
+        figures.miss(SLOT_COPPER, f"{NO_COPPER_FIGURE}: IR 에 트랙·비아가 없습니다")
+        return
+    stats = net_routing_stats(ir)
+    figures.add(SLOT_COPPER, bar_figure([s["net"] for s in stats], [s["length_mm"] for s in stats], title="넷별 동박 길이", y_label="길이 (mm)", unit="mm", fig_id=SLOT_COPPER))
+
+
+def tolerance_figure_of(ir: CircuitIR, figures: ReportFigures) -> None:
+    """The theory-vs-simulation tolerance chart into the ``tolerance`` slot (rows from :func:`~ai_eda.report.figures.tolerance_rows`, nothing recomputed)."""
+    rows = tolerance_rows(ir)
+    if not rows:
+        figures.miss(SLOT_TOLERANCE, f"{NO_TOLERANCE_FIGURE}: 비교할 시뮬레이션 설정이 없습니다")
+        return
+    figures.add(SLOT_TOLERANCE, tolerance_figure(rows, fig_id=SLOT_TOLERANCE))
+
+
+def stage_figures(stage: Stage, ir: CircuitIR, library: KicadLibrary | None) -> ReportFigures:
+    """Every figure the report of ``stage`` shows (theory: template curves + waveform; circuit: placement, board, copper bars; final: tolerance + waveform; parts: none)."""
+    figures = ReportFigures()
+    if stage is Stage.ARCHITECTURE:
+        theory_figures_of(ir, figures)
+        waveform_figures_of(ir, figures)
+    elif stage is Stage.PCB:
+        board_figures_of(ir, library, figures)
+    elif stage is Stage.RELEASE:
+        tolerance_figure_of(ir, figures)
+        waveform_figures_of(ir, figures)
+    return figures
+
+
 # --- 1. theory report ----------------------------------------------------------------
 
 
@@ -228,11 +450,12 @@ def _parameter_rows(ir: CircuitIR) -> list[list[object]]:
     return rows
 
 
-def _simulation_section(ir: CircuitIR) -> list[str]:
+def _simulation_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     sim = ir.simulation
     out = ["## 시뮬레이션 설정", ""]
     if sim is None:
         out += ["시뮬레이션 설정 없음.", ""]
+        out += ["### 측정 파형", ""] + figures.lines(SLOT_WAVEFORM)
         return out
     out.append("### 자극(stimuli)")
     out.append("")
@@ -269,16 +492,24 @@ def _simulation_section(ir: CircuitIR) -> list[str]:
             "    f_measured = (N − 1) / (t_N − t_1)", "",
             "에지가 3개 미만이거나 swing 이 엔진 자체의 수렴 허용오차(reltol·max|v| + vntol) 이하이면 '발진 없음' 으로 FAIL 이며 절대 PASS 가 되지 않습니다.", "",
         ]
+    out += ["### 측정 파형", "",
+            "아래 파형은 현재 IR 의 넷리스트로 실행된 최신 ngspice 결과(`results.json`)에서 기대값이 읽는 벡터(템플릿이 지정한 넷 포함)를 그대로 그린 것입니다. 판정은 최종 보고서의 '이론값 대 시뮬레이션' 표에 있습니다.", ""]
+    out += figures.lines(SLOT_WAVEFORM)
     return out
 
 
-def theory_report(ir: CircuitIR, library: KicadLibrary | None = None) -> str:
+def theory_report(ir: CircuitIR, library: KicadLibrary | None = None, *, figures: ReportFigures | None = None) -> str:
     """Report 1: the circuit theory of the template that built ``ir`` with the IR's numbers, its inputs, constraints and simulation setup.
 
     ``library`` is accepted for symmetry with the other builders and not read:
-    theory needs no library fact.
+    theory needs no library fact. ``figures`` are the report's figures
+    (:func:`stage_figures`; built here when not given): the template's
+    theory curves and the measured waveform, each printed as a placeholder
+    line and its caption, or as one sentence saying what is missing.
     """
-    out = _header("이론 보고서", ir)
+    if figures is None:
+        figures = stage_figures(Stage.ARCHITECTURE, ir, library)
+    out = _header(REPORT_TITLES[Stage.ARCHITECTURE], ir)
     out += [
         "## 설계 입력과 결정 구조", "",
         "이 시스템은 \"LLM 이 설계의 진실을 정하지 않는다\" 는 원칙으로 동작합니다. 회로에 들어간 숫자는 세 종류뿐입니다: "
@@ -298,6 +529,8 @@ def theory_report(ir: CircuitIR, library: KicadLibrary | None = None) -> str:
         sections = [TheorySection("회로 이론", f"{NO_TEMPLATE}: 이 설계는 템플릿이 만들지 않았으므로 템플릿의 이론 설명이 없습니다. 파라미터 표의 식과 아래 시뮬레이션 설정이 IR 이 담고 있는 전부입니다.")]
     for sec in sections:
         out += [f"## {sec.title}", "", sec.body, ""]
+    out += ["## 이론 그림", "", "템플릿의 이론 식을 이 설계의 파라미터 값으로 그린 곡선입니다(IR 의 `parameters` 만 읽음). 시뮬레이션 결과가 아니며 판정도 아닙니다.", ""]
+    out += figures.lines(SLOT_THEORY)
     out += ["## 제약 조건", ""]
     if ir.constraints:
         rows = [[f"`{c.id}`", c.kind.value, c.target, c.description, ", ".join(f"{k} = {_traced_text(v)}" for k, v in c.parameters.items()) or "-"] for c in ir.constraints]
@@ -305,7 +538,7 @@ def theory_report(ir: CircuitIR, library: KicadLibrary | None = None) -> str:
     else:
         out.append(f"제약 조건 {NO_RECORD}.")
     out.append("")
-    out += _simulation_section(ir)
+    out += _simulation_section(ir, figures)
     return "\n".join(out).rstrip("\n") + "\n"
 
 
@@ -419,15 +652,15 @@ def _part_note_lines(note: PartNote | None) -> list[str]:
 
 def parts_report(ir: CircuitIR, library: KicadLibrary | None = None) -> str:
     """Report 2: every part - the BOM-like table, then role / why / criteria / unverified substitutes, library facts, IR facts, existence check, requirements served."""
-    out = _header("부품 선정 보고서", ir)
+    out = _header(REPORT_TITLES[Stage.COMPONENT_SELECTION], ir)
     out += ["## 부품 목록", ""]
     if not ir.components:
-        out += [f"부품 {NO_RECORD}: 설계가 비어 있습니다.", ""]
+        out += [f"부품 {NO_RECORD}: 설계가 비어 있습니다.", "", NO_CHART_IN_PARTS, ""]
         return "\n".join(out).rstrip("\n") + "\n"
     rows = [[f"`{c.ref}`", c.value, c.description or "-", f"`{_lib_id(c, 'symbol')}`", f"`{_lib_id(c, 'footprint')}`", c.package.value if c.package is not None else NO_RECORD, _pins_text(c)] for c in ir.components]
     out.append(_table(["ref", "값", "설명", "심볼", "풋프린트", "패키지", "핀"], rows))
     out += ["", f"'{SUBSTITUTES_HEADING}' 아래의 부품 이름은 제안일 뿐이며 파이프라인은 그 부품의 핀 배열·정격을 확인하지 않았습니다. "
-            "부품의 심볼·풋프린트·핀은 KiCad 라이브러리 파일에서 읽은 것이고, 존재 확인의 세부 항목이 무엇이 확인되었는지를 말합니다.", ""]
+            "부품의 심볼·풋프린트·핀은 KiCad 라이브러리 파일에서 읽은 것이고, 존재 확인의 세부 항목이 무엇이 확인되었는지를 말합니다.", "", NO_CHART_IN_PARTS, ""]
     template = template_for(ir)
     notes = template.part_notes(ir) if template is not None else {}
     for c in ir.components:
@@ -597,11 +830,12 @@ def _schematic_section(ir: CircuitIR) -> list[str]:
     return out
 
 
-def _placement_section(ir: CircuitIR) -> list[str]:
+def _placement_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     out = ["## 배치", ""]
     pcb = ir.pcb
     if pcb is None or not pcb.placements:
         out += [f"배치 {NO_RECORD}: IR 에 부품 위치가 없습니다.", ""]
+        out += figures.lines(SLOT_PLACEMENT)
         return out
     first = pcb.placements[0].provenance
     tools = sorted({(p.provenance.tool or "", p.provenance.tool_version or "") for p in pcb.placements})
@@ -624,6 +858,7 @@ def _placement_section(ir: CircuitIR) -> list[str]:
         rows.append([f"`{p.component_ref}`", f"`{_lib_id(c, 'footprint')}`" if c is not None else NO_RECORD, f"{p.x_mm:g}", f"{p.y_mm:g}", f"{p.rotation_deg:g}", p.side.value,
                      _provenance_text(p.provenance)])
     out += [_table(["ref", "풋프린트", "x (mm)", "y (mm)", "회전 (°)", "면", "출처"], rows), ""]
+    out += figures.lines(SLOT_PLACEMENT)
     if any(t == PLACER_ID for t, _v in tools):
         out += [
             "### 배치 규칙과 그 한계", "",
@@ -636,7 +871,7 @@ def _placement_section(ir: CircuitIR) -> list[str]:
     return out
 
 
-def _routing_section(ir: CircuitIR) -> list[str]:
+def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     out = ["## 배선", ""]
     pcb = ir.pcb
     if pcb is None or (not pcb.tracks and not pcb.vias):
@@ -649,6 +884,7 @@ def _routing_section(ir: CircuitIR) -> list[str]:
         else:
             out += [f"{NO_ROUTING}: IR 에 트랙·비아가 없습니다. 보드는 배치만 된 상태입니다(구리 없음). "
                     "이 보드가 DRC 를 통과하는지는 이 보고서가 판정하지 않으며, kicad-cli 가 실제로 낸 결과만 아래 단계 기록의 `drc` 항목에 옮깁니다.", ""]
+        out += figures.lines(SLOT_BOARD) + figures.lines(SLOT_COPPER)
         out += _routing_results(ir)
         return out
     first = pcb.tracks[0].provenance if pcb.tracks else pcb.vias[0].provenance
@@ -675,6 +911,7 @@ def _routing_section(ir: CircuitIR) -> list[str]:
     unrouted = [s["net"] for s in stats if s["segments"] == 0 and s["vias"] == 0]
     if unrouted:
         out += [f"구리가 없는 넷: {', '.join(f'`{n}`' for n in unrouted)} (핀이 하나뿐인 넷은 이을 것이 없고, 그 외는 라우터가 잇지 못한 넷입니다 — `pcb.routing.connectivity` 가 말합니다).", ""]
+    out += figures.lines(SLOT_BOARD) + figures.lines(SLOT_COPPER)
     if None not in (g, w, c, e, d_v):
         out += [
             "### 라우터의 keep-out 규칙 (파라미터 값을 넣은 것)", "",
@@ -766,20 +1003,24 @@ def _stage_record_section(record: RunRecord, stages: tuple[Stage, ...], title: s
     return out
 
 
-def circuit_report(ir: CircuitIR, library: KicadLibrary | None, record: RunRecord) -> str:
+def circuit_report(ir: CircuitIR, library: KicadLibrary | None, record: RunRecord, *, figures: ReportFigures | None = None) -> str:
     """Report 3: the schematic (nets and roles), the placement (rule, positions, limits) and the routing (parameters, per-net statistics, reference copper values, ``pcb.routing.*`` verdicts).
 
-    ``library`` is accepted for symmetry with the other builders and not
-    read: every geometry number here is in the IR already.
+    The text reads no library fact (every geometry number is in the IR);
+    ``library`` is what the board figures read pad shapes from
+    (:func:`stage_figures`, built here when ``figures`` is not given) - the
+    library the pipeline resolved, exactly as the PCB compiler reads it.
     """
-    out = _header("회로 보고서", ir)
+    if figures is None:
+        figures = stage_figures(Stage.PCB, ir, library)
+    out = _header(REPORT_TITLES[Stage.PCB], ir)
     out += [
         "회로도와 보드는 이 IR 에서 컴파일한 파생물입니다. 아래는 IR 이 담고 있는 연결·위치·구리와, 그것을 만든 도구가 기록한 규칙, "
         "그리고 참고 공식으로 계산한 표시값입니다. ERC / DRC 판정은 kicad-cli 만이 내리며 그 결과는 단계 기록에 그대로 옮깁니다.", "",
     ]
     out += _schematic_section(ir)
-    out += _placement_section(ir)
-    out += _routing_section(ir)
+    out += _placement_section(ir, figures)
+    out += _routing_section(ir, figures)
     out += _stage_record_section(record, CIRCUIT_STAGES, "단계 기록 (PLACEMENT / SCHEMATIC / PCB / DRC)")
     return "\n".join(out).rstrip("\n") + "\n"
 
@@ -831,16 +1072,18 @@ def _all_stages_section(record: RunRecord) -> list[str]:
     return out
 
 
-def _theory_vs_simulation(ir: CircuitIR) -> list[str]:
+def _theory_vs_simulation(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     out = ["## 이론값 대 시뮬레이션", ""]
     sim = ir.simulation
     if sim is None or not sim.expectations:
         out += [f"기대값 {NO_RECORD}: 비교할 시뮬레이션 설정이 없습니다.", ""]
+        out += figures.lines(SLOT_TOLERANCE) + figures.lines(SLOT_WAVEFORM)
         return out
     summary = ir.validation.latest(SPICE_CHECK)
     out.append(f"- `{SPICE_CHECK}` 최신 결과: " + (f"**{summary.status}** ({_tool_text(summary.tool, summary.tool_version)}) — {_cell(summary.message)}" if summary is not None else NO_RECORD))
     out += ["- 이론 공칭값은 IR 의 기대값(템플릿의 식으로 계산기가 낸 값 또는 사용자 값), 측정값은 ngspice 결과(`spice.<id>` 의 `details.measured`)입니다. "
-            "허용치 = max(tol_abs, tol_rel·|공칭값|); 공칭값이 0 이면 tol_rel 은 허용치가 아니므로 tol_abs 만 셉니다(SPICE 단계의 판정 규칙과 같음). 판정은 저장된 결과의 상태 그대로입니다.", ""]
+            "허용치는 SPICE 단계가 결과에 기록한 값(`details.tolerance`)이고, 기록이 없는 기대값만 같은 규칙 max(tol_abs, tol_rel·|공칭값|) 로 IR 에서 계산합니다; "
+            "공칭값이 0 이면 tol_rel 은 허용치가 아니므로 tol_abs 만 셉니다(SPICE 단계의 판정 규칙과 같음). 판정은 저장된 결과의 상태 그대로입니다.", ""]
     rows = []
     extra: list[str] = []
     for e in sim.expectations:
@@ -850,14 +1093,8 @@ def _theory_vs_simulation(ir: CircuitIR) -> list[str]:
         details = r.details if r is not None and isinstance(r.details, dict) else {}
         measured = details.get("measured")
         measured = float(measured) if isinstance(measured, (int, float)) and not isinstance(measured, bool) else None
-        tol_abs = float(e.tol_abs.value) if e.tol_abs is not None else None
-        tol_rel = float(e.tol_rel.value) if e.tol_rel is not None else None
-        limit = None
-        if nominal is not None:
-            # the SPICE stage's rule (ai_eda.tools.spice.stage.judge): a relative tolerance on a nominal of 0 is no tolerance
-            relative = tol_rel * abs(nominal) if tol_rel is not None and nominal != 0.0 else None
-            candidates = [x for x in (tol_abs, relative) if x is not None]
-            limit = max(candidates) if candidates else None
+        # the recorded limit first (the one the verdict was judged against); the stage's rule on the IR only without a record
+        limit, _recorded = expectation_limit(e, details if r is not None else None)
         if measured is not None and nominal is not None:
             dev = measured - nominal
             dev_text = quantity(dev, unit)
@@ -883,6 +1120,8 @@ def _theory_vs_simulation(ir: CircuitIR) -> list[str]:
     out += [_table(["기대값", "벡터 / 축약", "이론 공칭값", "시뮬레이션 측정값", "편차", "편차 (%)", "허용치", "판정"], rows), ""]
     if extra:
         out += extra + [""]
+    out += figures.lines(SLOT_TOLERANCE)
+    out += ["### 측정 파형", ""] + figures.lines(SLOT_WAVEFORM)
     return out
 
 
@@ -975,12 +1214,14 @@ def _conclusion_section(ir: CircuitIR, record: RunRecord) -> list[str]:
     return ["## 결론", "", " ".join(parts), ""]
 
 
-def final_report(ir: CircuitIR, record: RunRecord) -> str:
-    """Report 4: requirements, every stage outcome, theory vs simulation per expectation, the verification matrix, artifacts, the recorded RELEASE outcome, remaining work, conclusion."""
-    out = _header("최종 보고서", ir)
+def final_report(ir: CircuitIR, record: RunRecord, *, figures: ReportFigures | None = None) -> str:
+    """Report 4: requirements, every stage outcome, theory vs simulation per expectation (table, tolerance chart, waveform), the verification matrix, artifacts, the recorded RELEASE outcome, remaining work, conclusion."""
+    if figures is None:
+        figures = stage_figures(Stage.RELEASE, ir, None)
+    out = _header(REPORT_TITLES[Stage.RELEASE], ir)
     out += _requirements_section(ir)
     out += _all_stages_section(record)
-    out += _theory_vs_simulation(ir)
+    out += _theory_vs_simulation(ir, figures)
     out += _matrix_section(ir)
     out += _artifacts_section(ir)
     out += _release_section(record)
@@ -992,41 +1233,119 @@ def final_report(ir: CircuitIR, record: RunRecord) -> str:
 # --- writers -------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class StageDocument:
+    """One report built once: its title, the Markdown text, the same text rendered as a self-contained HTML page, and the figures the placeholders name."""
+
+    stage: Stage
+    title: str
+    markdown: str
+    html: str
+    figures: ReportFigures
+
+
+def build_stage_document(stage: Stage, ir: CircuitIR, library: KicadLibrary | None, record: RunRecord) -> StageDocument | None:
+    """The report ``stage`` completes (:data:`STAGE_REPORTS`) as Markdown + HTML with its figures built exactly once; ``None`` for a stage without a report."""
+    if stage not in STAGE_REPORTS:
+        return None
+    figures = stage_figures(stage, ir, library)
+    if stage is Stage.ARCHITECTURE:
+        md = theory_report(ir, library, figures=figures)
+    elif stage is Stage.COMPONENT_SELECTION:
+        md = parts_report(ir, library)
+    elif stage is Stage.PCB:
+        md = circuit_report(ir, library, record, figures=figures)
+    else:
+        md = final_report(ir, record, figures=figures)
+    title = f"{REPORT_TITLES[stage]}: {ir.project.name}"
+    return StageDocument(stage, title, md, markdown_to_html(md, title=title, figures=figures.figures), figures)
+
+
 def build_stage_report(stage: Stage, ir: CircuitIR, library: KicadLibrary | None, record: RunRecord) -> str | None:
     """The Markdown of the report ``stage`` completes (:data:`STAGE_REPORTS`), ``None`` for a stage without one."""
-    if stage is Stage.ARCHITECTURE:
-        return theory_report(ir, library)
-    if stage is Stage.COMPONENT_SELECTION:
-        return parts_report(ir, library)
-    if stage is Stage.PCB:
-        return circuit_report(ir, library, record)
-    if stage is Stage.RELEASE:
-        return final_report(ir, record)
-    return None
+    doc = build_stage_document(stage, ir, library, record)
+    return doc.markdown if doc is not None else None
 
 
-def write_stage_report(stage: Stage, ir: CircuitIR, library: KicadLibrary | None, record: RunRecord, workdir: Path, *, reports_dir: Path | None = None) -> Path | None:
-    """Write the report of ``stage`` to ``<workdir>/reports/<name>`` (LF, UTF-8; ``reports_dir`` overrides the folder) and return its path; ``None`` for a stage without a report.
+@dataclass(frozen=True)
+class StageReportResult:
+    """What :func:`write_stage_report` wrote: the ``.md`` and ``.html`` paths, the ``.pdf`` path when a browser printed it, else why not (``pdf_reason``)."""
 
-    Nothing else is touched: the IR is not saved, no artifact is registered.
+    stage: Stage
+    markdown: Path
+    html: Path
+    pdf: Path | None
+    pdf_reason: str | None
+    #: the ids of the figures embedded in the HTML (the Markdown's placeholders)
+    figure_ids: tuple[str, ...]
+
+    @property
+    def paths(self) -> list[Path]:
+        """The files this write produced, ``.md`` first."""
+        return [self.markdown, self.html] + ([self.pdf] if self.pdf is not None else [])
+
+    def summary(self) -> str:
+        """``(+ .html, .pdf)`` or ``(+ .html; pdf not produced: <reason>)`` for a printed line."""
+        if self.pdf is not None:
+            return "(+ .html, .pdf)"
+        return f"(+ .html; pdf not produced: {self.pdf_reason})"
+
+
+def _remove_stale_pdf(path: Path) -> None:
+    """A ``.pdf`` from an earlier write is removed when this write produces none: a PDF beside the ``.md`` always belongs to it."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write_stage_report(
+    stage: Stage, ir: CircuitIR, library: KicadLibrary | None, record: RunRecord, workdir: Path, *,
+    reports_dir: Path | None = None, browser: Path | str | None = None, pdf: bool = True,
+) -> StageReportResult | None:
+    """Write the report of ``stage`` as ``<workdir>/reports/<name>.md`` and ``.html`` (LF, UTF-8; ``reports_dir`` overrides the folder) and, when ``pdf`` and a browser is given or found, ``.pdf``.
+
+    ``None`` for a stage without a report. No browser (or ``pdf=False``)
+    means no PDF and a reason in the result, never an exception; a stale
+    ``.pdf`` from an earlier write is then removed so that a PDF on disk
+    always matches the ``.md`` / ``.html`` beside it. Nothing else is
+    touched: the IR is not saved, no artifact is registered.
     """
-    text = build_stage_report(stage, ir, library, record)
-    if text is None:
+    doc = build_stage_document(stage, ir, library, record)
+    if doc is None:
         return None
     folder = Path(reports_dir) if reports_dir is not None else Path(workdir) / REPORTS_DIR
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / STAGE_REPORTS[stage]
-    path.write_text(text, encoding="utf-8", newline="\n")
-    return path
+    md_path = folder / STAGE_REPORTS[stage]
+    html_path, pdf_path = md_path.with_suffix(".html"), md_path.with_suffix(".pdf")
+    md_path.write_text(doc.markdown, encoding="utf-8", newline="\n")
+    html_path.write_text(doc.html, encoding="utf-8", newline="\n")
+    written: Path | None = None
+    reason: str | None = None
+    if not pdf:
+        reason = PDF_NOT_REQUESTED
+        _remove_stale_pdf(pdf_path)
+    else:
+        exe = Path(browser) if browser is not None else find_browser()
+        if exe is None:
+            reason = NO_BROWSER_REASON
+            _remove_stale_pdf(pdf_path)
+        else:
+            result = html_to_pdf(html_path, pdf_path, exe)  # removes a stale PDF itself; ok only when this run wrote one
+            written, reason = (pdf_path, None) if result.ok else (None, result.reason)
+    return StageReportResult(stage, md_path, html_path, written, reason, tuple(doc.figures.figures))
 
 
-def write_all_stage_reports(ir: CircuitIR, library: KicadLibrary | None, record: RunRecord, workdir: Path, *, reports_dir: Path | None = None) -> list[Path]:
-    """Write the four reports from a saved IR and its run record (``ai-eda stage-reports``); returns the paths in stage order."""
-    out: list[Path] = []
+def write_all_stage_reports(
+    ir: CircuitIR, library: KicadLibrary | None, record: RunRecord, workdir: Path, *,
+    reports_dir: Path | None = None, browser: Path | str | None = None, pdf: bool = True,
+) -> list[StageReportResult]:
+    """Write the four reports from a saved IR and its run record (``ai-eda stage-reports``); returns the results in stage order."""
+    out: list[StageReportResult] = []
     for stage in STAGE_REPORTS:
-        path = write_stage_report(stage, ir, library, record, workdir, reports_dir=reports_dir)
-        if path is not None:
-            out.append(path)
+        result = write_stage_report(stage, ir, library, record, workdir, reports_dir=reports_dir, browser=browser, pdf=pdf)
+        if result is not None:
+            out.append(result)
     return out
 
 
@@ -1040,15 +1359,36 @@ __all__ = [
     "IPC2221_K_OUTER",
     "LIBRARY_PROPERTIES",
     "MATRIX_ORDER",
+    "NO_BOARD_FIGURE",
+    "NO_CHART_IN_PARTS",
+    "NO_COPPER_FIGURE",
+    "NO_LIBRARY_FIGURE",
     "NO_MEASUREMENT",
+    "NO_PLACEMENT_FIGURE",
     "NO_ROUTING",
     "NO_RUN_RECORD",
     "NO_TEMPLATE",
     "NO_TEMPLATE_INFO",
+    "NO_TOLERANCE_FIGURE",
+    "NO_WAVEFORM",
+    "PDF_NOT_REQUESTED",
     "REPORTS_DIR",
+    "REPORT_SUFFIXES",
+    "REPORT_TITLES",
+    "SLOT_BOARD",
+    "SLOT_COPPER",
+    "SLOT_PLACEMENT",
+    "SLOT_THEORY",
+    "SLOT_TOLERANCE",
+    "SLOT_WAVEFORM",
     "STAGE_REPORTS",
     "SUBSTITUTES_HEADING",
+    "ReportFigures",
     "RunRecord",
+    "StageDocument",
+    "StageReportResult",
+    "board_figures_of",
+    "build_stage_document",
     "build_stage_report",
     "circuit_report",
     "copper_resistance_ohm",
@@ -1057,10 +1397,14 @@ __all__ = [
     "net_routing_stats",
     "parts_report",
     "routing_params_of",
+    "stage_figures",
     "strip_paths",
     "template_for",
     "template_of",
+    "theory_figures_of",
     "theory_report",
+    "tolerance_figure_of",
+    "waveform_figures_of",
     "write_all_stage_reports",
     "write_stage_report",
 ]

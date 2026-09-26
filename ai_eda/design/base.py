@@ -15,13 +15,19 @@ the template id the user confirmed and of the library on disk.
 
 A template also *explains* its design for the stage reports
 (:mod:`ai_eda.report.stages`): :meth:`Template.theory` gives the circuit
-theory with the IR's own numbers substituted and :meth:`Template.part_notes`
-the role, the reason and the substitute criteria of every part. Both are
-views: they read ``ir.parameters`` (a missing key prints :data:`NO_RECORD`,
-never a guess), recompute display numbers with the formulas they show and
-write nothing into the IR. Substitute part names are suggestions the
-pipeline never verified and carry :data:`UNVERIFIED_SUBSTITUTE` on every
-line.
+theory with the IR's own numbers substituted, :meth:`Template.theory_figures`
+draws the curves that theory text derives (a
+:class:`~ai_eda.report.figures.Figure` each, captioned with the equation the
+text names) and :meth:`Template.part_notes` the role, the reason and the
+substitute criteria of every part. All three are views: they read
+``ir.parameters`` through :func:`parameter_value` (a missing key prints
+:data:`NO_RECORD` or draws no figure, never a guess), recompute display
+numbers with the formulas they show and write nothing into the IR.
+:meth:`Template.theory_figure_vectors` only *names* the SPICE vectors the
+theory report should plot beside the expectations' own (the template's
+base nets, say); the report reads them from the recorded run, never from the
+template. Substitute part names are suggestions the pipeline never verified
+and carry :data:`UNVERIFIED_SUBSTITUTE` on every line.
 """
 
 from __future__ import annotations
@@ -29,7 +35,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -37,6 +43,9 @@ from ai_eda.ir import CircuitIR, MissingInformation, Provenance, ProvenanceKind,
 from ai_eda.tools.kicad.library import KicadLibrary
 
 from ai_eda.design.inputs import DesignInput, canonical_key
+
+if TYPE_CHECKING:  # the report package imports this one (stages -> TEMPLATES), so the figure type is a type-only import here
+    from ai_eda.report.figures import Figure
 
 TEMPLATE_VERSION = "0.1"
 #: tool id of the template machinery (``Provenance.tool`` is ``design.template.<template id>`` on structural decisions)
@@ -277,6 +286,19 @@ class Template(ABC):
         Every template overrides this; the default says the template gives no theory text.
         """
         return [TheorySection("이론 설명 없음", f"템플릿 '{self.id}' v{self.version}은 이론 설명을 제공하지 않습니다.")]
+
+    def theory_figures(self, ir: CircuitIR) -> list[Figure]:
+        """The theory curves of this template drawn with ``ir``'s numbers (a view: nothing is written to the IR).
+
+        Each figure's caption names the equation the theory text uses. A
+        template whose numbers the IR lacks returns no figure for that curve
+        (the report says so) instead of guessing. Default: no figure.
+        """
+        return []
+
+    def theory_figure_vectors(self) -> tuple[str, ...]:
+        """SPICE vectors (spelled as the IR spells them, ``v(OUT)``) the theory report plots beside the expectations' own; default none."""
+        return ()
 
     def part_notes(self, ir: CircuitIR) -> dict[str, PartNote]:
         """Per reference designator: role, reason, substitute criteria and unverified candidates. Default: nothing (the parts report says so per part)."""
