@@ -17,7 +17,7 @@ import math
 
 from ai_eda.ir.provenance import Traced, derived
 
-CALC_VERSION = "0.6"
+CALC_VERSION = "0.7"
 
 #: tool id -> input roles, in the calculator's parameter order
 ROLES: dict[str, tuple[str, ...]] = {
@@ -44,6 +44,11 @@ ROLES: dict[str, tuple[str, ...]] = {
     "calc.astable.tran_stop": ("f_osc",),
     "calc.astable.tran_start": ("f_osc",),
     "calc.astable.v_be_reverse": ("v_cc", "v_be"),
+    "calc.rc.tran_step": ("tau",),
+    "calc.rc.tran_stop": ("tau",),
+    "calc.regulator.p_dissipation": ("v_in", "v_out", "i_load"),
+    "calc.crystal.load_capacitance": ("c1", "c2", "c_stray"),
+    "calc.lc.cutoff": ("l", "c"),
 }
 #: tool id -> the unit each role's input is expected to carry (``None``: any); an input whose unit is set
 #: and differs is refused by the recompute (a swapped voltage / resistance would otherwise be computed)
@@ -71,6 +76,11 @@ ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.astable.tran_stop": ("Hz",),
     "calc.astable.tran_start": ("Hz",),
     "calc.astable.v_be_reverse": ("V", "V"),
+    "calc.rc.tran_step": ("s",),
+    "calc.rc.tran_stop": ("s",),
+    "calc.regulator.p_dissipation": ("V", "V", "A"),
+    "calc.crystal.load_capacitance": ("F", "F", "F"),
+    "calc.lc.cutoff": ("H", "F"),
 }
 
 
@@ -288,3 +298,60 @@ def astable_v_be_reverse(v_cc: Traced[float], v_be: Traced[float], ids: tuple[st
     if v_cc.value <= v_be.value:
         raise ValueError("supply voltage must exceed the base-emitter voltage")
     return _derived(v_cc.value - v_be.value, "calc.astable.v_be_reverse", ids, "V", "V_BE_reverse = V_cc - V_BE")
+
+
+# --------------------------------------------------------------------------- RC transient window, linear regulator, crystal load, LC corner
+
+#: time steps per time constant of an RC step-response transient (tran_step = tau / RC_TRAN_STEPS_PER_TAU, so t = tau is the 100th grid point)
+RC_TRAN_STEPS_PER_TAU = 100.0
+#: time constants an RC step-response transient runs (tran_stop = RC_TRAN_STOP_TAUS * tau: the charge is within e^-5 = 0.7 % of its final value)
+RC_TRAN_STOP_TAUS = 5.0
+
+
+def rc_tran_step(tau: Traced[float], ids: tuple[str] = ("tau",)) -> Traced[float]:
+    """Transient time step for an RC step response with time constant ``tau``: tau / 100 (t = tau is a multiple of the step)."""
+    if tau.value <= 0:
+        raise ValueError("time constant must be positive")
+    return _derived(tau.value / RC_TRAN_STEPS_PER_TAU, "calc.rc.tran_step", ids, "s", "tran_step = tau / 100 (t = tau is the 100th step)")
+
+
+def rc_tran_stop(tau: Traced[float], ids: tuple[str] = ("tau",)) -> Traced[float]:
+    """End of the transient for an RC step response with time constant ``tau``: 5 tau."""
+    if tau.value <= 0:
+        raise ValueError("time constant must be positive")
+    return _derived(RC_TRAN_STOP_TAUS * tau.value, "calc.rc.tran_stop", ids, "s", "tran_stop = 5 * tau (the charge is within e^-5 of its final value)")
+
+
+def regulator_dissipation(v_in: Traced[float], v_out: Traced[float], i_load: Traced[float], ids: tuple[str, str, str] = ("v_in", "v_out", "i_load")) -> Traced[float]:
+    """Dissipation of a linear regulator dropping ``v_in`` to ``v_out`` at the load current ``i_load``: P = (V_in - V_out) * I_load.
+
+    The regulator's own quiescent current is not included (it is not an
+    input), so the value is the pass element's share only.
+    """
+    if i_load.value < 0:
+        raise ValueError("load current must not be negative")
+    if v_in.value < v_out.value:
+        raise ValueError("input voltage is below the output voltage: a linear regulator cannot regulate")
+    return _derived((v_in.value - v_out.value) * i_load.value, "calc.regulator.p_dissipation", ids, "W", "P = (V_in - V_out) * I_load (pass element; quiescent current not included)")
+
+
+def crystal_load_capacitance(c1: Traced[float], c2: Traced[float], c_stray: Traced[float], ids: tuple[str, str, str] = ("c1", "c2", "c_stray")) -> Traced[float]:
+    """The load capacitance a Pierce crystal oscillator presents to its crystal: C_L = C1 * C2 / (C1 + C2) + C_stray."""
+    if c1.value <= 0 or c2.value <= 0:
+        raise ValueError("load capacitors must be positive")
+    if c_stray.value < 0:
+        raise ValueError("stray capacitance must not be negative")
+    total = c1.value + c2.value
+    return _derived(c1.value * c2.value / total + c_stray.value, "calc.crystal.load_capacitance", ids, "F", "C_L = C1 * C2 / (C1 + C2) + C_stray")
+
+
+def lc_cutoff(l: Traced[float], c: Traced[float], ids: tuple[str, str] = ("l", "c")) -> Traced[float]:
+    """Corner (resonance) frequency of an LC low-pass: f_0 = 1 / (2 pi sqrt(L C))."""
+    if l.value <= 0:
+        raise ValueError("inductance must be positive")
+    if c.value <= 0:
+        raise ValueError("capacitance must be positive")
+    product = l.value * c.value
+    if product == 0:
+        raise ValueError("calc.lc.cutoff underflows: L C is zero in float arithmetic for these inputs")
+    return _derived(1.0 / (2.0 * math.pi * math.sqrt(product)), "calc.lc.cutoff", ids, "Hz", "f_0 = 1 / (2 pi sqrt(L C))")

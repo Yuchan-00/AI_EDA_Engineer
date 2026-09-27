@@ -68,6 +68,8 @@ from ai_eda.report.figures import Figure, bar_figure, board_figure, expectation_
 from ai_eda.report.pdf import NO_BROWSER_REASON, find_browser, html_to_pdf, markdown_to_html
 from ai_eda.report.pipeline_log import PipelineRecord
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, LibraryLookupError
+from ai_eda.tools.placement.core_ring import BODY_OVERHANG_MM, CORE_MIN_PADS, EDGE_REF_PREFIXES, INNER_MAX_PADS
+from ai_eda.tools.placement.core_ring import PLACER_ID as RING_PLACER_ID
 from ai_eda.tools.placement.grid import PLACER_ID
 from ai_eda.tools.spice.evidence import fresh_spice_run
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK
@@ -796,7 +798,9 @@ def _largest_dc_current(ir: CircuitIR) -> tuple[str, float] | None:
     found = template_of(ir)
     if found is None:
         return None
-    p = {k: parameter_value(ir, k) for k in ("v_in", "r_c", "r1", "r2", "i_led")}
+    p = {k: parameter_value(ir, k) for k in ("v_in", "r_c", "r1", "r2", "i_led", "i_load_budget")}
+    if found[0] == "atmega128_devboard" and p["i_load_budget"] is not None:
+        return "I_load (+5V 레일의 설계 부하 예산, 측정값 아님)", p["i_load_budget"]
     if found[0] == "astable" and p["v_in"] is not None and p["r_c"]:
         return "I_C(sat) ≈ V_cc/R_c", p["v_in"] / p["r_c"]
     if found[0] == "divider" and p["v_in"] is not None and p["r1"] is not None and p["r2"] is not None and (p["r1"] + p["r2"]):
@@ -830,6 +834,11 @@ def _schematic_section(ir: CircuitIR) -> list[str]:
     return out
 
 
+#: ``derived_from`` entries a placer writes per part (shown per row, not in the parameter line)
+_PER_PART_ENTRIES = ("footprint:", "ring:", "pull_angle_deg:", "pull:", "core:")
+_RING_NAMES = {"inner": "안쪽", "outer": "바깥", "core": "코어"}
+
+
 def _placement_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     out = ["## 배치", ""]
     pcb = ir.pcb
@@ -839,7 +848,8 @@ def _placement_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
         return out
     first = pcb.placements[0].provenance
     tools = sorted({(p.provenance.tool or "", p.provenance.tool_version or "") for p in pcb.placements})
-    params = sorted({e for p in pcb.placements for e in p.provenance.derived_from if not e.startswith("footprint:")})
+    params = sorted({e for p in pcb.placements for e in p.provenance.derived_from if not e.startswith(_PER_PART_ENTRIES)})
+    ring = any(t == RING_PLACER_ID for t, _v in tools)
     if first.tool:
         out.append("- 배치 도구: " + ", ".join(_tool_text(t, v) for t, v in tools if t) + (f" — {first.note}" if first.note else ""))
     else:
@@ -858,7 +868,37 @@ def _placement_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
         rows.append([f"`{p.component_ref}`", f"`{_lib_id(c, 'footprint')}`" if c is not None else NO_RECORD, f"{p.x_mm:g}", f"{p.y_mm:g}", f"{p.rotation_deg:g}", p.side.value,
                      _provenance_text(p.provenance)])
     out += [_table(["ref", "풋프린트", "x (mm)", "y (mm)", "회전 (°)", "면", "출처"], rows), ""]
+    if ring:
+        ring_rows = []
+        for p in pcb.placements:
+            entry = dict(e.split(":", 1) for e in p.provenance.derived_from if ":" in e)
+            ring_rows.append([f"`{p.component_ref}`", _RING_NAMES.get(entry.get("ring", ""), entry.get("ring") or NO_RECORD),
+                              entry.get("pull_angle_deg") or NO_RECORD, f"`{entry['pull']}`" if entry.get("pull") else NO_RECORD])
+        out += ["부품별 링과 당김 각 (각 배치의 provenance `derived_from` 그대로):", "", _table(["ref", "링", "당김 각 (°)", "당김 출처"], ring_rows), ""]
     out += figures.lines(SLOT_PLACEMENT)
+    if ring:
+        core = next((e.split(":", 1)[1] for p in pcb.placements for e in p.provenance.derived_from if e.startswith("core:")), NO_RECORD)
+        counts = {name: sum(1 for p in pcb.placements if f"ring:{name}" in p.provenance.derived_from) for name in ("inner", "outer")}
+        out += [
+            "### 배치 규칙과 그 한계", "",
+            f"`{RING_PLACER_ID}` 는 패드가 {CORE_MIN_PADS}개 이상인 부품이 있을 때 PCB 에이전트가 쓰는 배치기입니다. 패드(서로 다른 패드 번호)가 가장 많은 부품이 코어이며 "
+            f"(이 보드: `{core}`) 보드 중앙에 회전 0 으로 놓입니다. 다른 부품마다 '당김 각'을 구합니다: 그 부품이 넷으로 이어지는 코어 패드들의 방향을 코어 중심에서 본 원형 평균 "
+            "(0° = 동쪽, 화면에서 반시계 방향). 전원·접지 넷(종류 POWER / GROUND)은 신호 넷으로 코어에 닿지 않는 부품에만 셈에 넣고(크리스탈 커패시터는 GND 패드가 아니라 XTAL 핀을 따름), "
+            "코어 패드에 닿지 않는 넷으로 서로 이어진 부품들은 한 그룹으로 그룹 전체의 각을 따릅니다(표의 '당김 출처': `signal` / `rail` / `group:<참조들>` / `none`). "
+            "각이 같은 부품은 당김 출처로 먼저 나뉘어 그룹 사이에 다른 부품이 끼지 않고, 그룹 안에서는 코어에 닿지 않는 넷을 따라 그룹의 커넥터(없으면 첫 부품)부터 "
+            "너비 우선으로 이어지는 순서(예: DC 잭 → 다이오드 → 입력 커패시터 → 레귤레이터)로 놓입니다.", "",
+            f"안쪽 링(이 보드 {counts['inner']}개): 패드가 {INNER_MAX_PADS}개 이하이고, 연결된 모든 핀의 넷이 코어 패드에도 닿으며, 참조 접두가 "
+            f"{' / '.join(EDGE_REF_PREFIXES)} (커넥터·스위치)가 아닌 부품 — 디커플링, 크리스탈과 부하 커패시터, 리셋 R/C, 풀업. 코어 extent 밖 `spacing_mm` 에서 시작하는 띠에 놓입니다. "
+            f"바깥 링(이 보드 {counts['outer']}개): 나머지 전부(커넥터, 레귤레이터 쪽 부품, LED 와 저항, 스위치)로, 보드 가장자리에서 `margin_mm` 안쪽 띠의 바깥 가장자리에 붙습니다. "
+            "각 띠는 남동쪽 모서리에서 시작해 반시계 방향으로 도는 네 변이며, 부품은 당김 각이 가리키는 위치 순서로 놓이고 변을 따라 눕습니다(긴 쪽이 변과 나란히; 커넥터·스위치는 핀 1 쪽이 바깥; "
+            "두 방향 중 패드가 넷의 상대편 - 코어 패드, 없으면 같은 넷의 다른 부품 - 에 더 가까운 쪽). "
+            f"예외: extent 가 한쪽으로 패드보다 {BODY_OVERHANG_MM:g} mm 이상 더 튀어나온 커넥터·스위치(DC 잭의 몸체처럼)는 그 쪽이 보드 가장자리를 향하도록 변에 수직으로 돌려 놓아, "
+            "몸체 끝이 외곽에서 `margin_mm` 안쪽에 오고 그 앞에는 부품이 없습니다(어느 끝이 플러그 입구인지는 풋프린트가 말하지 않으므로 읽지 않습니다). "
+            "외곽은 바깥 띠 + `margin_mm` 을 1 mm 단위로 올린 크기이고 코어 중심이 정수 mm 에 옵니다. 배치 뒤 모든 extent 쌍이 서로 떨어져 있고 외곽 안에 있음을 재측정해 확인하며, 아니면 거부합니다.", "",
+            "정직한 한계: 이 배치기는 연결의 방향만 봅니다. 디커플링 커패시터와 그 전원 핀 사이의 실제 거리, 신호 무결성, 열, EMI 는 고려하지 않고, "
+            "커넥터의 결합 방향은 위의 몸체 규칙으로만 다룹니다. "
+            "배치의 유효성(courtyard 겹침, 외곽 위반)은 kicad-cli DRC 만이 판정합니다.", "",
+        ]
     if any(t == PLACER_ID for t, _v in tools):
         out += [
             "### 배치 규칙과 그 한계", "",
@@ -883,6 +923,7 @@ def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
             out += [f"{NO_ROUTING}: IR 에 트랙·비아가 없습니다. 보드에는 부품 위치도 구리도 없습니다.", ""]
         else:
             out += [f"{NO_ROUTING}: IR 에 트랙·비아가 없습니다. 보드는 배치만 된 상태입니다(구리 없음). "
+                    "라우터가 이 보드에서 잇지 못한 넷과 그 이유(한 넷이라도 남으면 구리를 통째로 제안하지 않음)는 아래 단계 기록의 `placement` 메시지에 그대로 있습니다. "
                     "이 보드가 DRC 를 통과하는지는 이 보고서가 판정하지 않으며, kicad-cli 가 실제로 낸 결과만 아래 단계 기록의 `drc` 항목에 옮깁니다.", ""]
         out += figures.lines(SLOT_BOARD) + figures.lines(SLOT_COPPER)
         out += _routing_results(ir)

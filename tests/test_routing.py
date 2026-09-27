@@ -538,3 +538,153 @@ def test_a_net_the_first_order_starves_is_routed_first_in_a_second_pass(tmp_path
     x = board_ir(tmp_path, fixture_library(tmp_path / "kicad3"), [("R1", "PAD1", 3.0, 3.0), ("R2", "PAD1", 9.0, 3.0)], {"N": [("R1", "1"), ("R2", "1")]}, (12.0, 6.0))
     s = route_board(x, fixture_library(tmp_path / "kicad3")).stats
     assert s["passes"] == 1 and s["net_order"] == ["N"]
+
+
+# --------------------------------------------------------------------------- routing rules from the pad pitch
+
+
+def _placed_mcu(tmp_path: Path, *, shift: tuple[float, float] = (0.0, 0.0)):
+    """The synthetic 64-pad MCU board of ``tests/test_core_ring.py`` placed by core_ring (every placement moved by ``shift``)."""
+    from tests.test_core_ring import mcu_ir, mcu_library
+    from ai_eda.tools.placement.core_ring import core_ring_placement
+
+    mlib = mcu_library(tmp_path / "mcu_kicad")
+    ir = mcu_ir(tmp_path, mlib)
+    ring = core_ring_placement(ir, mlib)
+    placements = [p.model_copy(update={"x_mm": p.x_mm + shift[0], "y_mm": p.y_mm + shift[1]}) for p in ring.placements]
+    ir.pcb = PCBDesign(outline=ring.outline, placements=placements)
+    return ir, mlib
+
+
+def test_fine_rules_are_chosen_from_the_finest_pad_pitch(tmp_path: Path):
+    from ai_eda.tools.routing import FINE_PITCH_MM, FINE_RULES, finest_pad_pitch
+
+    ir, mlib = _placed_mcu(tmp_path)
+    assert finest_pad_pitch(ir, mlib) == (0.8, "Test_MCU:QFP64")  # the QFP's 0.8 mm, not the 1.65 mm of the 0603 parts
+    p = RoutingParams.for_board(ir, mlib)
+    assert FINE_PITCH_MM == 1.0 and FINE_RULES == {"grid_mm": 0.2, "track_width_mm": 0.25, "clearance_mm": 0.2, "via_diameter_mm": 0.6, "via_drill_mm": 0.3, "edge_clearance_mm": 0.3}
+    assert p == RoutingParams(**FINE_RULES, rules="fine", pad_pitch_mm=0.8, pitch_footprint="Test_MCU:QFP64")
+    assert (p.via_cost, p.bend_cost) == (RoutingParams().via_cost, RoutingParams().bend_cost)
+    assert p.derived_from_entry() == (
+        "params:grid=0.2,width=0.25,clearance=0.2,via=0.6/0.3,edge=0.3,via_cost=12.0,bend_cost=0.6,rules=fine,pad_pitch=0.8,pitch_footprint=Test_MCU:QFP64"
+    )
+    # fab minimums still raise the fine rules, and the reason stays recorded
+    ir.pcb.manufacturing = ManufacturingConstraints(min_track_width_mm=assumption(0.3, note="fab page not read"), min_clearance_mm=assumption(0.15, note="idem"))
+    eff, raised = effective_params(ir, p)
+    assert raised == {"track_width_mm": (0.25, 0.3)} and eff.track_width_mm == 0.3 and eff.clearance_mm == 0.2 and eff.rules == "fine" and eff.pad_pitch_mm == 0.8
+    # nonsense is refused
+    with pytest.raises(CompileError, match="pad_pitch_mm must be a finite number > 0"):
+        RoutingParams(pad_pitch_mm=0.0).check()
+
+
+def test_default_rules_on_boards_without_a_fine_pitch(tmp_path: Path, lib: KicadLibrary):
+    from ai_eda.ir import LibraryRef
+    from ai_eda.tools.routing import finest_pad_pitch
+    from tests.fixtures_kicad import divider_with_connector_ir
+    from tests.test_circuit_templates import template_library
+    from tests.test_core_ring import mcu_library
+
+    # the astable's THT parts (TO-92 inline at 2.54 mm on the synthetic template library) and the divider's 0603 / header parts
+    tlib = template_library(tmp_path / "tpl")
+    ir = CircuitIR(project=ProjectMeta(id="osc", name="osc", workdir=str(tmp_path)))
+    for ref, (library, name) in {"Q1": ("Package_TO_SOT_THT", "TO-92_Inline"), "R1": ("Resistor_THT", "R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"),
+                                 "C1": ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm"), "J1": ("Connector_PinHeader_2.54mm", "PinHeader_1x03_P2.54mm_Vertical")}.items():
+        c = make_part(ref)
+        c.footprint = tlib.resolve_footprint(LibraryRef(library=library, name=name))
+        ir.components.append(c)
+    assert finest_pad_pitch(ir, tlib)[0] >= 1.0
+    assert RoutingParams.for_board(ir, tlib) == RoutingParams() and RoutingParams.for_board(ir, tlib).rules is None
+    div = divider_with_connector_ir(tmp_path, tlib)
+    assert RoutingParams.for_board(div, tlib) == RoutingParams()
+    assert RoutingParams().derived_from_entry() == "params:grid=0.25,width=0.4,clearance=0.25,via=0.8/0.4,edge=0.3,via_cost=12.0,bend_cost=0.6"  # unchanged
+    # what counts as a pitch: pads that can carry different nets, with copper, not on top of each other
+    mlib = mcu_library(tmp_path / "mcu")
+    x = board_ir(tmp_path, lib, [("R1", "DUP1", 3.0, 3.0), ("R2", "CAGE", 9.0, 3.0)], {}, (14.0, 8.0))
+    assert finest_pad_pitch(x, lib) == (1.4, "Test:CAGE")  # DUP1's two pads "1" are one logical pad; CAGE's unnumbered bars are copper 1.4 mm from its pad
+    x = board_ir(tmp_path, lib, [("R1", "PAD1", 3.0, 3.0), ("R2", "SMD1", 9.0, 3.0)], {}, (14.0, 8.0))
+    assert finest_pad_pitch(x, lib) is None and RoutingParams.for_board(x, lib) == RoutingParams()  # one pad per footprint: no pitch at all
+    sw = CircuitIR(project=ProjectMeta(id="sw", name="sw", workdir=str(tmp_path)))
+    for ref, name in (("SW1", "SW4"), ("H1", "HOLE")):
+        c = make_part(ref)
+        c.footprint = mlib.resolve_footprint(LibraryRef(library="Test_MCU", name=name))
+        sw.components.append(c)
+    assert finest_pad_pitch(sw, mlib) == (4.5, "Test_MCU:SW4")  # 6.5 mm between the two "1" pads does not count, 4.5 mm between "1" and "2" does; the NPTH has no copper
+    # a component whose footprint is not on disk is not measured (route_board refuses that board anyway)
+    sw.components[0].footprint = LibraryRef(library="Test_MCU", name="Missing")
+    assert finest_pad_pitch(sw, mlib) is None
+
+
+def test_the_qfp_terminal_rule_holds_at_the_fine_rules_and_fails_at_the_defaults(tmp_path: Path):
+    """0.45 mm pads at 0.8 mm pitch: at the fine rules every U1 terminal is a usable cell inside its pad's inscribed circle - also with the core
+    off the routing grid by 0.1 mm (the worst case) -, while the default rules' keep-out (0.25 + 0.2 + 0.125 = 0.575 mm, exactly the gap from a
+    pad centre to its neighbour's edge) fences most of them: whichever way a terminal cell is off the pad centre, one neighbour is nearer."""
+    from tests.test_core_ring import QFP_PITCH, qfp_pad
+
+    fine = None
+    for shift in ((0.0, 0.0), (0.1, 0.1), (0.1, 0.0)):
+        ir, mlib = _placed_mcu(tmp_path / f"s{shift[0]}_{shift[1]}", shift=shift)
+        fine = RoutingParams.for_board(ir, mlib)
+        board = _Board(ir, mlib, fine)
+        terms = [t for net in board.terminals.values() for t in net if t.pad.ref == "U1"]
+        assert len(terms) == 28  # the U1 pins the fixture wires: VCC x2, GND x3, AVCC, AREF, RESET, XTAL x2, UART x2, ports A / B (8 + 8)
+        for t in terms:
+            x, y = board.pos(t.cell)
+            assert math.hypot(x - t.pad.cx, y - t.pad.cy) <= fine.grid_mm * math.sqrt(2) / 2 + 1e-9 < t.pad.inscribed_r == 0.225
+            assert board.usable_layers(t, board.net_index[next(n for n, ts in board.terminals.items() if t in ts)]) == (0,), (t.label, shift)
+        default = _Board(ir, mlib, RoutingParams())
+        fenced = [t for net, ts in default.terminals.items() for t in ts if t.pad.ref == "U1" and not default.usable_layers(t, default.net_index[net])]
+        assert len(fenced) >= 14, len(fenced)  # 21 of 28 at the core on the grid
+    # the pad geometry the numbers above rely on
+    assert qfp_pad(1)[2:] == (1.5, 0.45) and QFP_PITCH - 0.45 == pytest.approx(0.35)
+    assert fine.clearance_mm + fine.track_width_mm / 2 + fine.grid_mm / 2 < QFP_PITCH - 0.45 / 2 - fine.grid_mm / 2  # 0.425 < 0.475: the neighbour never fences a terminal
+
+
+def test_qfp_pads_escape_along_their_axis_at_the_fine_rules(tmp_path: Path):
+    """U1's 8 port-A pins to the J1 header, alone on the board: every net routes, and the segment that crosses a U1 pad's edge - whichever
+    end of it lies on the pad - leaves along the pad's long axis, or across it only from a side with no neighbouring pad (a corner pad's free
+    end: pins 1, 16, 17, 32, 33, 48, 49, 64). Segments entirely inside the pad (the stub from the terminal cell to the pad centre) are not
+    escapes and are skipped."""
+    ir, mlib = _placed_mcu(tmp_path)
+    keep = {"U1", "J1"}
+    ir.components = [c for c in ir.components if c.ref in keep]
+    ir.nets = [n for n in ir.nets if n.name.startswith("PA")]
+    ir.pcb.placements = [p for p in ir.pcb.placements if p.component_ref in keep]
+    p = RoutingParams.for_board(ir, mlib)
+    r = route_board(ir, mlib, p)
+    assert r.unrouted == {} and r.stats["routed_nets"] == 8 and r.params == p, r.stats
+    assert all(t.width_mm == 0.25 and t.provenance.derived_from[-1] == p.derived_from_entry() for t in r.tracks)
+    u1 = ir.pcb.placement("U1")
+    fp = mlib.load_footprint(ir.component("U1").footprint)
+    across_seen: list[str] = []
+    for net in ir.nets:
+        pin = next(q.pin_number for q in net.pins if q.component_ref == "U1")
+        pad = fp.pad(pin)
+        cx, cy = u1.x_mm + pad.x, u1.y_mm + pad.y
+        horizontal = pad.size_w > pad.size_h
+
+        def on(pt: tuple[float, float]) -> bool:
+            return abs(pt[0] - cx) <= pad.size_w / 2 + 1e-9 and abs(pt[1] - cy) <= pad.size_h / 2 + 1e-9
+
+        touching = [t for t in r.tracks if t.net == net.name and (on(t.start) or on(t.end))]
+        crossing = [t for t in touching if not (on(t.start) and on(t.end))]
+        assert crossing, (net.name, touching)
+        # the row's neighbours: the U1 pads one pitch away along the row (the row runs across a horizontal pad's long axis)
+        neighbours = [q for q in fp.pads if q.number != pin and math.isclose(math.hypot(q.x - pad.x, q.y - pad.y), 0.8, abs_tol=1e-6)]
+        assert 1 <= len(neighbours) <= 2
+        for t in crossing:
+            inside, outside = (t.start, t.end) if on(t.start) else (t.end, t.start)
+            if (inside[1] == outside[1]) if horizontal else (inside[0] == outside[0]):
+                continue  # along the long axis
+            across = (outside[1] - inside[1]) if horizontal else (outside[0] - inside[0])
+            toward = [q.number for q in neighbours if ((q.y - pad.y) if horizontal else (q.x - pad.x)) * across > 0]
+            assert toward == [], (net.name, pin, t.start, t.end, toward)  # never from between two pads
+            assert pin in ("1", "16", "17", "32", "33", "48", "49", "64"), (net.name, pin)
+            across_seen.append(pin)
+    assert across_seen == ["48"]  # PA3's corner pad, entered from the free end of the east row at this placement
+    assert _geometry(r) == _geometry(route_board(copy.deepcopy(ir), mcu_library_copy(tmp_path), p))
+
+
+def mcu_library_copy(tmp_path: Path) -> KicadLibrary:
+    from tests.test_core_ring import mcu_library
+
+    return mcu_library(tmp_path / "mcu_kicad_again")

@@ -11,11 +11,14 @@ decided exclusively by real ``kicad-cli`` DRC
 """
 
 from ai_eda.tools.routing.maze import (
+    FINE_PITCH_MM,
+    FINE_RULES,
     ROUTER_ID,
     ROUTER_VERSION,
     Routing,
     RoutingParams,
     effective_params,
+    finest_pad_pitch,
     route_board,
 )
 from ai_eda.tools.routing.naive import (
@@ -30,12 +33,15 @@ from ai_eda.tools.routing.naive import (
 __all__ = [
     "DEFAULT_LAYER",
     "DEFAULT_TRACK_WIDTH_MM",
+    "FINE_PITCH_MM",
+    "FINE_RULES",
     "NET_CLASS_TRACK_WIDTH_MM",
     "ROUTER_ID",
     "ROUTER_VERSION",
     "Routing",
     "RoutingParams",
     "effective_params",
+    "finest_pad_pitch",
     "net_pad_centers",
     "route_board",
     "route_naive",

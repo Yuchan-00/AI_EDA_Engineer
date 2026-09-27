@@ -19,12 +19,27 @@ Invariants this module enforces (CLAUDE.md #1 and #2):
   own ``(symbol ...)`` tree renamed ``"Lib:Name"`` (what KiCad itself embeds);
   kicad-cli compares it with the global library and warns on any deviation.
 * **No accidental connections.** KiCad connects by exact coordinate
-  equality, so the grid pitch is derived from the measured extent of every
-  symbol (body, pins, stubs, label text -
-  :func:`~ai_eda.compilers.schematic_layout.symbol_extent`) and the compiler
+  equality, so the column widths and row heights of the symbol table are
+  derived from the measured extent of every symbol (body, pins, stubs,
+  label text - :func:`~ai_eda.compilers.schematic_layout.symbol_extent`,
+  :func:`~ai_eda.compilers.schematic_layout.layout_positions`), the sheet
+  is the smallest ISO size that holds them
+  (:func:`~ai_eda.compilers.schematic_layout.layout_paper`), and the compiler
   refuses a layout in which any two connection points (pin ends, stub ends)
   coincide, a connection point lies on another stub, or two extents touch.
-  Stacked pins (two pins of one symbol at the same point) are refused too.
+  Stacked pins (two pins of one symbol at the same point, like the hidden
+  VCC / GND pins of the ATmega128) are accepted only when the IR puts every
+  pin at that point in the same net and they point the same way; the point
+  then gets one stub and one label. Stacked pins in different nets are
+  refused like any other coinciding points.
+* **Fields where the library puts them.** Each instance's Reference and
+  Value field is written at the library symbol's own field position turned
+  by the instance's rotation / mirror, with the library's angle and
+  justification - what KiCad does when it places a symbol (the
+  ATmega128-16A's value below its body, not across its pin names). Only a
+  library field without a position falls back to a fixed offset right of
+  the origin. Fields are text, not connection points; they are not part of
+  the measured extents.
 
 Connectivity model: each pin of each net gets a 2.54 mm wire stub leaving the
 pin away from the symbol body and a global label at the stub end named after
@@ -52,13 +67,16 @@ from ai_eda.compilers.schematic_layout import (
     Extent,
     Vec,
     label_orientation,
+    layout_paper,
     layout_positions,
     natural_ref_key,
     pin_body_direction,
     pin_position,
     point_on_segment,
+    snap,
     stub_end,
     symbol_extent,
+    transform_offset,
 )
 from ai_eda.errors import CompileError, NothingToCompileError
 from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, Component, PinElectricalType
@@ -77,7 +95,6 @@ SCH_FORMAT_VERSION = 20260101
 #: producer is recorded in the title_block comment and in ArtifactRef.generator / generator_version.
 GENERATOR = "eeschema"
 GENERATOR_VERSION = "10.0"
-PAPER = "A4"
 FONT_SIZE_MM = 1.27
 #: neutral label shape: adds no driver / direction semantics to ERC
 GLOBAL_LABEL_SHAPE = "passive"
@@ -108,12 +125,50 @@ class _PlacedSymbol:
 # --------------------------------------------------------------------------- node builders
 
 
-def _effects(justify: str | None = None) -> Node:
-    return S("effects", S("font", S("size", FONT_SIZE_MM, FONT_SIZE_MM)), S("justify", justify) if justify else None)
+def _effects(justify: str | tuple[str, ...] | None = None) -> Node:
+    tokens = (justify,) if isinstance(justify, str) else tuple(justify or ())
+    return S("effects", S("font", S("size", FONT_SIZE_MM, FONT_SIZE_MM)), S("justify", *tokens) if tokens else None)
 
 
-def _property(key: str, value: str, x: float, y: float, rot: int = 0, hide: bool = False, justify: str | None = None) -> Node:
+def _property(key: str, value: str, x: float, y: float, rot: float = 0, hide: bool = False, justify: str | tuple[str, ...] | None = None) -> Node:
     return S("property", Q(key), Q(value), S("at", x, y, rot), S("hide", True) if hide else None, _effects(justify))
+
+
+#: where a Reference / Value field goes when the library symbol gives it no position: right of the origin, above / below it
+_FALLBACK_FIELDS: dict[str, tuple[float, float]] = {"Reference": (2.54, -1.27), "Value": (2.54, 1.27)}
+
+
+def _library_field(symbol: SymbolDef, key: str) -> tuple[float, float, float, tuple[str, ...]] | None:
+    """``(x, y, angle, justify tokens)`` of the library symbol's own ``key`` field (library frame, Y up); ``None`` without a position."""
+    for prop in sexpr.find_all(symbol.node, "property"):
+        if len(prop) < 3 or isinstance(prop[1], list) or str(prop[1]) != key:
+            continue
+        at = sexpr.find(prop, "at")
+        if at is None or len(at) < 3:
+            return None
+        try:
+            x, y = sexpr.to_float(at[1]), sexpr.to_float(at[2])
+            angle = sexpr.to_float(at[3]) if len(at) > 3 else 0.0
+        except (TypeError, ValueError):
+            return None
+        effects = sexpr.find(prop, "effects")
+        justify = sexpr.find(effects, "justify") if effects is not None else None
+        tokens = tuple(str(t) for t in justify[1:] if not isinstance(t, list)) if justify is not None else ()
+        return x, y, angle, tokens
+    return None
+
+
+def _field(key: str, value: str, ps: "_PlacedSymbol") -> Node:
+    """A Reference / Value field where the library symbol puts it: its ``(at ..)`` offset turned by the instance's rotation / mirror
+    (KiCad's own rule when it places a symbol), its angle and justification as the library writes them (KiCad applies the instance's
+    transform when it draws); the fixed fallback offset only when the library gives no position."""
+    lib = _library_field(ps.symbol, key)
+    if lib is None:
+        fx, fy = _FALLBACK_FIELDS[key]
+        return _property(key, value, snap(ps.x + fx), snap(ps.y + fy), justify="left")
+    lx, ly, angle, justify = lib
+    dx, dy = transform_offset(lx, ly, ps.rotation, ps.mirror)
+    return _property(key, value, snap(ps.x + dx), snap(ps.y + dy), angle, justify=justify)
 
 
 def _wire(a: Vec, b: Vec, uuid: str) -> Node:
@@ -145,7 +200,7 @@ def _no_connect(at: Vec, uuid: str) -> Node:
 
 class SchematicCompiler(Compiler):
     id = "compiler.kicad_sch"
-    version = "0.3"
+    version = "0.5"
     kind = ArtifactKind.SCHEMATIC
 
     def compile(self, ir: CircuitIR, ctx: CompileContext) -> ArtifactRef:
@@ -170,11 +225,13 @@ class SchematicCompiler(Compiler):
             raise NothingToCompileError("IR has no components: nothing to draw (the schematic stage needs a component list)")
         root_uuid = sheet_uuid(project_id)
         components = self._checked_components(ir)
-        placed = self._place(components, library, self._pin_net_names(ir))
+        pin_nets = self._pin_net_names(ir)
+        placed = self._place(components, library, pin_nets)
         pins_by_key = self._pin_map(placed)
-        self._check_geometry(placed, pins_by_key)
+        stacked = self._stacks(placed, pins_by_key, pin_nets)
+        self._check_geometry(placed, pins_by_key, stacked)
 
-        no_connects, wires, labels = self._connectivity(ir, placed, pins_by_key)
+        no_connects, wires, labels = self._connectivity(ir, placed, pins_by_key, stacked)
 
         lib_entries = [placed[ref].symbol for ref in placed]
         lib_symbols = S(
@@ -189,7 +246,7 @@ class SchematicCompiler(Compiler):
             S("generator", Q(GENERATOR)),
             S("generator_version", Q(GENERATOR_VERSION)),
             S("uuid", Q(root_uuid)),
-            S("paper", Q(PAPER)),
+            self._paper(placed),
             S(
                 "title_block",
                 S("title", Q(ir.project.name)),
@@ -204,6 +261,12 @@ class SchematicCompiler(Compiler):
             S("sheet_instances", S("path", Q("/"), S("page", Q("1")))),
             S("embedded_fonts", False),
         )
+
+    @staticmethod
+    def _paper(placed: dict[str, _PlacedSymbol]) -> Node:
+        """``(paper "A4")`` unless the placed extents need a larger sheet (A3 .. A0, else ``"User" W H``)."""
+        name, w, h = layout_paper(ps.extent for ps in placed.values())
+        return S("paper", Q(name)) if name != "User" else S("paper", Q(name), w, h)
 
     # --- validation -----------------------------------------------------------------
 
@@ -279,14 +342,60 @@ class SchematicCompiler(Compiler):
         return out
 
     @staticmethod
-    def _check_geometry(placed: dict[str, _PlacedSymbol], pins: dict[tuple[str, str], _PlacedPin]) -> None:
+    def _stacks(
+        placed: dict[str, _PlacedSymbol], pins: dict[tuple[str, str], _PlacedPin], pin_nets: dict[tuple[str, str], str],
+    ) -> dict[tuple[str, str], tuple[str, str]]:
+        """Stacked pins: ``{member: representative}`` for every pin of a symbol instance that sits on another pin of the same instance.
+
+        KiCad connects every pin at one point, so a library symbol may stack
+        pins that are one node electrically (the ATmega128's hidden VCC / GND
+        pins on the visible ones). That is accepted only when the IR agrees:
+        every pin at the point is in the *same* IR net (or none of them is in
+        any net, left to the no_connect rule) and they all leave the point in
+        the same direction. The representative is the lowest pin number at
+        the point; it alone gets the wire stub and the global label (one
+        connection point, so no label is stacked on another), the others are
+        connected by KiCad through the shared point. Anything else - two nets,
+        a pin in a net stacked on one in none, different directions - is a
+        :class:`CompileError` (the ``coincides with`` refusal), never a silent
+        merge.
+        """
+        out: dict[tuple[str, str], tuple[str, str]] = {}
+        for ref in sorted(placed, key=natural_ref_key):
+            at: dict[Vec, list[tuple[str, str]]] = {}
+            for key in sorted((k for k in pins if k[0] == ref), key=lambda k: natural_ref_key(k[1])):
+                at.setdefault(pins[key].position, []).append(key)
+            for point, keys in at.items():
+                if len(keys) < 2:
+                    continue
+                first = keys[0]
+                for key in keys[1:]:
+                    what = f"pin {ref}.{key[1]} at {point} coincides with pin {ref}.{first[1]}; KiCad would connect them"
+                    if pin_nets.get(key) != pin_nets.get(first):
+                        nets = (pin_nets.get(key), pin_nets.get(first))
+                        raise CompileError(
+                            f"{what} (stacked pins of {placed[ref].symbol.lib_id!r}), but the IR puts them in "
+                            f"{'no net' if nets[0] is None else repr(nets[0])} and {'no net' if nets[1] is None else repr(nets[1])}"
+                        )
+                    if pins[key].body_dir != pins[first].body_dir:
+                        raise CompileError(f"{what} (stacked pins of {placed[ref].symbol.lib_id!r} pointing in different directions; unsupported)")
+                    out[key] = first
+        return out
+
+    @staticmethod
+    def _check_geometry(
+        placed: dict[str, _PlacedSymbol], pins: dict[tuple[str, str], _PlacedPin], stacked: dict[tuple[str, str], tuple[str, str]] | None = None,
+    ) -> None:
         """Refuse any layout in which KiCad could connect things the IR does not connect.
 
         Every pin end and every stub end is a connection point; two of them at
         the same coordinates, or one lying on another pin's stub, would merge
         nets silently (ERC does not report it). Extents that touch are refused
-        as the guard behind the pitch computation.
+        as the guard behind the pitch computation. A stacked pin
+        (``stacked``, see :meth:`_stacks`) is not a point of its own: it is
+        its representative's point, which the IR already puts in the same net.
         """
+        stacked = stacked or {}
         refs = sorted(placed, key=natural_ref_key)
         for i, a in enumerate(refs):
             for b in refs[i + 1 :]:
@@ -295,6 +404,8 @@ class SchematicCompiler(Compiler):
         points: dict[Vec, str] = {}
         stubs: dict[tuple[str, str], tuple[Vec, Vec]] = {}
         for key in sorted(pins, key=lambda k: (natural_ref_key(k[0]), natural_ref_key(k[1]))):
+            if key in stacked:
+                continue
             pp = pins[key]
             label = f"{pp.ref}.{pp.pin.number}"
             end = stub_end(pp.position, pp.body_dir)
@@ -311,8 +422,10 @@ class SchematicCompiler(Compiler):
                     raise CompileError(f"{what} at {point} lies on the wire stub of {key[0]}.{key[1]}; KiCad would connect them")
 
     def _connectivity(
-        self, ir: CircuitIR, placed: dict[str, _PlacedSymbol], pins: dict[tuple[str, str], _PlacedPin]
+        self, ir: CircuitIR, placed: dict[str, _PlacedSymbol], pins: dict[tuple[str, str], _PlacedPin],
+        stacked: dict[tuple[str, str], tuple[str, str]] | None = None,
     ) -> tuple[list[Node], list[Node], list[Node]]:
+        stacked = stacked or {}
         project_id = ir.project.id
         names = [n.name for n in ir.nets]
         if len(set(names)) != len(names):
@@ -334,6 +447,8 @@ class SchematicCompiler(Compiler):
                         continue  # same pin listed twice in one net: harmless
                     raise CompileError(f"pin {pref.component_ref}.{pref.pin_number} is in both nets {owner[key]!r} and {net.name!r}")
                 owner[key] = net.name
+                if key in stacked:
+                    continue  # connected through its representative's point, which carries this net's stub and label
                 pp = pins[key]
                 end = stub_end(pp.position, pp.body_dir)
                 angle, justify = label_orientation(pp.body_dir)
@@ -346,7 +461,8 @@ class SchematicCompiler(Compiler):
             ref, number = key
             ir_pin = placed[ref].component.pin(number)
             if ir_pin is not None and ir_pin.electrical_type is PinElectricalType.NO_CONNECT:
-                no_connects.append(_no_connect(pins[key].position, net_item_uuid(project_id, "no_connect", ref, number)))
+                if key not in stacked:  # one marker per point: a stacked pin shares its representative's
+                    no_connects.append(_no_connect(pins[key].position, net_item_uuid(project_id, "no_connect", ref, number)))
                 continue
             raise CompileError(f"pin {ref}.{number} ({(ir_pin.electrical_type if ir_pin else 'unknown')}) is not in any net; "
                                "connect it or mark it no_connect in the IR")
@@ -376,8 +492,8 @@ class SchematicCompiler(Compiler):
             S("on_board", True),
             S("dnp", False),
             S("uuid", Q(symbol_uuid(project_id, c.ref))),
-            _property("Reference", c.ref, x + 2.54, y - 1.27, justify="left"),
-            _property("Value", c.value, x + 2.54, y + 1.27, justify="left"),
+            _field("Reference", c.ref, ps),
+            _field("Value", c.value, ps),
             _property("Footprint", ps.footprint_id, x, y, hide=True),
             _property("Datasheet", datasheet, x, y, hide=True),
             _property("Description", description, x, y, hide=True),

@@ -76,8 +76,9 @@ APP_HTML = r"""<!doctype html>
 <option value="5 V 전원, 순방향 전압 2 V·순방향 전류 10 mA인 LED 표시등" data-template="led" data-inputs="input_voltage=5 V|led_forward_voltage=2 V|led_forward_current=10 mA">LED 표시등 (led)</option>
 <option value="차단 주파수 1 kHz인 1차 RC 저역통과 필터" data-template="rc_lowpass" data-inputs="cutoff_frequency=1 kHz">RC 저역통과 (rc_lowpass)</option>
 <option value="5 V 입력, 1 kHz 구형파 발진기" data-template="astable" data-inputs="input_voltage=5 V|oscillation_frequency=1 kHz">구형파 발진기 (astable)</option>
+<option value="ATmega128 개발 보드: DC 잭 9 V 입력, L7805 5 V 레귤레이터, 16 MHz 크리스탈, 모든 포트 1x8 헤더, ISP 2x3, UART0 1x4" data-template="atmega128_devboard" data-inputs="input_voltage=9 V|clock_frequency=16 MHz">ATmega128 개발 보드 (atmega128_devboard)</option>
 </select>
-<p id="new-example-hint" class="hint">고르면 네 가지 결정론적 회로 템플릿 중 하나의 요청문을 아래 요청문 칸에 채웁니다. LLM 없이 실행하면 요청문은 읽지 않습니다: 첫 실행의 질문(적용 분야, 시장)에 답한 뒤, 템플릿 입력을 개요의 '추가 답변'에 <code>키=값</code> 줄로 줍니다.</p>
+<p id="new-example-hint" class="hint">고르면 다섯 가지 결정론적 회로 템플릿 중 하나의 요청문을 아래 요청문 칸에 채웁니다. LLM 없이 실행하면 요청문은 읽지 않습니다: 첫 실행의 질문(적용 분야, 시장)에 답한 뒤, 템플릿 입력을 개요의 '추가 답변'에 <code>키=값</code> 줄로 줍니다.</p>
 <p id="new-example-inputs" class="hint" hidden></p>
 </div>
 <div class="field">

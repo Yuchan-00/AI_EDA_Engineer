@@ -15,6 +15,7 @@ violation) - an expectation, never measured yet.
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 
 import pytest
@@ -671,3 +672,158 @@ def test_maze_routed_divider_passes_real_drc_connectivity_and_clearance(tmp_path
     print("DRC on the maze-routed divider:", drc.status, "violation types:", types, "unconnected:", len(unconnected))
     assert unconnected == [], f"the routed board must leave nothing unconnected; DRC reported {len(unconnected)} (types: {types})"
     assert not any(t == "clearance" or t == "track_width" or str(t).startswith("via") for t in types), types
+
+
+# --------------------------------------------------------------------------- core ring + fine rules (a many-pad part)
+
+
+def _mcu_board(tmp_path: Path, keep: tuple[str, ...] = ("U1", "J1", "C1", "C2")):
+    """The synthetic 64-pad MCU fixture of ``tests/test_core_ring.py`` cut down to ``keep`` (nets filtered to them): small enough to route in a test."""
+    from tests.test_core_ring import mcu_ir, mcu_library
+
+    mlib = mcu_library(tmp_path / "mcu_kicad")
+    ir = mcu_ir(tmp_path, mlib)
+    ir.components = [c for c in ir.components if c.ref in keep]
+    nets = []
+    for net in ir.nets:
+        pins = [p for p in net.pins if p.component_ref in keep]
+        if pins:
+            nets.append(net.model_copy(update={"pins": pins}))
+    ir.nets = nets
+    return ir, mlib
+
+
+def test_agent_places_a_many_pad_board_on_the_core_ring_and_routes_it_at_the_fine_rules(tmp_path: Path):
+    from ai_eda.agents.pcb import RING_RATIONALE
+    from ai_eda.tools.routing.maze import RoutingParams
+
+    ir, mlib = _mcu_board(tmp_path)
+    res = _run_agent(ir, tmp_path, mlib)
+    [proposal] = res.proposals
+    payload: PCBDesign = proposal.payload
+    fine = RoutingParams.for_board(ir.model_copy(update={"pcb": payload}), mlib)
+    assert fine.rules == "fine" and fine.pad_pitch_mm == 0.8 and fine.pitch_footprint == "Test_MCU:QFP64"
+    o = payload.outline
+    assert res.notes[0] == (
+        f"placement.core_ring 0.2: 4 component(s) on a {o.width_mm} x {o.height_mm} mm generated outline at (0.0, 0.0), core U1 (64 pads) at "
+        f"({o.width_mm / 2}, {o.height_mm / 2}), 2 part(s) on the inner ring, 1 on the outer ring, spacing {SPACING_MM} mm, margin {MARGIN_MM} mm"
+    )
+    assert res.notes[1].startswith(f"{ROUTER_ID} {ROUTER_VERSION}: 10 net(s) routed on F.Cu/B.Cu, ") and "; grid 0.2 mm, width 0.25 mm, clearance 0.2 mm, via 0.6/0.3 mm, edge 0.3 mm" in res.notes[1]
+    assert "; fine rules: pad pitch 0.8 mm (Test_MCU:QFP64) is below 1.0 mm" in res.notes[1] and proposal.description == f"{res.notes[0]}; {res.notes[1]}"
+    assert proposal.rationale.startswith(RING_RATIONALE) and "DRC decides validity" in proposal.rationale
+    # provenance: core_ring on every placement, the fine rules and the pitch that chose them on every track and via
+    assert {p.provenance.tool for p in payload.placements} == {"placement.core_ring"} and payload.tracks
+    for item in [*payload.tracks, *payload.vias]:
+        assert item.provenance.derived_from[-1] == fine.derived_from_entry() and item.provenance.derived_from[-1].endswith(",rules=fine,pad_pitch=0.8,pitch_footprint=Test_MCU:QFP64")
+    assert all(t.width_mm == 0.25 for t in payload.tracks) and all((v.diameter_mm, v.drill_mm) == (0.6, 0.3) for v in payload.vias)
+    # the IR copper connects every net (IR geometry, not DRC)
+    Orchestrator.apply_proposals(ir, res.proposals)
+    assert _routing_checks(ir, tmp_path, mlib)[CONNECTIVITY_CHECK].status is S.PASS
+    # deterministic: the same proposal from a copy of the IR and another library instance
+    other, other_lib = _mcu_board(tmp_path / "b")
+    again = PCBAgent().run(copy.deepcopy(other), _ctx(tmp_path, other_lib))
+    assert design_data(again.proposals[0].payload) == design_data(payload) and again.notes == res.notes
+
+
+def test_the_core_ring_starts_at_32_pads_and_every_other_board_keeps_the_grid(tmp_path: Path):
+    from ai_eda.ir import Component, LibraryRef
+    from ai_eda.tools.placement.core_ring import CORE_MIN_PADS
+    from tests.test_core_ring import _header, mcu_library
+
+    mlib = mcu_library(tmp_path / "mcu_kicad")
+    pretty = tmp_path / "mcu_kicad" / "footprints" / "Test_MCU.pretty"
+    for n in (CORE_MIN_PADS - 1, CORE_MIN_PADS):
+        (pretty / f"HDR1x{n:02d}.kicad_mod").write_text(_header(n), encoding="utf-8")
+    for n, placer in ((CORE_MIN_PADS - 1, f"placement.grid {PLACER_VERSION}"), (CORE_MIN_PADS, "placement.core_ring 0.2")):
+        ir = CircuitIR(project=ProjectMeta(id="t", name="t", workdir=str(tmp_path)))
+        for ref, name in (("J1", f"HDR1x{n:02d}"), ("R1", "R0603")):
+            ir.components.append(Component(ref=ref, value=name, footprint=mlib.resolve_footprint(LibraryRef(library="Test_MCU", name=name)), provenance=NET_P))
+        res = _run_agent(ir, tmp_path, mlib, **{ROUTING_KEY: "skip"})
+        assert res.notes[0].startswith(f"{placer}: 2 component(s)"), res.notes[0]
+        assert {p.provenance.tool for p in res.proposals[0].payload.placements} == {placer.split()[0]}
+
+
+def test_existing_boards_keep_the_grid_and_the_default_rules_exactly(tmp_path: Path):
+    """The grid-placed synthetic astable and the hand-placed divider: no fine-rule note, the default params entry verbatim, and the agent's
+    copper identical to ``route_board`` with no params at all (the router's own default) - the selection changes nothing below 1.0 mm pitch."""
+    from ai_eda.ir import Component, LibraryRef
+    from ai_eda.tools.routing import RoutingParams, route_board
+
+    lib = template_library(tmp_path / "kicad")
+    ir = CircuitIR(project=ProjectMeta(id="osc", name="osc", workdir=str(tmp_path)))
+    parts = {"C1": ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm"), "C2": ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm"), "J1": ("Connector_PinHeader_2.54mm", "PinHeader_1x03_P2.54mm_Vertical"),
+             "Q1": ("Package_TO_SOT_THT", "TO-92_Inline"), "Q2": ("Package_TO_SOT_THT", "TO-92_Inline"), **{f"R{i}": ("Resistor_THT", "R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal") for i in range(1, 5)}}
+    for ref, (library, name) in parts.items():
+        ir.components.append(Component(ref=ref, value=name, footprint=lib.resolve_footprint(LibraryRef(library=library, name=name)), provenance=NET_P))
+    nets = {
+        "VCC": [("J1", "1"), ("R1", "1"), ("R2", "1"), ("R3", "1"), ("R4", "1")], "Q1_C": [("R1", "2"), ("Q1", "3"), ("C1", "1")],
+        "Q2_B": [("C1", "2"), ("R4", "2"), ("Q2", "2")], "OUT": [("R2", "2"), ("Q2", "3"), ("C2", "1"), ("J1", "2")],
+        "Q1_B": [("C2", "2"), ("R3", "2"), ("Q1", "2")], "GND": [("J1", "3"), ("Q1", "1"), ("Q2", "1")],
+    }
+    ir.nets = [Net(name=n, pins=[PinRef(component_ref=r, pin_number=k) for r, k in pins], provenance=NET_P) for n, pins in nets.items()]
+    div = divider_with_connector_ir(tmp_path, lib)
+    for board, placer in ((ir, "placement.grid 0.1: 9 component(s)"), (div, "not placed: ir.pcb already has 3 placement(s)")):
+        res = _run_agent(board, tmp_path, lib)
+        [proposal] = res.proposals
+        assert res.notes[0].startswith(placer) and not any("fine rules" in n for n in res.notes), res.notes
+        payload = proposal.payload
+        assert payload.tracks and all(t.provenance.derived_from[-1] == RoutingParams().derived_from_entry() for t in [*payload.tracks, *payload.vias])
+        direct = route_board(board.model_copy(update={"pcb": payload.model_copy(update={"tracks": [], "vias": []})}), lib)
+        assert [design_data(t) for t in payload.tracks] == [design_data(t) for t in direct.tracks]
+        assert [design_data(v) for v in payload.vias] == [design_data(v) for v in direct.vias]
+
+
+def test_core_ring_refusals_and_unrouted_fine_boards_are_notes(tmp_path: Path):
+    from ai_eda.tools.routing import RoutingParams
+    from tests.test_core_ring import mcu_ir, mcu_library
+
+    mlib = mcu_library(tmp_path / "mcu_kicad")
+    # an inner ring that cannot hold its parts: nothing proposed, the placer's reason noted
+    res = _run_agent(mcu_ir(tmp_path, mlib, decoupling=30), tmp_path, mlib)
+    assert res.proposals == [] and len(res.notes) == 1 and res.notes[0].startswith("not placed: the inner ring cannot hold its 38 part(s)")
+    # a fab clearance that fences every pad: the placement alone, the fine-rule note (with the raised value) before the per-net reasons
+    ir, mlib = _mcu_board(tmp_path)
+    ir.pcb = PCBDesign(manufacturing=ManufacturingConstraints(min_clearance_mm=assumption(3.0, note="absurd, to fence every pad")))
+    res = _run_agent(ir, tmp_path, mlib)
+    [proposal] = res.proposals
+    assert proposal.payload.tracks == [] and len(proposal.payload.placements) == 4 and proposal.payload.manufacturing.min_clearance_mm.value == 3.0
+    assert res.notes[0].startswith("placement.core_ring 0.2: 4 component(s)") and res.notes[0].endswith(f"; {UNROUTED_NOTE}")
+    assert res.notes[1] == (
+        "fine rules: pad pitch 0.8 mm (Test_MCU:QFP64) is below 1.0 mm: grid 0.2 mm, width 0.25 mm, clearance 3.0 mm, via 0.6/0.3 mm, edge 0.3 mm "
+        "(raised to ir.pcb.manufacturing minimums: clearance_mm 0.2 -> 3.0)"
+    )
+    assert len(res.notes) > 2 and all(n.startswith("not routed: ") for n in res.notes[2:])
+    # parameters the agent was built with are used as given: at the default rules the QFP's terminals sit in their neighbours' keep-out
+    ir, mlib = _mcu_board(tmp_path)
+    res = PCBAgent(routing=RoutingParams()).run(ir, _ctx(tmp_path, mlib))
+    [proposal] = res.proposals
+    assert proposal.payload.tracks == [] and not any("fine rules" in n for n in res.notes)
+    assert any(n.startswith("not routed: PA") and "terminal cell" in n and "inside a keep-out" in n for n in res.notes), res.notes
+
+
+def test_a_partial_route_is_reported_as_not_applied_and_never_proposed(tmp_path: Path):
+    """At the default rules the cut-down MCU board routes some nets and fences the QFP terminals of the rest: the proposal carries the
+    placement only, and one ``not applied:`` note (before the per-net reasons) says what the router did connect - its own numbers."""
+    from ai_eda.tools.routing.maze import RoutingParams, route_board
+
+    ir, mlib = _mcu_board(tmp_path)
+    res = PCBAgent(routing=RoutingParams()).run(ir, _ctx(tmp_path, mlib))
+    [proposal] = res.proposals
+    assert proposal.payload.tracks == [] and proposal.payload.vias == []
+    reasons = [n for n in res.notes if n.startswith("not routed: ")]
+    dropped = [n for n in res.notes if n.startswith("not applied: ")]
+    assert len(dropped) == 1 and res.notes[1] == dropped[0] and res.notes[2:] == reasons
+    m = re.fullmatch(
+        rf"not applied: {ROUTER_ID} {ROUTER_VERSION} connected (\d+) of (\d+) net\(s\) \((\d+) track\(s\), (\d+) via\(s\), ([0-9.]+) mm of copper, (\d) pass\(es\)\) "
+        r"but not the (\d+) below; a half-routed board is never proposed, so the proposal carries the placement only",
+        dropped[0],
+    )
+    assert m is not None, dropped[0]
+    routed, total, tracks, vias, length, _passes, unrouted = int(m[1]), int(m[2]), int(m[3]), int(m[4]), float(m[5]), m[6], int(m[7])
+    assert routed > 0 and tracks > 0 and unrouted == len(reasons) and routed + unrouted == total
+    again = route_board(ir.model_copy(update={"pcb": proposal.payload}), mlib, RoutingParams())
+    assert (routed, tracks, vias, length) == (again.stats["routed_nets"], len(again.tracks), len(again.vias), again.stats["total_length_mm"])
+    # a board where nothing routes gets no such note (nothing was connected)
+    ir.pcb = PCBDesign(manufacturing=ManufacturingConstraints(min_clearance_mm=assumption(3.0, note="absurd, to fence every pad")))
+    res = _run_agent(ir, tmp_path, mlib)
+    assert not any(n.startswith("not applied: ") for n in res.notes)

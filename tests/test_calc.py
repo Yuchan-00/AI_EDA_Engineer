@@ -8,7 +8,9 @@ from ai_eda.tools.calc import (
     CALC_VERSION,
     ROLE_UNITS,
     ROLES,
+    crystal_load_capacitance,
     current_from_voltage_resistance,
+    lc_cutoff,
     led_series_resistor,
     parallel_resistance,
     power_from_voltage_current,
@@ -16,7 +18,10 @@ from ai_eda.tools.calc import (
     rc_lowpass_phase_deg,
     rc_step_response,
     rc_time_constant,
+    rc_tran_step,
+    rc_tran_stop,
     recompute_parameters,
+    regulator_dissipation,
     voltage_divider_output,
 )
 
@@ -85,6 +90,11 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
         "calc.astable.tran_stop": (user_requirement(1e3),),
         "calc.astable.tran_start": (user_requirement(1e3),),
         "calc.astable.v_be_reverse": (user_requirement(5.0), user_requirement(0.7)),
+        "calc.rc.tran_step": (user_requirement(1e-3),),
+        "calc.rc.tran_stop": (user_requirement(1e-3),),
+        "calc.regulator.p_dissipation": (user_requirement(9.0), user_requirement(5.0), user_requirement(0.05)),
+        "calc.crystal.load_capacitance": (user_requirement(22e-12), user_requirement(22e-12), user_requirement(4e-12)),
+        "calc.lc.cutoff": (user_requirement(10e-6), user_requirement(100e-9)),
     }
     assert set(CALCULATORS) == set(sample) == set(ROLES) == set(ROLE_UNITS)
     for tool, (fn, keys) in CALCULATORS.items():
@@ -140,3 +150,36 @@ def test_led_resistor_guards():
     assert r.value == pytest.approx(300.0)
     with pytest.raises(ValueError):
         led_series_resistor(user_requirement(1.0), authoritative(2.0, DS), authoritative(0.01, DS))
+
+
+def test_regulator_crystal_lc_and_rc_window_calculators():
+    """The four calculators the ATmega128 board adds (CALC_VERSION 0.7): values, units, roles and the inputs each refuses."""
+    p = regulator_dissipation(user_requirement(9.0, "V"), user_requirement(5.0, "V"), user_requirement(0.05, "A"), ("v_in", "v_out_reg", "i_load_budget"))
+    assert p.value == pytest.approx(0.2) and p.unit == "W" and p.provenance.inputs == {"v_in": "v_in", "v_out": "v_out_reg", "i_load": "i_load_budget"}
+    assert regulator_dissipation(user_requirement(5.0), user_requirement(5.0), user_requirement(0.05)).value == 0.0  # no headroom, no loss (dropout is not this calculator's business)
+    with pytest.raises(ValueError, match="below the output voltage"):
+        regulator_dissipation(user_requirement(4.0), user_requirement(5.0), user_requirement(0.05))
+    with pytest.raises(ValueError, match="load current must not be negative"):
+        regulator_dissipation(user_requirement(9.0), user_requirement(5.0), user_requirement(-0.01))
+    c_l = crystal_load_capacitance(user_requirement(22e-12, "F"), user_requirement(22e-12, "F"), user_requirement(4e-12, "F"), ("c_xtal", "c_xtal", "c_stray"))
+    assert c_l.value == pytest.approx(15e-12) and c_l.unit == "F" and c_l.provenance.derived_from == ["c_xtal", "c_xtal", "c_stray"]
+    assert crystal_load_capacitance(user_requirement(10e-12), user_requirement(30e-12), user_requirement(0.0)).value == pytest.approx(7.5e-12)
+    with pytest.raises(ValueError, match="load capacitors must be positive"):
+        crystal_load_capacitance(user_requirement(0.0), user_requirement(22e-12), user_requirement(4e-12))
+    with pytest.raises(ValueError, match="stray capacitance must not be negative"):
+        crystal_load_capacitance(user_requirement(22e-12), user_requirement(22e-12), user_requirement(-1e-12))
+    f0 = lc_cutoff(user_requirement(10e-6, "H"), user_requirement(100e-9, "F"))
+    assert f0.value == pytest.approx(1.0 / (2 * math.pi * math.sqrt(1e-12))) and f0.unit == "Hz" and f0.provenance.tool == "calc.lc.cutoff"
+    with pytest.raises(ValueError, match="inductance must be positive"):
+        lc_cutoff(user_requirement(0.0), user_requirement(1e-7))
+    with pytest.raises(ValueError, match="capacitance must be positive"):
+        lc_cutoff(user_requirement(1e-5), user_requirement(-1e-7))
+    with pytest.raises(ValueError, match="underflows"):
+        lc_cutoff(user_requirement(1e-200), user_requirement(1e-200))
+    tau = rc_time_constant(user_requirement(1e4, "ohm"), user_requirement(1e-7, "F"))
+    step, stop = rc_tran_step(tau), rc_tran_stop(tau)
+    assert (step.value, stop.value, step.unit, stop.unit) == (pytest.approx(1e-5), pytest.approx(5e-3), "s", "s") and step.provenance.inputs == {"tau": "tau"}
+    for fn in (rc_tran_step, rc_tran_stop):
+        with pytest.raises(ValueError, match="time constant must be positive"):
+            fn(user_requirement(0.0, "s"))
+    assert CALC_VERSION == "0.7" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")

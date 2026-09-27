@@ -20,7 +20,7 @@ from ai_eda.agents import AgentContext
 from ai_eda.agents.repair import RepairAgent
 from ai_eda.compilers import BOMCompiler, CPLCompiler, CompileContext, GerberExporter, PCBCompiler, SchematicCompiler
 from ai_eda.compilers.pins import pad_pin_types
-from ai_eda.compilers.schematic_layout import Extent, layout_pitch, layout_positions, symbol_extent
+from ai_eda.compilers.schematic_layout import LAYOUT_PAPERS, Extent, layout_columns, layout_paper, layout_pitch, layout_positions, symbol_extent
 from ai_eda.errors import CompileError, ToolExecutionError
 from ai_eda.ir import (
     ArtifactKind,
@@ -195,6 +195,33 @@ def test_layout_pitch_grows_with_the_symbols_and_never_below_the_default():
     assert px >= 10 - (-10) + 5.08
     pos = layout_positions({"A": left, "B": right}, columns=2)
     assert not left.shifted(*pos["A"]).overlaps(right.shifted(*pos["B"]))
+
+
+def test_layout_table_gives_a_tall_symbol_its_own_row_and_column_and_the_sheet_grows_to_hold_it():
+    """A 64-pin symbol (the ATmega128's measured extent with labels) makes only its own row tall and its own column wide; the uniform
+    grid gave every cell its size (a 31-part board became a sheet about 1 m tall). The sheet is the smallest ISO size holding every extent."""
+    small = Extent(-5.08, -5.08, 5.08, 5.08)
+    tall = Extent(-27.94, -62.23, 25.4, 60.96)
+    ext = {**{f"C{i}": small for i in range(1, 13)}, "J1": tall, **{f"R{i}": small for i in range(1, 18)}}
+    assert layout_columns(len(ext)) == 6 and layout_columns(16) == 4 and layout_columns(3) == 4
+    pos = layout_positions(ext)
+    boxes = {r: ext[r].shifted(*pos[r]) for r in ext}
+    refs = sorted(boxes)
+    assert all(not boxes[a].overlaps(boxes[b]) for i, a in enumerate(refs) for b in refs[i + 1:])
+    assert pos["C1"] == (50.8, 50.8) and pos["J1"] == (50.8, pos["R1"][1]) and all(round(v / 2.54, 6) % 1 == 0 for p in pos.values() for v in p)
+    rows = sorted({y for _, y in pos.values()})
+    cols = sorted({x for x, _ in pos.values()})
+    assert len(rows) == 5 and len(cols) == 6
+    assert rows[1] - rows[0] == pytest.approx(25.4) and rows[4] - rows[3] == pytest.approx(25.4)  # rows without the tall symbol keep the minimum pitch
+    assert rows[3] - rows[2] >= tall.ymax - small.ymin + 5.08 - 1e-9 and rows[2] - rows[1] >= small.ymax - tall.ymin + 5.08 - 1e-9
+    assert cols[1] - cols[0] >= tall.xmax - small.xmin + 5.08 - 1e-9 and cols[2] - cols[1] == pytest.approx(25.4)
+    assert rows[4] - rows[0] < 4 * layout_pitch(ext.values())[1] / 2  # the uniform pitch would have been the tall symbol's for every row
+    name, w, h = layout_paper(boxes.values())
+    assert all(b.xmax + 50.8 <= w and b.ymax + 50.8 <= h for b in boxes.values())
+    smaller = [p for p in LAYOUT_PAPERS if p[1] < w or p[2] < h]
+    assert all(any(b.xmax + 50.8 > pw or b.ymax + 50.8 > ph for b in boxes.values()) for _, pw, ph in smaller)
+    assert layout_paper([small.shifted(50.8, 50.8)]) == ("A4", 297.0, 210.0)
+    assert layout_paper([Extent(0, 0, 2000.3, 10)]) == ("User", 2052.0, 61.0)  # beyond A0: a User sheet, whole millimetres
 
 
 @needs_libs

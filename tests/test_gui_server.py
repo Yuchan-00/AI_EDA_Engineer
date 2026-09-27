@@ -390,10 +390,10 @@ def test_the_page_is_the_korean_app_and_needs_nothing_its_csp_forbids(shared):
     created = set(re.findall(r"\bid: '([A-Za-z0-9_-]+)'", APP_JS))
     wanted = set(re.findall(r"\$\('([A-Za-z0-9_-]+)'\)", APP_JS))
     assert wanted and wanted <= ids | created, wanted - ids - created
-    # the new-project form: the name rule and the four template requests, each naming its template's inputs (the answers without --llm)
+    # the new-project form: the name rule and the five template requests, each naming its template's inputs (the answers without --llm)
     assert 'pattern="[A-Za-z0-9][A-Za-z0-9_\\-]{0,63}"' in APP_HTML
     examples = page_examples()
-    assert len(examples) == 4 and "5 V 입력, 1 kHz 구형파 발진기" in [e["value"] for e in examples]
+    assert len(examples) == 5 and "5 V 입력, 1 kHz 구형파 발진기" in [e["value"] for e in examples]
     needs = {t.id: set(t.needs) for t in TEMPLATES}
     assert sorted(e["data-template"] for e in examples) == sorted(needs)
     for e in examples:
@@ -422,9 +422,10 @@ def page_examples() -> list[dict[str, str]]:
 def test_each_example_request_names_the_answers_that_select_its_template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Without --llm the request text is not read: the example's ``data-inputs`` given as answers (after the two baseline
     questions) are what makes its template present the design table - the path the page tells the user to take."""
+    from tests.fixtures_atmega import atmega_library
     from tests.test_circuit_templates import BASE
 
-    lib = template_library(tmp_path / "kicad")
+    lib = atmega_library(tmp_path / "kicad")  # every template's parts: the ATmega128 board's beside the four small templates
     monkeypatch.setenv("KICAD10_SYMBOL_DIR", str(lib.roots[0] / "symbols"))
     monkeypatch.setattr("ai_eda.tools.kicad.cli.find_kicad_cli", lambda: None)
     for example in page_examples():

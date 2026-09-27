@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -84,7 +85,14 @@ def _effects():
     return SX("effects", SX("font", SX("size", 1.27, 1.27)))
 
 
+#: the Reference / Value field positions the fixture symbols carry (library frame, Y up, left-justified): right of the origin, above / below it
+FIELD_AT = {"Reference": (2.54, 1.27), "Value": (2.54, -1.27)}
+
+
 def _prop(key, value, hide=False):
+    if key in FIELD_AT:
+        x, y = FIELD_AT[key]
+        return SX("property", Q(key), Q(value), SX("at", x, y, 0), SX("effects", SX("font", SX("size", 1.27, 1.27)), SX("justify", "left")))
     return SX("property", Q(key), Q(value), SX("at", 0, 0, 0), SX("hide", True) if hide else None, _effects())
 
 
@@ -675,7 +683,7 @@ ASTABLE_C_TEXT = "64.8172677616823n"
 
 def test_astable_calculators_refuse_out_of_domain_inputs():
     c = astable_c_for_frequency(user_requirement(1000.0, "Hz"), user_requirement(10_000.0, "ohm"), user_requirement(5.0, "V"), user_requirement(0.7, "V"))
-    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.6"
+    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.7"
     assert c.provenance.inputs == {"f_osc": "f_osc", "r_b": "r_b", "v_cc": "v_cc", "v_be": "v_be"}
     f = astable_frequency(user_requirement(10_000.0, "ohm"), c, user_requirement(5.0, "V"), user_requirement(0.7, "V"))
     assert f.value == pytest.approx(1000.0) and f.unit == "Hz" and f.provenance.tool == "calc.astable.f"
@@ -914,9 +922,21 @@ def test_readme_usage_counts_every_template():
     """README's usage sentence names as many templates as ``TEMPLATES`` holds (the astable was added without updating it)."""
     readme = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
     line = next(ln for ln in readme.splitlines() if "템플릿은 " in ln and "confirm_design=yes" in ln)
-    assert f"템플릿은 {len(TEMPLATES)}종(" in line and len(TEMPLATES) == 4
-    for name in ("무부하 저항 분배기", "LED+직렬 저항", "1차 RC 저역통과", "BJT 비안정 멀티바이브레이터"):
+    assert f"템플릿은 {len(TEMPLATES)}종(" in line and len(TEMPLATES) == 5
+    for name in ("무부하 저항 분배기", "LED+직렬 저항", "1차 RC 저역통과", "BJT 비안정 멀티바이브레이터", "ATmega128 개발 보드"):
         assert name in line, name
+    # every present-tense count agrees: each "템플릿 N종(" phrase (the Agent row too), the GUI section's example list and the GUI's own hint
+    # (the dated change-log entries keep the counts of their day and are not checked)
+    present = readme.split("\n## 변경 이력", 1)[0]
+    counts = re.findall(r"템플릿은? (\d+)종\(", present)
+    assert len(counts) >= 2 and set(counts) == {str(len(TEMPLATES))}, counts
+    word = {4: "네", 5: "다섯", 6: "여섯"}[len(TEMPLATES)]
+    gui = next(ln for ln in readme.splitlines() if "새 프로젝트 폼(이름, 요청문," in ln)
+    assert f"새 프로젝트 폼(이름, 요청문, {word} 템플릿의 예시 요청문)" in gui
+    page = (Path(__file__).parent.parent / "ai_eda" / "gui" / "page.py").read_text(encoding="utf-8")
+    assert f"고르면 {word} 가지 결정론적 회로 템플릿" in page
+    # the placement is not grid-only any more (core_ring when a part has >= 32 pads)
+    assert "PCB = grid 배치" not in present and "`placement.grid`의 결정론적 grid 배치를 단일" not in present
 
 
 # --------------------------------------------------------------------------- a confirmation counts only for the table the user saw

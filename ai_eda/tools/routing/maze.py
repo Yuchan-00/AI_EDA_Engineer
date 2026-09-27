@@ -102,9 +102,12 @@ __all__ = [
     "LAYERS",
     "BLOCKED",
     "CONVEX_PAD_SHAPES",
+    "FINE_PITCH_MM",
+    "FINE_RULES",
     "RoutingParams",
     "Routing",
     "effective_params",
+    "finest_pad_pitch",
     "route_board",
 ]
 
@@ -135,7 +138,15 @@ _EPS = 1e-9
 
 @dataclass(frozen=True, slots=True)
 class RoutingParams:
-    """The router's knobs (mm, except the two costs in grid steps). Every one lands in the provenance."""
+    """The router's knobs (mm, except the two costs in grid steps). Every one lands in the provenance.
+
+    ``rules`` / ``pad_pitch_mm`` / ``pitch_footprint`` say why the values
+    were chosen when :meth:`for_board` picked the fine rules (``None`` for
+    values given directly or the defaults); they change nothing in the search
+    and are appended to :meth:`derived_from_entry` only when set, so a
+    default-rule board's provenance is exactly what it was before they
+    existed.
+    """
 
     grid_mm: float = 0.25
     track_width_mm: float = 0.4
@@ -145,6 +156,9 @@ class RoutingParams:
     edge_clearance_mm: float = 0.3
     via_cost: float = 12.0
     bend_cost: float = 0.6
+    rules: str | None = None
+    pad_pitch_mm: float | None = None
+    pitch_footprint: str | None = None
 
     def check(self) -> None:
         """Refuse parameters that make no sense (:class:`CompileError`)."""
@@ -156,14 +170,91 @@ class RoutingParams:
                 raise CompileError(f"routing parameter {name} must be >= 0 (got {getattr(self, name)!r})")
         if self.via_diameter_mm <= self.via_drill_mm:
             raise CompileError(f"via diameter {self.via_diameter_mm} mm must exceed the via drill {self.via_drill_mm} mm")
+        if self.pad_pitch_mm is not None and not (math.isfinite(self.pad_pitch_mm) and self.pad_pitch_mm > 0):
+            raise CompileError(f"routing parameter pad_pitch_mm must be a finite number > 0 (got {self.pad_pitch_mm!r})")
 
     def derived_from_entry(self) -> str:
-        """The ``derived_from`` entry that records every parameter."""
-        return (
+        """The ``derived_from`` entry that records every parameter (and, when set, the rule set and the pitch that chose it)."""
+        entry = (
             f"params:grid={self.grid_mm},width={self.track_width_mm},clearance={self.clearance_mm},"
             f"via={self.via_diameter_mm}/{self.via_drill_mm},edge={self.edge_clearance_mm},"
             f"via_cost={self.via_cost},bend_cost={self.bend_cost}"
         )
+        if self.rules is not None:
+            entry += f",rules={self.rules},pad_pitch={self.pad_pitch_mm},pitch_footprint={self.pitch_footprint}"
+        return entry
+
+    @classmethod
+    def for_board(cls, ir: CircuitIR, library: KicadLibrary) -> RoutingParams:
+        """The fine rules (:data:`FINE_RULES`) when the finest pad pitch on the board is below :data:`FINE_PITCH_MM`, else the defaults.
+
+        The pitch is :func:`finest_pad_pitch` (library pad positions). The
+        default instance is returned as ``cls()`` - no ``rules`` recorded -
+        so a board whose pads are all at least :data:`FINE_PITCH_MM` apart
+        routes exactly as before this method existed. Fab minimums in
+        ``ir.pcb.manufacturing`` still raise either set when the router runs
+        (:func:`effective_params`).
+        """
+        pitch = finest_pad_pitch(ir, library)
+        if pitch is None or pitch[0] >= FINE_PITCH_MM:
+            return cls()
+        return cls(**FINE_RULES, rules="fine", pad_pitch_mm=pitch[0], pitch_footprint=pitch[1])
+
+
+#: a board whose finest centre-to-centre pad pitch is below this (mm) is routed with :data:`FINE_RULES`
+FINE_PITCH_MM = 1.0
+#: the fine rules: a 0.2 mm grid puts a terminal cell inside the inscribed circle of a 0.45 mm wide 0.8 mm-pitch pad
+#: (worst case 0.2 * sqrt(2) / 2 = 0.141 mm from its centre < 0.225 mm) and a 0.25 mm track at 0.2 mm clearance
+#: leaves such a pad along its axis; the via shrinks with it
+FINE_RULES: dict[str, float] = {
+    "grid_mm": 0.2,
+    "track_width_mm": 0.25,
+    "clearance_mm": 0.2,
+    "via_diameter_mm": 0.6,
+    "via_drill_mm": 0.3,
+    "edge_clearance_mm": 0.3,
+}
+
+
+def _copper(pad: Pad) -> bool:
+    return pad.pad_type != "np_thru_hole" and any(layer.endswith(".Cu") for layer in pad.layers)
+
+
+def finest_pad_pitch(ir: CircuitIR, library: KicadLibrary) -> tuple[float, str] | None:
+    """``(pitch, footprint lib id)``: the smallest centre-to-centre distance between two copper pads of one footprint on the board.
+
+    Only pads that can carry different nets count: two pads with the same
+    non-empty number are one logical pad (a split thermal pad, a switch's
+    duplicated pins) and are skipped, as are pads without copper (paste-only
+    apertures, NPTH holes) and coincident centres. Distances are taken in the
+    footprint's own frame (a rotation does not change them) and rounded to
+    KiCad's resolution; ties go to the first footprint in natural ref order.
+    Components without a footprint, or whose footprint is not on disk, are
+    not measured here: :func:`route_board` refuses such a board anyway, so no
+    copper is ever routed at rules chosen without them. ``None`` when no
+    footprint has two such pads.
+    """
+    best: tuple[float, str] | None = None
+    seen: dict[str, float | None] = {}
+    for comp in sorted(ir.components, key=lambda c: natural_ref_key(c.ref)):
+        if comp.footprint is None or not library.resolve_footprint(comp.footprint).verified:
+            continue
+        fp = library.load_footprint(comp.footprint)
+        if fp.lib_id not in seen:
+            pads = [p for p in fp.pads if _copper(p)]
+            pitch: float | None = None
+            for i, a in enumerate(pads):
+                for b in pads[i + 1:]:
+                    if a.number and a.number == b.number:
+                        continue
+                    d = _q(math.hypot(a.x - b.x, a.y - b.y))
+                    if d > 0 and (pitch is None or d < pitch):
+                        pitch = d
+            seen[fp.lib_id] = pitch
+        pitch = seen[fp.lib_id]
+        if pitch is not None and (best is None or pitch < best[0]):
+            best = (pitch, fp.lib_id)
+    return best
 
 
 @dataclass(slots=True)

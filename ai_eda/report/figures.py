@@ -820,6 +820,121 @@ def _value_label(value: str, limit: int = _VALUE_LABEL_CHARS) -> str:
     return _shorten(f"{_g(number / 10**e3, 5)}{_SPICE_SUFFIXES[e3]}", limit)
 
 
+@dataclass(frozen=True)
+class _PartBox:
+    """One placed part as the board labels see it: its extent, its own pads (the square each pad can reach) and their drawn copper, in pixels."""
+
+    ref: str
+    value: str
+    box: _Box
+    pads: tuple[_Box, ...]
+    copper: tuple[_Box, ...] = ()
+
+
+def _label_layouts(part: _PartBox) -> dict[str, tuple[str, float, float, float, float]]:
+    """The candidate spots of a part's two labels: ``name -> (text-anchor, ref x, ref baseline, value x, value baseline)``."""
+    x1, y1, x2, y2 = part.box
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    ref_w, value_w = _text_width(part.ref, _SMALL_PX), _text_width(_value_label(part.value), _SMALL_PX - 1)
+    return {
+        "inside": ("middle", cx, cy - 3, cx, cy + 11),
+        "default": ("middle", cx, y1 - 4, cx, y2 + 11),
+        "left": ("end", x1 - 3 - value_w - 4, cy + 4, x1 - 3, cy + 4),
+        "right": ("start", x2 + 3, cy + 4, x2 + 3 + ref_w + 4, cy + 4),
+        "above2": ("middle", cx, y1 - 17, cx, y1 - 4),
+        "below2": ("middle", cx, y2 + 11, cx, y2 + 25),
+        "left2": ("end", x1 - 3, cy - 2, x1 - 3, cy + 11),
+        "right2": ("start", x2 + 3, cy - 2, x2 + 3, cy + 11),
+    }
+
+
+def _label_boxes(part: _PartBox, layout: tuple[str, float, float, float, float]) -> list[_Box]:
+    anchor, rx, ry, vx, vy = layout
+
+    def one(x: float, y: float, w: float, px: float) -> _Box:
+        left = x - w / 2 if anchor == "middle" else (x - w if anchor == "end" else x)
+        return (left, y - px, left + w, y + 3)
+
+    return [one(rx, ry, _text_width(part.ref, _SMALL_PX), _SMALL_PX), one(vx, vy, _text_width(_value_label(part.value), _SMALL_PX - 1), _SMALL_PX - 1)]
+
+
+def _board_labels(parts: Sequence[_PartBox], width: float) -> list[str]:
+    """The ref / value labels of every placed part, each pair where it overlaps no label already placed.
+
+    A part's labels go inside its extent when both fit there clear of its
+    own pads (the empty middle of a QFP); otherwise the default is the
+    reference centred above the part and the value centred below it. A part
+    is *crowded* when those default labels would overlap another part's
+    default labels (parts packed around a microcontroller). Three sweeps, each
+    in IR order: (1) every part that is not crowded takes its inside spot,
+    else its default, else a spot beside it - one line left / right, both
+    lines above / below, two lines left / right - clear of every other
+    part's extent; (2) a crowded part takes its inside spot or a spot beside
+    it that is clear of every other part's extent *and* default labels;
+    (3) the crowded parts
+    still without a spot take the first spot beside them clear of the other
+    parts' extents, else the default. Every spot must be free of the labels
+    placed before it, the default and the spots beside a part must not
+    cover another part's drawn pad copper (a label over a QFP's pads hides
+    them), and a spot beside a part must lie inside the figure; when none is
+    free the default stays - nothing is dropped. The labels are emitted in
+    IR order. A board without crowded parts, without a part large enough to
+    hold its labels and without a default label on another part's pads is
+    drawn exactly as before these rules existed. Deterministic: the result
+    depends on the parts and their order only.
+    """
+    layouts = [_label_layouts(p) for p in parts]
+    defaults = [_label_boxes(p, lay["default"]) for p, lay in zip(parts, layouts)]
+    overlaps = _LabelPlacer._overlaps
+    crowded = [any(overlaps(a, b) for j, other in enumerate(defaults) if j != i for a in defaults[i] for b in other) for i in range(len(parts))]
+    taken: list[_Box] = []
+    chosen: dict[int, tuple[str, float, float, float, float]] = {}
+    beside = ("left", "right", "above2", "below2", "left2", "right2")
+
+    def first_free(i: int, spots: Sequence[str], strict: bool) -> tuple[str, float, float, float, float] | None:
+        part, lay = parts[i], layouts[i]
+        x1, y1, x2, y2 = part.box
+        extents = [q.box for j, q in enumerate(parts) if j != i]
+        others_default = [b for j, d in enumerate(defaults) if j != i for b in d] if strict else []
+        others_copper = [c for j, q in enumerate(parts) if j != i for c in q.copper]
+        for name in spots:
+            boxes = _label_boxes(part, lay[name])
+            if name == "inside" and not all(
+                b[0] >= x1 + 2 and b[2] <= x2 - 2 and b[1] >= y1 + 2 and b[3] <= y2 - 2 and not any(overlaps(b, pad) for pad in part.pads) for b in boxes
+            ):
+                continue
+            if name != "inside" and any(overlaps(b, c) for b in boxes for c in others_copper):
+                continue
+            if name in beside and any(b[0] < 2 or b[2] > width - 2 or b[1] < 2 or any(overlaps(b, o) for o in extents + others_default) for b in boxes):
+                continue
+            if not any(overlaps(b, t) for b in boxes for t in taken):
+                return lay[name]
+        return None
+
+    def take(i: int, layout: tuple[str, float, float, float, float]) -> None:
+        chosen[i] = layout
+        taken.extend(_label_boxes(parts[i], layout))
+
+    for i in range(len(parts)):
+        if not crowded[i]:
+            take(i, first_free(i, ("inside", "default", *beside), False) or layouts[i]["default"])
+    for i in range(len(parts)):
+        if crowded[i] and (layout := first_free(i, ("inside", *beside), True)) is not None:
+            take(i, layout)
+    for i in range(len(parts)):
+        if crowded[i] and i not in chosen:
+            take(i, first_free(i, (*beside, "default"), False) or layouts[i]["default"])
+    out: list[str] = []
+    for i, part in enumerate(parts):
+        anchor, rx, ry, vx, vy = chosen[i]
+        out += [
+            f'<text class="ref" x="{_f(rx)}" y="{_f(ry)}" text-anchor="{anchor}" font-size="{_SMALL_PX}" font-weight="600" {_LABEL_HALO}>{esc(part.ref)}</text>',
+            f'<text class="value" data-value="{esc(part.value)}" x="{_f(vx)}" y="{_f(vy)}" text-anchor="{anchor}" font-size="{_SMALL_PX - 1}" '
+            f'fill="{INK_SECONDARY}" {_LABEL_HALO}>{esc(_value_label(part.value))}</text>',
+        ]
+    return out
+
+
 def _wrap_caption(line: str, max_px: float, px: float) -> list[str]:
     """``line`` split after ``;`` / ``,`` into lines whose estimated width fits ``max_px``; a single piece wider than that is broken at character level, so nothing is ever clipped at the SVG edge."""
     out: list[str] = []
@@ -876,7 +991,9 @@ def layer_class(layer: str) -> str:
 
 
 def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, scale_px_per_mm: float = 18.0, max_width: int = COLUMN_PX, fig_id: str | None = None) -> Figure:
-    """The placed board of ``ir``: outline, every pad from the KiCad library, tracks and vias (``copper=True``), reference / value labels and a caption line.
+    """The placed board of ``ir``: outline, every pad from the KiCad library, tracks and vias (``copper=True``), reference / value labels
+    (inside a part whose extent holds them clear of its pads, else above / below it, beside it when crowded: :func:`_board_labels`)
+    and a caption line.
 
     Reads exactly what the PCB compiler reads (``ir.pcb.outline``,
     ``ir.pcb.placement(ref)`` for every component, the footprint loaded
@@ -971,11 +1088,20 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     out.append("</g>")
     # pads: bottom SMD first, then front SMD, then through-hole (visible on both sides) on top
     pad_items: list[tuple[int, str]] = []
-    labels: list[str] = []
+    label_parts: list[_PartBox] = []
     for comp, placement, fp in placed:
+        own_pads: list[_Box] = []
+        own_copper: list[_Box] = []
         for pad in fp.pads:
             cx, cy = pad_center(placement, pad)
             angle = pad_angle(placement, pad)
+            reach = max(pad.size_w, pad.size_h) / 2 * scale
+            own_pads.append((X(cx) - reach, Y(cy) - reach, X(cx) + reach, Y(cy) + reach))
+            if math.isclose(angle % 90.0, 0.0, abs_tol=1e-9):  # the drawn copper: exact at quarter turns, the reach square otherwise
+                hw, hh = (pad.size_w, pad.size_h) if math.isclose(angle % 180.0, 0.0, abs_tol=1e-9) else (pad.size_h, pad.size_w)
+                own_copper.append((X(cx) - hw / 2 * scale, Y(cy) - hh / 2 * scale, X(cx) + hw / 2 * scale, Y(cy) + hh / 2 * scale))
+            else:
+                own_copper.append(own_pads[-1])
             layers = pad_layers(placement, pad)
             fill, tht = _pad_fill(pad, layers)
             order = 2 if tht else (1 if "F.Cu" in layers else 0)
@@ -987,14 +1113,7 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
             pad_items.append((order, "".join(parts)))
         box = footprint_bbox(placement, fp)
         if box is not None:
-            lx = X((box.x1 + box.x2) / 2)
-            labels.append(
-                f'<text class="ref" x="{_f(lx)}" y="{_f(Y(box.y1) - 4)}" text-anchor="middle" font-size="{_SMALL_PX}" font-weight="600" {_LABEL_HALO}>{esc(comp.ref)}</text>'
-            )
-            labels.append(
-                f'<text class="value" data-value="{esc(comp.value)}" x="{_f(lx)}" y="{_f(Y(box.y2) + 11)}" text-anchor="middle" font-size="{_SMALL_PX - 1}" '
-                f'fill="{INK_SECONDARY}" {_LABEL_HALO}>{esc(_value_label(comp.value))}</text>'
-            )
+            label_parts.append(_PartBox(comp.ref, comp.value, (X(box.x1), Y(box.y1), X(box.x2), Y(box.y2)), tuple(own_pads), tuple(own_copper)))
     out.append('<g class="pads">')
     out += [markup for _, markup in sorted(pad_items, key=lambda item: item[0])]
     out.append("</g>")
@@ -1006,7 +1125,7 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
         )
     out.append("</g>")
     out.append('<g class="labels">')
-    out += labels
+    out += _board_labels(label_parts, width)
     out.append("</g>")
     for i, line in enumerate(caption_lines):
         y = height - 10 - _BOARD_CAPTION_LINE_H * (len(caption_lines) - 1 - i)

@@ -464,6 +464,67 @@ def test_long_values_are_respelled_or_shortened_on_the_board_but_kept_in_the_dat
     assert [t.text for t in _by_class(root, "value") if t.get("data-value") == "3.3000000000000003"] == ["3.3"]
 
 
+def _label_boxes(root: ET.Element) -> dict[str, list[tuple[float, float, float, float]]]:
+    """``ref -> [ref label box, value label box]`` in pixels, estimated as the figure module estimates them."""
+    out: dict[str, list[tuple[float, float, float, float]]] = {}
+    refs = _by_class(root, "ref")
+    values = _by_class(root, "value")
+    for ref, value in zip(refs, values):
+        pair = []
+        for t in (ref, value):
+            px, w = float(t.get("font-size")), figures._text_width(t.text, float(t.get("font-size")))
+            x, y, anchor = float(t.get("x")), float(t.get("y")), t.get("text-anchor")
+            left = x - w / 2 if anchor == "middle" else (x - w if anchor == "end" else x)
+            pair.append((left, y - px, left + w, y + 3))
+        out[ref.text] = pair
+    return out
+
+
+def _pad_copper(root: ET.Element) -> dict[str, list[tuple[float, float, float, float]]]:
+    """``ref -> [box of each drawn pad]`` in pixels, read back from the pads' shapes (quarter-turn pads: exact)."""
+    out: dict[str, list[tuple[float, float, float, float]]] = {}
+    for g in _by_class(root, "pad"):
+        shape = list(g)[0]
+        if shape.tag == f"{SVG_NS}circle":
+            cx, cy, r = (float(shape.get(k)) for k in ("cx", "cy", "r"))
+            box = (cx - r, cy - r, cx + r, cy + r)
+        else:
+            x, y, w, h = (float(shape.get(k)) for k in ("x", "y", "width", "height"))
+            box = (x, y, x + w, y + h)
+        out.setdefault(g.get("data-ref"), []).append(box)
+    return out
+
+
+def labels_on_foreign_copper(root: ET.Element) -> list[tuple[str, str]]:
+    """``(label ref, pad owner)`` for every ref / value label box that covers another part's drawn pad."""
+    copper = _pad_copper(root)
+    return [(ref, owner) for ref, pair in _label_boxes(root).items() for b in pair for owner, pads in copper.items() if owner != ref
+            for d in pads if b[0] < d[2] and d[0] < b[2] and b[1] < d[3] and d[1] < b[3]]
+
+
+def test_board_labels_move_beside_crowded_parts_and_keep_the_default_elsewhere(tmp_path: Path):
+    """Uncrowded small parts keep their labels centred above / below unless that would cover another part's pads; parts packed so close
+    that those labels would collide get them beside the part instead, and no two labels overlap while a free spot exists."""
+    ir, lib = _board(tmp_path)
+    root = _parse(board_figure(ir, lib).svg)
+    anchors = {t.text: t.get("text-anchor") for t in _by_class(root, "ref")}
+    assert anchors["J1"] == "middle"  # nothing of another part under its default spots
+    # R2 (bottom side) reaches under R1: R1's value below it would cover R2's pad 1 and R2's reference above it R1's pad 2 - both move beside
+    assert anchors["R1"] != "middle" and anchors["R2"] != "middle"
+    assert labels_on_foreign_copper(root) == []
+    # R2 just below R1 (centres aligned): R1's value below it and R2's reference above it would share the gap
+    ir.pcb.placement("R1").x_mm, ir.pcb.placement("R1").y_mm = 15.0, 5.0
+    ir.pcb.placement("R2").x_mm, ir.pcb.placement("R2").y_mm = 15.0, 11.2
+    ir.pcb.tracks, ir.pcb.vias = [], []
+    fig = board_figure(ir, lib)
+    root = _parse(fig.svg)
+    boxes = _label_boxes(root)
+    flat = [(ref, b) for ref, pair in boxes.items() for b in pair]
+    assert not [(a, c) for i, (a, b) in enumerate(flat) for c, d in flat[i + 1:] if a != c and b[0] < d[2] and d[0] < b[2] and b[1] < d[3] and d[1] < b[3]]
+    assert {t.get("text-anchor") for t in _by_class(root, "ref")} != {"middle"}  # someone moved beside its part
+    assert fig.svg == board_figure(ir, lib).svg
+
+
 def test_board_caption_wraps_inside_the_svg_and_labels_wear_a_halo(tmp_path: Path):
     """On a 30 x 20 mm board the caption line is longer than the figure: it wraps into lines that fit, and the height grows with them; every ref / value label carries a surface-coloured halo so it stays legible over copper."""
     ir, lib = _board(tmp_path)

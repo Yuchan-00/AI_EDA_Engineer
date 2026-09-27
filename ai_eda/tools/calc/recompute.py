@@ -53,9 +53,11 @@ from ai_eda.tools.calc.basic import (
     astable_tran_step,
     astable_tran_stop,
     astable_v_be_reverse,
+    crystal_load_capacitance,
     current_from_voltage_resistance,
     divider_r1_for_v_out,
     junction_temperature,
+    lc_cutoff,
     led_current,
     led_series_resistor,
     parallel_resistance,
@@ -68,6 +70,9 @@ from ai_eda.tools.calc.basic import (
     rc_r_for_cutoff,
     rc_step_response,
     rc_time_constant,
+    rc_tran_step,
+    rc_tran_stop,
+    regulator_dissipation,
     voltage_divider_output,
     voltage_divider_ratio,
 )
@@ -104,6 +109,11 @@ CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     "calc.astable.tran_stop": (astable_tran_stop, ROLES["calc.astable.tran_stop"]),
     "calc.astable.tran_start": (astable_tran_start, ROLES["calc.astable.tran_start"]),
     "calc.astable.v_be_reverse": (astable_v_be_reverse, ROLES["calc.astable.v_be_reverse"]),
+    "calc.rc.tran_step": (rc_tran_step, ROLES["calc.rc.tran_step"]),
+    "calc.rc.tran_stop": (rc_tran_stop, ROLES["calc.rc.tran_stop"]),
+    "calc.regulator.p_dissipation": (regulator_dissipation, ROLES["calc.regulator.p_dissipation"]),
+    "calc.crystal.load_capacitance": (crystal_load_capacitance, ROLES["calc.crystal.load_capacitance"]),
+    "calc.lc.cutoff": (lc_cutoff, ROLES["calc.lc.cutoff"]),
 }
 
 #: lower-cased unit spelling -> the key a role's expected unit lower-cases to. A thermal resistance is written

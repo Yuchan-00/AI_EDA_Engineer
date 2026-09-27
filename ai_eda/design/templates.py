@@ -1,4 +1,4 @@
-"""The four verified circuit templates and the closed-world selection between them.
+"""The five verified circuit templates and the closed-world selection between them.
 
 Invariant: a template is selected only by *confirmed* requirement values
 (:mod:`ai_eda.design.inputs`), computes every number with a registered
@@ -42,7 +42,15 @@ Templates:
   v(OUT) (``Reduce.FREQUENCY``) and whose swing is checked against the
   supply; the supply (3..6 V, the reverse base-emitter rating of small
   NPNs) and the frequency (100 Hz..20 kHz, non-polar timing capacitors and
-  the model's missing switching times) are validity conditions.
+  the model's missing switching times) are validity conditions;
+* ``atmega128_devboard`` - a minimal ATmega128 development board from
+  ``clock_frequency`` (the crystal, 1..16 MHz) and ``input_voltage`` (the DC
+  jack, 7..15 V): DC jack, reverse-polarity diode and L7805, the MCU wired
+  pin by pin by library name (64 pins), decoupling, LC-filtered AVCC, RC
+  reset, crystal, every port on a header, ISP 2x3 and UART0 1x4. The MCU and
+  the regulator have no SPICE model and are excluded; the power LED
+  current, the reset RC delay and the AVCC DC level are simulated. It lives
+  in :mod:`ai_eda.design.atmega128` (imported below the shared helpers).
 """
 
 from __future__ import annotations
@@ -698,17 +706,24 @@ class LedTemplate(Template):
 
 
 def _example(key: str) -> str:
-    return {"input_voltage": "5 V", "led_forward_voltage": "2 V", "led_forward_current": "10 mA", "oscillation_frequency": "1 kHz"}.get(key, f"<value {UNIT_OF[key]}>")
+    return {
+        "input_voltage": "5 V", "led_forward_voltage": "2 V", "led_forward_current": "10 mA", "oscillation_frequency": "1 kHz", "clock_frequency": "16 MHz",
+    }.get(key, f"<value {UNIT_OF[key]}>")
 
 
-def _missing_inputs(plan: Plan, who: str, missing: list[str], unusable: dict[str, str]) -> Plan:
-    """A template input no requirement states is a required question; one stated but unreadable is a note (the requirement must change)."""
+def _missing_inputs(plan: Plan, who: str, missing: list[str], unusable: dict[str, str], examples: dict[str, str] | None = None) -> Plan:
+    """A template input no requirement states is a required question; one stated but unreadable is a note (the requirement must change).
+
+    ``examples`` overrides the example answer per key (a template whose
+    validity range excludes the generic example gives one inside it).
+    """
     for k in missing:
         if k in unusable:
             plan.notes.append(f"{k} not usable: {unusable[k]}")
         else:
+            example = (examples or {}).get(k) or _example(k)
             plan.questions.append(MissingInformation(
-                key=k, question=f"{who} needs {k} in {UNIT_OF[k]}: answer {k}=<value {UNIT_OF[k]}> (e.g. {k}=\"{_example(k)}\")",
+                key=k, question=f"{who} needs {k} in {UNIT_OF[k]}: answer {k}=<value {UNIT_OF[k]}> (e.g. {k}=\"{example}\")",
                 rationale="template input",
             ))
     return _refused(plan, f"input(s) {missing} missing")
@@ -1351,7 +1366,11 @@ class AstableTemplate(Template):
         }
 
 
-TEMPLATES: list[Template] = [DividerTemplate(), LedTemplate(), RcLowpassTemplate(), AstableTemplate()]
+# The ATmega128 board lives in its own module (it is large) and uses the helpers above: imported here, after them, so the
+# import is one-way whichever module is loaded first (the package ``__init__`` always loads this one before it).
+from ai_eda.design.atmega128 import Atmega128DevboardTemplate  # noqa: E402
+
+TEMPLATES: list[Template] = [DividerTemplate(), LedTemplate(), RcLowpassTemplate(), AstableTemplate(), Atmega128DevboardTemplate()]
 
 
 def template_keys_text() -> str:
@@ -1451,6 +1470,7 @@ __all__ = [
     "RESISTOR",
     "RESISTOR_THT",
     "TEMPLATES",
+    "Atmega128DevboardTemplate",
     "AstableTemplate",
     "DividerTemplate",
     "LedTemplate",
