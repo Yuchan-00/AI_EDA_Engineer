@@ -89,6 +89,7 @@ __all__ = [
     "downsample",
     "esc",
     "expectation_limit",
+    "layer_class",
     "log_ticks",
     "nice_ticks",
     "plot_vector",
@@ -96,6 +97,7 @@ __all__ = [
     "svg_line_chart",
     "tolerance_figure",
     "tolerance_rows",
+    "vector_kind",
     "waveform_figure",
     "waveform_figures",
 ]
@@ -712,11 +714,15 @@ def plot_vector(vectors: dict[str, Any], name: str) -> str | None:
 _plot_vector = plot_vector
 
 
-def _vector_kind(result: dict[str, Any], plot_name: str) -> str:
+def vector_kind(result: dict[str, Any], plot_name: str) -> str:
+    """``"voltage"`` or ``"current"``: the analysis' recorded ``vector_types`` entry when it is one of those, else ``#branch`` in the name means a current."""
     kind = (result.get("vector_types") or {}).get(plot_name)
     if isinstance(kind, str) and kind in _KIND_AXES:
         return kind
     return "current" if "#branch" in plot_name else "voltage"
+
+
+_vector_kind = vector_kind
 
 
 def waveform_figure(results_json: dict[str, Any], analysis_id: str, vectors: Sequence[str], *, title: str, fig_id: str = "waveform") -> Figure:
@@ -864,6 +870,11 @@ def _pad_fill(pad: Pad, layers: list[str]) -> tuple[str, bool]:
     return OTHER_COPPER, False
 
 
+def layer_class(layer: str) -> str:
+    """The class of a copper layer's track group in a board figure: ``F.Cu`` -> ``layer-F_Cu`` (every character outside ``[A-Za-z0-9_-]`` becomes ``_``)."""
+    return "layer-" + _ID_SAFE_RE.sub("_", layer)
+
+
 def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, scale_px_per_mm: float = 18.0, max_width: int = COLUMN_PX, fig_id: str | None = None) -> Figure:
     """The placed board of ``ir``: outline, every pad from the KiCad library, tracks and vias (``copper=True``), reference / value labels and a caption line.
 
@@ -877,7 +888,12 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     with a white drill, vias gray with a white drill. ``scale_px_per_mm`` is
     reduced when the board would be wider than ``max_width`` px. Every pad
     is one ``<g class="pad">``, every track one ``<line class="track">``,
-    every via one ``<g class="via">``; the labels wear a surface-coloured
+    every via one ``<g class="via">``. The layers are groups a viewer can
+    toggle by class: ``outline`` (the board rect), one ``<g>`` per copper
+    layer inside ``<g class="tracks">`` (:func:`layer_class`: ``layer-B_Cu``
+    and ``layer-F_Cu`` always, empty when unused, plus any other layer that
+    carries a track; ``copper=False`` draws no layer group), ``pads``,
+    ``vias`` and ``labels``; the labels wear a surface-coloured
     halo so they stay legible over copper, and the caption line inside the
     figure wraps to the figure's width (one ``<text class="caption">`` per
     line). ``copper=False`` draws the placement only (id default
@@ -940,6 +956,8 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     )
     out.append('<g class="tracks">')
     for layer in layer_order:
+        if copper:
+            out.append(f'<g class="{layer_class(layer)}" data-layer="{esc(layer)}">')
         for i, t in enumerate(tracks):
             if t.layer != layer:
                 continue
@@ -948,6 +966,8 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
                 f'x2="{_f(X(t.end[0]))}" y2="{_f(Y(t.end[1]))}" stroke="{COPPER_COLOURS.get(t.layer, OTHER_COPPER)}" '
                 f'stroke-width="{_f(t.width_mm * scale)}" stroke-linecap="round"/>'
             )
+        if copper:
+            out.append("</g>")
     out.append("</g>")
     # pads: bottom SMD first, then front SMD, then through-hole (visible on both sides) on top
     pad_items: list[tuple[int, str]] = []

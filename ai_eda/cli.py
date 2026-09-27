@@ -103,6 +103,16 @@
                              makes the reports say so; --no-pdf writes no PDF, --browser names the headless
                              browser to print with, else it is discovered - none found means .md + .html
                              only and the reason is printed); exit 0 written, 2 usage/IR error - never 1
+    ai-eda gui [--root DIR] [--port N] [--open]
+                             the local web GUI (Korean) for the projects under DIR (default `projects`
+                             under the current directory, the folder `new` uses): create a project, run /
+                             review / re-write its reports from forms, answer its questions and preview
+                             every result (schematic, board, waveforms, validation, BOM, the stage reports,
+                             report.html, the PDFs) with downloads and a zip. 127.0.0.1 only (default port
+                             8766; 0 = a free port, printed), no --host on purpose; --open opens the page
+                             in the default browser. A run is an `ai-eda` subprocess whose flags come from
+                             the form, so keys, budgets, --llm claude and --online are approved exactly as
+                             on the command line; the GUI never deletes or renames anything
     ai-eda doctor also prints "browser (pdf): <path or NOT FOUND>" - the Chromium / Chrome / Edge the
                              stage reports are printed with ($AI_EDA_BROWSER, PATH, a Playwright install,
                              the Windows / macOS install paths)
@@ -115,10 +125,12 @@ browser that ``run`` / ``stage-reports`` print the stage reports with runs
 with name resolution and the proxy switched off
 (``ai_eda.report.pdf.PRINT_FLAGS``), so it cannot reach any host either
 (measured: no ``connect()`` at all; ``--no-pdf`` skips the browser
-altogether). ``serve`` is the one command
-that opens a socket without a flag: a loopback *listening* socket on
-127.0.0.1 that answers only requests whose Host header names this machine -
-no outbound connection is ever made, so no ``ExternalAction`` is involved.
+altogether). ``serve`` and ``gui`` are the commands
+that open a socket without a flag: a loopback *listening* socket on
+127.0.0.1 that answers only requests whose Host header names this machine
+(``gui`` also refuses a POST from another origin) - no outbound connection
+is ever made, so no ``ExternalAction`` is involved; the runs ``gui`` starts
+are ``ai-eda`` subprocesses under their own flags.
 The budget flags are the user's approval of paid calls, ``--llm claude`` the
 approval of using the subscription login and ``--online`` the approval of
 network fetches: all are recorded in the approval gate's audit log. The IR
@@ -359,15 +371,24 @@ def _browser_option(args: argparse.Namespace) -> tuple[Path | None, bool] | None
     return (Path(chosen) if chosen else None), not getattr(args, "no_pdf", False)
 
 
-def cmd_new(args: argparse.Namespace) -> int:
+def new_project(name: str, request: str | None = None, workdir: str | Path | None = None) -> Path:
+    """Write the empty project IR ``ai-eda new`` creates and return the ir.json path (``<workdir>/ir.json``, absolute).
+
+    The one code path of ``new`` and the GUI's "new project" form.
+    ``workdir`` defaults to ``projects/<name>`` under the current directory.
+    """
     from ai_eda.ir import CircuitIR, ProjectMeta
 
     # recorded absolute: a relative workdir would be resolved against whatever directory a later `run` / `review`
     # is started from, and the artifacts, the archive and the parts cache would land away from ir.json
-    workdir = Path(args.dir or f"projects/{args.name}").resolve()
-    ir = CircuitIR(project=ProjectMeta(id=args.name, name=args.name, workdir=str(workdir)))
-    ir.requirements.raw_input = args.request or ""
-    path = ir.save(workdir / "ir.json")
+    resolved = Path(workdir or f"projects/{name}").resolve()
+    ir = CircuitIR(project=ProjectMeta(id=name, name=name, workdir=str(resolved)))
+    ir.requirements.raw_input = request or ""
+    return ir.save(resolved / "ir.json")
+
+
+def cmd_new(args: argparse.Namespace) -> int:
+    path = new_project(args.name, args.request, args.dir)
     print(f"created {path}")
     return 0
 
@@ -925,6 +946,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return serve(Path(args.ir), args.port)
 
 
+def cmd_gui(args: argparse.Namespace) -> int:
+    """Serve the local web GUI on 127.0.0.1 (a loopback listening socket, nothing outbound); exit 0 on Ctrl-C, 2 for a bind error (a port outside 0-65535 is a usage error, also 2)."""
+    from ai_eda.gui.server import serve_gui
+
+    return serve_gui(Path(args.root), args.port, open_browser=args.open)
+
+
+def port_number(text: str) -> int:
+    """An ``--port`` value: a TCP port 0-65535 (0 = a free port); anything else is a usage error (exit 2), never a traceback from ``bind``."""
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a port number: {text!r}") from None
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be 0-65535 (0 picks a free port): {port}")
+    return port
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The ``ai-eda`` argument parser (``run``'s options come from :data:`RUN_OPTIONS`)."""
     p = argparse.ArgumentParser(prog="ai-eda", description="AI EDA ENGINEER")
@@ -959,7 +998,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sv = sub.add_parser("serve", help="serve the report on 127.0.0.1 (read-only, re-rendered on every request; no --host on purpose)")
     sv.add_argument("ir")
-    sv.add_argument("--port", type=int, default=8765, help="TCP port on 127.0.0.1 (default 8765; 0 picks a free port and prints it)")
+    sv.add_argument("--port", type=port_number, default=8765, help="TCP port on 127.0.0.1 (default 8765; 0 picks a free port and prints it)")
     sv.set_defaults(fn=cmd_serve)
 
     sr = sub.add_parser("stage-reports", help="re-write the four Korean stage reports (theory, parts, circuit, final) from ir.json and pipeline.json (read-only; no verdict)")
@@ -968,6 +1007,12 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--no-pdf", action="store_true", help="write .md + .html only (no headless browser print)")
     sr.add_argument("--browser", metavar="PATH", help="the Chromium / Chrome / Edge binary to print the PDFs with (default: discovered - $AI_EDA_BROWSER, PATH, Playwright, install paths)")
     sr.set_defaults(fn=cmd_stage_reports)
+
+    g = sub.add_parser("gui", help="the local web GUI for the projects under --root (127.0.0.1 only; runs are ai-eda subprocesses; no --host on purpose)")
+    g.add_argument("--root", metavar="DIR", default="projects", help="the projects root: one folder per project holding ir.json (default: projects under the current directory, as for new)")
+    g.add_argument("--port", type=port_number, default=8766, help="TCP port on 127.0.0.1 (default 8766; 0 picks a free port and prints it)")
+    g.add_argument("--open", action="store_true", help="open the page in the default web browser")
+    g.set_defaults(fn=cmd_gui)
     return p
 
 
