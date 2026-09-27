@@ -12,6 +12,9 @@ it writes) to the callable and the order of its inputs, so
 scale-factor semantics (``m`` = milli, ``meg`` = mega).
 :mod:`ai_eda.tools.calc.quantity` reads engineering quantities from
 requirement text (``M`` = mega, units required, never guessed).
+:mod:`ai_eda.tools.calc.part_value` writes the readable part value
+(``Component.value``: KiCad style, 5 significant digits, ``100n``) and reads
+it back with the quantity parser to compare within that display rounding.
 """
 
 from ai_eda.tools.calc.basic import (
@@ -47,6 +50,14 @@ from ai_eda.tools.calc.basic import (
     voltage_divider_output,
     voltage_divider_ratio,
 )
+from ai_eda.tools.calc.part_value import (
+    PART_VALUE_DIGITS,
+    PART_VALUE_VERSION,
+    display_tolerance,
+    format_part_value,
+    parse_part_value,
+    part_value_agrees,
+)
 from ai_eda.tools.calc.quantity import (
     PREFIX_EXPONENTS,
     PREFIXABLE_UNITS,
@@ -79,6 +90,8 @@ __all__ = [
     "MIL_FACTOR",
     "NGSPICE_EXACT_MANTISSA",
     "NGSPICE_EXPONENT_RANGE",
+    "PART_VALUE_DIGITS",
+    "PART_VALUE_VERSION",
     "PREFIXABLE_UNITS",
     "PREFIX_EXPONENTS",
     "QUANTITY_VERSION",
@@ -98,8 +111,10 @@ __all__ = [
     "crystal_load_capacitance",
     "current_from_voltage_resistance",
     "derived_values",
+    "display_tolerance",
     "divider_r1_for_v_out",
     "find_quantities",
+    "format_part_value",
     "format_quantity",
     "format_spice_number",
     "junction_temperature",
@@ -109,9 +124,11 @@ __all__ = [
     "ngspice_reads",
     "parallel_resistance",
     "parse_answer",
+    "parse_part_value",
     "parse_quantity",
     "parse_spice_number",
     "parse_unit",
+    "part_value_agrees",
     "power_from_voltage_current",
     "power_from_voltage_resistance",
     "rc_ac_fstart",

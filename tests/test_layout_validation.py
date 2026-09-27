@@ -181,6 +181,29 @@ def test_a_placed_unrouted_board_fails_connectivity_listing_the_nets(tmp_path: P
     assert c.status is S.NOT_APPLICABLE and "no net with two or more pads" in c.message
 
 
+def test_a_partial_route_fails_connectivity_naming_exactly_the_unrouted_nets(tmp_path: Path, lib: KicadLibrary):
+    """What ``pcb.routing=partial`` applies: the router's whole nets, none of the rest. The check names the nets without copper (and
+    only them) and FAILs - the board is honestly unfinished - while the applied copper keeps the router's clearance (IR geometry, not DRC)."""
+    from tests.test_routing import SWAP_NETS, SWAP_PARTS
+
+    ir = board_ir(tmp_path, lib, SWAP_PARTS, SWAP_NETS, (12.0, 9.0))
+    r = route_board(ir, lib, RoutingParams(max_iterations=1))  # capped: A has no legal route, B keeps its own
+    assert list(r.unrouted) == ["A"] and {t.net for t in r.tracks} == {"B"}
+    ir.pcb.tracks, ir.pcb.vias = list(r.tracks), list(r.vias)
+    _limit(ir, r.params.clearance_mm)
+    checks = _checks(ir, tmp_path, lib)
+    c = checks[CONNECTIVITY_CHECK]
+    assert c.status is S.FAIL and c.message.startswith("1 net(s) not connected through IR copper: A: R2.1 not connected to R1.1 (") and "not DRC" in c.message
+    assert {row["net"]: row["status"] for row in c.details["nets"]} == {"A": "FAIL", "B": "PASS"}
+    assert [row["unconnected"] for row in c.details["nets"] if row["net"] == "A"] == [["R2.1"]] and c.details["items"] == []
+    assert checks[CLEARANCE_CHECK].status is S.PASS and checks[CLEARANCE_CHECK].details["violations"] == []
+    # the uncapped router finishes the same board: both checks PASS
+    full = route_board(ir.model_copy(update={"pcb": ir.pcb.model_copy(update={"tracks": [], "vias": []})}), lib)
+    ir.pcb.tracks, ir.pcb.vias = list(full.tracks), list(full.vias)
+    checks = _checks(ir, tmp_path, lib)
+    assert checks[CONNECTIVITY_CHECK].status is S.PASS and checks[CLEARANCE_CHECK].status is S.PASS
+
+
 def test_copper_on_an_unknown_net_or_layer_fails(tmp_path: Path, lib: KicadLibrary):
     ir = _two_pads(tmp_path, lib)
     ir.pcb.tracks = [_track("N", (3.0, 3.0), (9.0, 3.0)), _track("GHOST", (1.0, 1.0), (2.0, 1.0)), _track("N", (3.0, 3.0), (3.0, 4.0), layer="In1.Cu")]

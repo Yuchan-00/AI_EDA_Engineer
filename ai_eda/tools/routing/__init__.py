@@ -1,9 +1,11 @@
 """Routing tools.
 
 :mod:`ai_eda.tools.routing.maze` is the pipeline's router: a deterministic
-two-layer grid maze router (``F.Cu`` / ``B.Cu``, vias) whose every track and
-via is ``derived`` from the IR placements, the KiCad footprints on disk and
-its recorded parameters. :mod:`ai_eda.tools.routing.naive` is the old
+two-layer grid maze router (``F.Cu`` / ``B.Cu``, vias) with negotiated
+congestion (rip-up and reroute until no net's copper lies in another's
+clearance halo) whose every track and via is ``derived`` from the IR
+placements, the KiCad footprints on disk and its recorded parameters; it
+emits whole nets only. :mod:`ai_eda.tools.routing.naive` is the old
 straight-line **placeholder** kept as a fixture helper (it knows nothing
 about clearances, crossings or layers). Whether a routed board is valid is
 decided exclusively by real ``kicad-cli`` DRC

@@ -42,20 +42,27 @@ Invariants this agent keeps:
   target: ``apply_proposals`` resolves every target's parent *before* any
   step runs, so a second ``pcb.placements`` proposal in the same result would
   land on the old (replaced) object or raise on ``None``.
-* A half-routed board is never proposed: when the router leaves any net
-  unrouted (:attr:`~ai_eda.tools.routing.maze.Routing.unrouted`), refuses
-  (``CompileError``, a library error) or is skipped, the proposal carries
-  the placement only (nothing at all when the board was already placed)
-  and one ``not routed: <net>: <reason>`` note per net, after a
+* A half-routed board is never proposed by default: when the router leaves
+  any net unrouted (:attr:`~ai_eda.tools.routing.maze.Routing.unrouted`),
+  refuses (``CompileError``, a library error) or is skipped, the proposal
+  carries the placement only (nothing at all when the board was already
+  placed) and one ``not routed: <net>: <reason>`` note per net, after a
   ``not applied:`` note with what the router did connect (nets, tracks,
-  vias, copper length, passes) when it connected any - reported, never
-  proposed. Anything else propagates: it is a defect, not a verdict.
+  vias, copper length, negotiation iterations) when it connected any -
+  reported, never proposed. Only the opt-in answer ``--answer
+  pcb.routing=partial`` (:data:`PARTIAL_ANSWER`) proposes the nets the
+  router did connect - each net whole, the router never emits part of one -
+  with a ``partial:`` note naming every net left without copper for manual
+  routing in KiCad (``pcb.routing.connectivity`` then FAILs naming them at
+  IR_BUILD: the board is honestly unfinished). Anything else propagates: it
+  is a defect, not a verdict.
 * It asks no question. The only steering is the two control keys
   :data:`PLACEMENT_KEY` (``--answer pcb.placement=skip`` proposes nothing)
   and :data:`ROUTING_KEY` (``--answer pcb.routing=skip`` proposes the
-  placement without copper); any other value is noted as not understood and
-  the work proceeds; the keys never become requirements (``CONTROL_KEYS`` in
-  :mod:`ai_eda.agents.keys`).
+  placement without copper, ``--answer pcb.routing=partial`` applies the
+  routed nets of a board the router could not finish); any other value is
+  noted as not understood and the work proceeds; the keys never become
+  requirements (``CONTROL_KEYS`` in :mod:`ai_eda.agents.keys`).
 
 The PLACEMENT stage runs before IR_BUILD, so this agent may see an
 inconsistent IR (a net naming a component that does not exist). The placer
@@ -89,6 +96,9 @@ from ai_eda.tools.routing.maze import FINE_PITCH_MM, ROUTER_ID, ROUTER_VERSION, 
 #: without copper (``PLACEMENT_KEY`` / ``ROUTING_KEY``: control keys, never requirements, defined in
 #: :mod:`ai_eda.agents.keys` and imported above)
 SKIP_ANSWER = "skip"
+#: ``--answer pcb.routing=partial``: when the router leaves nets unrouted, apply the nets it did route (each whole)
+#: instead of the placement alone; the unrouted nets are named for manual routing
+PARTIAL_ANSWER = "partial"
 #: the note a board left without copper gets: what DRC will say about it
 UNROUTED_NOTE = "unrouted: DRC will report unconnected_items until routed"
 #: the rationale of a proposal whose placement is the grid / the core ring
@@ -166,10 +176,16 @@ class PCBAgent(Agent):
     ) -> AgentResult:
         """Route ``board`` (placements, no copper) and build the one proposal; ``placed`` says whether this run placed it (``basis``: how)."""
         answer = ctx.answers.get(ROUTING_KEY)
+        partial = False
         if answer is not None:
             if answer.strip().lower() == SKIP_ANSWER:
                 return self._unrouted(board, notes, ["routing skipped by answer"], placed=placed, description=description, basis=basis)
-            notes.append(f"{ROUTING_KEY}={answer!r} not understood (the only answer is '{SKIP_ANSWER}'); routing as usual")
+            if answer.strip().lower() == PARTIAL_ANSWER:
+                partial = True
+            else:
+                notes.append(
+                    f"{ROUTING_KEY}={answer!r} not understood (the only answers are '{SKIP_ANSWER}' and '{PARTIAL_ANSWER}'); routing as usual"
+                )
         if board.tracks or board.vias or board.zones:
             reason = f"not routed: ir.pcb already has copper ({len(board.tracks)} track(s), {len(board.vias)} via(s), {len(board.zones)} zone(s)); the agent never replaces copper"
             return self._unrouted(board, notes, [reason], placed=placed, description=description, basis=basis)
@@ -186,23 +202,28 @@ class PCBAgent(Agent):
         except (CompileError, LibraryLookupError, LibraryFormatError) as e:
             rules = [self._rules_note(params)] if params is not None and params.rules is not None else []
             return self._unrouted(board, notes, [*rules, f"not routed: {e}"], placed=placed, description=description, basis=basis)
-        if routing.unrouted:
-            reasons = [f"not routed: {net}: {why}" for net, why in routing.unrouted.items()]
+        reasons = [f"not routed: {net}: {why}" for net, why in routing.unrouted.items()]
+        if routing.unrouted and not (partial and routing.stats.get("routed_nets")):
             rules = [self._rules_note(routing.params, routing.stats.get("raised"))] if routing.params.rules is not None else []
             dropped = [self._dropped_note(routing)] if routing.stats.get("routed_nets") else []
             return self._unrouted(board, notes, [*rules, *dropped, *reasons], placed=placed, description=description, basis=basis)
         payload = board.model_copy(update={"tracks": list(routing.tracks), "vias": list(routing.vias)})
         routed = self._routing_description(routing)
+        which = "the nets listed as routed" if routing.unrouted else "every net"
         if placed:
             notes.append(description)
             full = f"{description}; {routed}"
             rationale = (
-                f"{basis}; every net maze-routed on F.Cu/B.Cu from the library pad geometry at the recorded width / clearance / via sizes; DRC decides validity"
+                f"{basis}; {which} maze-routed on F.Cu/B.Cu from the library pad geometry at the recorded width / clearance / via sizes; DRC decides validity"
             )
         else:
             full = routed
-            rationale = "every net maze-routed on F.Cu/B.Cu from the existing placements and the library pad geometry at the recorded width / clearance / via sizes; DRC decides validity"
+            rationale = f"{which} maze-routed on F.Cu/B.Cu from the existing placements and the library pad geometry at the recorded width / clearance / via sizes; DRC decides validity"
         notes.append(routed)
+        if routing.unrouted:  # the opt-in partial board: whole nets only, the rest named
+            left = self._partial_note(routing)
+            full = f"{full}; {left}"
+            notes += [left, *reasons]
         proposal = IRProposal(description=full, target="pcb", operation="set", payload=payload, rationale=rationale)
         return self._result(proposals=[proposal], notes=notes)
 
@@ -231,8 +252,19 @@ class PCBAgent(Agent):
         total = s["routed_nets"] + s["unrouted_nets"]
         return (
             f"not applied: {ROUTER_ID} {ROUTER_VERSION} connected {s['routed_nets']} of {total} net(s) ({s['track_count']} track(s), {s['via_count']} via(s), "
-            f"{s['total_length_mm']} mm of copper, {s.get('passes', 1)} pass(es)) but not the {s['unrouted_nets']} below; a half-routed board is never proposed, "
-            "so the proposal carries the placement only"
+            f"{s['total_length_mm']} mm of copper, {s['iterations']} iteration(s)) but not the {s['unrouted_nets']} below; a half-routed board is never proposed, "
+            f"so the proposal carries the placement only (--answer {ROUTING_KEY}={PARTIAL_ANSWER} applies the routed nets, each whole)"
+        )
+
+    @staticmethod
+    def _partial_note(routing: Routing) -> str:
+        """The opt-in partial board: which nets were left without copper, for manual routing."""
+        s = routing.stats
+        total = s["routed_nets"] + s["unrouted_nets"]
+        return (
+            f"partial: {ROUTING_KEY}={PARTIAL_ANSWER} applies the {s['routed_nets']} of {total} net(s) the router connected, each whole; "
+            f"{s['unrouted_nets']} net(s) have no copper and need manual routing in KiCad: {', '.join(routing.unrouted)} "
+            "(pcb.routing.connectivity judges the IR copper, DRC the board)"
         )
 
     @staticmethod
@@ -241,8 +273,8 @@ class PCBAgent(Agent):
         s = routing.stats
         text = (
             f"{ROUTER_ID} {ROUTER_VERSION}: {s['routed_nets']} net(s) routed on F.Cu/B.Cu, {s['track_count']} track(s), {s['via_count']} via(s), "
-            f"{s['total_length_mm']} mm of copper; grid {p.grid_mm} mm, width {p.track_width_mm} mm, clearance {p.clearance_mm} mm, "
-            f"via {p.via_diameter_mm}/{p.via_drill_mm} mm, edge {p.edge_clearance_mm} mm"
+            f"{s['total_length_mm']} mm of copper, {s['iterations']} negotiation iteration(s); grid {p.grid_mm} mm, width {p.track_width_mm} mm, "
+            f"clearance {p.clearance_mm} mm, via {p.via_diameter_mm}/{p.via_drill_mm} mm, edge {p.edge_clearance_mm} mm"
         )
         if p.rules is not None:
             text += f"; {p.rules} rules: pad pitch {p.pad_pitch_mm} mm ({p.pitch_footprint}) is below {FINE_PITCH_MM} mm"
@@ -269,4 +301,4 @@ class PCBAgent(Agent):
         return None
 
 
-__all__ = ["GRID_RATIONALE", "PCBAgent", "PLACEMENT_KEY", "RING_RATIONALE", "ROUTING_KEY", "SKIP_ANSWER", "UNROUTED_NOTE"]
+__all__ = ["GRID_RATIONALE", "PARTIAL_ANSWER", "PCBAgent", "PLACEMENT_KEY", "RING_RATIONALE", "ROUTING_KEY", "SKIP_ANSWER", "UNROUTED_NOTE"]

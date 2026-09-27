@@ -30,7 +30,9 @@ ACCEPT_REGS_KEY = "accept_regulations"
 REJECT_REGS_KEY = "reject_regulations"
 PROPOSE_REGS_KEY = "propose_regulations"
 #: PCB agent: ``--answer pcb.placement=skip`` proposes no placement (and hence no routing); ``--answer pcb.routing=skip``
-#: proposes the placement without copper
+#: proposes the placement without copper, ``--answer pcb.routing=partial`` (opt-in) applies the nets the router did
+#: route - each whole - when it could not route them all, naming the rest for manual routing (the default is the
+#: placement alone: all or nothing)
 PLACEMENT_KEY = "pcb.placement"
 ROUTING_KEY = "pcb.routing"
 

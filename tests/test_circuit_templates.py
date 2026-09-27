@@ -58,6 +58,7 @@ from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.tools.calc import CALC_VERSION, parse_answer, recompute_parameters
 from ai_eda.design.templates import AstableTemplate
 from ai_eda.tools.calc.basic import astable_c_for_frequency, astable_frequency, led_series_resistor
+from ai_eda.tools.calc.part_value import parse_part_value, part_value_agrees
 from ai_eda.tools.calc.quantity import QUANTITY_VERSION
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.library import KicadLibrary
@@ -235,7 +236,7 @@ def test_confirm_applies_the_divider_with_the_choices_as_user_values(tmp_path: P
     ids_before = [r.id for r in ir.requirements.requirements]
     state, ctx = _confirm(ir, tmp_path, lib, None)
     out = state.outcome(Stage.ARCHITECTURE)
-    assert out.status is S.NOT_VERIFIED and out.message.startswith("15 proposal(s) applied, nothing verified; template divider v0.1 confirmed by the user: 15 proposal(s)")
+    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"15 proposal(s) applied, nothing verified; template divider v{TEMPLATE_VERSION} confirmed by the user: 15 proposal(s)")
     assert "design choices recorded as the user's values: r2 = 10000 ohm" in out.message
     assert [q.key for q in out.questions] == ["output_current"] and not out.questions[0].required  # advisory, the real key
     assert not state.blocked and state.outcomes[-1].stage is Stage.RELEASE and state.outcomes[-1].status is not S.PASS
@@ -525,7 +526,7 @@ def test_led_template_wires_by_pin_name_and_models_the_led_as_a_confirmed_choice
     assert "led_model: ideal constant-V_f LED: D1 is excluded from the netlist and replaced by the stimulus VLED = v_f" in question
     assert "req.led_forward_current: led_forward_current = 0.01 A (stated as '10 mA')" in question and "r_led = 300 ohm [calc.led.R from v_in, v_f, i_f]" in question
     state, ctx = _confirm(ir, tmp_path, lib, None)
-    assert state.outcome(Stage.ARCHITECTURE).message.startswith("14 proposal(s) applied, nothing verified; template led v0.1 confirmed by the user: 14 proposal(s)")
+    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"14 proposal(s) applied, nothing verified; template led v{TEMPLATE_VERSION} confirmed by the user: 14 proposal(s)")
     assert [c.ref for c in ir.components] == ["R1", "D1", "J1"]
     p = ir.parameters
     assert list(p) == ["v_in", "v_f", "i_f", "r_led", "i_led", "tol_rel"]
@@ -594,7 +595,7 @@ def test_rc_template_ties_the_corner_expectation_to_the_users_requirement(tmp_pa
     assert "r = 1591.54943092 ohm [calc.rc.r_for_cutoff from f_c, c]" in question and "expectation h_fc: v(OUT) at 1000 Hz = 0.707106781187 +/- 2% verifies req.cutoff_frequency" in question
     ids_before = [r.id for r in ir.requirements.requirements]
     state, ctx = _confirm(ir, tmp_path, lib, None)
-    assert state.outcome(Stage.ARCHITECTURE).message.startswith("18 proposal(s) applied, nothing verified; template rc_lowpass v0.1 confirmed by the user: 18 proposal(s)")
+    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"18 proposal(s) applied, nothing verified; template rc_lowpass v{TEMPLATE_VERSION} confirmed by the user: 18 proposal(s)")
     assert [r.id for r in ir.requirements.requirements] == ids_before and ir.requirements.get("cutoff_gain") is None  # no fabricated requirement
     p = ir.parameters
     assert list(p) == ["f_c", "c", "r", "tau", "h_fc", "tol_rel", "ac_fstart", "ac_fstop", "ac_probe"]
@@ -611,7 +612,9 @@ def test_rc_template_ties_the_corner_expectation_to_the_users_requirement(tmp_pa
     assert [c.id for c in ir.constraints] == ["c.rc_lowpass.cutoff"] and "|H(f_c)| = 1/sqrt(2)" in ir.topology.rationale
     assert recompute_parameters(ir).message == "10 value(s) recomputed"
     assert _netlist(ir, tmp_path, lib) == "rc\nC1 OUT 0 1e-7\nR1 IN OUT 1.5915494309189537k\nVVIN IN 0 DC 1 AC 1\n.end\n"
-    assert ir.component("R1").value == "1.5915494309189537k"  # the exact calculator value: E-series snapping is not built
+    # the part value is the calculator's value to 5 significant digits (display); the netlist above keeps the exact number; E-series snapping is not built
+    assert ir.component("R1").value == "1.5915k" and ir.component("C1").value == "100n"
+    assert part_value_agrees(ir.component("R1").value, p["r"].value, "ohm") is True and ir.component("R1").spice.value.value == p["r"].value
     assert state.outcome(Stage.PCB).status is S.PASS and IndependentReviewer(tools=ctx.tools).check_requirements_vs_ir(ir, tmp_path).status is S.PASS
 
 
@@ -678,7 +681,9 @@ def test_the_design_package_never_returns_a_model_or_assumption_value(tmp_path: 
 
 #: C = 1 / (2 f R_b ln((2 Vcc - V_BE) / (Vcc - V_BE))) at 1 kHz, 10 k, 5 V, 0.7 V = 64.817 nF
 ASTABLE_C = 1.0 / (2.0 * 1000.0 * 10_000.0 * math.log((2.0 * 5.0 - 0.7) / (5.0 - 0.7)))
-ASTABLE_C_TEXT = "64.8172677616823n"
+#: the netlist spelling (``format_spice_number``: ngspice reads it back as exactly ASTABLE_C) and the part value (display, 5 significant digits)
+ASTABLE_C_NETLIST = "64.8172677616823n"
+ASTABLE_C_VALUE = "64.817n"
 
 
 def test_astable_calculators_refuse_out_of_domain_inputs():
@@ -717,7 +722,7 @@ def test_astable_table_lists_every_choice_computed_value_part_net_and_simulation
         "tran_step = 5e-06 s [calc.astable.tran_step from f_osc]", "tran_stop = 0.02 s [calc.astable.tran_stop from f_osc]", "tran_start = 0.01 s [calc.astable.tran_start from f_osc]",
         "v_be_reverse = 4.3 V [calc.astable.v_be_reverse from v_in, v_be]",
         "Q1 Transistor_BJT:2N3904 / Package_TO_SOT_THT:TO-92_Inline, value 2N3904 (pins 1, 2, 3 from ", "R3 Device:R / Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal, value 10k",
-        f"C2 Device:C / Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm, value {ASTABLE_C_TEXT}", "J1 Connector_Generic:Conn_01x03 / Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical",
+        f"C2 Device:C / Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm, value {ASTABLE_C_VALUE}", "J1 Connector_Generic:Conn_01x03 / Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical",
         "VCC (power): J1.1, R1.1, R2.1, R3.1, R4.1", "Q1_C (signal): R1.2, Q1.3, C1.1", "Q2_B (signal): C1.2, R4.2, Q2.2", "OUT (signal): R2.2, Q2.3, C2.1, J1.2", "Q1_B (signal): C2.2, R3.2, Q1.2", "GND (ground): J1.3, Q1.1, Q2.1",
         "stimulus VIN: dc 5 V on VCC; Q1 / Q2 on '.model QNPN NPN (TR=200n)'; C2 ic = -1 V; analysis tran 5e-06 0.02 0.01 uic (s)",
         "expectation f_osc: frequency of v(OUT) rising edges = 1000 Hz +/- 10% verifies req.oscillation_frequency (fewer than 3 edges is 'no oscillation detected', FAIL)",
@@ -735,7 +740,7 @@ def test_confirm_applies_the_astable_with_the_model_card_ic_and_uic_as_the_users
     ids_before = [r.id for r in ir.requirements.requirements]
     state, ctx = _confirm(ir, tmp_path, lib, None)
     out = state.outcome(Stage.ARCHITECTURE)
-    assert out.status is S.NOT_VERIFIED and out.message.startswith("34 proposal(s) applied, nothing verified; template astable v0.1 confirmed by the user: 34 proposal(s)") and out.questions == []
+    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"34 proposal(s) applied, nothing verified; template astable v{TEMPLATE_VERSION} confirmed by the user: 34 proposal(s)") and out.questions == []
     assert [r.id for r in ir.requirements.requirements] == ids_before and not state.blocked and state.outcomes[-1].stage is Stage.RELEASE
     assert [c.ref for c in ir.components] == ["Q1", "Q2", "R1", "R2", "R3", "R4", "C1", "C2", "J1"] and [n.name for n in ir.nets] == ["VCC", "Q1_C", "Q2_B", "OUT", "Q1_B", "GND"]
     assert ir.topology.name == "BJT astable multivibrator" and ir.topology.blocks[0].component_refs == ["Q1", "Q2", "R1", "R2", "R3", "R4", "C1", "C2"]
@@ -760,7 +765,9 @@ def test_confirm_applies_the_astable_with_the_model_card_ic_and_uic_as_the_users
         assert q.spice.model_card.value == ".model QNPN NPN (TR=200n)" and q.spice.model_card.provenance.kind is ProvenanceKind.USER_REQUIREMENT
         assert q.spice.model_card.provenance.note.startswith(f"{CHOICE_NOTE_PREFIX}; template astable v{TEMPLATE_VERSION}: npn_model: generic Gummel-Poon NPN")
     c2 = ir.component("C2")
-    assert c2.value == ASTABLE_C_TEXT and c2.electrical["capacitance"].value == c2.spice.value.value == pytest.approx(ASTABLE_C) and c2.footprint.library == "Capacitor_THT"
+    assert c2.value == ASTABLE_C_VALUE and c2.electrical["capacitance"].value == c2.spice.value.value == pytest.approx(ASTABLE_C) and c2.footprint.library == "Capacitor_THT"
+    # the part value is display text: it parses (M = mega, the quantity parser) to the simulated value within the 5-significant-digit rounding
+    assert part_value_agrees(c2.value, c2.spice.value.value, "F") is True and parse_part_value(c2.value, "F") != c2.spice.value.value
     assert c2.spice.params["ic"].value == -1.0 and c2.spice.params["ic"].unit == "V" and c2.spice.params["ic"].provenance.kind is ProvenanceKind.USER_REQUIREMENT
     assert "c2_ic = -1.0 V" in c2.spice.params["ic"].provenance.note and "ic" not in ir.component("C1").spice.params
     assert ir.component("R1").electrical["resistance"].value == 1000.0 and ir.component("R4").spice.value.value == 10000.0 and ir.component("J1").spice.exclude
@@ -784,7 +791,7 @@ def test_confirm_applies_the_astable_with_the_model_card_ic_and_uic_as_the_users
     validators = _validate(ir, tmp_path, lib)
     assert validators["ir.assumptions"] is S.PASS and validators["ir.llm_requirements"] is S.PASS and validators["ir.connectivity"] is S.PASS
     assert _netlist(ir, tmp_path, lib) == (
-        f"osc\n.model QNPN NPN (TR=200n)\nC1 Q1_C Q2_B {ASTABLE_C_TEXT}\nC2 OUT Q1_B {ASTABLE_C_TEXT} ic=-1\nQ1 Q1_C Q1_B 0 QNPN\nQ2 OUT Q2_B 0 QNPN\n"
+        f"osc\n.model QNPN NPN (TR=200n)\nC1 Q1_C Q2_B {ASTABLE_C_NETLIST}\nC2 OUT Q1_B {ASTABLE_C_NETLIST} ic=-1\nQ1 Q1_C Q1_B 0 QNPN\nQ2 OUT Q2_B 0 QNPN\n"
         "R1 VCC Q1_C 1k\nR2 VCC OUT 1k\nR3 VCC Q1_B 10k\nR4 VCC Q2_B 10k\nVVIN VCC 0 DC 5\n.end\n"
     )
     assert state.outcome(Stage.SCHEMATIC).status is S.PASS and state.outcome(Stage.PCB).status is S.PASS and state.outcome(Stage.ERC).status is S.NOT_VERIFIED

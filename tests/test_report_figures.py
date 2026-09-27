@@ -462,6 +462,12 @@ def test_long_values_are_respelled_or_shortened_on_the_board_but_kept_in_the_dat
     ir.component("R1").value = "3.3000000000000003"
     root = _parse(board_figure(ir, lib).svg)
     assert [t.text for t in _by_class(root, "value") if t.get("data-value") == "3.3000000000000003"] == ["3.3"]
+    # a long value with KiCad's mega 'M' is cut, never re-spelled through the SPICE parser (which reads M as milli: 1.2346m would be 10^9 off)
+    ir.component("R1").value = "1.23456789012M"
+    ir.component("R2").value = "4.99999999999Meg"
+    root = _parse(board_figure(ir, lib).svg)
+    assert [t.text for t in _by_class(root, "value") if t.get("data-value") == "1.23456789012M"] == ["1.234567890…"]
+    assert [t.text for t in _by_class(root, "value") if t.get("data-value") == "4.99999999999Meg"] == ["5Meg"]
 
 
 def _label_boxes(root: ET.Element) -> dict[str, list[tuple[float, float, float, float]]]:
@@ -700,6 +706,26 @@ def test_bar_figure_labels_every_bar():
     # many bars still fit max_width
     many = bar_figure([f"N{i}" for i in range(30)], [float(i) for i in range(30)], title="t", y_label="y (mm)", unit="mm")
     assert int(_parse(many.svg).get("width")) == COLUMN_PX and len(_by_class(_parse(many.svg), "bar")) == 30
+
+
+def test_bar_figure_with_many_bars_drops_the_colliding_value_labels_and_stands_the_categories_upright():
+    """64 nets (the ATmega128 board) in one column: 9 px slots hold no value label, so none is drawn (the caption and data-value keep every
+    value), and the category labels stand vertical at the 10 px minimum, the figure growing downwards to hold the longest one."""
+    labels = ["VIN_RAW", "VIN", "+5V", "GND", "LED_A", "AVCC", "AREF", "RESET", *(f"P{p}{i}" for p in "ABCDEFG" for i in range(8))]
+    values = [21.5, 19.99, 215.808, 277.535, 2.735, 31.421, 12.112, 86.097, *(30.0 + i for i in range(56))]
+    assert len(labels) == len(values) == 64
+    fig = bar_figure(labels, values, title="넷별 동박 길이", y_label="길이 (mm)", unit="mm")
+    root = _parse(fig.svg)
+    assert int(root.get("width")) == COLUMN_PX and [b.get("data-label") for b in _by_class(root, "bar")] == labels
+    assert _by_class(root, "bar-label") == [] and [float(b.get("data-value")) for b in _by_class(root, "bar")] == values
+    assert all(f"{label} " in fig.caption for label in labels) and "GND 277.5 mm" in fig.caption
+    cats = _by_class(root, "category")
+    assert [c.text for c in cats] == labels and all(c.get("font-size") == "10" and c.get("transform", "").startswith("rotate(-90 ") for c in cats)
+    # the longest label (VIN_RAW: 7 characters at 0.6 em of 10 px = 42 px) ends inside the figure: plot bottom 310, label from 316 down, 6 px margin
+    assert int(root.get("height")) == 364 and fig.svg == bar_figure(labels, values, title="넷별 동박 길이", y_label="길이 (mm)", unit="mm").svg
+    # few bars keep their value labels and horizontal categories (the astable's six nets)
+    few = _parse(bar_figure(labels[:6], values[:6], title="t", y_label="y (mm)", unit="mm").svg)
+    assert len(_by_class(few, "bar-label")) == 6 and not any("rotate(-90" in (c.get("transform") or "") for c in _by_class(few, "category"))
 
 
 def test_figures_are_authored_at_the_column_width_with_readable_text(tmp_path: Path):

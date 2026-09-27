@@ -499,7 +499,11 @@ def test_routing_answer_is_a_control_key_and_skip_leaves_the_placement_without_c
     assert "unconnected_items" in res.notes[0]
     # any other value: noted as not understood, routing proceeds
     res = _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "yes"})
-    assert res.notes[0] == "pcb.routing='yes' not understood (the only answer is 'skip'); routing as usual" and res.proposals[0].payload.tracks
+    assert res.notes[0] == "pcb.routing='yes' not understood (the only answers are 'skip' and 'partial'); routing as usual" and res.proposals[0].payload.tracks
+    # partial on a board that routes completely changes nothing: the whole board, no partial note
+    res = _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "partial"})
+    assert res.proposals[0].payload.tracks and not any(n.startswith("partial: ") or n.startswith("not routed") for n in res.notes)
+    assert design_data(res.proposals[0].payload) == design_data(_run_agent(ir, tmp_path, lib).proposals[0].payload)
     # on a board that is already placed, skip proposes nothing at all
     Orchestrator.apply_proposals(ir, _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "skip"}).proposals)
     res = _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "skip"})
@@ -814,16 +818,87 @@ def test_a_partial_route_is_reported_as_not_applied_and_never_proposed(tmp_path:
     dropped = [n for n in res.notes if n.startswith("not applied: ")]
     assert len(dropped) == 1 and res.notes[1] == dropped[0] and res.notes[2:] == reasons
     m = re.fullmatch(
-        rf"not applied: {ROUTER_ID} {ROUTER_VERSION} connected (\d+) of (\d+) net\(s\) \((\d+) track\(s\), (\d+) via\(s\), ([0-9.]+) mm of copper, (\d) pass\(es\)\) "
-        r"but not the (\d+) below; a half-routed board is never proposed, so the proposal carries the placement only",
+        rf"not applied: {ROUTER_ID} {ROUTER_VERSION} connected (\d+) of (\d+) net\(s\) \((\d+) track\(s\), (\d+) via\(s\), ([0-9.]+) mm of copper, (\d+) iteration\(s\)\) "
+        r"but not the (\d+) below; a half-routed board is never proposed, so the proposal carries the placement only "
+        r"\(--answer pcb\.routing=partial applies the routed nets, each whole\)",
         dropped[0],
     )
     assert m is not None, dropped[0]
-    routed, total, tracks, vias, length, _passes, unrouted = int(m[1]), int(m[2]), int(m[3]), int(m[4]), float(m[5]), m[6], int(m[7])
+    routed, total, tracks, vias, length, iterations, unrouted = int(m[1]), int(m[2]), int(m[3]), int(m[4]), float(m[5]), int(m[6]), int(m[7])
     assert routed > 0 and tracks > 0 and unrouted == len(reasons) and routed + unrouted == total
     again = route_board(ir.model_copy(update={"pcb": proposal.payload}), mlib, RoutingParams())
-    assert (routed, tracks, vias, length) == (again.stats["routed_nets"], len(again.tracks), len(again.vias), again.stats["total_length_mm"])
+    assert (routed, tracks, vias, length, iterations) == (again.stats["routed_nets"], len(again.tracks), len(again.vias), again.stats["total_length_mm"], again.stats["iterations"])
     # a board where nothing routes gets no such note (nothing was connected)
     ir.pcb = PCBDesign(manufacturing=ManufacturingConstraints(min_clearance_mm=assumption(3.0, note="absurd, to fence every pad")))
     res = _run_agent(ir, tmp_path, mlib)
     assert not any(n.startswith("not applied: ") for n in res.notes)
+
+
+# --------------------------------------------------------------------------- pcb.routing=partial (opt-in)
+
+
+def test_the_partial_answer_applies_whole_routed_nets_and_names_the_rest(tmp_path: Path):
+    """Two crossing nets on one layer, the router capped at one negotiation iteration: B keeps a legal route, A has none. By default
+    nothing is applied (all or nothing; the board was already placed, so no proposal at all) and the ``not applied:`` note points at
+    the opt-in; ``--answer pcb.routing=partial`` applies B whole, names A for manual routing, and the IR-geometry check then FAILs naming
+    exactly A - the board is honestly unfinished - while every applied track keeps the router's clearance."""
+    from ai_eda.agents.pcb import PARTIAL_ANSWER
+    from ai_eda.tools.routing import RoutingParams
+    from tests.test_routing import SWAP_NETS, SWAP_PARTS, board_ir, fixture_library
+
+    flib = fixture_library(tmp_path / "kicad")
+    ir = board_ir(tmp_path, flib, SWAP_PARTS, SWAP_NETS, (12.0, 9.0))
+    agent = PCBAgent(routing=RoutingParams(max_iterations=1))
+    reason = "not routed: A: no legal route after 1 negotiation iteration(s): its copper still broke the clearance of B, and a route against the legal copper as an obstacle was not found"
+    before = ir.content_hash()
+    res = agent.run(ir, _ctx(tmp_path, flib))
+    assert res.proposals == [] and res.notes[0] == "not placed: ir.pcb already has 7 placement(s); the agent never replaces a layout"
+    assert res.notes[1].startswith(f"not applied: {ROUTER_ID} {ROUTER_VERSION} connected 1 of 2 net(s) (") and res.notes[1].endswith(f"(--answer {ROUTING_KEY}={PARTIAL_ANSWER} applies the routed nets, each whole)")
+    assert res.notes[2:] == [reason]
+    res = agent.run(ir, _ctx(tmp_path, flib, **{ROUTING_KEY: " Partial "}))
+    assert ir.content_hash() == before and res.questions == [] and not res.blocked_on_user
+    [proposal] = res.proposals
+    payload: PCBDesign = proposal.payload
+    assert payload.placements == ir.pcb.placements and payload.vias == [] and payload.tracks and {t.net for t in payload.tracks} == {"B"}
+    assert res.notes[1].startswith(f"{ROUTER_ID} {ROUTER_VERSION}: 1 net(s) routed on F.Cu/B.Cu, ") and ", 1 negotiation iteration(s); " in res.notes[1]
+    left = (
+        "partial: pcb.routing=partial applies the 1 of 2 net(s) the router connected, each whole; 1 net(s) have no copper and need manual routing "
+        "in KiCad: A (pcb.routing.connectivity judges the IR copper, DRC the board)"
+    )
+    assert res.notes[2:] == [left, reason] and proposal.description == f"{res.notes[1]}; {left}"
+    assert proposal.rationale.startswith("the nets listed as routed maze-routed") and "DRC decides validity" in proposal.rationale
+    Orchestrator.apply_proposals(ir, res.proposals)
+    ir.pcb.manufacturing = ManufacturingConstraints(min_clearance_mm=assumption(0.25, note="the router's own clearance as the limit"))
+    checks = _routing_checks(ir, tmp_path, flib)
+    connectivity = checks[CONNECTIVITY_CHECK]
+    assert connectivity.status is S.FAIL and "not DRC" in connectivity.message
+    assert {r["net"]: r["status"] for r in connectivity.details["nets"]} == {"A": "FAIL", "B": "PASS"} and connectivity.message.startswith("1 net(s) not connected through IR copper: A: ")
+    assert checks[CLEARANCE_CHECK].status is S.PASS
+    # partial never turns a board with nothing routed into a proposal of copper: the placement alone, no partial note
+    ir = parts_ir(tmp_path / "fenced", synthetic_library(tmp_path / "kicad_fenced"))
+    ir.pcb = PCBDesign(manufacturing=ManufacturingConstraints(min_clearance_mm=assumption(3.0, note="absurd, to fence every pad")))
+    res = PCBAgent().run(ir, _ctx(tmp_path, synthetic_library(tmp_path / "kicad_fenced"), **{ROUTING_KEY: PARTIAL_ANSWER}))
+    [proposal] = res.proposals
+    assert proposal.payload.tracks == [] and not any(n.startswith("partial: ") or n.startswith("not applied: ") for n in res.notes)
+
+
+def test_the_partial_answer_through_the_pipeline_is_a_control_key_and_ir_build_names_the_unrouted_net(tmp_path: Path):
+    """A statically fenced pad (the ``Test:CAGE`` bars) leaves N without any route; K routes. Through the orchestrator the partial answer
+    applies K at PLACEMENT, never becomes a requirement or a question, and IR_BUILD's connectivity FAILs naming N (IR geometry)."""
+    from tests.test_routing import board_ir, fixture_library
+
+    flib = fixture_library(tmp_path / "kicad")
+    parts = [("R1", "PAD1", 3.0, 3.0), ("C1", "CAGE", 9.0, 3.0), ("R2", "PAD1", 3.0, 7.0), ("R3", "PAD1", 9.0, 7.0)]
+    nets = {"N": [("R1", "1"), ("C1", "1")], "K": [("R2", "1"), ("R3", "1")]}
+    for answer, copper in (("partial", True), (None, False)):
+        ir = board_ir(tmp_path / str(answer), flib, parts, nets, (12.0, 10.0))
+        extra = {ROUTING_KEY: answer} if answer else {}
+        state = Orchestrator(_ctx(tmp_path / str(answer), flib, **extra)).run(ir, stop_after=Stage.IR_BUILD)
+        assert ir.requirements.get(ROUTING_KEY) is None and all(q.key != ROUTING_KEY for q in state.optional_questions + state.open_questions)
+        out = state.outcome(Stage.PLACEMENT)
+        assert out.status is S.NOT_VERIFIED
+        assert ("partial: pcb.routing=partial applies the 1 of 2 net(s)" in out.message) is copper and "not routed: N: " in out.message
+        assert ({t.net for t in ir.pcb.tracks} == {"K"}) is copper and (ir.pcb.tracks == []) is not copper
+        connectivity = ir.validation.latest(CONNECTIVITY_CHECK)
+        assert connectivity.status is S.FAIL and connectivity.ir_hash == ir.content_hash()
+        assert {r["net"]: r["status"] for r in connectivity.details["nets"]} == ({"N": "FAIL", "K": "PASS"} if copper else {"N": "FAIL", "K": "FAIL"})

@@ -15,7 +15,11 @@ requirement (the RC's |H(f_c)| expectation names ``cutoff_frequency`` and the
 reviewer compares the sweep point with it). A calculator that refuses its
 inputs, overflows (``ValueError``) or divides by an underflowed product
 (``ZeroDivisionError``) refuses the template with that sentence as the note -
-a build never raises on a number the user typed.
+a build never raises on a number the user typed. A part's ``value`` (the
+schematic, BOM and board text) is the design number in KiCad's spelling to 5
+significant digits (``100n``, ``1.5915k``, :mod:`ai_eda.tools.calc.part_value`);
+the SPICE binding and the netlist keep the calculator's exact number, and no
+E-series rounding is applied to either.
 
 Templates:
 
@@ -100,7 +104,7 @@ from ai_eda.tools.calc.basic import (
     rc_time_constant,
     voltage_divider_output,
 )
-from ai_eda.tools.calc.si import format_spice_number
+from ai_eda.tools.calc.part_value import PART_VALUE_DIGITS, format_part_value
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.spice import SpiceAnalysis
 
@@ -140,8 +144,15 @@ CAPACITOR_THT = (("Device", "C"), ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00m
 
 
 def _value_text(value: float) -> str:
-    """The part's ``value`` string: the same spelling the netlist carries, so BOM and SPICE agree."""
-    return format_spice_number(value)
+    """The part's ``value`` string for the schematic, the BOM and the board: KiCad's spelling to 5 significant digits (``100n``, ``1.5915k``).
+
+    Display text only (:mod:`ai_eda.tools.calc.part_value`): the SPICE
+    binding keeps the calculator's exact number and the netlist spells that
+    number itself (``format_spice_number``: ``1e-7``, ``1.5915494309189537k``),
+    so the part value and the simulated value differ by at most the display
+    rounding - a check compares them with ``part_value_agrees``, never as strings.
+    """
+    return format_part_value(value)
 
 
 def _part_line(c: Component) -> str:
@@ -294,14 +305,54 @@ def _is_choice(ir: CircuitIR, key: str) -> bool:
     return t is not None and t.provenance.kind is ProvenanceKind.USER_REQUIREMENT and (t.provenance.note or "").startswith(CHOICE_NOTE_PREFIX)
 
 
-def _resistor_criteria(value: float | None, dissipation: float | None, tolerance: str, *, chosen: bool = False) -> list[str]:
+#: what a report adds next to a calculator output a part carries: the part value is that number to 5 significant digits, the netlist the exact number
+VALUE_SPELLING_NOTE = f"부품 값 표기는 유효숫자 {PART_VALUE_DIGITS}자리, 넷리스트는 정확한 값"
+
+
+def _part_value_of(ir: CircuitIR, ref: str) -> str:
+    """The IR's own ``value`` text of part ``ref`` in backticks (copied, never re-spelled; a backtick inside cannot close the span); :data:`NO_RECORD` without that part."""
+    for c in ir.components:
+        if c.ref == ref:
+            return "`" + c.value.replace("`", "'") + "`"
+    return NO_RECORD
+
+
+def display_spelled(c: Component) -> bool | None:
+    """Whether ``c.value`` is the display spelling (:func:`_value_text`) of every design number in ``c.electrical``; ``None`` without one.
+
+    Template v0.1 wrote the netlist spelling (``64.8172677616823n``) and a
+    confirmed design is never rebuilt, so an IR may carry either; a report
+    says "5 significant digits" only where the IR's own text is that
+    spelling (a hand edit is neither, and is ``False``). Copied facts, no
+    status.
+    """
+    numbers = [t.value for t in c.electrical.values() if isinstance(t.value, (int, float)) and not isinstance(t.value, bool)]
+    if not numbers:
+        return None
+    try:
+        return all(c.value == _value_text(v) for v in numbers)
+    except ValueError:  # a number whose rounding passes the largest double has no display spelling
+        return False
+
+
+def _spelled(ir: CircuitIR, *refs: str) -> bool:
+    """Whether every part ``refs`` names is in ``ir`` and carries the display spelling of its design number (:func:`display_spelled`)."""
+    parts = {c.ref: c for c in ir.components}
+    return all(ref in parts and display_spelled(parts[ref]) is True for ref in refs)
+
+
+def _resistor_criteria(value: float | None, dissipation: float | None, tolerance: str, *, chosen: bool = False, spelled: bool = False) -> list[str]:
     """What any substitute resistor must satisfy: the value, twice the computed dissipation, the tolerance class.
 
     ``chosen`` says the value is a template choice the user confirmed (the
     parameter's provenance, see :func:`_is_choice`); otherwise it is a
-    calculator output printed unrounded, and the line says which.
+    calculator output without E-series rounding, and the line says which -
+    and, when ``spelled`` (the part's value is the display spelling of that
+    number, :func:`_spelled`), that the part value shows it to 5 significant
+    digits while the netlist keeps the exact number
+    (:data:`VALUE_SPELLING_NOTE`); a v0.1 netlist spelling keeps v0.1's line.
     """
-    origin = "템플릿 선택값, 사용자 확인" if chosen else "계산값 그대로: E 계열 반올림은 하지 않았음"
+    origin = "템플릿 선택값, 사용자 확인" if chosen else "계산값 그대로: E 계열 반올림은 하지 않았음" + (f"; {VALUE_SPELLING_NOTE}" if spelled else "")
     return [
         f"저항값 {quantity(value, 'ohm')} ({origin})",
         f"정격 전력 ≥ 2 × 계산 소비전력 = 2 × {quantity(dissipation, 'W')} = {quantity(_mul(2.0, dissipation), 'W')}",
@@ -536,13 +587,13 @@ class DividerTemplate(Template):
             "R1": PartNote(
                 role="R1: 상단 분압 저항 (VIN–VOUT), 출력 비율을 정함",
                 why=f"R2 = {quantity(r2, 'ohm')} 선택값에서 R1 = R2·(V_in − V_out)/V_out = {quantity(r1, 'ohm')} 로 계산. 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트(소형·자동 조립).",
-                criteria=_resistor_criteria(r1, _mul(i, i, r1), tol_text, chosen=_is_choice(ir, "r1")),
+                criteria=_resistor_criteria(r1, _mul(i, i, r1), tol_text, chosen=_is_choice(ir, "r1"), spelled=_spelled(ir, "R1")),
                 substitutes=_resistor_substitutes(r1, "Resistor_SMD"),
             ),
             "R2": PartNote(
                 role="R2: 하단 분압 저항 (VOUT–GND)",
                 why=f"템플릿 선택값 {quantity(r2, 'ohm')}: 분압 전류 {quantity(i, 'A')} 가 작아 소비전력이 무시할 만하고, 테브냉 저항이 kΩ 급이라 고임피던스 부하에 적합. 0603 SMD.",
-                criteria=_resistor_criteria(r2, _mul(i, i, r2), tol_text, chosen=_is_choice(ir, "r2")),
+                criteria=_resistor_criteria(r2, _mul(i, i, r2), tol_text, chosen=_is_choice(ir, "r2"), spelled=_spelled(ir, "R2")),
                 substitutes=_resistor_substitutes(r2, "Resistor_SMD"),
             ),
             "J1": _header_note("J1: VIN / VOUT / GND 헤더", "1 = VIN, 2 = VOUT, 3 = GND", "VOUT 은 고임피던스 기준 전압이므로 헤더 뒤에 부하를 달면 안 됨."),
@@ -687,7 +738,7 @@ class LedTemplate(Template):
             "R1": PartNote(
                 role="R1: LED 직렬 전류 제한 저항",
                 why=f"R = (V_in − V_f)/I_f = {quantity(r, 'ohm')} (계산기 값 그대로). 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트.",
-                criteria=_resistor_criteria(r, _mul(drop, i_led), tol_text, chosen=_is_choice(ir, "r_led")),
+                criteria=_resistor_criteria(r, _mul(drop, i_led), tol_text, chosen=_is_choice(ir, "r_led"), spelled=_spelled(ir, "R1")),
                 substitutes=_resistor_substitutes(r, "Resistor_SMD"),
             ),
             "D1": PartNote(
@@ -885,7 +936,7 @@ class RcLowpassTemplate(Template):
             "R1": PartNote(
                 role="R1: 직렬 저항 (IN–OUT), C1 과 함께 τ = RC 를 정함",
                 why=f"C = {quantity(c, 'F')} 선택값에서 R = 1/(2π·f_c·C) = {quantity(r, 'ohm')} 로 계산. 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트.",
-                criteria=_resistor_criteria(r, p_r, "1 % 이하 (Δf_c/f_c ≈ −ΔR/R: 저항 오차가 그대로 차단 주파수 오차가 됨)", chosen=_is_choice(ir, "r")),
+                criteria=_resistor_criteria(r, p_r, "1 % 이하 (Δf_c/f_c ≈ −ΔR/R: 저항 오차가 그대로 차단 주파수 오차가 됨)", chosen=_is_choice(ir, "r"), spelled=_spelled(ir, "R1")),
                 substitutes=_resistor_substitutes(r, "Resistor_SMD"),
             ),
             "C1": PartNote(
@@ -1185,6 +1236,9 @@ class AstableTemplate(Template):
         bound_text = ", ".join(f"{quantity(v, 'V')}/{quantity(f, 'Hz')} → C = {quantity(self._c_at(v, f, r_b, v_be), 'F')}" for v, f in bounds)
         c_e12 = nearest_e12(c)
         f_e12 = _div(1.0, _mul(2.0, r_b, c_e12, n["ln"]))
+        # the 5-digit claim only where both caps carry that spelling, and the same text (a v0.1 IR keeps v0.1's sentence)
+        same_text = _part_value_of(ir, "C1") == _part_value_of(ir, "C2")
+        c_spelling = f"; C1·C2 의 부품 값 표기 {_part_value_of(ir, 'C1')}: 유효숫자 {PART_VALUE_DIGITS}자리, 넷리스트는 정확한 값" if _spelled(ir, "C1", "C2") and same_text else ""
         return [
             TheorySection("동작 원리: 컬렉터 결합 비안정 멀티바이브레이터", (
                 "```\n" + astable_drawing(quantity(r_c, "ohm"), quantity(r_b, "ohm")) + "\n```\n\n"
@@ -1212,7 +1266,8 @@ class AstableTemplate(Template):
                 f"| 반주기 | T_half = R_b·C·ln항 | {quantity(n['t_half'], 's')} |\n"
                 f"| 베이스 시정수 | τ_b = R_b·C | {quantity(n['tau_b'], 's')} |\n"
                 f"| 베이스 역전압 (계산기 `calc.astable.v_be_reverse`) | V_cc − V_BE | **{quantity(n['v_rev'], 'V')}** |\n\n"
-                f"C 는 계산값 그대로입니다(E 계열 반올림 없음). 가장 가까운 E12 값 {quantity(c_e12, 'F')} 를 쓰면 (식 1)로 f = {quantity(f_e12, 'Hz')} 가 됩니다."
+                f"C 는 계산값 그대로입니다(E 계열 반올림 없음{c_spelling}). "
+                f"가장 가까운 E12 값 {quantity(c_e12, 'F')} 를 쓰면 (식 1)로 f = {quantity(f_e12, 'Hz')} 가 됩니다."
             )),
             TheorySection("저항값 선택 근거(설계 선택값)", (
                 f"- 컬렉터 저항 R_c = {quantity(r_c, 'ohm')}: 포화 시 컬렉터 전류 I_C(sat) ≈ V_cc/R_c = {quantity(n['i_c_sat'], 'A')}. 출력 구동 능력과 소비전력의 절충.\n"
@@ -1329,18 +1384,20 @@ class AstableTemplate(Template):
         r_c_note = lambda which, out: PartNote(  # noqa: E731
             role=f"{which}: {out}",
             why=f"R_c = {quantity(r_c, 'ohm')} (템플릿 선택값, 사용자 확인): I_C(sat) ≈ {quantity(n['i_c_sat'], 'A')} 로 출력 구동과 소비전력 {quantity(n['p_rc'], 'W')} 의 절충. 축형 THT 는 손납땜 기판용.",
-            criteria=_resistor_criteria(r_c, n["p_rc"], "1 % 또는 5 % (컬렉터 저항은 주파수에 들어가지 않음)", chosen=_is_choice(ir, "r_c")),
+            criteria=_resistor_criteria(r_c, n["p_rc"], "1 % 또는 5 % (컬렉터 저항은 주파수에 들어가지 않음)", chosen=_is_choice(ir, "r_c"), spelled=_spelled(ir, which)),
             substitutes=_resistor_substitutes(r_c, "Resistor_THT"),
         )
         r_b_note = lambda which, out: PartNote(  # noqa: E731
             role=f"{which}: {out}",
             why=f"R_b = {quantity(r_b, 'ohm')} = 10 × R_c (템플릿 선택값): I_B ≈ {quantity(n['i_b'], 'A')}, 강제 β ≈ {number(beta_forced, 3)} 로 포화 여유 확보. 반주기 T_half = R_b·C·ln항 에 직접 들어가는 타이밍 저항. 축형 THT.",
-            criteria=_resistor_criteria(r_b, n["p_rb"], "1 % 권장 (Δf/f ≈ −ΔR_b/R_b: 저항 오차가 그대로 주파수 오차가 됨)", chosen=_is_choice(ir, "r_b")),
+            criteria=_resistor_criteria(r_b, n["p_rb"], "1 % 권장 (Δf/f ≈ −ΔR_b/R_b: 저항 오차가 그대로 주파수 오차가 됨)", chosen=_is_choice(ir, "r_b"), spelled=_spelled(ir, which)),
             substitutes=_resistor_substitutes(r_b, "Resistor_THT"),
         )
         c_note = lambda which, out: PartNote(  # noqa: E731
             role=f"{which}: {out}",
-            why=f"C = {quantity(c, 'F')} 는 계산기 `calc.astable.c_for_frequency` 의 값 그대로(E 계열 반올림 없음). 매 주기 양극성 전압을 받으므로 무극성이어야 하고(제약 조건 `c.astable.nonpolar_caps`), 5 mm 디스크 THT 는 손납땜 기판용.",
+            why=f"C = {quantity(c, 'F')} 는 계산기 `calc.astable.c_for_frequency` 의 값 그대로(E 계열 반올림 없음"
+            + (f"; 부품 값 표기 {_part_value_of(ir, which)}: 유효숫자 {PART_VALUE_DIGITS}자리, 넷리스트는 정확한 값" if _spelled(ir, which) else "")
+            + "). 매 주기 양극성 전압을 받으므로 무극성이어야 하고(제약 조건 `c.astable.nonpolar_caps`), 5 mm 디스크 THT 는 손납땜 기판용.",
             criteria=[
                 "무극성 (세라믹 / 필름; 전해 커패시터 불가 - 양극성 전압을 받음)",
                 f"정전용량 {quantity(c, 'F')} ± 공차: Δf/f ≈ −ΔC/C 이므로 +10 % 이면 f ≈ {quantity(f_plus10, 'Hz')} (−9.1 %); 허용치 {number(_mul(100.0, n['tol_rel']), 3)} % 안에 들려면 5 % 이하 권장",
@@ -1470,6 +1527,8 @@ __all__ = [
     "RESISTOR",
     "RESISTOR_THT",
     "TEMPLATES",
+    "VALUE_SPELLING_NOTE",
+    "display_spelled",
     "Atmega128DevboardTemplate",
     "AstableTemplate",
     "DividerTemplate",

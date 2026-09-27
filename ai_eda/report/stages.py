@@ -62,11 +62,13 @@ from typing import Any
 
 from ai_eda.design import TEMPLATES
 from ai_eda.design.base import CHOICE_NOTE_PREFIX, NO_RECORD, TOOL_ID, PartNote, Template, TheorySection, parameter_value, quantity
+from ai_eda.design.templates import display_spelled
 from ai_eda.ir import CircuitIR, Component, Provenance, ProvenanceKind, Reduce, Traced, ValidationResult, ValidationStatus
 from ai_eda.parts.existence import CHECK_PREFIX as EXISTENCE_PREFIX
 from ai_eda.report.figures import Figure, bar_figure, board_figure, expectation_limit, plot_vector, tolerance_figure, tolerance_rows, waveform_figures
 from ai_eda.report.pdf import NO_BROWSER_REASON, find_browser, html_to_pdf, markdown_to_html
 from ai_eda.report.pipeline_log import PipelineRecord
+from ai_eda.tools.calc.part_value import PART_VALUE_DIGITS
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, LibraryLookupError
 from ai_eda.tools.placement.core_ring import BODY_OVERHANG_MM, CORE_MIN_PADS, EDGE_REF_PREFIXES, INNER_MAX_PADS
 from ai_eda.tools.placement.core_ring import PLACER_ID as RING_PLACER_ID
@@ -107,6 +109,13 @@ NO_TEMPLATE_INFO = "템플릿 정보 없음"
 SUBSTITUTES_HEADING = "대체 후보 (파이프라인이 검증하지 않은 이름)"
 #: what a report says where it needs a run record and has none
 NO_RUN_RECORD = "실행 기록 없음"
+#: under the parts table of a template design whose every numeric part carries the display spelling (``display_spelled``; a v0.1
+#: design keeps the netlist spelling and gets no note): the value column is display text, the netlist carries the exact design number
+VALUE_COLUMN_NOTE = (
+    f"템플릿이 만든 부품의 '값' 은 KiCad 방식의 표기입니다: 단위 없이 SI 접두어(`p` `n` `u` `m` `k` `M` = 메가 `G`), 유효숫자 최대 {PART_VALUE_DIGITS}자리, "
+    "끝자리 0 생략 (예: `100n`, `1.5915k`). 시뮬레이션 넷리스트와 계산기는 이 표기가 아니라 IR 의 정확한 설계값(SPICE 바인딩)을 쓰므로, "
+    f"두 값은 유효숫자 {PART_VALUE_DIGITS}자리 표기의 반올림만큼 다를 수 있습니다 (E 계열 반올림은 어느 쪽에도 하지 않음)."
+)
 #: the KiCad symbol properties the parts report shows, labelled as the library's own text
 LIBRARY_PROPERTIES: tuple[str, ...] = ("Description", "Datasheet", "ki_keywords")
 #: an absolute POSIX or Windows path inside a stored message (two or more segments, so a formula's ``a/(b+c)`` is not one;
@@ -661,9 +670,13 @@ def parts_report(ir: CircuitIR, library: KicadLibrary | None = None) -> str:
         return "\n".join(out).rstrip("\n") + "\n"
     rows = [[f"`{c.ref}`", c.value, c.description or "-", f"`{_lib_id(c, 'symbol')}`", f"`{_lib_id(c, 'footprint')}`", c.package.value if c.package is not None else NO_RECORD, _pins_text(c)] for c in ir.components]
     out.append(_table(["ref", "값", "설명", "심볼", "풋프린트", "패키지", "핀"], rows))
+    template = template_for(ir)
+    spelled = [x for x in (display_spelled(c) for c in ir.components) if x is not None]
+    if template is not None and spelled and all(spelled):
+        # only where every numeric part carries the display spelling: a v0.1 design keeps the netlist spelling (never rebuilt)
+        out += ["", VALUE_COLUMN_NOTE]
     out += ["", f"'{SUBSTITUTES_HEADING}' 아래의 부품 이름은 제안일 뿐이며 파이프라인은 그 부품의 핀 배열·정격을 확인하지 않았습니다. "
             "부품의 심볼·풋프린트·핀은 KiCad 라이브러리 파일에서 읽은 것이고, 존재 확인의 세부 항목이 무엇이 확인되었는지를 말합니다.", "", NO_CHART_IN_PARTS, ""]
-    template = template_for(ir)
     notes = template.part_notes(ir) if template is not None else {}
     for c in ir.components:
         out += [f"## {c.ref} — {c.description or c.value}", "", f"- 값: {c.value}", f"- 출처: {_provenance_text(c.provenance)}" + (f" — {strip_paths(c.provenance.note)}" if c.provenance.note else ""), ""]
@@ -681,6 +694,11 @@ def parts_report(ir: CircuitIR, library: KicadLibrary | None = None) -> str:
 
 #: what the circuit report says for a board without IR copper
 NO_ROUTING = "배선 없음"
+#: who decides what happens to a board with unrouted nets (the circuit report, routing.maze 0.2): the user's opt-in answer, never an agent
+PARTIAL_ROUTING_RULE = (
+    "그런 보드는 기본적으로 배치만 남기며(all-or-nothing), 사용자가 `--answer pcb.routing=partial` 로 답했을 때만 "
+    "완성된 넷을 넷 단위로 적용합니다."
+)
 #: what the final report prints for an expectation without a measured value
 NO_MEASUREMENT = "측정 없음"
 #: IPC-2221 external-layer current capacity  I = k · ΔT^0.44 · A^0.725  (I in A, ΔT in °C, A in mil²)
@@ -953,7 +971,26 @@ def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     if unrouted:
         out += [f"구리가 없는 넷: {', '.join(f'`{n}`' for n in unrouted)} (핀이 하나뿐인 넷은 이을 것이 없고, 그 외는 라우터가 잇지 못한 넷입니다 — `pcb.routing.connectivity` 가 말합니다).", ""]
     out += figures.lines(SLOT_BOARD) + figures.lines(SLOT_COPPER)
-    if None not in (g, w, c, e, d_v):
+    if None not in (g, w, c, e, d_v) and "max_iterations" in params:
+        # routing.maze 0.2 records its negotiation numbers in the params entry: the negotiated model, with the values the copper was routed at
+        out += [
+            "### 라우터의 keep-out 규칙 (파라미터 값을 넣은 것)", "",
+            "격자 미로 라우터는 F.Cu / B.Cu 두 층의 정사각 격자 위에서 넷마다 A* 탐색(한 칸 `base_cost`, 방향 전환 `bend_cost`, 층 전환(비아) `via_cost`; "
+            "휴리스틱은 맨해튼 거리)으로 잇고, 패드가 여럿인 넷은 패드 중심의 무게중심에 가장 가까운 패드에서 시작해 가장 가까운 패드를 하나씩 더하는 Steiner 트리로 키웁니다. "
+            "넷끼리의 겹침은 금지가 아니라 비용으로 협상합니다(rip-up and reroute): 다른 넷의 간격 영역 안의 셀은 반복마다 "
+            f"`present_cost` = {params.get('present_cost')} 에서 `present_growth` = {params.get('present_growth')} 배씩 비싸지고, 겹쳤던 셀에는 `history_cost` = "
+            f"{params.get('history_cost')} 가 쌓이며, 겹친 넷만 다시 배선해 겹침이 없어지거나 `max_iterations` = {params.get('max_iterations')} 에 이르면 멈춥니다. "
+            "내보내는 구리는 서로 다음 거리를 모두 지킵니다 (중심선 기준 거리):", "",
+            f"    다른 넷 패드 상자로부터        r = c + w/2 + g/2 = {c:g} + {w / 2:g} + {g / 2:g} = {c + w / 2 + g / 2:.3f} mm",
+            f"    다른 넷 트랙으로부터           r = w + c + g/2 = {w + c + g / 2:.3f} mm   (두 중심선 거리 ≥ w/2 + c + w/2)",
+            f"    비아와 다른 넷 트랙 (양 층)    r = d_v/2 + c + w/2 = {d_v / 2 + c + w / 2:.3f} mm",
+            f"    비아와 다른 넷 비아            r = d_v + c = {d_v + c:.3f} mm",
+            f"    보드 가장자리                  e + w/2 = {e + w / 2:.3f} mm   (비아는 e + d_v/2 = {e + d_v / 2:.3f} mm)", "",
+            "g/2 항은 격자 셀 사이를 지나는 구간까지 보수적으로 덮는 여유입니다. 비아는 어떤 패드 안에도 놓지 않고, 합법적인 배선을 찾지 못한 넷은 구리 없이 남깁니다(반쯤 배선된 넷 없음). "
+            f"{PARTIAL_ROUTING_RULE} "
+            "이 규칙은 라우터 자체의 파라미터이지 설계 규칙이 아니며, 보드의 유효성은 kicad-cli DRC 가 판정합니다.", "",
+        ]
+    elif None not in (g, w, c, e, d_v):
         out += [
             "### 라우터의 keep-out 규칙 (파라미터 값을 넣은 것)", "",
             "격자 미로 라우터는 F.Cu / B.Cu 두 층의 정사각 격자 위에서 넷을 (패드 수, 이름) 순으로 하나씩 A* 탐색으로 잇습니다 "
@@ -1412,6 +1449,7 @@ __all__ = [
     "NO_TEMPLATE_INFO",
     "NO_TOLERANCE_FIGURE",
     "NO_WAVEFORM",
+    "PARTIAL_ROUTING_RULE",
     "PDF_NOT_REQUESTED",
     "REPORTS_DIR",
     "REPORT_SUFFIXES",
@@ -1424,6 +1462,7 @@ __all__ = [
     "SLOT_WAVEFORM",
     "STAGE_REPORTS",
     "SUBSTITUTES_HEADING",
+    "VALUE_COLUMN_NOTE",
     "ReportFigures",
     "RunRecord",
     "StageDocument",

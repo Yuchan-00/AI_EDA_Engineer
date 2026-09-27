@@ -10,7 +10,8 @@ changes the design itself to make a stage pass. The PLACEMENT stage applies
 the ``PCBAgent``'s one deterministic proposal - the placement
 (``placement.core_ring`` when a part has at least 32 pads, else
 ``placement.grid``) plus the tracks and vias ``routing.maze`` derived from it (or the placement alone
-when a net is unroutable or ``--answer pcb.routing=skip`` was given) - like
+when a net is unroutable or ``--answer pcb.routing=skip`` was given; with the opt-in
+``--answer pcb.routing=partial`` the nets the router did route, each whole) - like
 any other proposal (through :meth:`Orchestrator.apply_proposals`, before
 IR_BUILD so every validator hash is about the placed, routed design and the
 ``pcb.routing.*`` IR-geometry checks judge that copper there), the

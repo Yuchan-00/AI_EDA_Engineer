@@ -36,8 +36,8 @@ from ai_eda.agents.circuit import CONFIRM_DESIGN_KEY
 from ai_eda.agents.keys import ROUTING_KEY
 from ai_eda.cli import main as cli_main
 from ai_eda.compilers.schematic_layout import natural_ref_key
-from ai_eda.design import NO_RECORD, TEMPLATES, UNVERIFIED_SUBSTITUTE, PartNote, Template, TheorySection, quantity
-from ai_eda.design.templates import astable_drawing, nearest_e12
+from ai_eda.design import NO_RECORD, TEMPLATE_VERSION, TEMPLATES, UNVERIFIED_SUBSTITUTE, PartNote, Template, TheorySection, quantity
+from ai_eda.design.templates import VALUE_SPELLING_NOTE, astable_drawing, nearest_e12
 from ai_eda.ir import ArtifactKind, CircuitIR, Provenance, ProvenanceKind, Traced, ValidationResult, ValidationStatus as S
 from ai_eda.report import (
     PIPELINE_FILE,
@@ -71,8 +71,10 @@ from ai_eda.report.stages import (
     NO_TEMPLATE_INFO,
     NO_TOLERANCE_FIGURE,
     NO_WAVEFORM,
+    PARTIAL_ROUTING_RULE,
     PDF_NOT_REQUESTED,
     SUBSTITUTES_HEADING,
+    VALUE_COLUMN_NOTE,
     copper_resistance_ohm,
     ipc2221_current_a,
     net_routing_stats,
@@ -157,7 +159,7 @@ def _assert_clean(text: str, tmp_path: Path) -> None:
 def test_astable_theory_report_states_the_formulas_with_the_design_numbers(astable, tmp_path: Path):
     ir, lib = astable
     text = theory_report(ir, lib)
-    assert text.startswith("# 이론 보고서: astable\n") and "템플릿 `astable` v0.1" in text
+    assert text.startswith("# 이론 보고서: astable\n") and f"템플릿 `astable` v{TEMPLATE_VERSION}" in text
     # the period expression and the substituted numbers (C, the half period, the reverse V_BE, the ln term)
     assert "ln((2·V_cc − V_BE)/(V_cc − V_BE))" in text and "(식 1)" in text
     assert "64.817 nF" in text and "500 µs" in text and "4.3 V" in text and "0.771399" in text
@@ -167,7 +169,7 @@ def test_astable_theory_report_states_the_formulas_with_the_design_numbers(astab
     assert "`.model QNPN NPN (TR=200n)`" in text and "step  = 1/(200·f) = 5 µs" in text and "stop  = 20/f      = 20 ms" in text
     # the parameter table: key, value, origin, calculator id or the confirmed-choice label, the formula note
     assert "| `c` | 64.817 nF | 계산기 출력 | `calc.astable.c_for_frequency` v0.7 ← f_osc, r_b, v_in, v_be | C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE))) |" in text
-    assert "| `r_b` | 10 kΩ | 사용자 확인 선택값 | template astable v0.1 |" in text
+    assert f"| `r_b` | 10 kΩ | 사용자 확인 선택값 | template astable v{TEMPLATE_VERSION} |" in text
     assert "| `v_in` | 5 V | 사용자 요구사항 | req.input_voltage |" in text
     # constraints, simulation setup, the judging rule and the frequency measurement rule (Reduce.FREQUENCY is used)
     assert "`c.astable.reverse_vbe`" in text and "`c.astable.nonpolar_caps`" in text
@@ -237,6 +239,10 @@ def test_astable_parts_report_lists_every_part_with_notes_library_facts_and_exis
         lines = [ln for ln in sec.split("\n\n", 1)[0].splitlines() if ln.strip()]
         assert lines and all(ln.startswith("- ") and "(검증되지 않음" in ln for ln in lines)
     assert "PN2222A" in text and "BC547 / BC548" in text and "`Transistor_BJT:BC547`" in text and "2N4401" in text
+    # the value column is the readable part value (5 significant digits), and the report says the netlist keeps the exact number
+    assert "| `C1` | 64.817n |" in text and "| `R3` | 10k |" in text and "- 값: 64.817n" in text and "64.8172677616823" not in text
+    assert text.count(VALUE_COLUMN_NOTE) == 1 and "유효숫자 최대 5자리" in VALUE_COLUMN_NOTE and "`M` = 메가" in VALUE_COLUMN_NOTE
+    assert "C = 64.817 nF 는 계산기 `calc.astable.c_for_frequency` 의 값 그대로(E 계열 반올림 없음; 부품 값 표기 `64.817n`: 유효숫자 5자리, 넷리스트는 정확한 값)." in text
     # the astable's computed criteria
     assert "- V_CEO ≥ 2·V_cc = 10 V (여유 2배)" in text and "- I_C(max) ≥ 10 × V_cc/R_c = 50 mA" in text
     assert "- V_EBO ≥ V_cc − V_BE = 4.3 V" in text and "TO-92 핀 순서 E-B-C (KiCad 심볼 `Q_NPN_EBC`" in text
@@ -265,7 +271,7 @@ def test_divider_parts_report(divider, tmp_path: Path):
     for ref in ("R1", "R2", "J1"):
         assert f"## {ref} — " in text and f"### 존재 확인 (`component.existence.{ref}`)" in text
     assert "- 역할: R1: 상단 분압 저항 (VIN–VOUT), 출력 비율을 정함" in text
-    assert "- 저항값 14 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음)" in text
+    assert f"- 저항값 14 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in text
     assert "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 3.5 mW = 7 mW" in text
     assert "- 전기 특성: resistance = 14 kΩ [계산기 출력 (calc.divider.r1_for_v_out v0.7)]" in text
     assert "- req.output_voltage (output_voltage: 5 V)" in text
@@ -301,6 +307,7 @@ def test_non_template_design_gets_honest_fallbacks(tmp_path: Path):
     assert parts.count("기록 없음: COMPONENT_SELECTION 단계가 이 부품을 아직 확인하지 않았습니다.") == 3  # no existence result yet
     assert "- req.v_out (6 V output (half the input) within 1 %)" in parts
     assert SUBSTITUTES_HEADING not in parts.split("## R1")[1]
+    assert VALUE_COLUMN_NOTE not in parts  # the value convention is the templates'; a hand-made design's values are printed as written
     circuit, final = circuit_report(ir, lib, None), final_report(ir, None)
     assert "| `R1` | `Resistor_SMD:R_0603_1608Metric` |" in circuit and NO_ROUTING in circuit and "### 배치 규칙과 그 한계" not in circuit  # hand placements, no copper
     assert "![fig](fig:placement)" in circuit and NO_BOARD_FIGURE in circuit and NO_COPPER_FIGURE in circuit  # placed by hand, no copper
@@ -312,11 +319,11 @@ def test_non_template_design_gets_honest_fallbacks(tmp_path: Path):
 
 
 def test_template_of_reads_the_structural_provenance(astable, divider):
-    assert template_of(astable[0]) == ("astable", "0.1") and template_for(astable[0]) is TEMPLATES[3]
-    assert template_of(divider[0]) == ("divider", "0.1") and template_for(divider[0]) is TEMPLATES[0]
+    assert template_of(astable[0]) == ("astable", TEMPLATE_VERSION) and template_for(astable[0]) is TEMPLATES[3]
+    assert template_of(divider[0]) == ("divider", TEMPLATE_VERSION) and template_for(divider[0]) is TEMPLATES[0]
     ir = astable[0].model_copy(deep=True)
     ir.topology = None  # a component's provenance still names the template
-    assert template_of(ir) == ("astable", "0.1")
+    assert template_of(ir) == ("astable", TEMPLATE_VERSION)
 
 
 def test_base_template_hooks_default_to_no_theory_and_no_notes(astable):
@@ -388,8 +395,12 @@ def test_circuit_report_lists_nets_placements_routing_and_the_reference_values(a
     assert "### 배치 규칙과 그 한계" in text and "참조 순서로 놓이므로" in text and "kicad-cli DRC 만이 판정" in text
     # the routing parameters come from the first track's provenance, the per-net lengths sum to the total
     params = routing_params_of(ir)
-    assert params == {"grid": "0.25", "width": "0.4", "clearance": "0.25", "via": "0.8/0.4", "edge": "0.3", "via_cost": "12.0", "bend_cost": "0.6"}
-    assert "- 배선 파라미터 (첫 트랙의 provenance `params:` 항목): `grid` = 0.25, `width` = 0.4, `clearance` = 0.25, `via` = 0.8/0.4, `edge` = 0.3, `via_cost` = 12.0, `bend_cost` = 0.6" in text
+    assert params == {"grid": "0.25", "width": "0.4", "clearance": "0.25", "via": "0.8/0.4", "edge": "0.3", "via_cost": "12.0", "bend_cost": "0.6",
+                      "base_cost": "1.0", "history_cost": "1.0", "present_cost": "0.5", "present_growth": "2.0", "max_iterations": "40", "window": "10.0"}
+    assert (
+        "- 배선 파라미터 (첫 트랙의 provenance `params:` 항목): `grid` = 0.25, `width` = 0.4, `clearance` = 0.25, `via` = 0.8/0.4, `edge` = 0.3, `via_cost` = 12.0, "
+        "`bend_cost` = 0.6, `base_cost` = 1.0, `history_cost` = 1.0, `present_cost` = 0.5, `present_growth` = 2.0, `max_iterations` = 40, `window` = 10.0"
+    ) in text
     rows = _table_rows(text, "### 넷별 배선 통계")
     assert [r[0] for r in rows] == [f"`{n.name}`" for n in ir.nets] + ["**합계**"]
     per_net = sum(float(r[2]) for r in rows[:-1])
@@ -398,6 +409,10 @@ def test_circuit_report_lists_nets_placements_routing_and_the_reference_values(a
     assert sum(s["segments"] for s in stats) == len(ir.pcb.tracks) and float(rows[-1][2]) == pytest.approx(sum(s["length_mm"] for s in stats), abs=0.001)
     # the keep-out rules with the parameter values substituted
     assert "r = c + w/2 + g/2 = 0.25 + 0.2 + 0.125 = 0.575 mm" in text and "r = w + c + g/2 = 0.775 mm" in text and "e + w/2 = 0.500 mm" in text
+    assert "r = d_v + c = 1.050 mm" in text and "`present_cost` = 0.5 에서 `present_growth` = 2.0 배씩" in text and "`max_iterations` = 40 에 이르면" in text
+    # who decides about a board with unrouted nets: the default keeps the placement only, the user's opt-in answer applies whole nets
+    assert PARTIAL_ROUTING_RULE == "그런 보드는 기본적으로 배치만 남기며(all-or-nothing), 사용자가 `--answer pcb.routing=partial` 로 답했을 때만 완성된 넷을 넷 단위로 적용합니다."
+    assert "합법적인 배선을 찾지 못한 넷은 구리 없이 남깁니다(반쯤 배선된 넷 없음). " + PARTIAL_ROUTING_RULE in text and "PCB 에이전트가 정합니다" not in text
     # IPC-2221 for 0.4 mm / 1 oz at 10 degC, checked against an inline computation of the formula
     area_mil2 = (0.4 / 0.0254) * (35.0 / 1000.0 / 0.0254)
     capacity = 0.048 * 10.0 ** 0.44 * area_mil2 ** 0.725
@@ -412,7 +427,7 @@ def test_circuit_report_lists_nets_placements_routing_and_the_reference_values(a
     # the IR-geometry verdicts and the stage messages, copied
     assert "- `pcb.routing.connectivity`: **PASS** (`pcb.routing` v0.1) — " in text and "(IR geometry check, not DRC)" in text
     assert "- `pcb.routing.clearance`: **NOT_VERIFIED** (`pcb.routing` v0.1) — no clearance limit in ir.pcb.manufacturing" in text
-    assert "- `placement`: **NOT_VERIFIED** — " in text and "routing.maze 0.1:" in text
+    assert "- `placement`: **NOT_VERIFIED** — " in text and "routing.maze 0.2:" in text
     assert "- `pcb`: **PASS** — astable.kicad_pcb" in text and "- `drc`: **NOT_VERIFIED** — kicad-cli not available" in text
     assert "PASS" not in text.split("## 배선")[0]  # statuses appear only where results are quoted
     _assert_clean(text, tmp_path)
@@ -692,6 +707,8 @@ def test_astable_theory_e12_sentence_follows_the_design_capacitor(astable):
     ln_term = math.log((2 * 5.0 - 0.7) / (5.0 - 0.7))
     text = theory_report(ir, lib)
     assert f"가장 가까운 E12 값 68 nF 를 쓰면 (식 1)로 f = {quantity(1 / (2 * 10_000.0 * 68e-9 * ln_term), 'Hz')} 가 됩니다." in text
+    # the part value is quoted from the IR (copied, not re-spelled): display text, the netlist keeps the exact number
+    assert "C 는 계산값 그대로입니다(E 계열 반올림 없음; C1·C2 의 부품 값 표기 `64.817n`: 유효숫자 5자리, 넷리스트는 정확한 값). " in text
     fast = ir.model_copy(deep=True)
     c_10k = 1 / (2 * 10_000.0 * 10_000.0 * ln_term)  # the calculator's C for 10 kHz with the same R_b / V_cc / V_BE
     for key, value in (("f_osc", 10_000.0), ("f_osc_design", 10_000.0), ("c", c_10k)):
@@ -798,14 +815,14 @@ def test_resistor_criteria_label_follows_the_parameter_provenance(astable, divid
     assert "계산값 그대로: E 계열 반올림은 하지 않았음" not in text  # no astable resistor is a calculator output
     ir, lib = divider
     text = parts_report(ir, lib)
-    assert "- 저항값 14 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음)" in text and "- 저항값 10 kΩ (템플릿 선택값, 사용자 확인)" in text
+    assert f"- 저항값 14 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in text and "- 저항값 10 kΩ (템플릿 선택값, 사용자 확인)" in text
     assert "저항값 10 kΩ (계산값 그대로" not in text
 
 
 def test_led_theory_and_parts_reports(tmp_path: Path):
     """The led template's hooks render with the design's numbers (5 V / 2 V / 10 mA -> 300 Ω, 30 mW) and are deterministic."""
     ir, lib = _build(tmp_path, "led", LED)
-    assert template_of(ir) == ("led", "0.1")
+    assert template_of(ir) == ("led", TEMPLATE_VERSION)
     text = theory_report(ir, lib)
     assert "R = (V_in − V_f)/I_f" in text and "= (5 V − 2 V)/10 mA = 300 Ω   (`calc.led.R`)" in text and "= 3 V/300 Ω = 10 mA   (`calc.led.I`)" in text
     assert "| 저항 소비전력 | P(R) = (V_in − V_f)·I = (V_in − V_f)²/R | 30 mW |" in text and "| LED 소비전력 | P(LED) = V_f·I | 20 mW |" in text
@@ -814,7 +831,7 @@ def test_led_theory_and_parts_reports(tmp_path: Path):
     parts = parts_report(ir, lib)
     notes = template_for(ir).part_notes(ir)
     assert set(notes) == {c.ref for c in ir.components} == {"R1", "D1", "J1"}
-    assert "- 저항값 300 Ω (계산값 그대로: E 계열 반올림은 하지 않았음)" in parts and "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 30 mW = 60 mW" in parts
+    assert f"- 저항값 300 Ω (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in parts and "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 30 mW = 60 mW" in parts
     assert "- 데이터시트의 V_f(@ I_f = 10 mA) 가 요구값 2 V 과 같을 것 (다르면 R1 을 다시 계산)" in parts and "- 최대 순방향 전류 I_f(max) ≥ 10 mA 에 여유" in parts
     for note in notes.values():
         assert note.criteria and note.substitutes and all(sub.endswith(UNVERIFIED_SUBSTITUTE) for sub in note.substitutes)
@@ -826,7 +843,7 @@ def test_led_theory_and_parts_reports(tmp_path: Path):
 def test_rc_lowpass_theory_and_parts_reports(tmp_path: Path):
     """The rc_lowpass hooks render with the design's numbers (1 kHz, 100 nF -> 1.5915 kΩ, τ = 159.15 µs) and state judge()'s bracket rule."""
     ir, lib = _build(tmp_path, "rc_lowpass", RC)
-    assert template_of(ir) == ("rc_lowpass", "0.1")
+    assert template_of(ir) == ("rc_lowpass", TEMPLATE_VERSION)
     text = theory_report(ir, lib)
     assert "R = 1/(2π·f_c·C) = 1/(2π·1 kHz·100 nF) = 1.5915 kΩ" in text and "τ = R·C = 159.15 µs   (`calc.rc.tau`)" in text and "검산: f_c = 1/(2π·R·C) = 1000 Hz" in text
     assert "| f_c = 1 kHz | 1/√2 = 0.70711 (−3.01 dB) | −45° |" in text and "| 10·f_c = 10 kHz | 0.0995 (−20.04 dB) | −84.3° |" in text
@@ -838,7 +855,7 @@ def test_rc_lowpass_theory_and_parts_reports(tmp_path: Path):
     parts = parts_report(ir, lib)
     notes = template_for(ir).part_notes(ir)
     assert set(notes) == {c.ref for c in ir.components} == {"R1", "C1", "J1"}
-    assert "- 저항값 1.5915 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음)" in parts and "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 628.32 µW = 1.2566 mW" in parts
+    assert f"- 저항값 1.5915 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in parts and "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 628.32 µW = 1.2566 mW" in parts
     assert "- 정전용량 100 nF, 공차 5 % 이하 (Δf_c/f_c ≈ −ΔC/C: 커패시터 오차가 그대로 차단 주파수 오차가 됨)" in parts
     for note in notes.values():
         assert note.criteria and note.substitutes and all(sub.endswith(UNVERIFIED_SUBSTITUTE) for sub in note.substitutes)

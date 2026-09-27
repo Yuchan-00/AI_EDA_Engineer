@@ -47,7 +47,8 @@ from ai_eda.design.inputs import DesignInput, canonical_key
 if TYPE_CHECKING:  # the report package imports this one (stages -> TEMPLATES), so the figure type is a type-only import here
     from ai_eda.report.figures import Figure
 
-TEMPLATE_VERSION = "0.1"
+#: 0.2: part values are KiCad-style display text to 5 significant digits (``100n``, not the netlist spelling ``1e-7``)
+TEMPLATE_VERSION = "0.2"
 #: tool id of the template machinery (``Provenance.tool`` is ``design.template.<template id>`` on structural decisions)
 TOOL_ID = "design.template"
 #: how a confirmed free choice's note starts (the rest names the template, its version and the choice)

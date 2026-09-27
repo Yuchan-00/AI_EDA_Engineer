@@ -1,4 +1,4 @@
-"""Deterministic two-layer grid maze router (pure, no I/O beyond the KiCad library).
+"""Deterministic two-layer grid maze router with negotiated congestion (pure, no I/O beyond the KiCad library).
 
 Invariant: every track and via produced here is a function of the IR's
 placements, the footprints read from a KiCad library
@@ -11,24 +11,50 @@ layer or a pad too small for the grid raises
 
 What this is: a Lee / A* maze router on a square grid over the board
 outline, ``F.Cu`` and ``B.Cu`` only, with vias between them, one track width
-for every net, nets routed one after another (no rip-up). Each net grows a
-tree from its first terminal: an A* search (4-neighbour steps cost 1, a
-change of direction adds ``bend_cost``, a layer change adds ``via_cost``;
-Manhattan heuristic to the nearest remaining terminal; heap ties broken by a
-monotonically increasing counter, so the result is a pure function of its
-inputs) from every cell of the tree to the nearest remaining terminal, until
-all terminals hang on the tree. A net whose terminal cannot be reached is
-recorded in :attr:`Routing.unrouted` with the reason and *all* of its copper
-is discarded - a half-routed net is never emitted - and routing continues
-with the next net. Nets are routed in ``(pad count, name)`` order; when that
-order leaves a net unrouted, one second pass routes the board again from
-scratch with the starved nets first (no rip-up: a whole new attempt in a
-different order, taken only when it leaves fewer nets unrouted, so a board
-that routes in one pass is unchanged; ``stats["passes"]`` / ``stats["net_order"]``
-say what happened).
+for every net, inside a PathFinder-style negotiated-congestion loop
+(rip-up and reroute):
+
+* **The search** (unchanged from 0.1 in kind): A* over ``(layer, cell,
+  direction)`` states, so the bend cost is exact; a 4-neighbour step costs
+  the cell's node cost, a change of direction adds ``bend_cost``, a layer
+  change adds the via cost; the heuristic is ``base_cost`` times the
+  Manhattan distance to the target (a lower bound: no step costs less than
+  ``base_cost``); heap ties are broken by a monotonically increasing push
+  counter, so the result is a pure function of its inputs. The search runs
+  in a window around the net's terminals (``window_mm`` beyond their
+  bounding box), doubled on failure until it covers the board.
+* **Multi-terminal nets** grow a Steiner tree: from the terminal nearest the
+  centroid of the net's pad centres, each step adds the unconnected terminal
+  nearest (Manhattan, grid cells) to the tree so far - one A* from every
+  tree cell to that terminal - until all terminals hang on the tree.
+* **Negotiation**: iteration 1 routes every net in ``(pad count, name)``
+  order, each seeing the others' copper not as an obstacle but as a cost:
+  a cell's node cost is ``base_cost * (1 + history) * (1 + present *
+  occupancy)``, occupancy being the number of other nets whose clearance
+  halo covers the cell, and a via's cost ``(via_cost + base_cost) * (1 +
+  history) * (1 + present * via occupancy) - base_cost`` plus the landing
+  cell's congestion. After each iteration every over-used cell (a net's
+  copper inside another net's halo) gains ``history_cost``; the present
+  factor starts at ``present_cost`` and is multiplied by ``present_growth``
+  per iteration; the next iteration rips up and reroutes, in the same fixed
+  order, every net that owns an over-used cell. The loop stops when no cell
+  is over-used (``stats["legal"]``) or after ``max_iterations``.
+* **What is emitted**: only mutually legal copper. When the cap is reached
+  with conflicts left, the net with the most conflict partners (then the
+  fewer pads, then the name) is ripped up, repeatedly, until the rest is
+  legal; each such net is then tried once more against the legal copper as
+  a hard obstacle (0.1's rule: no cell of it - its terminal cells, where the
+  search starts and ends, included - inside another net's halo) and kept
+  only when that succeeds. A net that
+  still has no legal route - or a terminal no search can reach even with
+  every other net's copper ignored - is listed in :attr:`Routing.unrouted`
+  with the reason and **no copper at all**: a half-routed net is never
+  emitted. Whether a board with unrouted nets is applied is the caller's
+  decision (:class:`~ai_eda.agents.pcb.PCBAgent`: all-or-nothing unless the
+  user answered ``pcb.routing=partial``).
 
 Obstacle model (board frame, mm, Y down; every emitted coordinate is rounded
-with :func:`ai_eda.tools.kicad.geometry._q`):
+with :func:`ai_eda.tools.kicad.geometry._q`). The static part is 0.1's:
 
 * an *owner map* per layer says for every grid cell which net may use it
   (free, one net, or :data:`BLOCKED`). A cell closer than
@@ -38,18 +64,23 @@ with :func:`ai_eda.tools.kicad.geometry._q`):
   by the pad's net; a cell claimed by two nets, or near a pad without a net
   (unnumbered pads, NPTH holes, pins no net names), is BLOCKED. A cell closer
   than ``edge_clearance + width/2`` to the outline is BLOCKED on both layers.
-* a routed path is marked with radius ``width + clearance + grid/2`` around
-  every path cell on its layer and a via with radius
-  ``via_diameter/2 + clearance + width/2`` on both layers, so the next net
-  keeps ``clearance`` from this copper. Because the marks of a net are
-  neither an obstacle nor a shortcut for the net itself, they are written
-  once the whole net has routed (which is what lets a failed net be
-  discarded without a trace).
+  These cells are never entered by a foreign net, whatever the costs.
+* the copper of a routed net is its *halo*, counted, not owned: every path
+  cell covers the cells within ``width + clearance + grid/2`` on its layer
+  (a foreign track centre there would come closer than ``clearance``) and
+  the cells within ``via_diameter/2 + clearance + width/2`` in the via plane
+  (a foreign via centre there would); every via covers the cells within
+  ``via_diameter/2 + clearance + width/2`` on both layers and within
+  ``via_diameter + clearance`` in the via plane. Every one of these relations
+  is symmetric, so "no net's copper lies in another net's halo" is exactly
+  "every copper pair of different nets keeps ``clearance``" - a legal result
+  keeps every clearance of 0.1's model (a via's hard pad / edge rules below
+  included).
 * a via may sit where every cell within ``via_diameter/2 + clearance +
-  width/2`` on *both* layers is free or the net's own, at least
-  ``edge_clearance + via_diameter/2`` from the outline, and where its copper
-  disc (radius ``via_diameter/2``) overlaps no pad box at all - the net's own
-  pads included: a via is drilled next to a pad, never through it
+  width/2`` on *both* layers is free or the net's own on the static map, at
+  least ``edge_clearance + via_diameter/2`` from the outline, and where its
+  copper disc (radius ``via_diameter/2``) overlaps no pad box at all - the
+  net's own pads included: a via is drilled next to a pad, never through it
   (no via-in-pad).
 * a pad's terminal is the grid cell nearest to its centre; it must lie inside
   the pad's inscribed circle, so the track ending there overlaps the pad
@@ -79,7 +110,8 @@ judges grounding) and :attr:`Routing.stats` says which were raised.
 Traceability: every :class:`~ai_eda.ir.Track` / :class:`~ai_eda.ir.Via`
 carries ``derived`` provenance naming this router (:data:`ROUTER_ID` /
 :data:`ROUTER_VERSION`), the net, the placements of the net's components and
-every parameter in ``derived_from``. ``Provenance.inputs`` stays empty: it is
+every parameter in ``derived_from``; the note names the iteration count and
+how the net's route was obtained. ``Provenance.inputs`` stays empty: it is
 the calculator role map, and a track is not a calculator output.
 """
 
@@ -87,6 +119,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -113,11 +146,13 @@ __all__ = [
 
 #: provenance ``tool`` / ``tool_version`` stamped on every track and via
 ROUTER_ID = "routing.maze"
-ROUTER_VERSION = "0.1"
+ROUTER_VERSION = "0.2"
 #: the only copper layers this router knows (index 0 / 1 in the owner maps)
 LAYERS: tuple[str, str] = ("F.Cu", "B.Cu")
 #: owner-map value of a cell no net may use
 BLOCKED = -1
+#: flat static-map value of a cell no pad or edge claims (the owner maps say ``None``)
+_FREE = -2
 
 #: ``(track parameter, ir.pcb.manufacturing limit)`` pairs a fab minimum can raise
 _FAB_MINIMUMS: tuple[tuple[str, str], ...] = (
@@ -128,24 +163,30 @@ _FAB_MINIMUMS: tuple[tuple[str, str], ...] = (
 )
 #: pad shapes whose copper lies inside the ``(size)`` box (convex): the only ones this router models
 CONVEX_PAD_SHAPES = frozenset({"circle", "rect", "oval", "roundrect"})
-#: 4-neighbour steps: east, south, west, north (board frame, Y down)
-_DIRS: tuple[tuple[int, int], ...] = ((1, 0), (0, 1), (-1, 0), (0, -1))
 #: direction index of a state that has no direction yet (a seed or the far end of a via)
 _NO_DIR = 4
 _STATES_PER_CELL = 5
 _EPS = 1e-9
+_INF = math.inf
 
 
 @dataclass(frozen=True, slots=True)
 class RoutingParams:
-    """The router's knobs (mm, except the two costs in grid steps). Every one lands in the provenance.
+    """The router's knobs (mm; the costs in grid steps; the iteration cap a count). Every one lands in the provenance.
+
+    Geometry: ``grid_mm``, ``track_width_mm``, ``clearance_mm``,
+    ``via_diameter_mm`` / ``via_drill_mm``, ``edge_clearance_mm``. Search
+    costs: ``base_cost`` (one grid step on a free cell), ``via_cost``,
+    ``bend_cost``. Negotiation: ``history_cost`` (added to an over-used
+    cell's history after each iteration), ``present_cost`` (the present-
+    congestion factor of iteration 1) and ``present_growth`` (its factor per
+    iteration), ``max_iterations``; ``window_mm`` is the search window's
+    margin around a net's terminals (doubled on failure).
 
     ``rules`` / ``pad_pitch_mm`` / ``pitch_footprint`` say why the values
     were chosen when :meth:`for_board` picked the fine rules (``None`` for
     values given directly or the defaults); they change nothing in the search
-    and are appended to :meth:`derived_from_entry` only when set, so a
-    default-rule board's provenance is exactly what it was before they
-    existed.
+    and are appended to :meth:`derived_from_entry` only when set.
     """
 
     grid_mm: float = 0.25
@@ -156,18 +197,30 @@ class RoutingParams:
     edge_clearance_mm: float = 0.3
     via_cost: float = 12.0
     bend_cost: float = 0.6
+    base_cost: float = 1.0
+    history_cost: float = 1.0
+    present_cost: float = 0.5
+    present_growth: float = 2.0
+    max_iterations: int = 40
+    window_mm: float = 10.0
     rules: str | None = None
     pad_pitch_mm: float | None = None
     pitch_footprint: str | None = None
 
     def check(self) -> None:
         """Refuse parameters that make no sense (:class:`CompileError`)."""
-        for name in ("grid_mm", "track_width_mm", "via_drill_mm", "via_diameter_mm"):
-            if not (getattr(self, name) > 0):
-                raise CompileError(f"routing parameter {name} must be > 0 (got {getattr(self, name)!r})")
-        for name in ("clearance_mm", "edge_clearance_mm", "via_cost", "bend_cost"):
-            if not (getattr(self, name) >= 0):
-                raise CompileError(f"routing parameter {name} must be >= 0 (got {getattr(self, name)!r})")
+        for name in ("grid_mm", "track_width_mm", "via_drill_mm", "via_diameter_mm", "base_cost", "window_mm"):
+            value = getattr(self, name)
+            if not (isinstance(value, (int, float)) and math.isfinite(value) and value > 0):
+                raise CompileError(f"routing parameter {name} must be > 0 (got {value!r})")
+        for name in ("clearance_mm", "edge_clearance_mm", "via_cost", "bend_cost", "history_cost", "present_cost"):
+            value = getattr(self, name)
+            if not (isinstance(value, (int, float)) and math.isfinite(value) and value >= 0):
+                raise CompileError(f"routing parameter {name} must be >= 0 (got {value!r})")
+        if not (isinstance(self.present_growth, (int, float)) and math.isfinite(self.present_growth) and self.present_growth >= 1):
+            raise CompileError(f"routing parameter present_growth must be >= 1 (got {self.present_growth!r})")
+        if isinstance(self.max_iterations, bool) or not isinstance(self.max_iterations, int) or self.max_iterations < 1:
+            raise CompileError(f"routing parameter max_iterations must be an integer >= 1 (got {self.max_iterations!r})")
         if self.via_diameter_mm <= self.via_drill_mm:
             raise CompileError(f"via diameter {self.via_diameter_mm} mm must exceed the via drill {self.via_drill_mm} mm")
         if self.pad_pitch_mm is not None and not (math.isfinite(self.pad_pitch_mm) and self.pad_pitch_mm > 0):
@@ -178,7 +231,9 @@ class RoutingParams:
         entry = (
             f"params:grid={self.grid_mm},width={self.track_width_mm},clearance={self.clearance_mm},"
             f"via={self.via_diameter_mm}/{self.via_drill_mm},edge={self.edge_clearance_mm},"
-            f"via_cost={self.via_cost},bend_cost={self.bend_cost}"
+            f"via_cost={self.via_cost},bend_cost={self.bend_cost},base_cost={self.base_cost},"
+            f"history_cost={self.history_cost},present_cost={self.present_cost},present_growth={self.present_growth},"
+            f"max_iterations={self.max_iterations},window={self.window_mm}"
         )
         if self.rules is not None:
             entry += f",rules={self.rules},pad_pitch={self.pad_pitch_mm},pitch_footprint={self.pitch_footprint}"
@@ -189,11 +244,9 @@ class RoutingParams:
         """The fine rules (:data:`FINE_RULES`) when the finest pad pitch on the board is below :data:`FINE_PITCH_MM`, else the defaults.
 
         The pitch is :func:`finest_pad_pitch` (library pad positions). The
-        default instance is returned as ``cls()`` - no ``rules`` recorded -
-        so a board whose pads are all at least :data:`FINE_PITCH_MM` apart
-        routes exactly as before this method existed. Fab minimums in
-        ``ir.pcb.manufacturing`` still raise either set when the router runs
-        (:func:`effective_params`).
+        default instance is returned as ``cls()`` - no ``rules`` recorded.
+        Fab minimums in ``ir.pcb.manufacturing`` still raise either set when
+        the router runs (:func:`effective_params`).
         """
         pitch = finest_pad_pitch(ir, library)
         if pitch is None or pitch[0] >= FINE_PITCH_MM:
@@ -265,8 +318,10 @@ class Routing:
     vias: list[Via] = field(default_factory=list)
     unrouted: dict[str, str] = field(default_factory=dict)
     params: RoutingParams = field(default_factory=RoutingParams)
-    #: routed_nets, unrouted_nets, skipped_nets (< 2 pads), net_length_mm, total_length_mm, track_count,
-    #: via_count, grid (nx, ny, cells per layer), raised (parameter -> [requested, effective])
+    #: routed_nets, unrouted_nets, skipped_nets (< 2 pads), net_length_mm, total_length_mm, track_count, via_count,
+    #: grid (nx, ny, cells per layer), raised (parameter -> [requested, effective]), iterations, legal (the negotiation
+    #: ended without an over-used cell), history (per iteration: rerouted nets, over-used cells, conflicting nets),
+    #: dropped (nets ripped up after the cap), recovered (dropped nets routed again against the legal copper), net_order
     stats: dict[str, Any] = field(default_factory=dict)
 
 
@@ -329,12 +384,11 @@ class _PadGeom:
     net: int  # net index or BLOCKED
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _Terminal:
     pad: _PadGeom
     cell: int  # cell index k = j * nx + i
     label: str
-    stub_layer: int | None = None  # the layer the stub was emitted on once the terminal is connected
 
 
 def _pad_copper_layers(placement, pad: Pad) -> tuple[int, ...]:
@@ -363,11 +417,22 @@ def _disc(radius: float, grid: float) -> list[tuple[int, int]]:
     return [(a, b) for a in range(-k, k + 1) for b in range(-k, k + 1) if math.hypot(a * grid, b * grid) < radius - _EPS]
 
 
+class _Halo:
+    """A disc of grid offsets as flat index offsets, with its reach for the in-bounds fast path."""
+
+    __slots__ = ("offsets", "flat", "reach")
+
+    def __init__(self, offsets: list[tuple[int, int]], nx: int) -> None:
+        self.offsets = offsets
+        self.flat = [a + b * nx for a, b in offsets]
+        self.reach = max((max(abs(a), abs(b)) for a, b in offsets), default=0)
+
+
 # --------------------------------------------------------------------------- the board model
 
 
 class _Board:
-    """The grid, the owner maps and the terminals of one IR (built once per :func:`route_board`)."""
+    """The grid, the static owner maps and the terminals of one IR (built once per :func:`route_board`)."""
 
     def __init__(self, ir: CircuitIR, library: KicadLibrary, p: RoutingParams) -> None:
         if ir.pcb is None:
@@ -390,7 +455,7 @@ class _Board:
         self.nx = int(self.w / g + _EPS) + 1
         self.ny = int(self.h / g + _EPS) + 1
         self.n = self.nx * self.ny
-        # owner maps: one flat list per layer, None = free
+        # static owner maps (pads and the board edge): one flat list per layer, None = free
         self.owner: list[list[int | None]] = [[None] * self.n for _ in LAYERS]
         self.via_edge_ok: list[bool] = [False] * self.n
         #: False where a via's copper disc would overlap a pad box (any net, any layer): no via-in-pad
@@ -404,11 +469,20 @@ class _Board:
                 self.owner[1][k] = BLOCKED
             self.via_edge_ok[k] = d >= edge_via - _EPS
         self.pad_radius = p.clearance_mm + p.track_width_mm / 2.0 + g / 2.0
-        self.path_disc = _disc(p.track_width_mm + p.clearance_mm + g / 2.0, g)
+        #: track-to-track: a foreign track centre closer than this to a path cell breaks the clearance (0.1's path mark)
+        self.track_halo = _Halo(_disc(p.track_width_mm + p.clearance_mm + g / 2.0, g), self.nx)
+        #: track-to-via: a via centre closer than this to a track centre (and a via's static pad / edge check, 0.1's via mark)
         self.via_disc = _disc(p.via_diameter_mm / 2.0 + p.clearance_mm + p.track_width_mm / 2.0, g)
+        self.via_track_halo = _Halo(self.via_disc, self.nx)
+        #: via-to-via: centres at least via_diameter + clearance apart
+        self.via_via_halo = _Halo(_disc(p.via_diameter_mm + p.clearance_mm, g), self.nx)
         self.net_index = {net.name: k for k, net in enumerate(ir.nets)}
         self.terminals: dict[str, list[_Terminal]] = {net.name: [] for net in ir.nets}
         self._load_pads(ir, library)
+        #: the static owner maps as one flat list over ``layer * n + k`` with :data:`_FREE` for free cells (the search reads this)
+        self.stat: list[int] = [_FREE if v is None else v for v in self.owner[0]] + [_FREE if v is None else v for v in self.owner[1]]
+        #: per cell, lazily: BLOCKED / _FREE / the one net whose pads the via's keep-out touches (see :meth:`via_static_at`)
+        self.via_static: list[int | None] = [None] * self.n
 
     # --- coordinates ---------------------------------------------------------
 
@@ -472,7 +546,7 @@ class _Board:
                 if not layers:
                     raise CompileError(f"cannot route net {net_name!r}: pad {comp.ref}.{pad.number} is on no copper layer ({pad.layers})")
                 self.terminals[net_name].append(self._terminal(geom))
-        for name, terms in self.terminals.items():
+        for terms in self.terminals.values():
             terms.sort(key=lambda t: (natural_ref_key(t.pad.ref), natural_ref_key(t.pad.number)))
 
     @staticmethod
@@ -516,7 +590,12 @@ class _Board:
                 x = self.ox + i * g
                 dx = max(abs(x - geom.cx) - geom.hw, 0.0)
                 if math.hypot(dx, dy) < r - _EPS:
-                    self._own(owner, j * self.nx + i, geom.net)
+                    k = j * self.nx + i
+                    cur = owner[k]
+                    if cur is None:
+                        owner[k] = geom.net
+                    elif cur != geom.net:
+                        owner[k] = BLOCKED
 
     def _forbid_vias_in(self, geom: _PadGeom) -> None:
         """Clear ``via_pad_ok`` where a via disc (radius ``via_diameter/2``) would overlap the pad box (any layer: a via spans both)."""
@@ -535,143 +614,395 @@ class _Board:
         """The pad's copper layers on which the terminal cell is free or the net's own (never BLOCKED / another net's)."""
         return tuple(layer for layer in terminal.pad.layers if self.owner[layer][terminal.cell] in (None, net))
 
-    @staticmethod
-    def _own(owner: list[int | None], k: int, net: int) -> None:
-        cur = owner[k]
-        if cur is None:
-            owner[k] = net
-        elif cur != net:
-            owner[k] = BLOCKED
+    def via_static_at(self, k: int) -> int:
+        """:data:`BLOCKED`, :data:`_FREE` or the one net that may drill a via at cell ``k`` given the pads and the edge (memoised).
 
-    def mark_disc(self, layer: int, k: int, disc: list[tuple[int, int]], net: int) -> None:
-        j, i = divmod(k, self.nx)
-        owner = self.owner[layer]
-        for a, b in disc:
-            ii, jj = i + a, j + b
-            if 0 <= ii < self.nx and 0 <= jj < self.ny:
-                self._own(owner, jj * self.nx + ii, net)
+        BLOCKED when the via would be too near the edge, overlap any pad box,
+        leave the grid, or when a cell within ``via_diameter/2 + clearance +
+        width/2`` is BLOCKED or owned by two nets on either layer; the owning
+        net when some of those cells belong to one net's pads; free otherwise.
+        """
+        cached = self.via_static[k]
+        if cached is not None:
+            return cached
+        value = self._via_static(k)
+        self.via_static[k] = value
+        return value
 
-    def via_allowed(self, k: int, net: int) -> bool:
+    def _via_static(self, k: int) -> int:
         if not self.via_edge_ok[k] or not self.via_pad_ok[k]:
-            return False
+            return BLOCKED
         j, i = divmod(k, self.nx)
+        stat, n = self.stat, self.n
+        owner = _FREE
         for a, b in self.via_disc:
             ii, jj = i + a, j + b
             if not (0 <= ii < self.nx and 0 <= jj < self.ny):
-                return False
+                return BLOCKED
             kk = jj * self.nx + ii
-            for owner in self.owner:
-                cur = owner[kk]
-                if cur is not None and cur != net:
-                    return False
-        return True
+            for o in (stat[kk], stat[n + kk]):
+                if o == _FREE:
+                    continue
+                if o == BLOCKED or (owner != _FREE and owner != o):
+                    return BLOCKED
+                owner = o
+        return owner
+
+    def via_allowed(self, k: int, net: int) -> bool:
+        """Whether the static map (pads, edge) lets ``net`` drill a via at cell ``k`` (other nets' copper is negotiated, not checked here)."""
+        v = self.via_static_at(k)
+        return v == _FREE or v == net
+
+    def halo_cells(self, halo: _Halo, k: int, base: int, out: set[int]) -> None:
+        """Add ``base + cell`` for every cell of ``halo`` around cell ``k`` that lies on the grid."""
+        j, i = divmod(k, self.nx)
+        r = halo.reach
+        if r <= i < self.nx - r and r <= j < self.ny - r:
+            b = base + k
+            out.update([b + f for f in halo.flat])
+            return
+        for a, bb in halo.offsets:
+            ii, jj = i + a, j + bb
+            if 0 <= ii < self.nx and 0 <= jj < self.ny:
+                out.add(base + jj * self.nx + ii)
+
+
+# --------------------------------------------------------------------------- one net's route
+
+
+@dataclass(slots=True)
+class _NetRoute:
+    """The route of one net: the ordered steps (stubs and paths), its cells, and the halo it covers."""
+
+    steps: list[tuple[str, Any, int]] = field(default_factory=list)  # ("stub", terminal, layer) | ("path", path, 0)
+    path_cells: set[int] = field(default_factory=set)  # layer * n + k
+    via_cells: list[int] = field(default_factory=list)  # k, in path order
+    cover_t: set[int] = field(default_factory=set)  # track plane: layer * n + k
+    cover_v: set[int] = field(default_factory=set)  # via plane: k
+    how: str = "negotiated"  # "negotiated" or "recovered" (routed again against the legal copper after the cap)
+
+
+class _Negotiation:
+    """The present / history costs and the halo counts of every routed net (PathFinder state)."""
+
+    def __init__(self, board: _Board, p: RoutingParams) -> None:
+        self.board = board
+        self.p = p
+        n = board.n
+        self.halo = [0] * (2 * n)
+        self.vhalo = [0] * n
+        self.hist = [0.0] * (2 * n)
+        self.vhist = [0.0] * n
+        self.pres = p.present_cost
+        self.ncost = [p.base_cost] * (2 * n)
+        self.vcost = [p.via_cost] * n
+        #: the search's per-state best cost and predecessor (``state = (layer * n + k) * 5 + direction``), reset after every search
+        self.g_best = [_INF] * (2 * n * _STATES_PER_CELL)
+        self.prev = [-1] * (2 * n * _STATES_PER_CELL)
+
+    # --- costs -----------------------------------------------------------------
+
+    def _node(self, c: int) -> float:
+        return self.p.base_cost * (1.0 + self.hist[c]) * (1.0 + self.pres * self.halo[c])
+
+    def _via(self, k: int) -> float:
+        p = self.p
+        return (p.via_cost + p.base_cost) * (1.0 + self.vhist[k]) * (1.0 + self.pres * self.vhalo[k]) - p.base_cost
+
+    def recompute(self) -> None:
+        """Every node / via cost from the current present factor, history and counts (after the factor or the history changed)."""
+        base, pres = self.p.base_cost, self.pres
+        self.ncost = [base * (1.0 + h) * (1.0 + pres * o) for h, o in zip(self.hist, self.halo)]
+        vb = self.p.via_cost + base
+        self.vcost = [vb * (1.0 + h) * (1.0 + pres * o) - base for h, o in zip(self.vhist, self.vhalo)]
+
+    # --- occupancy -------------------------------------------------------------
+
+    def add(self, route: _NetRoute) -> None:
+        halo, ncost = self.halo, self.ncost
+        for c in route.cover_t:
+            halo[c] += 1
+            ncost[c] = self._node(c)
+        vhalo, vcost = self.vhalo, self.vcost
+        for k in route.cover_v:
+            vhalo[k] += 1
+            vcost[k] = self._via(k)
+
+    def remove(self, route: _NetRoute) -> None:
+        halo, ncost = self.halo, self.ncost
+        for c in route.cover_t:
+            halo[c] -= 1
+            ncost[c] = self._node(c)
+        vhalo, vcost = self.vhalo, self.vcost
+        for k in route.cover_v:
+            vhalo[k] -= 1
+            vcost[k] = self._via(k)
+
+    def overused(self, route: _NetRoute) -> tuple[list[int], list[int]]:
+        """``(track cells, via cells)`` of ``route`` that lie inside another net's halo (its own halo always covers them)."""
+        halo, vhalo = self.halo, self.vhalo
+        return [c for c in route.path_cells if halo[c] > 1], [k for k in route.via_cells if vhalo[k] > 1]
+
+
+def _cover(board: _Board, route: _NetRoute) -> None:
+    """Fill ``route.cover_t`` / ``cover_v`` from its path and via cells (module docstring: the halo radii)."""
+    n = board.n
+    cover_t: set[int] = set()
+    cover_v: set[int] = set()
+    for c in route.path_cells:
+        layer_base = n if c >= n else 0
+        k = c - layer_base
+        board.halo_cells(board.track_halo, k, layer_base, cover_t)
+        board.halo_cells(board.via_track_halo, k, 0, cover_v)
+    for k in set(route.via_cells):
+        board.halo_cells(board.via_track_halo, k, 0, cover_t)
+        board.halo_cells(board.via_track_halo, k, n, cover_t)
+        board.halo_cells(board.via_via_halo, k, 0, cover_v)
+    route.cover_t = cover_t
+    route.cover_v = cover_v
 
 
 # --------------------------------------------------------------------------- the search
 
 
-def _astar(board: _Board, net: int, tree: list[int], tree_set: set[int], targets: dict[int, _Terminal]) -> list[int] | None:
-    """Cheapest path (as ``layer * n + cell`` ids) from any tree cell to any target cell; ``None`` when none is reachable.
+def _search(
+    neg: _Negotiation, net: int, seeds: list[int], targets: set[int], target_ij: tuple[int, int], window: tuple[int, int, int, int], strict: bool,
+) -> list[int] | None:
+    """Cheapest path (``layer * n + cell`` ids) from any seed to any target cell inside ``window``; ``None`` when none is reachable.
 
-    States are ``(layer, cell, direction)`` so the bend cost is exact; the
-    heuristic is the Manhattan distance to the nearest target cell (a lower
-    bound: every step costs at least 1 and bends / vias only add). Ties in
-    the heap are broken by the push counter, never by memory addresses.
+    ``strict`` makes every cell another net's halo covers an obstacle (0.1's
+    rule; used only to recover a dropped net against legal copper), else such
+    cells cost their negotiated node cost. Only stepped-into cells are
+    checked here: the caller (:func:`_route_net`) keeps strict seeds and
+    targets outside the halos. The per-state cost / predecessor
+    arrays are the negotiation's, shared by every search and reset after
+    each one (only the states this search touched).
     """
-    p = board.p
-    nx, n = board.nx, board.n
-    owner = board.owner
-    bend, via_cost = p.bend_cost, p.via_cost
-    target_ij = [divmod(c % n, nx) for c in targets]  # (j, i)
-
-    def h(c: int) -> float:
-        j, i = divmod(c % n, nx)
-        return min(abs(i - ti) + abs(j - tj) for tj, ti in target_ij)
-
-    g_cost: dict[int, float] = {}
-    prev: dict[int, int] = {}
+    board = neg.board
+    n, nx = board.n, board.nx
+    stat = board.stat
+    via_static = board.via_static
+    ncost, vcost, halo, vhalo = neg.ncost, neg.vcost, neg.halo, neg.vhalo
+    base, bend = neg.p.base_cost, neg.p.bend_cost
+    i0, j0, i1, j1 = window
+    tj, ti = target_ij
+    # the heuristic, split by axis: base * |i - ti| + base * |j - tj|
+    hx = [base * abs(i - ti) for i in range(nx)]
+    hy = [base * abs(j - tj) for j in range(board.ny)]
+    dirs = ((1, 1, 0), (nx, 0, 1), (-1, -1, 0), (-nx, 0, -1))  # (flat step, di, dj): east, south, west, north
+    g_best = neg.g_best
+    prev = neg.prev
+    touched: list[int] = []
     heap: list[tuple[float, int, float, int]] = []
     counter = 0
-    for c in tree:
+    for c in seeds:
         s = c * _STATES_PER_CELL + _NO_DIR
-        if s not in g_cost:
-            g_cost[s] = 0.0
-            heap.append((h(c), counter, 0.0, s))
-            counter += 1
-    heapq.heapify(heap)
-    via_memo: dict[int, bool] = {}
-    found: int | None = None
-    while heap:
-        _, _, g, s = heapq.heappop(heap)
-        if g > g_cost.get(s, math.inf):
+        if g_best[s] == 0.0:
             continue
-        c, d = divmod(s, _STATES_PER_CELL)
-        if c in targets and c not in tree_set:
+        g_best[s] = 0.0
+        prev[s] = -1
+        touched.append(s)
+        j, i = divmod(c - n if c >= n else c, nx)
+        heap.append((hx[i] + hy[j], counter, 0.0, s))
+        counter += 1
+    heapq.heapify(heap)
+    heappush, heappop = heapq.heappush, heapq.heappop
+    found = -1
+    while heap:
+        _, _, g, s = heappop(heap)
+        if g > g_best[s]:
+            continue
+        c = s // _STATES_PER_CELL
+        d = s - c * _STATES_PER_CELL
+        if c in targets:
             found = s
             break
-        layer, k = divmod(c, n)
-        j, i = divmod(k, nx)
-        for nd, (di, dj) in enumerate(_DIRS):
-            if d != _NO_DIR and nd == (d + 2) % 4:
+        if c < n:
+            other = c + n
+            k = c
+        else:
+            other = c - n
+            k = other
+        j = k // nx
+        i = k - j * nx
+        back = (d + 2) & 3 if d != _NO_DIR else -1
+        for nd in range(4):
+            if nd == back:
                 continue  # no reversal onto the cell we came from
-            ii, jj = i + di, j + dj
-            if not (0 <= ii < nx and 0 <= jj < board.ny):
+            step, di, dj = dirs[nd]
+            ii = i + di
+            jj = j + dj
+            if ii < i0 or ii > i1 or jj < j0 or jj > j1:
                 continue
-            kk = jj * nx + ii
-            nc = layer * n + kk
-            cur = owner[layer][kk]
-            if cur is not None and cur != net:
-                continue  # BLOCKED or another net's: never entered, a target cell included
-            ng = g + 1.0 + (bend if d != _NO_DIR and nd != d else 0.0)
-            ns = nc * _STATES_PER_CELL + nd
-            if ng < g_cost.get(ns, math.inf):
-                g_cost[ns] = ng
-                prev[ns] = s
-                heapq.heappush(heap, (ng + h(nc), counter, ng, ns))
+            c2 = c + step
+            o = stat[c2]
+            if o != _FREE and o != net:
+                continue  # BLOCKED or another net's pad keep-out: never entered, a target cell included
+            if strict and halo[c2]:
+                continue
+            ng = g + ncost[c2]
+            if d != _NO_DIR and nd != d:
+                ng += bend
+            s2 = c2 * _STATES_PER_CELL + nd
+            if ng < g_best[s2]:
+                if g_best[s2] == _INF:
+                    touched.append(s2)
+                g_best[s2] = ng
+                prev[s2] = s
+                heappush(heap, (ng + hx[ii] + hy[jj], counter, ng, s2))
                 counter += 1
-        ok = via_memo.get(k)
-        if ok is None:
-            ok = via_memo[k] = board.via_allowed(k, net)
-        if ok:
-            nc = (1 - layer) * n + k
-            ns = nc * _STATES_PER_CELL + _NO_DIR
-            ng = g + via_cost
-            if ng < g_cost.get(ns, math.inf):
-                g_cost[ns] = ng
-                prev[ns] = s
-                heapq.heappush(heap, (ng + h(nc), counter, ng, ns))
+        v = via_static[k]
+        if v is None:
+            v = board.via_static_at(k)
+        if (v == _FREE or v == net) and not (strict and (vhalo[k] or halo[other])):
+            ng = g + vcost[k] + ncost[other] - base
+            s2 = other * _STATES_PER_CELL + _NO_DIR
+            if ng < g_best[s2]:
+                if g_best[s2] == _INF:
+                    touched.append(s2)
+                g_best[s2] = ng
+                prev[s2] = s
+                heappush(heap, (ng + hx[i] + hy[j], counter, ng, s2))
                 counter += 1
-    if found is None:
-        return None
     path: list[int] = []
-    s = found
-    while True:
-        c = s // _STATES_PER_CELL
-        if not path or path[-1] != c:
-            path.append(c)
-        if s not in prev:
-            break
-        s = prev[s]
-    path.reverse()
-    return path
+    if found >= 0:
+        s = found
+        while s >= 0:
+            c = s // _STATES_PER_CELL
+            if not path or path[-1] != c:
+                path.append(c)
+            s = prev[s]
+        path.reverse()
+    for s in touched:
+        g_best[s] = _INF
+    return path if found >= 0 else None
+
+
+def _route_net(neg: _Negotiation, net: Net, idx: int, terms: list[_Terminal], strict: bool = False) -> _NetRoute | str:
+    """Grow the net's Steiner tree (module docstring) at the current costs; the reason when a terminal is unreachable.
+
+    Terminals are tracked by their position in ``terms``, never by label: a
+    footprint may repeat a pad number (a switch's paired pins), and each such
+    pad is a terminal of its own that gets its own path end and stub.
+    """
+    board = neg.board
+    n, nx = board.n, board.nx
+    usable = [board.usable_layers(t, idx) for t in terms]
+    # a terminal cell inside a keep-out (a foreign pad, a net-less pad, the board edge) is no seed and no target on that
+    # layer; a terminal with no usable layer cannot be connected without breaking the router's own clearance
+    fenced = [t for t, layers in zip(terms, usable) if not layers]
+    if fenced:
+        x, y = board.pos(fenced[0].cell)
+        return (
+            f"{fenced[0].label} terminal cell ({x:g}, {y:g}) is inside a keep-out on every copper layer of the pad "
+            f"(a foreign pad, a pad without a net or the board edge is within clearance {board.p.clearance_mm:g} + width/2 of it)"
+        )
+    if strict:
+        # against legal copper a terminal cell inside another net's halo is no seed and no target either: the search checks the
+        # halo only on the cells it steps into, and a seed is never stepped into (negotiated mode counts it as a path cell instead)
+        usable = [tuple(layer for layer in layers if not neg.halo[layer * n + t.cell]) for t, layers in zip(terms, usable)]
+        fenced = [t for t, layers in zip(terms, usable) if not layers]
+        if fenced:
+            x, y = board.pos(fenced[0].cell)
+            return f"{fenced[0].label} terminal cell ({x:g}, {y:g}) is inside another net's clearance halo on every copper layer of the pad"
+    # the start: the terminal nearest the centroid of the pad centres (ties: natural ref order)
+    mx = sum(t.pad.cx for t in terms) / len(terms)
+    my = sum(t.pad.cy for t in terms) / len(terms)
+    first = min(range(len(terms)), key=lambda q: math.hypot(terms[q].pad.cx - mx, terms[q].pad.cy - my))
+    ij = [divmod(t.cell, nx) for t in terms]  # (j, i)
+    margin = max(1, int(round(board.p.window_mm / board.p.grid_mm)))
+    box = (min(i for _, i in ij), min(j for j, _ in ij), max(i for _, i in ij), max(j for j, _ in ij))
+    full = (0, 0, board.nx - 1, board.ny - 1)
+    route = _NetRoute()
+    stubbed: set[int] = set()
+    at_terminal: dict[int, int] = {}  # tree cell -> terminal index, for the terminals' own cells
+    tree: list[int] = []
+    tree_set: set[int] = set()
+    remaining = [q for q in range(len(terms)) if q != first]
+    dmin = {q: abs(ij[q][1] - ij[first][1]) + abs(ij[q][0] - ij[first][0]) for q in remaining}
+
+    def cells_of(q: int) -> list[int]:
+        return [layer * n + terms[q].cell for layer in usable[q]]
+
+    def stub(q: int, layer: int) -> None:
+        if q not in stubbed:
+            stubbed.add(q)
+            route.steps.append(("stub", terms[q], layer))
+
+    def grow(cells: list[int]) -> None:
+        for c in cells:
+            if c in tree_set:
+                continue
+            tree_set.add(c)
+            tree.append(c)
+            j, i = divmod(c - n if c >= n else c, nx)
+            for q in remaining:
+                tj, ti = ij[q]
+                dd = abs(i - ti) + abs(j - tj)
+                if dd < dmin[q]:
+                    dmin[q] = dd
+
+    def attach(q: int) -> None:
+        for c in cells_of(q):
+            at_terminal.setdefault(c, q)
+        grow(cells_of(q))
+
+    attach(first)
+    while remaining:
+        already = [q for q in remaining if any(c in tree_set for c in cells_of(q))]
+        if already:
+            q = already[0]
+            stub(q, next(c for c in cells_of(q) if c in tree_set) // n)
+            remaining.remove(q)
+            attach(q)
+            continue
+        target = min(remaining, key=lambda q: dmin[q])  # ties: the first in natural ref order
+        targets = set(cells_of(target))
+        grown = margin
+        while True:
+            window = (max(0, box[0] - grown), max(0, box[1] - grown), min(board.nx - 1, box[2] + grown), min(board.ny - 1, box[3] + grown))
+            path = _search(neg, idx, tree, targets, ij[target], window, strict)
+            if path is not None or window == full:
+                break
+            grown *= 2
+        if path is None:
+            return ", ".join(terms[q].label for q in remaining) + " unreachable from the routed part of the net"
+        seed = at_terminal.get(path[0])
+        if seed is not None:
+            stub(seed, path[0] // n)
+        route.steps.append(("path", path, 0))
+        for a, b in zip(path, path[1:]):
+            if a // n != b // n:
+                route.via_cells.append(a % n)
+        route.path_cells.update(path)
+        stub(target, path[-1] // n)
+        remaining.remove(target)
+        grow(path)
+        attach(target)
+    _cover(board, route)
+    return route
 
 
 # --------------------------------------------------------------------------- emission
 
 
-def _provenance(net: Net, p: RoutingParams) -> Provenance:
+def _provenance(net: Net, p: RoutingParams, how: str, iterations: int, legal: bool) -> Provenance:
     refs = sorted({pin.component_ref for pin in net.pins})
+    if how == "recovered":
+        story = f"routed against the legal copper as an obstacle after {iterations} negotiation iteration(s) left it in conflict"
+    else:
+        story = f"negotiated-congestion route, {iterations} iteration(s)" + ("" if legal else ", kept after the conflicting nets were ripped up")
     return Provenance(
         kind=ProvenanceKind.DERIVED,
         tool=ROUTER_ID,
         tool_version=ROUTER_VERSION,
         derived_from=[f"net:{net.name}", *(f"placement:{r}" for r in refs), p.derived_from_entry()],
-        note="grid maze route on F.Cu/B.Cu; validity is decided by kicad-cli DRC (pcb.routing checks the IR geometry only)",
+        note=f"grid maze route on F.Cu/B.Cu ({story}); validity is decided by kicad-cli DRC (pcb.routing checks the IR geometry only)",
     )
 
 
 class _NetCopper:
-    """The copper of one net while it is being routed (discarded whole when a terminal is unreachable)."""
+    """The tracks and vias of one routed net, built from its recorded steps."""
 
     def __init__(self, board: _Board, net: Net, prov: Provenance) -> None:
         self.board = board
@@ -680,8 +1011,6 @@ class _NetCopper:
         self.p = board.p
         self.tracks: list[Track] = []
         self.vias: list[Via] = []
-        self.path_cells: list[tuple[int, int]] = []  # (layer, k)
-        self.via_cells: list[int] = []
 
     def _track(self, layer: int, a: int, b: int) -> None:
         start, end = self.board.pos(a), self.board.pos(b)
@@ -705,7 +1034,6 @@ class _NetCopper:
                 self.vias.append(
                     Via(net=self.net.name, x_mm=x, y_mm=y, drill_mm=self.p.via_drill_mm, diameter_mm=self.p.via_diameter_mm, layers=LAYERS, provenance=self.prov)
                 )
-                self.via_cells.append(ka)
                 continue
             step = (kb % nx - ka % nx, kb // nx - ka // nx)
             if run_start is None:
@@ -715,27 +1043,13 @@ class _NetCopper:
                 run_start, run_dir = ka, step
         if run_start is not None:
             self._track(path[-1] // n, run_start, path[-1] % n)
-        for c in path:
-            self.path_cells.append(divmod(c, n))
 
     def add_stub(self, terminal: _Terminal, layer: int) -> None:
         """One segment from the terminal cell to the exact pad centre (nothing when the cell is the centre)."""
-        if terminal.stub_layer is not None:
-            return
-        terminal.stub_layer = layer
         start = self.board.pos(terminal.cell)
         end = (_q(terminal.pad.cx), _q(terminal.pad.cy))
         if start != end:
             self.tracks.append(Track(net=self.net.name, layer=LAYERS[layer], start=start, end=end, width_mm=self.p.track_width_mm, provenance=self.prov))
-
-    def commit(self) -> None:
-        """Write the net's marks on the owner maps (only once the whole net has routed)."""
-        idx = self.board.net_index[self.net.name]
-        for layer, k in self.path_cells:
-            self.board.mark_disc(layer, k, self.board.path_disc, idx)
-        for k in self.via_cells:
-            for layer in range(len(LAYERS)):
-                self.board.mark_disc(layer, k, self.board.via_disc, idx)
 
     def length_mm(self) -> float:
         return sum(math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1]) for t in self.tracks)
@@ -744,88 +1058,96 @@ class _NetCopper:
 # --------------------------------------------------------------------------- the router
 
 
-def _route_net(board: _Board, net: Net, copper: _NetCopper) -> str | None:
-    """Grow the net's tree until every terminal hangs on it; the reason when a terminal is unreachable."""
-    n = board.n
-    idx = board.net_index[net.name]
-    terms = board.terminals[net.name]
-    # a terminal cell inside a keep-out (a foreign pad, a net-less pad, the board edge) is no seed and no target on that
-    # layer; a terminal with no usable layer cannot be connected without breaking the router's own clearance
-    usable = {t.label: board.usable_layers(t, idx) for t in terms}
-    fenced = [t for t in terms if not usable[t.label]]
-    if fenced:
-        x, y = board.pos(fenced[0].cell)
-        return (
-            f"{fenced[0].label} terminal cell ({x:g}, {y:g}) is inside a keep-out on every copper layer of the pad "
-            f"(a foreign pad, a pad without a net or the board edge is within clearance {board.p.clearance_mm:g} + width/2 of it)"
-        )
-    first, remaining = terms[0], list(terms[1:])
-    tree: list[int] = [layer * n + first.cell for layer in usable[first.label]]
-    tree_set = set(tree)
-    seeds = {c: first for c in tree}
-    while remaining:
-        targets: dict[int, _Terminal] = {}
-        for t in remaining:
-            for layer in usable[t.label]:
-                targets.setdefault(layer * n + t.cell, t)
-        already = [t for t in remaining if any(layer * n + t.cell in tree_set for layer in usable[t.label])]
-        if already:
-            t = already[0]
-            layer = next(layer for layer in usable[t.label] if layer * n + t.cell in tree_set)
-            copper.add_stub(t, layer)
-            remaining.remove(t)
-            continue
-        path = _astar(board, idx, tree, tree_set, targets)
-        if path is None:
-            return ", ".join(t.label for t in remaining) + " unreachable from the routed part of the net"
-        seed = seeds.get(path[0])
-        if seed is not None:
-            copper.add_stub(seed, path[0] // n)
-        copper.add_path(path)
-        reached = targets[path[-1]]
-        copper.add_stub(reached, path[-1] // n)
-        remaining.remove(reached)
-        for c in path:
-            if c not in tree_set:
-                tree_set.add(c)
-                tree.append(c)
-        for layer in usable[reached.label]:
-            c = layer * n + reached.cell
-            if c not in tree_set:
-                tree_set.add(c)
-                tree.append(c)
-    return None
-
-
-def route_board(ir: CircuitIR, library: KicadLibrary, params: RoutingParams | None = None) -> Routing:
+def route_board(
+    ir: CircuitIR, library: KicadLibrary, params: RoutingParams | None = None, *, progress: Callable[[dict[str, Any]], None] | None = None,
+) -> Routing:
     """Route every net of the placed board on ``F.Cu`` / ``B.Cu``; pure (same IR + library + params -> same result).
 
     ``ir`` is not mutated and its existing copper (``ir.pcb.tracks`` / ``vias``
     / ``zones``) is neither an obstacle nor reused: the caller decides what to
     do with the result (the PCB agent never routes a board that already has
-    copper). Nets are routed in ``(pad count, name)`` order, with one second
-    pass from scratch that puts the nets the first pass could not route first
-    (module docstring); a net with fewer than two pads is skipped (nothing to
-    connect; listed in ``stats["skipped_nets"]``). A net whose terminals
-    cannot all be reached in either pass is listed in :attr:`Routing.unrouted`
-    with no copper at all. Tracks come in routing order (``stats["net_order"]``),
-    then path order. Raises :class:`CompileError` for anything that would
-    need a guess (module docstring).
+    copper). Nets are negotiated in ``(pad count, name)`` order (module
+    docstring); a net with fewer than two pads is skipped (nothing to
+    connect; listed in ``stats["skipped_nets"]``). A net without a legal
+    route is listed in :attr:`Routing.unrouted` with no copper at all. Tracks
+    come in routing order (``stats["net_order"]``), then path order.
+    ``progress``, when given, is called after every negotiation iteration
+    with that iteration's row of ``stats["history"]`` (for a caller that
+    reports progress; it never changes the result). Raises
+    :class:`CompileError` for anything that would need a guess (module
+    docstring).
     """
     p, raised = effective_params(ir, params)
     board = _Board(ir, library, p)
     ordered = sorted(ir.nets, key=lambda net: (len(board.terminals[net.name]), net.name))
     skipped = [net.name for net in ordered if len(board.terminals[net.name]) < 2]
     order = [net for net in ordered if len(board.terminals[net.name]) >= 2]
-    result, lengths = _route_in_order(board, order, p)
-    passes = 1
-    if result.unrouted:
-        # second pass, from scratch: the nets the first order starved go first (their relative order kept); it is
-        # taken only when it leaves fewer nets unrouted, so a board that routes in one pass is unchanged
-        retry = [net for net in order if net.name in result.unrouted] + [net for net in order if net.name not in result.unrouted]
-        again, again_lengths = _route_in_order(_Board(ir, library, p), retry, p)
-        if len(again.unrouted) < len(result.unrouted):
-            result, lengths, order, passes = again, again_lengths, retry, 2
+    neg = _Negotiation(board, p)
+    routes: dict[str, _NetRoute] = {}
+    unrouted: dict[str, str] = {}
+    history: list[dict[str, Any]] = []
+    legal = not order
+    iterations = 0
+    todo = list(order)
+    while todo and iterations < p.max_iterations:
+        iterations += 1
+        for net in todo:
+            old = routes.pop(net.name, None)
+            if old is not None:
+                neg.remove(old)
+            got = _route_net(neg, net, board.net_index[net.name], board.terminals[net.name])
+            if isinstance(got, str):  # unreachable even with the other nets' copper as a mere cost: a static fence
+                unrouted[net.name] = got
+                continue
+            routes[net.name] = got
+            neg.add(got)
+        over_t: set[int] = set()
+        over_v: set[int] = set()
+        conflicting: list[str] = []
+        for net in order:
+            route = routes.get(net.name)
+            if route is None:
+                continue
+            ct, cv = neg.overused(route)
+            if ct or cv:
+                conflicting.append(net.name)
+                over_t.update(ct)
+                over_v.update(cv)
+        row = {"iteration": iterations, "rerouted": len(todo), "overused_cells": len(over_t) + len(over_v), "conflicting": list(conflicting)}
+        history.append(row)
+        if progress is not None:
+            progress(dict(row))
+        if not conflicting:
+            legal = True
+            break
+        for c in over_t:
+            neg.hist[c] += p.history_cost
+        for k in over_v:
+            neg.vhist[k] += p.history_cost
+        neg.pres *= p.present_growth
+        neg.recompute()
+        names = set(conflicting)
+        todo = [net for net in order if net.name in names]
+    dropped: list[str] = []
+    recovered: list[str] = []
+    if not legal:
+        dropped = _drop_conflicts(neg, order, routes, iterations, unrouted)
+        recovered = _recover(neg, order, routes, dropped, unrouted)
+    result = Routing(params=p, unrouted={net.name: unrouted[net.name] for net in order if net.name in unrouted})
+    lengths: dict[str, float] = {}
+    for net in order:
+        route = routes.get(net.name)
+        if route is None:
+            continue
+        copper = _NetCopper(board, net, _provenance(net, p, route.how, iterations, legal))
+        for kind, item, layer in route.steps:
+            if kind == "stub":
+                copper.add_stub(item, layer)
+            else:
+                copper.add_path(item)
+        result.tracks.extend(copper.tracks)
+        result.vias.extend(copper.vias)
+        lengths[net.name] = _q(copper.length_mm())
     result.stats = {
         "routed_nets": len(lengths),
         "unrouted_nets": len(result.unrouted),
@@ -836,24 +1158,59 @@ def route_board(ir: CircuitIR, library: KicadLibrary, params: RoutingParams | No
         "via_count": len(result.vias),
         "grid": (board.nx, board.ny, board.n),
         "raised": {name: [requested, effective] for name, (requested, effective) in raised.items()},
-        "passes": passes,
+        "iterations": iterations,
+        "legal": legal,
+        "history": history,
+        "dropped": dropped,
+        "recovered": recovered,
         "net_order": [net.name for net in order],
     }
     return result
 
 
-def _route_in_order(board: _Board, order: list[Net], p: RoutingParams) -> tuple[Routing, dict[str, float]]:
-    """Route ``order`` on a fresh ``board``; ``(result without stats, routed net -> copper length)``."""
-    result = Routing(params=p)
-    lengths: dict[str, float] = {}
-    for net in order:
-        copper = _NetCopper(board, net, _provenance(net, p))
-        reason = _route_net(board, net, copper)
-        if reason is not None:
-            result.unrouted[net.name] = reason
+def _partners(neg: _Negotiation, route: _NetRoute, routes: dict[str, _NetRoute], name: str) -> list[str]:
+    """The other nets whose halo holds some of ``route``'s copper (sorted by name)."""
+    out = []
+    for other, r in routes.items():
+        if other == name:
             continue
-        copper.commit()
-        result.tracks.extend(copper.tracks)
-        result.vias.extend(copper.vias)
-        lengths[net.name] = _q(copper.length_mm())
-    return result, lengths
+        if not route.path_cells.isdisjoint(r.cover_t) or not r.cover_v.isdisjoint(route.via_cells):
+            out.append(other)
+    return sorted(out)
+
+
+def _drop_conflicts(neg: _Negotiation, order: list[Net], routes: dict[str, _NetRoute], iterations: int, unrouted: dict[str, str]) -> list[str]:
+    """Rip up conflicting nets (most partners first, then fewer pads, then name) until the rest is legal; the dropped names in order."""
+    pads = {net.name: len(net.pins) for net in order}
+    dropped: list[str] = []
+    while True:
+        bad = [net.name for net in order if net.name in routes and any(neg.overused(routes[net.name]))]
+        if not bad:
+            return dropped
+        partners = {name: _partners(neg, routes[name], routes, name) for name in bad}
+        victim = min(bad, key=lambda name: (-len(partners[name]), pads[name], name))
+        neg.remove(routes.pop(victim))
+        dropped.append(victim)
+        unrouted[victim] = (
+            f"no legal route after {iterations} negotiation iteration(s): its copper still broke the clearance of "
+            f"{', '.join(partners[victim])}, and a route against the legal copper as an obstacle was not found"
+        )
+
+
+def _recover(neg: _Negotiation, order: list[Net], routes: dict[str, _NetRoute], dropped: list[str], unrouted: dict[str, str]) -> list[str]:
+    """Route each dropped net once more with every other net's halo as an obstacle, terminal cells included (legal by construction); the recovered names."""
+    board = neg.board
+    recovered: list[str] = []
+    names = set(dropped)
+    for net in order:
+        if net.name not in names:
+            continue
+        got = _route_net(neg, net, board.net_index[net.name], board.terminals[net.name], strict=True)
+        if isinstance(got, str):
+            continue
+        got.how = "recovered"
+        routes[net.name] = got
+        neg.add(got)
+        unrouted.pop(net.name, None)
+        recovered.append(net.name)
+    return recovered

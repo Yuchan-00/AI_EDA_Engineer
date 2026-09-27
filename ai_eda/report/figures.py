@@ -808,10 +808,22 @@ _SPICE_SUFFIXES: dict[int, str] = {-15: "f", -12: "p", -9: "n", -6: "u", -3: "m"
 _LABEL_HALO = f'paint-order="stroke" stroke="{BOARD_FILL}" stroke-width="3" stroke-linejoin="round"'
 
 
+#: an upper-case ``M`` not followed by ``eg``: mega for KiCad and a part value, milli for SPICE
+_AMBIGUOUS_MEGA_RE = re.compile(r"M(?![eE][gG])")
+
+
 def _value_label(value: str, limit: int = _VALUE_LABEL_CHARS) -> str:
-    """The board's value label: ``value`` as written when it fits ``limit``; a longer SPICE number is re-spelled to 5 significant digits with its scale letter (``64.8172677616823n`` -> ``64.817n``); anything else is cut with an ellipsis."""
+    """The board's value label: ``value`` as written when it fits ``limit``; a longer SPICE number is re-spelled to 5 significant digits with its scale letter (``64.8172677616823n`` -> ``64.817n``); anything else is cut with an ellipsis.
+
+    A value with an upper-case ``M`` that is not ``Meg`` is never re-spelled:
+    a part value reads it as mega (KiCad, :mod:`ai_eda.tools.calc.part_value`)
+    and the SPICE parser as milli, so re-spelling would change the number by
+    10^9 - it is cut like any other long text.
+    """
     if len(value) <= limit:
         return value
+    if _AMBIGUOUS_MEGA_RE.search(value):
+        return _shorten(value, limit)
     try:
         number = parse_spice_number(value)
     except ValueError:
@@ -1322,16 +1334,25 @@ def tolerance_figure(rows: Sequence[ToleranceRow], *, title: str = "이론 공�
 
 _BAR_SLOT = 64
 _BAR_W = 24
+#: a bar slot narrower than this (px) gets a vertical category label: slanted ones would overlap their neighbours
+_NARROW_SLOT_PX = 16
+#: the smallest text size a figure is authored with (px)
+_MIN_TEXT_PX = 10
 
 
 def bar_figure(labels: Sequence[str], values: Sequence[float], *, title: str, y_label: str, unit: str = "", fig_id: str = "bars", height: int = 360, max_width: int = COLUMN_PX) -> Figure:
-    """Single-series vertical bars (blue) with a direct value label on every bar, e.g. per-net copper length.
+    """Single-series vertical bars (blue) with a direct value label on every bar that has room for one, e.g. per-net copper length.
 
     ``unit`` labels the values (``mm``); the y axis title carries it too.
     Bars are 24 px wide in 64 px slots (the chart is as wide as its bars
     need, at most ``max_width``), rounded at the data end and square at the
-    baseline, with a 2 px gap kept by the slot. ``ValueError`` for empty
-    input, mismatched lengths or a non-finite value.
+    baseline, with a 2 px gap kept by the slot. When the slots get too
+    narrow for the value labels (many bars at ``max_width``: the 64 nets of
+    a dev board) no bar carries one - the caption lists every value and each
+    bar keeps it in ``data-value`` - and when they are narrower than
+    :data:`_NARROW_SLOT_PX` the category labels stand vertical at the 10 px
+    minimum text size, the figure growing downwards to hold the longest.
+    ``ValueError`` for empty input, mismatched lengths or a non-finite value.
     """
     if not labels or len(labels) != len(values):
         raise ValueError(f"labels and values must be non-empty and of equal length (got {len(labels)} and {len(values)})")
@@ -1357,7 +1378,13 @@ def bar_figure(labels: Sequence[str], values: Sequence[float], *, title: str, y_
         width = max_width
         slot = (width - ml - mr) / n
     bar_w = min(_BAR_W, max(2.0, slot - 4))
-    out = _svg_open(width, height, title)
+    # value labels only when every one fits its slot (a partial set would read as missing data); vertical category labels in slots too narrow for slanted ones
+    value_labels = all(_text_width(t, _SMALL_PX) <= slot - 2 for t in value_texts)
+    vertical = slot < _NARROW_SLOT_PX
+    svg_height = height
+    if vertical:
+        svg_height = height + max(0, int(math.ceil(max(_text_width(label, _MIN_TEXT_PX) for label in labels) + 12 - (height - bottom))))
+    out = _svg_open(width, svg_height, title)
     out.append(_title_text(title, 12, 24))
     sy = _Scale(y_lo, y_hi, bottom, top, False)
     y_ticks = nice_ticks(y_lo, y_hi)
@@ -1393,10 +1420,17 @@ def bar_figure(labels: Sequence[str], values: Sequence[float], *, title: str, y_
                 f"Q{_f(x0 + bar_w)},{_f(bottom_px)} {_f(x0 + bar_w)},{_f(bottom_px - r)} V{_f(base)} Z"
             )
         out.append(f'<path class="bar" data-label="{esc(label)}" data-value="{_g(v)}" d="{path}" fill="{SERIES_COLOURS[0]}"/>')
-        ly = top_px - 6 if v >= 0 else bottom_px + 14
-        out.append(f'<text class="bar-label" x="{_f(cx)}" y="{_f(ly)}" text-anchor="middle" font-size="{_SMALL_PX}">{esc(text)}</text>')
+        if value_labels:
+            ly = top_px - 6 if v >= 0 else bottom_px + 14
+            out.append(f'<text class="bar-label" x="{_f(cx)}" y="{_f(ly)}" text-anchor="middle" font-size="{_SMALL_PX}">{esc(text)}</text>')
         rotate = _text_width(label, _TEXT_PX) > slot - 6
-        if rotate:
+        if vertical:
+            lx, ly = cx + _MIN_TEXT_PX * 0.35, bottom + 6
+            out.append(
+                f'<text class="category" x="{_f(lx)}" y="{_f(ly)}" text-anchor="end" font-size="{_MIN_TEXT_PX}" fill="{INK_SECONDARY}" '
+                f'transform="rotate(-90 {_f(lx)} {_f(ly)})">{esc(label)}</text>'
+            )
+        elif rotate:
             out.append(
                 f'<text class="category" x="{_f(cx)}" y="{_f(bottom + 14)}" text-anchor="end" fill="{INK_SECONDARY}" '
                 f'transform="rotate(-30 {_f(cx)} {_f(bottom + 14)})">{esc(label)}</text>'

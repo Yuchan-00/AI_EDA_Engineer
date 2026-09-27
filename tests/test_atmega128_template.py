@@ -48,7 +48,7 @@ from ai_eda.ir import CircuitIR, Net, NetKind, PinRef, ProvenanceKind, Reduce, R
 from ai_eda.gui.preview import board_svg, project_schematic_svg
 from ai_eda.report.figures import _text_width
 from ai_eda.report.stages import build_stage_document
-from ai_eda.tools.calc import CALC_VERSION, recompute_parameters
+from ai_eda.tools.calc import CALC_VERSION, part_value_agrees, recompute_parameters
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.geometry import footprint_bbox, pads_bbox
 from ai_eda.tools.placement.core_ring import MARGIN_MM
@@ -124,10 +124,10 @@ def test_table_lists_every_input_choice_computed_value_part_net_and_simulation_l
         # parts from the library on disk
         "U1 MCU_Microchip_ATmega:ATmega128-16A / Package_QFP:TQFP-64_14x14mm_P0.8mm, value ATmega128-16A (pins " + ", ".join(str(k) for k in range(1, 65)) + " from ",
         "U2 Regulator_Linear:L7805 / Package_TO_SOT_THT:TO-220-3_Vertical, value L7805", "J1 Connector:Barrel_Jack_Switch / Connector_BarrelJack:BarrelJack_Horizontal",
-        "D1 Device:D / Diode_THT:D_DO-41_SOD81_P10.16mm_Horizontal, value 1N4007", "C1 Device:C_Polarized / Capacitor_THT:CP_Radial_D5.0mm_P2.50mm, value 1e-5",
-        "R1 Device:R / Resistor_SMD:R_0805_2012Metric, value 1.5k", "D2 Device:LED / LED_SMD:LED_0805_2012Metric, value LED", "L1 Device:L / Inductor_SMD:L_0805_2012Metric, value 1e-5",
-        "C8 Device:C / Capacitor_SMD:C_0603_1608Metric, value 1e-7", "SW1 Switch:SW_Push / Button_Switch_THT:SW_PUSH_6mm", "Y1 Device:Crystal / Crystal:Crystal_HC49-4H_Vertical, value 16MHz",
-        "C9 Device:C / Capacitor_SMD:C_0603_1608Metric, value 22.0p", "J2 Connector_Generic:Conn_02x03_Odd_Even / Connector_PinHeader_2.54mm:PinHeader_2x03_P2.54mm_Vertical",
+        "D1 Device:D / Diode_THT:D_DO-41_SOD81_P10.16mm_Horizontal, value 1N4007", "C1 Device:C_Polarized / Capacitor_THT:CP_Radial_D5.0mm_P2.50mm, value 10u",
+        "R1 Device:R / Resistor_SMD:R_0805_2012Metric, value 1.5k", "D2 Device:LED / LED_SMD:LED_0805_2012Metric, value LED", "L1 Device:L / Inductor_SMD:L_0805_2012Metric, value 10u",
+        "C8 Device:C / Capacitor_SMD:C_0603_1608Metric, value 100n", "SW1 Switch:SW_Push / Button_Switch_THT:SW_PUSH_6mm", "Y1 Device:Crystal / Crystal:Crystal_HC49-4H_Vertical, value 16MHz",
+        "C9 Device:C / Capacitor_SMD:C_0603_1608Metric, value 22p", "J2 Connector_Generic:Conn_02x03_Odd_Even / Connector_PinHeader_2.54mm:PinHeader_2x03_P2.54mm_Vertical",
         "J3 Connector_Generic:Conn_01x04 / Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical", "J9 Connector_Generic:Conn_01x08 / Connector_PinHeader_2.54mm:PinHeader_1x08_P2.54mm_Vertical",
         "J10 Connector_Generic:Conn_01x05 / Connector_PinHeader_2.54mm:PinHeader_1x05_P2.54mm_Vertical", "J11 Connector_Generic:Conn_01x02 / Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical",
         # nets, pins found by name (D1 / D2: 1 = K, 2 = A; U2: 1 IN, 2 GND, 3 OUT; U1 by the ATmega128 names)
@@ -156,7 +156,7 @@ def test_table_lists_every_input_choice_computed_value_part_net_and_simulation_l
 def test_confirm_applies_the_board_with_every_mcu_pin_in_exactly_one_net(tmp_path: Path):
     ir, lib, state, _ = _built(tmp_path)
     out = state.outcome(Stage.ARCHITECTURE)
-    assert out.status is S.NOT_VERIFIED and out.message.startswith("129 proposal(s) applied, nothing verified; template atmega128_devboard v0.1 confirmed by the user: 129 proposal(s)")
+    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"129 proposal(s) applied, nothing verified; template atmega128_devboard v{TEMPLATE_VERSION} confirmed by the user: 129 proposal(s)")
     assert [c.ref for c in ir.components] == REFS
     assert [n.name for n in ir.nets] == ["VIN_RAW", "VIN", "+5V", "GND", "LED_A", "AVCC", "AREF", "RESET", "PEN", "XTAL1", "XTAL2", *PORT_NETS]
     # every pin of every part is in exactly one net; U1's 64 pins, found by name, land where the ATmega128 pinout says
@@ -226,6 +226,13 @@ def test_the_simulation_excludes_what_has_no_model_and_judges_three_analog_facts
     c8 = ir.component("C8").spice
     assert c8.params["ic"].value == 0.0 and c8.params["ic"].provenance.kind is ProvenanceKind.USER_REQUIREMENT and "c8_ic = 0.0 V" in c8.params["ic"].provenance.note
     assert ir.component("L1").electrical["inductance"].value == 1e-5 and ir.component("C9").electrical["capacitance"].value == 22e-12
+    # part values are KiCad display text (the netlist, NETLIST above, keeps format_spice_number's exact spelling: 1e-7, 1e-5)
+    values = {c.ref: c.value for c in ir.components if c.electrical}
+    assert values == {"C1": "10u", "C2": "10u", "C3": "100n", "R1": "1.5k", "C4": "100n", "C5": "100n", "L1": "10u", "C6": "100n", "C7": "100n",
+                      "R2": "10k", "C8": "100n", "R3": "10k", "C9": "22p", "C10": "22p"}
+    for c in ir.components:
+        for key, t in c.electrical.items():  # parsed with the quantity parser, within the 5-significant-digit display rounding
+            assert part_value_agrees(c.value, t.value, t.unit) is True, (c.ref, key, c.value, t.value)
     sim = ir.simulation
     v5v, vled = sim.stimulus("V5V"), sim.stimulus("VLED")
     assert (v5v.net, v5v.reference_net, v5v.value.value, v5v.serves_requirements) == ("+5V", "GND", 5.0, ["req.input_voltage"]) and "regulator_model" in v5v.provenance.note

@@ -9,15 +9,24 @@ plus the through-hole and SMD fixture footprints written by
 unnumbered THT bars, ``Test:TINY`` a 0.2 mm SMD pad, ``Test:PAD2`` / ``Test:SMD2`` / ``Test:WALL2``
 two-pad versions of the first three, ``Test:SMD054`` a 0.54 x 0.64 mm and
 ``Test:SMD0510`` a 0.5 x 1.0 mm SMD pad, ``Test:TRAP`` a trapezoid and
-``Test:CUST`` a custom-shape pad, ``Test:DUP1`` two pads numbered "1"). Boards are a few
+``Test:CUST`` a custom-shape pad, ``Test:DUP1`` two pads numbered "1", ``Test:VBAR`` /
+``Test:HBAR`` net-less 0.5 x 4 mm F.Cu bars and ``Test:BPLANE`` a net-less 60 x 60 mm
+B.Cu pad - a copper plane that leaves one routable layer and no via site). Boards are a few
 millimetres, so the grids are small. Nothing here claims DRC: the router's
 clearances are its parameters, and the tests check the IR geometry it
 promised (the ``pcb.routing.*`` validators do the same in the pipeline).
+
+Router 0.2 negotiates congestion (rip-up and reroute). What 0.1 - nets one
+after another, each against the copper of the nets before it, no rip-up -
+would do is reproduced by :func:`first_come`: on a board without a via site
+it is exactly 0.1's pass (same search, same costs, same tie-breaking), so a
+board it cannot finish in either net order is a board 0.1 could not route.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import math
 from pathlib import Path
 
@@ -48,12 +57,15 @@ from ai_eda.ir.provenance import design_data
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.routing import ROUTER_ID, ROUTER_VERSION, Routing, RoutingParams, effective_params, route_board
-from ai_eda.tools.routing.maze import BLOCKED, LAYERS, _Board
+from ai_eda.tools.routing.maze import BLOCKED, LAYERS, _Board, _Negotiation, _route_net
 from tests.conftest import DS
 from tests.test_parts_existence import make_part, synthetic_library
 
 NET_P = Provenance(kind=ProvenanceKind.DERIVED, tool="fixture")
 P = RoutingParams()
+#: the negotiation's numbers, recorded after the geometry and the search costs in every ``params:`` entry
+NEGOTIATION_ENTRY = "base_cost=1.0,history_cost=1.0,present_cost=0.5,present_growth=2.0,max_iterations=40,window=10.0"
+DEFAULT_ENTRY = f"params:grid=0.25,width=0.4,clearance=0.25,via=0.8/0.4,edge=0.3,via_cost=12.0,bend_cost=0.6,{NEGOTIATION_ENTRY}"
 #: the router's own promise: track centre to foreign pad edge >= clearance + width / 2
 PAD_KEEPOUT = P.clearance_mm + P.track_width_mm / 2
 
@@ -84,6 +96,10 @@ _FOOTPRINTS = {
     ),
     # two pads that share the number "1" (split thermal / mounting pads): one logical pad in KiCad
     "DUP1": '(pad "1" thru_hole circle (at -1.5 0) (size 1.6 1.6) (drill 0.8) (layers "*.Cu" "*.Mask"))\n  (pad "1" thru_hole circle (at 1.5 0) (size 1.6 1.6) (drill 0.8) (layers "*.Cu" "*.Mask"))',
+    # net-less F.Cu bars and a B.Cu plane (larger than any test board): single-layer boards without a via site
+    "VBAR": '(pad "" smd rect (at 0 0) (size 0.5 4.0) (layers "F.Cu" "F.Mask"))',
+    "HBAR": '(pad "" smd rect (at 0 0) (size 4.0 0.5) (layers "F.Cu" "F.Mask"))',
+    "BPLANE": '(pad "" smd rect (at 0 0) (size 60 60) (layers "B.Cu"))',
 }
 
 
@@ -194,14 +210,16 @@ def test_every_track_and_via_is_traced_to_the_router_the_net_the_placements_and_
     ir = board_ir(tmp_path, lib, [("R1", "SMD1", 3.0, 4.0), ("R2", "SMD1", 9.0, 4.0)], {"N": [("R1", "1"), ("R2", "1")]}, (12.0, 8.0), sides={"R2": BoardSide.BOTTOM})
     r = route_board(ir, lib)
     assert r.unrouted == {} and len(r.vias) == 1, r.stats  # top SMD to bottom SMD: exactly one layer change
-    assert ROUTER_ID == "routing.maze" and ROUTER_VERSION == "0.1"
+    assert ROUTER_ID == "routing.maze" and ROUTER_VERSION == "0.2"
+    assert r.stats["iterations"] == 1 and r.stats["legal"] is True and r.stats["dropped"] == [] and r.stats["recovered"] == []
     for item in [*r.tracks, *r.vias]:
         prov = item.provenance
         assert prov.kind is ProvenanceKind.DERIVED and not prov.needs_verification and prov.note != UNRECORDED_ORIGIN
         assert prov.tool == ROUTER_ID and prov.tool_version == ROUTER_VERSION
-        assert prov.derived_from == ["net:N", "placement:R1", "placement:R2", "params:grid=0.25,width=0.4,clearance=0.25,via=0.8/0.4,edge=0.3,via_cost=12.0,bend_cost=0.6"]
+        assert prov.derived_from == ["net:N", "placement:R1", "placement:R2", DEFAULT_ENTRY]
         assert prov.inputs == {}  # the calculator role map stays empty
         assert "DRC" in prov.note and "IR geometry" in prov.note
+        assert "(negotiated-congestion route, 1 iteration(s))" in prov.note  # the iteration count is named
     via_at = (r.vias[0].x_mm, r.vias[0].y_mm)
     assert r.vias[0].layers == ("F.Cu", "B.Cu") and any(t.layer == "B.Cu" for t in r.tracks)  # the via sits beside the bottom pad, a B.Cu track enters it
     assert r.vias[0].drill_mm == 0.4 and r.vias[0].diameter_mm == 0.8
@@ -292,7 +310,7 @@ def test_parameters_are_raised_to_the_fab_minimums_and_recorded(tmp_path: Path, 
     assert r.unrouted == {} and r.params == eff and len(r.vias) == 1
     assert all(t.width_mm == 0.5 for t in r.tracks) and r.vias[0].drill_mm == 0.5 and r.vias[0].diameter_mm == 1.0
     assert r.stats["raised"] == {"track_width_mm": [0.4, 0.5], "via_drill_mm": [0.4, 0.5], "via_diameter_mm": [0.8, 1.0], "edge_clearance_mm": [0.3, 0.35]}
-    assert r.tracks[0].provenance.derived_from[-1] == "params:grid=0.25,width=0.5,clearance=0.25,via=1.0/0.5,edge=0.35,via_cost=12.0,bend_cost=0.6"
+    assert r.tracks[0].provenance.derived_from[-1] == f"params:grid=0.25,width=0.5,clearance=0.25,via=1.0/0.5,edge=0.35,via_cost=12.0,bend_cost=0.6,{NEGOTIATION_ENTRY}"
     # a caller's own parameters are raised the same way, and effective_params never lowers one
     eff, raised = effective_params(ir, RoutingParams(track_width_mm=0.6, clearance_mm=0.1))
     assert eff.track_width_mm == 0.6 and eff.clearance_mm == 0.2 and raised == {"clearance_mm": (0.1, 0.2), "via_drill_mm": (0.4, 0.5), "via_diameter_mm": (0.8, 1.0), "edge_clearance_mm": (0.3, 0.35)}
@@ -300,8 +318,13 @@ def test_parameters_are_raised_to_the_fab_minimums_and_recorded(tmp_path: Path, 
     ir.pcb.manufacturing = ManufacturingConstraints(min_via_drill_mm=assumption(0.8, note="x"))
     with pytest.raises(CompileError, match="via drill to 0.8 mm, which is not below the via diameter 0.8 mm"):
         effective_params(ir)
-    # nonsense parameters are refused
-    for bad in (RoutingParams(grid_mm=0.0), RoutingParams(track_width_mm=-1.0), RoutingParams(clearance_mm=-0.1), RoutingParams(via_diameter_mm=0.4, via_drill_mm=0.4), RoutingParams(bend_cost=-1.0)):
+    # nonsense parameters are refused, the negotiation's included
+    for bad in (
+        RoutingParams(grid_mm=0.0), RoutingParams(track_width_mm=-1.0), RoutingParams(clearance_mm=-0.1), RoutingParams(via_diameter_mm=0.4, via_drill_mm=0.4),
+        RoutingParams(bend_cost=-1.0), RoutingParams(base_cost=0.0), RoutingParams(history_cost=-1.0), RoutingParams(present_cost=math.nan),
+        RoutingParams(present_growth=0.9), RoutingParams(max_iterations=0), RoutingParams(max_iterations=2.5), RoutingParams(max_iterations=True),
+        RoutingParams(window_mm=0.0), RoutingParams(via_cost=math.inf),
+    ):
         with pytest.raises(CompileError, match="routing parameter|via diameter"):
             route_board(ir, lib, bad)
 
@@ -495,17 +518,11 @@ def test_the_compiled_board_carries_one_segment_per_track_and_one_via_per_via(tm
     assert all(isinstance(v, Via) for v in ir.pcb.vias)
 
 
-def test_a_net_the_first_order_starves_is_routed_first_in_a_second_pass(tmp_path: Path):
-    """The grid-placed synthetic astable: five nets routed in (pad count, name) order wall the 5-pad VCC net in, a fresh pass with VCC first routes all six.
-
-    Same placements the pipeline's grid placer produces for the ``astable``
-    template on the synthetic template library (THT R / C / Q, an SMD 1x03
-    header); the result is a pure function of the inputs either way.
-    """
+def _astable(tmp_path: Path, lib: KicadLibrary) -> CircuitIR:
+    """The grid-placed synthetic astable: the placements the pipeline's grid placer produces for the ``astable`` template on the
+    synthetic template library (THT R / C / Q, an SMD 1x03 header)."""
     from ai_eda.ir import LibraryRef
-    from tests.test_circuit_templates import template_library
 
-    lib = template_library(tmp_path / "kicad")
     ir = CircuitIR(project=ProjectMeta(id="osc", name="osc", workdir=str(tmp_path)))
     parts = {
         "C1": ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm", 5.34, 3.2), "C2": ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm", 16.83, 3.2),
@@ -522,22 +539,45 @@ def test_a_net_the_first_order_starves_is_routed_first_in_a_second_pass(tmp_path
         assert c.footprint.verified, name
         ir.components.append(c)
         placements.append(Placement(component_ref=ref, x_mm=x, y_mm=y, provenance=NET_P))
-    nets = {
-        "VCC": [("J1", "1"), ("R1", "1"), ("R2", "1"), ("R3", "1"), ("R4", "1")], "Q1_C": [("R1", "2"), ("Q1", "3"), ("C1", "1")],
-        "Q2_B": [("C1", "2"), ("R4", "2"), ("Q2", "2")], "OUT": [("R2", "2"), ("Q2", "3"), ("C2", "1"), ("J1", "2")],
-        "Q1_B": [("C2", "2"), ("R3", "2"), ("Q1", "2")], "GND": [("J1", "3"), ("Q1", "1"), ("Q2", "1")],
-    }
-    ir.nets = [Net(name=n, pins=[PinRef(component_ref=r, pin_number=k) for r, k in pins], provenance=NET_P) for n, pins in nets.items()]
+    ir.nets = [Net(name=n, pins=[PinRef(component_ref=r, pin_number=k) for r, k in pins], provenance=NET_P) for n, pins in ASTABLE_NETS.items()]
     ir.pcb = PCBDesign(outline=BoardOutline(width_mm=48.96, height_mm=13.2), placements=placements)
+    return ir
+
+
+ASTABLE_NETS = {
+    "VCC": [("J1", "1"), ("R1", "1"), ("R2", "1"), ("R3", "1"), ("R4", "1")], "Q1_C": [("R1", "2"), ("Q1", "3"), ("C1", "1")],
+    "Q2_B": [("C1", "2"), ("R4", "2"), ("Q2", "2")], "OUT": [("R2", "2"), ("Q2", "3"), ("C2", "1"), ("J1", "2")],
+    "Q1_B": [("C2", "2"), ("R3", "2"), ("Q1", "2")], "GND": [("J1", "3"), ("Q1", "1"), ("Q2", "1")],
+}
+
+
+def test_the_synthetic_astable_is_negotiated_to_a_legal_board(tmp_path: Path):
+    """0.1 walled the 5-pad VCC net in on this board and needed a second pass with VCC first; 0.2 negotiates: iteration 1 routes every
+    net against the others' copper as a cost, the conflicts are ripped up and rerouted until no net's copper lies in another's halo.
+    The result is legal (the independent validator agrees at the router's clearance), whole and a pure function of the inputs."""
+    from tests.test_circuit_templates import template_library
+    from ai_eda.validation import ValidationContext, default_registry
+
+    lib = template_library(tmp_path / "kicad")
+    ir = _astable(tmp_path, lib)
     r = route_board(ir, lib)
-    assert r.unrouted == {} and r.stats["routed_nets"] == 6 and r.stats["passes"] == 2, r.stats
-    assert r.stats["net_order"] == ["VCC", "GND", "Q1_B", "Q1_C", "Q2_B", "OUT"]  # the starved net first, the others in the first pass's order
-    assert [t.net for t in r.tracks][0] == "VCC" and set(r.stats["net_length_mm"]) == set(nets)
+    s = r.stats
+    assert r.unrouted == {} and s["routed_nets"] == 6 and s["legal"] is True and s["dropped"] == [] and s["recovered"] == [], s
+    assert s["net_order"] == ["GND", "Q1_B", "Q1_C", "Q2_B", "OUT", "VCC"]  # (pad count, name): no reordering any more
+    assert s["iterations"] == len(s["history"]) > 1 and s["history"][-1]["conflicting"] == [] and s["history"][0]["rerouted"] == 6
+    assert all(row["conflicting"] for row in s["history"][:-1])  # the loop ran exactly until the conflicts were gone
+    assert [row["rerouted"] for row in s["history"][1:]] == [len(row["conflicting"]) for row in s["history"][:-1]]  # only conflicting nets rerouted
+    assert set(s["net_length_mm"]) == set(ASTABLE_NETS) and "passes" not in s
+    assert all(f"{s['iterations']} iteration(s)" in t.provenance.note for t in r.tracks)
     assert _geometry(r) == _geometry(route_board(copy.deepcopy(ir), template_library(tmp_path / "kicad2")))  # still a pure function of the inputs
-    # a board that routes in one pass reports it
+    ir.pcb.tracks, ir.pcb.vias = list(r.tracks), list(r.vias)
+    ir.pcb.manufacturing = ManufacturingConstraints(min_clearance_mm=assumption(P.clearance_mm, note="the router's own clearance as the limit"))
+    checks = {c.check_id: c for c in default_registry.get("pcb.routing").validate(ir, ValidationContext(workdir=tmp_path, tools={"kicad_library": lib}))}
+    assert checks["pcb.routing.connectivity"].status.value == "PASS" and checks["pcb.routing.clearance"].status.value == "PASS", checks
+    # a board that is legal after one iteration reports it
     x = board_ir(tmp_path, fixture_library(tmp_path / "kicad3"), [("R1", "PAD1", 3.0, 3.0), ("R2", "PAD1", 9.0, 3.0)], {"N": [("R1", "1"), ("R2", "1")]}, (12.0, 6.0))
     s = route_board(x, fixture_library(tmp_path / "kicad3")).stats
-    assert s["passes"] == 1 and s["net_order"] == ["N"]
+    assert s["iterations"] == 1 and s["legal"] and s["net_order"] == ["N"] and s["history"] == [{"iteration": 1, "rerouted": 1, "overused_cells": 0, "conflicting": []}]
 
 
 # --------------------------------------------------------------------------- routing rules from the pad pitch
@@ -566,7 +606,7 @@ def test_fine_rules_are_chosen_from_the_finest_pad_pitch(tmp_path: Path):
     assert p == RoutingParams(**FINE_RULES, rules="fine", pad_pitch_mm=0.8, pitch_footprint="Test_MCU:QFP64")
     assert (p.via_cost, p.bend_cost) == (RoutingParams().via_cost, RoutingParams().bend_cost)
     assert p.derived_from_entry() == (
-        "params:grid=0.2,width=0.25,clearance=0.2,via=0.6/0.3,edge=0.3,via_cost=12.0,bend_cost=0.6,rules=fine,pad_pitch=0.8,pitch_footprint=Test_MCU:QFP64"
+        f"params:grid=0.2,width=0.25,clearance=0.2,via=0.6/0.3,edge=0.3,via_cost=12.0,bend_cost=0.6,{NEGOTIATION_ENTRY},rules=fine,pad_pitch=0.8,pitch_footprint=Test_MCU:QFP64"
     )
     # fab minimums still raise the fine rules, and the reason stays recorded
     ir.pcb.manufacturing = ManufacturingConstraints(min_track_width_mm=assumption(0.3, note="fab page not read"), min_clearance_mm=assumption(0.15, note="idem"))
@@ -596,7 +636,7 @@ def test_default_rules_on_boards_without_a_fine_pitch(tmp_path: Path, lib: Kicad
     assert RoutingParams.for_board(ir, tlib) == RoutingParams() and RoutingParams.for_board(ir, tlib).rules is None
     div = divider_with_connector_ir(tmp_path, tlib)
     assert RoutingParams.for_board(div, tlib) == RoutingParams()
-    assert RoutingParams().derived_from_entry() == "params:grid=0.25,width=0.4,clearance=0.25,via=0.8/0.4,edge=0.3,via_cost=12.0,bend_cost=0.6"  # unchanged
+    assert RoutingParams().derived_from_entry() == DEFAULT_ENTRY  # no rule set recorded below 1.0 mm pitch
     # what counts as a pitch: pads that can carry different nets, with copper, not on top of each other
     mlib = mcu_library(tmp_path / "mcu")
     x = board_ir(tmp_path, lib, [("R1", "DUP1", 3.0, 3.0), ("R2", "CAGE", 9.0, 3.0)], {}, (14.0, 8.0))
@@ -688,3 +728,178 @@ def mcu_library_copy(tmp_path: Path) -> KicadLibrary:
     from tests.test_core_ring import mcu_library
 
     return mcu_library(tmp_path / "mcu_kicad_again")
+
+
+# --------------------------------------------------------------------------- negotiated congestion (0.2)
+
+
+def first_come(ir: CircuitIR, lib: KicadLibrary, order: list[str]) -> dict[str, bool]:
+    """0.1's pass: each net in ``order`` routed against the copper of the nets before it as an obstacle, no rip-up; ``{net: routed}``.
+
+    The strict search keeps out of every other net's halo, which on a board
+    without a via site is exactly 0.1's owner-map rule (same A*, same costs,
+    same tie-breaking; a 2-pad net starts at its first pad in natural order
+    either way).
+    """
+    p, _ = effective_params(ir)
+    board = _Board(ir, lib, p)
+    neg = _Negotiation(board, p)
+    out: dict[str, bool] = {}
+    for name in order:
+        net = next(n for n in ir.nets if n.name == name)
+        got = _route_net(neg, net, board.net_index[name], board.terminals[name], strict=True)
+        out[name] = not isinstance(got, str)
+        if out[name]:
+            neg.add(got)
+    return out
+
+
+def _routing_checks(ir: CircuitIR, r: Routing, lib: KicadLibrary, tmp_path: Path) -> dict:
+    """The ``pcb.routing`` validator on ``ir`` carrying ``r``'s copper, the router's own clearance as the limit (IR geometry, not DRC)."""
+    from ai_eda.validation import ValidationContext, default_registry
+
+    x = copy.deepcopy(ir)
+    x.pcb.tracks, x.pcb.vias = list(r.tracks), list(r.vias)
+    x.pcb.manufacturing = ManufacturingConstraints(min_clearance_mm=assumption(r.params.clearance_mm, note="the router's own clearance as the limit"))
+    return {c.check_id: c for c in default_registry.get("pcb.routing").validate(x, ValidationContext(workdir=tmp_path, tools={"kicad_library": lib}))}
+
+
+#: two nets that cross on one layer (the B.Cu plane leaves no second layer and no via site): A from R1 (bottom left) to R2 (top right),
+#: B from R3 (bottom right) to R4 (top left); the net-less bars W0 / W1 close the left edge except for one gap
+SWAP_PARTS: list[Part] = [
+    ("Z1", "BPLANE", 6.0, 4.5), ("R1", "SMD1", 4.0, 7.0), ("R2", "SMD1", 10.5, 1.5), ("R3", "SMD1", 8.5, 7.5), ("R4", "SMD1", 4.5, 1.5),
+    ("W0", "HBAR", 1.0, 3.0), ("W1", "VBAR", 1.0, 6.5),
+]
+SWAP_NETS = {"A": [("R1", "1"), ("R2", "1")], "B": [("R3", "1"), ("R4", "1")]}
+
+
+def test_two_crossing_nets_that_first_come_routing_cannot_finish_in_either_order_are_negotiated(tmp_path: Path, lib: KicadLibrary):
+    """Whichever net goes first takes its shortest L and, with a pad and a bar, walls the other net's pads apart: 0.1 routed A then B,
+    then B first (its second pass), and left one net unrouted both times. 0.2 rips the conflict up until A and B trade their shortest
+    routes for a pair that fits - B around R1 through the gap in the bars - and the result is legal, single-layer and deterministic
+    (two runs compile to byte-identical boards)."""
+    ir = board_ir(tmp_path, lib, SWAP_PARTS, SWAP_NETS, (12.0, 9.0))
+    assert first_come(ir, lib, ["A", "B"]) == {"A": True, "B": False}
+    assert first_come(ir, lib, ["B", "A"]) == {"B": True, "A": False}
+    r = route_board(ir, lib)
+    s = r.stats
+    assert r.unrouted == {} and s["routed_nets"] == 2 and s["legal"] and s["dropped"] == [] and s["recovered"] == [], s
+    assert s["iterations"] > 1 and s["history"][0]["conflicting"] == ["A", "B"] and s["history"][-1]["conflicting"] == []
+    assert r.vias == [] and {t.layer for t in r.tracks} == {"F.Cu"}  # the plane leaves one layer
+    assert _connected([t for t in r.tracks if t.net == "A"], [(4.0, 7.0), (10.5, 1.5)]) and _connected([t for t in r.tracks if t.net == "B"], [(8.5, 7.5), (4.5, 1.5)])
+    assert s["net_length_mm"]["A"] + s["net_length_mm"]["B"] > 12.0 + 10.0  # longer than the two shortest routes together: the price of fitting
+    checks = _routing_checks(ir, r, lib, tmp_path)
+    assert checks["pcb.routing.connectivity"].status.value == "PASS" and checks["pcb.routing.clearance"].status.value == "PASS", checks
+    # deterministic: two more runs on copies with other library instances serialise to the same bytes - the design view of the copper
+    # (provenance included; its wall-clock stamp is not design content) and the stats
+    def as_bytes(x: Routing) -> bytes:
+        return json.dumps(design_data(PCBDesign(tracks=x.tracks, vias=x.vias)), sort_keys=True).encode() + repr(x.stats).encode()
+
+    runs = [as_bytes(route_board(copy.deepcopy(ir), fixture_library(tmp_path / f"kicad_run{k}"))) for k in (1, 2)]
+    assert runs[0] == runs[1] == as_bytes(r) and b"routing.maze" in runs[0]
+
+
+def test_the_iteration_cap_keeps_only_whole_legal_nets_and_names_the_rest(tmp_path: Path, lib: KicadLibrary):
+    """At the cap, conflicting nets are ripped up (most partners, then fewer pads, then name) until the rest is legal; a ripped-up net
+    gets one more route against the legal copper as an obstacle and keeps it when that exists. What is emitted is always whole and legal;
+    a net without a legal route has no copper and a reason - the caller applies all or nothing (or, on request, the whole nets)."""
+    ir = board_ir(tmp_path, lib, SWAP_PARTS, SWAP_NETS, (12.0, 9.0))
+    capped = RoutingParams(max_iterations=1)
+    r = route_board(ir, lib, capped)
+    s = r.stats
+    assert s["iterations"] == 1 and s["legal"] is False and s["dropped"] == ["A"] and s["recovered"] == []  # a tie on partners and pads: the name
+    assert r.unrouted == {"A": "no legal route after 1 negotiation iteration(s): its copper still broke the clearance of B, and a route against the legal copper as an obstacle was not found"}
+    assert r.tracks and {t.net for t in r.tracks} == {"B"} and s["routed_nets"] == 1 and s["unrouted_nets"] == 1 and list(s["net_length_mm"]) == ["B"]
+    assert all("kept after the conflicting nets were ripped up" in t.provenance.note and "1 iteration(s)" in t.provenance.note for t in r.tracks)
+    assert all(t.provenance.derived_from[-1] == capped.derived_from_entry() and "max_iterations=1" in t.provenance.derived_from[-1] for t in r.tracks)
+    checks = _routing_checks(ir, r, lib, tmp_path)
+    connectivity = checks["pcb.routing.connectivity"]
+    assert connectivity.status.value == "FAIL" and {row["net"]: row["status"] for row in connectivity.details["nets"]} == {"A": "FAIL", "B": "PASS"}
+    assert checks["pcb.routing.clearance"].status.value == "PASS"  # what is emitted keeps every clearance
+    # a crossing that has room around a pad: the ripped-up net is recovered against the legal copper
+    ir = board_ir(tmp_path, lib, [("Z1", "BPLANE", 6.0, 5.0), ("R1", "SMD1", 2.0, 5.0), ("R2", "SMD1", 10.0, 5.0), ("R3", "SMD1", 6.0, 3.0), ("R4", "SMD1", 6.0, 7.0)],
+                  {"A": [("R1", "1"), ("R2", "1")], "B": [("R3", "1"), ("R4", "1")]}, (12.0, 10.0))
+    r = route_board(ir, lib, capped)
+    s = r.stats
+    assert s["legal"] is False and s["dropped"] == ["A"] and s["recovered"] == ["A"] and r.unrouted == {} and s["routed_nets"] == 2, s
+    notes = {t.net: t.provenance.note for t in r.tracks}
+    assert "routed against the legal copper as an obstacle after 1 negotiation iteration(s) left it in conflict" in notes["A"]
+    assert "kept after the conflicting nets were ripped up" in notes["B"]
+    checks = _routing_checks(ir, r, lib, tmp_path)
+    assert checks["pcb.routing.connectivity"].status.value == "PASS" and checks["pcb.routing.clearance"].status.value == "PASS", checks
+    full = route_board(ir, lib)  # without the cap the negotiation itself makes it legal
+    assert full.stats["legal"] and full.unrouted == {} and full.stats["recovered"] == []
+
+
+def test_a_recovered_net_never_starts_at_a_terminal_inside_a_kept_nets_halo(tmp_path: Path, lib: KicadLibrary):
+    """A 0.9 mm track on a 0.25 mm grid (parameters ``check()`` accepts, as ``PCBAgent(routing=...)`` or a large fab minimum give):
+    after the cap drops A, B's kept track at x = 6.0 has a halo that covers A's own terminal cell R1.1 at (5.0, 5.0) - 1.0 mm off,
+    where two 0.9 mm tracks need 1.1 mm. The strict search checks the halo only on the cells it steps into, and a seed is never stepped
+    into, so the recovery used to start there and emit A 0.1 mm from B. A terminal cell inside another net's halo is no seed and no
+    target against legal copper: A stays unrouted with its drop reason, and what is emitted keeps the router's clearance."""
+    parts = [("R1", "TINY", 5.0, 5.0), ("R2", "SMD1", 3.5, 3.25), ("R3", "SMD1", 6.0, 3.25), ("R4", "TINY", 5.5, 7.0), ("Z1", "BPLANE", 5.0, 5.0)]
+    ir = board_ir(tmp_path, lib, parts, {"A": [("R1", "1"), ("R2", "1")], "B": [("R3", "1"), ("R4", "1")]}, (10.0, 10.0))
+    p = RoutingParams(grid_mm=0.25, track_width_mm=0.9, clearance_mm=0.2, max_iterations=1, via_diameter_mm=1.0, via_drill_mm=0.4)
+    r = route_board(ir, lib, p)
+    s = r.stats
+    assert s["dropped"] == ["A"] and s["recovered"] == [] and s["legal"] is False, s
+    assert r.unrouted == {"A": "no legal route after 1 negotiation iteration(s): its copper still broke the clearance of B, and a route against the legal copper as an obstacle was not found"}
+    assert {t.net for t in r.tracks} == {"B"}
+    checks = _routing_checks(ir, r, lib, tmp_path)
+    assert checks["pcb.routing.clearance"].status.value == "PASS", checks["pcb.routing.clearance"].message
+    assert {row["net"]: row["status"] for row in checks["pcb.routing.connectivity"].details["nets"]} == {"A": "FAIL", "B": "PASS"}
+    # the strict search itself: against B's copper, A's terminal is fenced with that reason instead of seeding a path
+    board = _Board(ir, lib, p)
+    neg = _Negotiation(board, p)
+    b = _route_net(neg, next(x for x in ir.nets if x.name == "B"), board.net_index["B"], board.terminals["B"])
+    assert not isinstance(b, str)
+    neg.add(b)
+    got = _route_net(neg, next(x for x in ir.nets if x.name == "A"), board.net_index["A"], board.terminals["A"], strict=True)
+    assert got == "R1.1 terminal cell (5, 5) is inside another net's clearance halo on every copper layer of the pad", got
+
+
+def test_a_multi_terminal_net_grows_a_steiner_tree_from_the_terminal_nearest_the_centroid(tmp_path: Path, lib: KicadLibrary):
+    """Five pads in a plus: the tree starts at the centre pad R3 (nearest the centroid, although R1 comes first in ref order) and adds
+    the nearest unconnected pad each time - four straight arms, 16 mm, one copper set."""
+    parts = [("R1", "PAD1", 2.0, 6.0), ("R2", "PAD1", 6.0, 2.0), ("R3", "PAD1", 6.0, 6.0), ("R4", "PAD1", 6.0, 10.0), ("R5", "PAD1", 10.0, 6.0), ("R6", "PAD1", 2.0, 2.0), ("R7", "PAD1", 10.0, 10.0)]
+    ir = board_ir(tmp_path, lib, parts, {"S": [(r, "1") for r in ("R1", "R2", "R3", "R4", "R5")], "T": [("R6", "1"), ("R7", "1")]}, (12.0, 12.0))
+    r = route_board(ir, lib)
+    s = r.stats
+    assert r.unrouted == {} and s["legal"] and s["net_order"] == ["T", "S"], s
+    star = [t for t in r.tracks if t.net == "S"]
+    assert (6.0, 6.0) == star[0].start  # the first segment leaves the centre pad
+    assert sorted((t.start, t.end) for t in star) == [((6.0, 6.0), (2.0, 6.0)), ((6.0, 6.0), (6.0, 2.0)), ((6.0, 6.0), (6.0, 10.0)), ((6.0, 6.0), (10.0, 6.0))]
+    assert s["net_length_mm"]["S"] == 16.0 and r.vias == []
+    checks = _routing_checks(ir, r, lib, tmp_path)
+    assert checks["pcb.routing.connectivity"].status.value == "PASS" and checks["pcb.routing.clearance"].status.value == "PASS", checks
+    assert {row["net"]: row["message"] for row in checks["pcb.routing.connectivity"].details["nets"]}["S"] == "5 pad(s) in one copper set"
+
+
+def test_the_synthetic_64_pin_mcu_board_routes_completely(tmp_path: Path):
+    """The whole core-ring-placed 64-pad MCU fixture (28 nets, the QFP at 0.8 mm pitch, fine rules), which 0.1 never finished: every
+    net routed, legal after the negotiation, and the independent validator agrees at the router's 0.2 mm clearance."""
+    ir, mlib = _placed_mcu(tmp_path)
+    p = RoutingParams.for_board(ir, mlib)
+    r = route_board(ir, mlib, p)
+    s = r.stats
+    assert r.unrouted == {} and s["routed_nets"] == len(ir.nets) == 28 and s["legal"] and s["dropped"] == [], (s["history"], r.unrouted)
+    assert s["iterations"] <= p.max_iterations and s["via_count"] == len(r.vias) and s["track_count"] == len(r.tracks)
+    checks = _routing_checks(ir, r, mlib, tmp_path)
+    assert checks["pcb.routing.connectivity"].status.value == "PASS", checks["pcb.routing.connectivity"].message
+    assert checks["pcb.routing.clearance"].status.value == "PASS", checks["pcb.routing.clearance"].message
+    assert all(t.width_mm == 0.25 for t in r.tracks) and all((v.diameter_mm, v.drill_mm) == (0.6, 0.3) for v in r.vias)
+
+
+def test_pads_that_repeat_a_number_are_each_a_terminal_with_their_own_stub(tmp_path: Path, lib: KicadLibrary):
+    """``Test:DUP1`` has two pads numbered "1" (a switch's paired pins): both carry the net, both are reached and both get the stub to
+    their exact (off-grid) centre - the router tracks terminals by position, never by the label they share."""
+    ir = board_ir(tmp_path, lib, [("R1", "PAD1", 2.0, 4.0), ("S1", "DUP1", 6.1, 4.1)], {"N": [("R1", "1"), ("S1", "1")]}, (10.0, 8.0))
+    board = _Board(ir, lib, P)
+    assert [t.label for t in board.terminals["N"]] == ["R1.1", "S1.1", "S1.1"]
+    r = route_board(ir, lib)
+    assert r.unrouted == {} and r.stats["legal"], r.stats
+    ends = {pt for t in r.tracks for pt in (t.start, t.end)}
+    assert {(4.6, 4.1), (7.6, 4.1)} <= ends  # both exact pad centres: one stub each
+    assert _connected(r.tracks, [(2.0, 4.0), (4.6, 4.1), (7.6, 4.1)])
+    checks = _routing_checks(ir, r, lib, tmp_path)
+    assert checks["pcb.routing.connectivity"].status.value == "PASS" and checks["pcb.routing.clearance"].status.value == "PASS"

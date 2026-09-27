@@ -172,6 +172,7 @@ from ai_eda.design.templates import (
     _refused,
     _resistor_criteria,
     _resistor_substitutes,
+    _spelled,
     _sub,
     _value_text,
 )
@@ -953,19 +954,19 @@ class Atmega128DevboardTemplate(Template):
             "R1": PartNote(
                 role="R1: 전원 LED 직렬 저항",
                 why=f"R = (V_out − V_f)/I = {quantity(n['r_led'], 'ohm')} (`calc.led.R`, 계산값 그대로). 0805 SMD.",
-                criteria=_resistor_criteria(n["r_led"], _mul(drop_led, n["i_led_design"]), tol_text, chosen=_is_choice(ir, "r_led")),
+                criteria=_resistor_criteria(n["r_led"], _mul(drop_led, n["i_led_design"]), tol_text, chosen=_is_choice(ir, "r_led"), spelled=_spelled(ir, "R1")),
                 substitutes=_resistor_substitutes(n["r_led"], "Resistor_SMD"),
             ),
             "R2": PartNote(
                 role="R2: ~RESET 풀업 저항",
                 why=f"선택값 {quantity(n['r_reset'], 'ohm')}: C8 과 함께 τ = {quantity(n['tau_reset'], 's')}. SW1 을 누르면 V_cc/R2 가 흐름.",
-                criteria=_resistor_criteria(n["r_reset"], _div(_mul(v_out, v_out), n["r_reset"]), "5 % 이하 (τ 오차)", chosen=_is_choice(ir, "r_reset")),
+                criteria=_resistor_criteria(n["r_reset"], _div(_mul(v_out, v_out), n["r_reset"]), "5 % 이하 (τ 오차)", chosen=_is_choice(ir, "r_reset"), spelled=_spelled(ir, "R2")),
                 substitutes=_resistor_substitutes(n["r_reset"], "Resistor_SMD"),
             ),
             "R3": PartNote(
                 role="R3: ~PEN 풀업 저항",
                 why=f"선택값 {quantity(n['r_pen'], 'ohm')}: ~PEN 을 HIGH 로 유지 (전류는 핀 누설분뿐).",
-                criteria=_resistor_criteria(n["r_pen"], _div(_mul(v_out, v_out), n["r_pen"]), "5 % 이하", chosen=_is_choice(ir, "r_pen")),
+                criteria=_resistor_criteria(n["r_pen"], _div(_mul(v_out, v_out), n["r_pen"]), "5 % 이하", chosen=_is_choice(ir, "r_pen"), spelled=_spelled(ir, "R3")),
                 substitutes=_resistor_substitutes(n["r_pen"], "Resistor_SMD"),
             ),
             "L1": PartNote(
