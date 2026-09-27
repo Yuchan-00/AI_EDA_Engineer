@@ -114,6 +114,15 @@ def _run_agent(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary | None, **answer
     return res
 
 
+def _board_notes(notes: list[str]) -> list[str]:
+    """The placement / routing notes: the silkscreen step's notes (all starting ``silkscreen``) come last and are tested in tests/test_silkscreen.py."""
+    return [n for n in notes if not n.startswith("silkscreen")]
+
+
+def _silk_kept_note(ir: CircuitIR) -> str:
+    return f"silkscreen not placed: ir.pcb already has {len(ir.pcb.silkscreen)} silkscreen text(s); the agent never replaces silkscreen"
+
+
 def _routing_checks(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary | None) -> dict[str, object]:
     """``{check id: result}`` of the ``pcb.routing`` validator on ``ir`` as it stands."""
     tools = {"kicad_library": lib} if lib is not None else {}
@@ -302,11 +311,13 @@ def test_agent_proposes_only_when_nothing_is_placed(tmp_path: Path, lib: KicadLi
     Orchestrator.apply_proposals(ir, res.proposals)
     assert ir.pcb is not None and [p.component_ref for p in ir.pcb.placements] == ["R1", "R2", "R3", "R4", "R10"]
     assert ir.pcb.outline == BoardOutline(width_mm=16.6, height_mm=7.4)
-    # ir.pcb with placements and copper -> nothing proposed, both reasons noted
+    # ir.pcb with placements, copper and silkscreen -> nothing proposed, the three reasons noted
+    assert ir.pcb.silkscreen and all(t.provenance.tool == "silkscreen.place" for t in ir.pcb.silkscreen)
     res = _run_agent(ir, tmp_path, lib)
     assert res.proposals == [] and res.notes == [
         "not placed: ir.pcb already has 5 placement(s); the agent never replaces a layout",
         f"not routed: ir.pcb already has copper ({len(ir.pcb.tracks)} track(s), 0 via(s), 0 zone(s)); the agent never replaces copper",
+        _silk_kept_note(ir),
     ]
     # ir.pcb with layers / manufacturing constraints but no placements -> the proposal keeps them and fills outline + placements;
     # the inner layers are more than the router knows, so the board is placed but not routed, and the note says so
@@ -352,7 +363,8 @@ def test_agent_places_and_routes_in_one_proposal(tmp_path: Path, lib: KicadLibra
     assert res.notes[0].startswith("placement.grid 0.1: 5 component(s)")
     assert res.notes[1].startswith(f"{ROUTER_ID} {ROUTER_VERSION}: 4 net(s) routed on F.Cu/B.Cu, {len(payload.tracks)} track(s), 0 via(s), ")
     assert "mm of copper" in res.notes[1] and "2 net(s) with fewer than 2 pads skipped (IN, OUT)" in res.notes[1]
-    assert proposal.description == f"{res.notes[0]}; {res.notes[1]}" and "DRC decides validity" in proposal.rationale
+    assert res.notes[2].startswith("silkscreen.place 0.1: 5 reference(s) on the silkscreen") and len(payload.silkscreen) >= 5
+    assert proposal.description == f"{res.notes[0]}; {res.notes[1]}; {res.notes[2]}" and "DRC decides validity" in proposal.rationale
     assert not any("clean" in n.lower() for n in res.notes)
     # the proposed board proves its connectivity by IR geometry (not DRC), the clearance needs a limit
     Orchestrator.apply_proposals(ir, res.proposals)
@@ -386,7 +398,8 @@ def test_existing_placements_without_copper_are_routed_and_never_moved(tmp_path:
     Orchestrator.apply_proposals(ir, _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "skip"}).proposals)
     ir.component("R2").footprint.name = "Missing"
     res = _run_agent(ir, tmp_path, lib)
-    assert res.proposals == [] and len(res.notes) == 2 and res.notes[1] == "not routed: cannot route: footprint Test:Missing of 'R2' was not found in a KiCad library"
+    assert res.proposals == [] and len(res.notes) == 3 and res.notes[1] == "not routed: cannot route: footprint Test:Missing of 'R2' was not found in a KiCad library"
+    assert res.notes[2] == _silk_kept_note(ir)  # the routing-skip placement above carried the silkscreen
 
 
 def test_an_unroutable_board_gets_the_placement_only_and_never_half_a_route(tmp_path: Path, lib: KicadLibrary):
@@ -398,8 +411,9 @@ def test_an_unroutable_board_gets_the_placement_only_and_never_half_a_route(tmp_
     assert len(proposal.payload.placements) == 5 and proposal.payload.tracks == [] and proposal.payload.vias == []
     assert res.notes[0].startswith("placement.grid 0.1: 5 component(s)") and res.notes[0].endswith(f"; {UNROUTED_NOTE}")
     # every terminal cell lies inside a foreign pad's 3 mm keep-out: the reason names the cell, never copper through the keep-out
-    assert [n[: n.index(" terminal cell")] for n in res.notes[1:]] == ["not routed: N0: R1.2", "not routed: N1: R2.1", "not routed: N2: R2.2", "not routed: N3: R3.2"]
-    assert all(n.endswith("is inside a keep-out on every copper layer of the pad (a foreign pad, a pad without a net or the board edge is within clearance 3 + width/2 of it)") for n in res.notes[1:])
+    board_notes = _board_notes(res.notes)
+    assert [n[: n.index(" terminal cell")] for n in board_notes[1:]] == ["not routed: N0: R1.2", "not routed: N1: R2.1", "not routed: N2: R2.2", "not routed: N3: R3.2"]
+    assert all(n.endswith("is inside a keep-out on every copper layer of the pad (a foreign pad, a pad without a net or the board edge is within clearance 3 + width/2 of it)") for n in board_notes[1:])
     Orchestrator.apply_proposals(ir, res.proposals)
     checks = _routing_checks(ir, tmp_path, lib)
     assert checks[CONNECTIVITY_CHECK].status is S.FAIL and "4 net(s) not connected through IR copper" in checks[CONNECTIVITY_CHECK].message
@@ -456,6 +470,7 @@ def test_existing_copper_is_never_replaced(tmp_path: Path, lib: KicadLibrary):
     assert res.proposals == [] and res.notes == [
         "not placed: ir.pcb already has 5 placement(s); the agent never replaces a layout",
         "not routed: ir.pcb already has copper (1 track(s), 0 via(s), 0 zone(s)); the agent never replaces copper",
+        _silk_kept_note(ir),
     ]
     assert ir.pcb == before
     ir.pcb.tracks = []
@@ -495,7 +510,8 @@ def test_routing_answer_is_a_control_key_and_skip_leaves_the_placement_without_c
     res = _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: " Skip "})
     [proposal] = res.proposals
     assert proposal.payload.tracks == [] and proposal.payload.vias == [] and len(proposal.payload.placements) == 5
-    assert len(res.notes) == 2 and res.notes[0].endswith(f"; {UNROUTED_NOTE}") and res.notes[1] == "routing skipped by answer"
+    assert len(res.notes) == 3 and res.notes[0].endswith(f"; {UNROUTED_NOTE}") and res.notes[1] == "routing skipped by answer"
+    assert res.notes[2].startswith("silkscreen.place 0.1: ") and proposal.payload.silkscreen  # the silkscreen does not need copper
     assert "unconnected_items" in res.notes[0]
     # any other value: noted as not understood, routing proceeds
     res = _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "yes"})
@@ -507,7 +523,7 @@ def test_routing_answer_is_a_control_key_and_skip_leaves_the_placement_without_c
     # on a board that is already placed, skip proposes nothing at all
     Orchestrator.apply_proposals(ir, _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "skip"}).proposals)
     res = _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "skip"})
-    assert res.proposals == [] and res.notes == ["not placed: ir.pcb already has 5 placement(s); the agent never replaces a layout", "routing skipped by answer"]
+    assert res.proposals == [] and res.notes == ["not placed: ir.pcb already has 5 placement(s); the agent never replaces a layout", "routing skipped by answer", _silk_kept_note(ir)]
     # through the pipeline: a board left unrouted FAILs pcb.routing.connectivity at IR_BUILD (IR geometry: no copper joins the pads); a FAIL
     # does not stop the run (only a required question does), so the honest verdict reaches RELEASE and the exit code - and the answer itself
     # never becomes a requirement or a question
@@ -713,7 +729,8 @@ def test_agent_places_a_many_pad_board_on_the_core_ring_and_routes_it_at_the_fin
         f"({o.width_mm / 2}, {o.height_mm / 2}), 2 part(s) on the inner ring, 1 on the outer ring, spacing {SPACING_MM} mm, margin {MARGIN_MM} mm"
     )
     assert res.notes[1].startswith(f"{ROUTER_ID} {ROUTER_VERSION}: 10 net(s) routed on F.Cu/B.Cu, ") and "; grid 0.2 mm, width 0.25 mm, clearance 0.2 mm, via 0.6/0.3 mm, edge 0.3 mm" in res.notes[1]
-    assert "; fine rules: pad pitch 0.8 mm (Test_MCU:QFP64) is below 1.0 mm" in res.notes[1] and proposal.description == f"{res.notes[0]}; {res.notes[1]}"
+    assert "; fine rules: pad pitch 0.8 mm (Test_MCU:QFP64) is below 1.0 mm" in res.notes[1] and proposal.description == f"{res.notes[0]}; {res.notes[1]}; {res.notes[2]}"
+    assert res.notes[2].startswith("silkscreen.place 0.1: ")
     assert proposal.rationale.startswith(RING_RATIONALE) and "DRC decides validity" in proposal.rationale
     # provenance: core_ring on every placement, the fine rules and the pitch that chose them on every track and via
     assert {p.provenance.tool for p in payload.placements} == {"placement.core_ring"} and payload.tracks
@@ -796,7 +813,7 @@ def test_core_ring_refusals_and_unrouted_fine_boards_are_notes(tmp_path: Path):
         "fine rules: pad pitch 0.8 mm (Test_MCU:QFP64) is below 1.0 mm: grid 0.2 mm, width 0.25 mm, clearance 3.0 mm, via 0.6/0.3 mm, edge 0.3 mm "
         "(raised to ir.pcb.manufacturing minimums: clearance_mm 0.2 -> 3.0)"
     )
-    assert len(res.notes) > 2 and all(n.startswith("not routed: ") for n in res.notes[2:])
+    assert len(_board_notes(res.notes)) > 2 and all(n.startswith("not routed: ") for n in _board_notes(res.notes)[2:])
     # parameters the agent was built with are used as given: at the default rules the QFP's terminals sit in their neighbours' keep-out
     ir, mlib = _mcu_board(tmp_path)
     res = PCBAgent(routing=RoutingParams()).run(ir, _ctx(tmp_path, mlib))
@@ -816,7 +833,7 @@ def test_a_partial_route_is_reported_as_not_applied_and_never_proposed(tmp_path:
     assert proposal.payload.tracks == [] and proposal.payload.vias == []
     reasons = [n for n in res.notes if n.startswith("not routed: ")]
     dropped = [n for n in res.notes if n.startswith("not applied: ")]
-    assert len(dropped) == 1 and res.notes[1] == dropped[0] and res.notes[2:] == reasons
+    assert len(dropped) == 1 and res.notes[1] == dropped[0] and _board_notes(res.notes)[2:] == reasons
     m = re.fullmatch(
         rf"not applied: {ROUTER_ID} {ROUTER_VERSION} connected (\d+) of (\d+) net\(s\) \((\d+) track\(s\), (\d+) via\(s\), ([0-9.]+) mm of copper, (\d+) iteration\(s\)\) "
         r"but not the (\d+) below; a half-routed board is never proposed, so the proposal carries the placement only "
@@ -839,8 +856,8 @@ def test_a_partial_route_is_reported_as_not_applied_and_never_proposed(tmp_path:
 
 def test_the_partial_answer_applies_whole_routed_nets_and_names_the_rest(tmp_path: Path):
     """Two crossing nets on one layer, the router capped at one negotiation iteration: B keeps a legal route, A has none. By default
-    nothing is applied (all or nothing; the board was already placed, so no proposal at all) and the ``not applied:`` note points at
-    the opt-in; ``--answer pcb.routing=partial`` applies B whole, names A for manual routing, and the IR-geometry check then FAILs naming
+    no copper is applied (all or nothing; the board was already placed, so the only proposal is its silkscreen) and the ``not applied:``
+    note points at the opt-in; ``--answer pcb.routing=partial`` applies B whole, names A for manual routing, and the IR-geometry check then FAILs naming
     exactly A - the board is honestly unfinished - while every applied track keeps the router's clearance."""
     from ai_eda.agents.pcb import PARTIAL_ANSWER
     from ai_eda.tools.routing import RoutingParams
@@ -852,9 +869,12 @@ def test_the_partial_answer_applies_whole_routed_nets_and_names_the_rest(tmp_pat
     reason = "not routed: A: no legal route after 1 negotiation iteration(s): its copper still broke the clearance of B, and a route against the legal copper as an obstacle was not found"
     before = ir.content_hash()
     res = agent.run(ir, _ctx(tmp_path, flib))
-    assert res.proposals == [] and res.notes[0] == "not placed: ir.pcb already has 7 placement(s); the agent never replaces a layout"
+    [silk_only] = res.proposals  # no copper: the existing board plus its silkscreen, nothing else
+    assert silk_only.payload.tracks == [] and silk_only.payload.vias == [] and silk_only.payload.placements == ir.pcb.placements and silk_only.payload.silkscreen
+    assert design_data(silk_only.payload.model_copy(update={"silkscreen": []})) == design_data(ir.pcb) and silk_only.description.startswith("silkscreen.place 0.1: ")
+    assert res.notes[0] == "not placed: ir.pcb already has 7 placement(s); the agent never replaces a layout"
     assert res.notes[1].startswith(f"not applied: {ROUTER_ID} {ROUTER_VERSION} connected 1 of 2 net(s) (") and res.notes[1].endswith(f"(--answer {ROUTING_KEY}={PARTIAL_ANSWER} applies the routed nets, each whole)")
-    assert res.notes[2:] == [reason]
+    assert _board_notes(res.notes)[2:] == [reason]
     res = agent.run(ir, _ctx(tmp_path, flib, **{ROUTING_KEY: " Partial "}))
     assert ir.content_hash() == before and res.questions == [] and not res.blocked_on_user
     [proposal] = res.proposals
@@ -865,7 +885,7 @@ def test_the_partial_answer_applies_whole_routed_nets_and_names_the_rest(tmp_pat
         "partial: pcb.routing=partial applies the 1 of 2 net(s) the router connected, each whole; 1 net(s) have no copper and need manual routing "
         "in KiCad: A (pcb.routing.connectivity judges the IR copper, DRC the board)"
     )
-    assert res.notes[2:] == [left, reason] and proposal.description == f"{res.notes[1]}; {left}"
+    assert _board_notes(res.notes)[2:] == [left, reason] and proposal.description.startswith(f"{res.notes[1]}; {left}; silkscreen.place 0.1: ")
     assert proposal.rationale.startswith("the nets listed as routed maze-routed") and "DRC decides validity" in proposal.rationale
     Orchestrator.apply_proposals(ir, res.proposals)
     ir.pcb.manufacturing = ManufacturingConstraints(min_clearance_mm=assumption(0.25, note="the router's own clearance as the limit"))

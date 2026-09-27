@@ -149,6 +149,10 @@ class Pad:
     drill: float | None
     layers: list[str]
     roundrect_rratio: float | None = None
+    #: ``(drill ... (offset x y))``: the copper shape sits at ``(x, y)`` plus this offset rotated by the pad angle (KiCad's
+    #: ``PAD::ShapePos``); the hole stays at ``(x, y)``. 0 when the file gives none.
+    offset_x: float = 0.0
+    offset_y: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +356,7 @@ def _parse_pads(fp: list) -> list[Pad]:
         if at is None or len(at) < 3 or size is None or len(size) < 3 or layers is None:
             raise LibraryFormatError(f"footprint {name!r}: pad {str(pad[1])!r} lacks (at)/(size)/(layers)")
         drill: float | None = None
+        offset = (0.0, 0.0)
         drill_node = sexpr.find(pad, "drill")
         if drill_node is not None:
             for atom in sexpr.args(drill_node):
@@ -360,6 +365,11 @@ def _parse_pads(fp: list) -> list[Pad]:
                     break
                 except ValueError:
                     continue  # "oval" etc.
+            off = sexpr.find(drill_node, "offset")
+            if off is not None:
+                if len(off) < 3:
+                    raise LibraryFormatError(f"footprint {name!r}: pad {str(pad[1])!r} has a malformed (drill (offset ...))")
+                offset = (_finite(off[1], f"pad {str(pad[1])!r} (drill offset x)", name), _finite(off[2], f"pad {str(pad[1])!r} (drill offset y)", name))
         rr = sexpr.get(pad, "roundrect_rratio")
         pads.append(
             Pad(
@@ -374,6 +384,8 @@ def _parse_pads(fp: list) -> list[Pad]:
                 drill=drill,
                 layers=[str(layer) for layer in sexpr.args(layers)],
                 roundrect_rratio=sexpr.to_float(rr) if rr is not None else None,
+                offset_x=offset[0],
+                offset_y=offset[1],
             )
         )
     return pads

@@ -22,7 +22,19 @@ before IR_BUILD for the same reason - the limits feed the ``.kicad_pro``
 design rules written in the SCHEMATIC stage and the board thickness), and
 the compilers / DRC judge it. Copper the IR already carries is never
 replaced by a proposal. The orchestrator compiles what the
-IR contains (``ir.pcb.tracks`` included) and lets the tools judge it. A stage whose input
+IR contains (``ir.pcb.tracks`` and ``ir.pcb.silkscreen`` included) and lets the tools judge it.
+
+3D outputs are pictures, never evidence: right after the board compiles,
+the PCB stage compiles the built-in preview ``<project>.preview.glb``
+(``ArtifactKind.MODEL_3D``, :mod:`ai_eda.compilers.model3d`; deterministic,
+registered with ``generated_from_ir_hash``) and appends a note to the stage
+message - how many part boxes have a STEP height - without a ``compile.*``
+result and without touching the stage's status; a refusal is the note. The
+MANUFACTURING_OUTPUTS stage runs KiCad's own STEP / GLB / render exports
+(:data:`KICAD_3D_EXPORTS`, kicad-cli flags not measured on 10.0.6) after the
+gerbers and registers them like the gerbers; without kicad-cli its message
+says :data:`NO_KICAD_3D`, a failed export is a note, and neither is ever a
+FAIL. A stage whose input
 does not exist yet (no components, no ``ir.pcb``, no board to export) is
 NOT_VERIFIED; a stage whose input is inconsistent (pins that do not match
 the library, a pin in no net, an unverified footprint) is FAIL with the
@@ -33,6 +45,7 @@ verdict.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, get_args, get_origin
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
@@ -58,12 +71,16 @@ from ai_eda.compilers import (
     CompileContext,
     DrillExporter,
     GerberExporter,
+    GlbExporter,
     PCBCompiler,
+    Preview3DCompiler,
     ProjectFileCompiler,
+    RenderExporter,
     SchematicCompiler,
     SpiceNetlistCompiler,
+    StepExporter,
 )
-from ai_eda.errors import CompileError, NothingToCompileError, ToolUnavailableError
+from ai_eda.errors import CompileError, NothingToCompileError, ToolExecutionError, ToolUnavailableError
 from ai_eda.ir import ArtifactKind, CircuitIR, MissingInformation, ValidationResult, ValidationStatus, worst_status
 from ai_eda.ir.provenance import design_data
 from ai_eda.tools.calc import recompute_parameters
@@ -154,6 +171,10 @@ StageFn = Callable[[CircuitIR, AgentContext], StageOutcome]
 
 #: artifact kinds produced by the manufacturing-outputs stage, in export order
 MANUFACTURING_EXPORTS: tuple[ArtifactKind, ...] = (ArtifactKind.GERBER, ArtifactKind.DRILL)
+#: KiCad's own 3D outputs, exported after the gerbers when kicad-cli is available (a picture each: never a status)
+KICAD_3D_EXPORTS: tuple[ArtifactKind, ...] = (ArtifactKind.KICAD_STEP, ArtifactKind.KICAD_GLB, ArtifactKind.KICAD_RENDER)
+#: what the manufacturing-outputs stage says when there is no kicad-cli for the 3D exports
+NO_KICAD_3D = "3D export skipped: kicad-cli not found"
 
 
 class Orchestrator:
@@ -170,6 +191,10 @@ class Orchestrator:
                 ArtifactKind.GERBER: GerberExporter(),
                 ArtifactKind.DRILL: DrillExporter(),
                 ArtifactKind.KICAD_PROJECT: ProjectFileCompiler(),
+                ArtifactKind.MODEL_3D: Preview3DCompiler(),
+                ArtifactKind.KICAD_STEP: StepExporter(),
+                ArtifactKind.KICAD_GLB: GlbExporter(),
+                ArtifactKind.KICAD_RENDER: RenderExporter(),
             },
         )
         # One library instance for the schematic / PCB compilers (parsed libraries are cached per instance).
@@ -420,8 +445,32 @@ class Orchestrator:
                     message = f"{message}; project file: {p_message}"
                 else:
                     ir.artifacts.pop(ArtifactKind.KICAD_PROJECT, None)  # an older project file would be stale evidence
+            else:
+                # the built-in 3D preview of the board just compiled: registered like any artifact, but a picture - its note
+                # is appended and it never changes the stage's status (module docstring of ai_eda.compilers.model3d)
+                message = f"{message}; {self._preview_3d(ir, ctx, board_compiled=status is ValidationStatus.PASS)}"
             return StageOutcome(stage=stage, status=status, message=message)
         return fn
+
+    @staticmethod
+    def _preview_3d(ir: CircuitIR, ctx: AgentContext, *, board_compiled: bool) -> str:
+        """Compile ``ArtifactKind.MODEL_3D`` after a board that compiled; the stage-message note. No ``compile.*`` result is recorded."""
+        kind = ArtifactKind.MODEL_3D
+        compiler = ctx.tools["compilers"].get(kind)
+        if not board_compiled or compiler is None:
+            ir.artifacts.pop(kind, None)  # an older preview would picture another design
+            return "3D preview not compiled: " + ("the board did not compile" if not board_compiled else "no compiler registered")
+        cctx = CompileContext(workdir=ctx.workdir, tools=ctx.tools)
+        try:
+            art, scene = compiler.compile_scene(ir, cctx) if hasattr(compiler, "compile_scene") else (compiler.compile(ir, cctx), None)
+        except (CompileError, NotImplementedError) as e:  # NothingToCompileError and the scene's SceneError are CompileErrors
+            ir.artifacts.pop(kind, None)
+            return f"3D preview not compiled: {e}"
+        ir.artifacts[kind] = art
+        counts = ""
+        if scene is not None:
+            counts = f": {len(scene.bodies_with_step)} part box(es) with a STEP height, {len(scene.bodies_without_step)} flat outline(s) without"
+        return f"3D preview {Path(art.path).name}{counts} (a picture of the IR, not a check)"
 
     def _kicad_check(self, check: str) -> StageFn:
         stage = Stage.ERC if check == "kicad.erc" else Stage.DRC
@@ -463,7 +512,7 @@ class Orchestrator:
                 notes.append(f"{kind}: {_neutralised_summary(art.notes)}")
         notes.insert(0, "BOM/CPL compiled" if not statuses else "BOM/CPL: see below")
         if ArtifactKind.PCB not in ir.artifacts:
-            notes.append("gerber/drill skipped (no PCB)")
+            notes += ["gerber/drill skipped (no PCB)", "3D export skipped (no PCB)"]
             return StageOutcome(stage=stage, status=worst_status(statuses + [ValidationStatus.NOT_VERIFIED]), message="; ".join(notes))
         for kind in MANUFACTURING_EXPORTS:
             try:
@@ -471,6 +520,7 @@ class Orchestrator:
             except ToolUnavailableError as e:
                 # the missing tool makes *this* export unverified; an earlier BOM/CPL FAIL in ``statuses`` still counts
                 notes.append(f"{kind} export skipped: {e}")
+                notes += self._export_3d(ir, ctx)
                 return StageOutcome(stage=stage, status=worst_status(statuses + [ValidationStatus.NOT_VERIFIED]), message="; ".join(notes))
             if status != ValidationStatus.PASS:
                 statuses.append(status)
@@ -481,7 +531,39 @@ class Orchestrator:
             ir.validation.add(res)
             statuses.append(res.status)
             notes.append(f"{res.check_id} {res.status}: {res.message}")
+        notes += self._export_3d(ir, ctx)
         return StageOutcome(stage=stage, status=worst_status(statuses), message="; ".join(notes))
+
+    @staticmethod
+    def _export_3d(ir: CircuitIR, ctx: AgentContext) -> list[str]:
+        """KiCad's STEP / GLB / render of the fresh board (:data:`KICAD_3D_EXPORTS`), registered like the gerbers; the notes. Never a status.
+
+        Without kicad-cli the one note is :data:`NO_KICAD_3D` (an export from
+        an earlier run stays registered and shows as stale, like a gerber set).
+        With it, each export either registers its files or, when kicad-cli
+        refuses or writes nothing usable (its flags are not measured on
+        10.0.6), unregisters the kind - the exporter deleted the old file
+        first - and the note says why; the stage's status is the gerbers'.
+        """
+        kicad = ctx.tools.get("kicad_cli")
+        if not isinstance(kicad, KicadCli) or not kicad.available():
+            return [NO_KICAD_3D]
+        notes: list[str] = []
+        cctx = CompileContext(workdir=ctx.workdir, tools=ctx.tools)
+        for kind in KICAD_3D_EXPORTS:
+            compiler = ctx.tools["compilers"].get(kind)
+            if compiler is None:
+                notes.append(f"{kind} export skipped: no exporter registered")
+                continue
+            try:
+                art = compiler.compile(ir, cctx)
+            except (CompileError, NotImplementedError, ToolUnavailableError, ToolExecutionError) as e:
+                ir.artifacts.pop(kind, None)
+                notes.append(f"{kind} export failed (3D, not a check): {e}")
+                continue
+            ir.artifacts[kind] = art
+            notes.append(f"{kind} exported {', '.join(Path(f).name for f in (art.files or [art.path]))} (3D, not a check)")
+        return notes
 
     def _calculation(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         """Recompute every derived parameter with its registered calculator (``calc.recompute``).

@@ -19,7 +19,23 @@ verdict.
 * :func:`board_svg` is :func:`ai_eda.report.figures.board_figure` with
   copper: pad geometry from the KiCad library on disk, never guessed; its
   layer groups carry the classes ``layer-F_Cu`` / ``layer-B_Cu`` / ``pads``
-  / ``vias`` / ``outline`` / ``labels`` so the page can toggle them.
+  / ``vias`` / ``outline`` / ``silk`` (``layer-F_SilkS`` / ``layer-B_SilkS``
+  inside) / ``labels`` so the page can toggle them.
+* :func:`model3d_scene` is the scene of the built-in 3D preview
+  (:func:`ai_eda.tools.model3d.scene.build_scene` of the current IR, the
+  KiCad library and the 3D model library this process finds - the same
+  function the ``MODEL_3D`` compiler writes ``<project>.preview.glb`` from,
+  so an unchanged IR on the same libraries gives the registered file's
+  bytes); :func:`model3d_glb` is its glTF binary for the page's WebGL
+  viewer, :func:`model3d_svg` its painter's-algorithm SVG (the fallback
+  without WebGL; views of :data:`~ai_eda.tools.model3d.iso.VIEWS`), and
+  :func:`model3d_summary` its caption, the body rule
+  (:data:`~ai_eda.tools.model3d.scene.BODY_CAPTION`) and one row per part box.
+  A picture of boxes, never a status. :func:`kicad_3d_files` lists KiCad's
+  own STEP / GLB / render exports (``ArtifactKind.KICAD_STEP`` /
+  ``KICAD_GLB`` / ``KICAD_RENDER``, real part shapes, written only where
+  kicad-cli runs) with their artifact facts; :func:`kicad_render_file` is the
+  one gate to a render PNG (a registered member, confined to the workdir).
 * :func:`waveform_plan` / :func:`waveform_svgs` draw every recorded
   ``tran`` / ``dc`` / ``ac`` analysis of ``spice/results.json`` that
   succeeded (every vector as ngspice wrote it, voltages and currents on
@@ -76,6 +92,7 @@ from ai_eda.report.pipeline_log import PIPELINE_FILE
 from ai_eda.report.stages import REPORT_SUFFIXES, REPORT_TITLES, REPORTS_DIR, STAGE_REPORTS
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.manufacturing.csv_cells import bom_cell_text
+from ai_eda.tools.model3d import BODY_CAPTION, VIEWS, Scene, build_scene, iso_svg, scene_caption, write_glb
 from ai_eda.tools.spice.rawfile import COMPLEX_SUFFIXES
 from ai_eda.tools.spice.stage import RESULTS_DIR, RESULTS_FILE, read_results
 
@@ -107,8 +124,23 @@ NO_WAVEFORM = "파형 없음: 그 id의 파형이 spice/results.json에 없습�
 NO_BOM = "BOM 없음: bom.csv가 없습니다 (MANUFACTURING_OUTPUTS 단계가 씁니다; 개요의 manufacturing_outputs 줄을 보십시오)"
 NO_CPL = "CPL 없음: cpl.csv가 없습니다 (MANUFACTURING_OUTPUTS 단계가 씁니다; 개요의 manufacturing_outputs 줄을 보십시오)"
 NO_REPORT_FILE = "보고서 파일 없음: 그 이름의 단계 보고서가 아직 쓰이지 않았습니다"
+NO_MODEL3D = "3D 미리보기 없음: IR에 기판 외곽과 부품 배치가 없습니다 (PLACEMENT 단계가 배치합니다; 개요의 placement 줄을 보십시오)"
+NO_MODEL3D_VIEW = "3D 미리보기 없음: 그런 보기가 없습니다 (iso, iso_bottom, top, bottom)"
+NO_KICAD_RENDER = "KiCad 렌더 없음: 그 이름의 PNG가 등록된 KiCad 렌더(kicad_render)에 없습니다"
+#: what KiCad's own 3D exports are called on the page (they carry the footprints' real 3D part models)
+KICAD_3D_LABEL = "KiCad 3D 모델(실제 부품 모양)"
+#: KiCad's own 3D exports, in the order the page lists them, with what each file is
+KICAD_3D_KINDS: tuple[tuple[ArtifactKind, str], ...] = (
+    (ArtifactKind.KICAD_STEP, "STEP (kicad-cli pcb export step)"),
+    (ArtifactKind.KICAD_GLB, "GLB (kicad-cli pcb export glb)"),
+    (ArtifactKind.KICAD_RENDER, "렌더 PNG (kicad-cli pcb render, 위·아래)"),
+)
+#: the width of the fallback SVG (the page scales it to the column)
+MODEL3D_SVG_WIDTH = 960
 #: what each previewed artifact is called in the sentence for a registered file that is not on disk
-ARTIFACT_WORDS: dict[ArtifactKind, str] = {ArtifactKind.SCHEMATIC: "회로도", ArtifactKind.PCB: "기판", ArtifactKind.BOM: "BOM", ArtifactKind.CPL: "CPL"}
+ARTIFACT_WORDS: dict[ArtifactKind, str] = {
+    ArtifactKind.SCHEMATIC: "회로도", ArtifactKind.PCB: "기판", ArtifactKind.BOM: "BOM", ArtifactKind.CPL: "CPL", ArtifactKind.MODEL_3D: "3D 미리보기",
+}
 
 class PreviewMissing(LookupError):
     """The input of a preview does not exist yet (the server's 404); the message is the Korean sentence the page shows."""
@@ -223,6 +255,98 @@ def board_svg(ir: CircuitIR, library: KicadLibrary) -> str:
     if not board_available(ir):
         raise PreviewMissing(NO_BOARD)
     return board_figure(ir, library, copper=True, fig_id="board").svg
+
+
+# --------------------------------------------------------------------------- the built-in 3D preview and KiCad's 3D exports
+
+
+def model3d_scene(ir: CircuitIR, library: KicadLibrary) -> Scene:
+    """The 3D preview scene of the current IR (:func:`~ai_eda.tools.model3d.scene.build_scene`, 3D library discovered as the compiler does).
+
+    :class:`PreviewMissing` (:data:`NO_MODEL3D`) without an outline or
+    placements - the board figure's input; a scene that cannot be built
+    without guessing (a footprint not on disk ...) raises its own error.
+    """
+    if not board_available(ir):
+        raise PreviewMissing(NO_MODEL3D)
+    return build_scene(ir, library)
+
+
+def model3d_glb(scene: Scene) -> bytes:
+    """The scene as glTF 2.0 binary (:func:`~ai_eda.tools.model3d.glb.write_glb`: deterministic bytes, no path, no time)."""
+    return write_glb(scene)
+
+
+def model3d_svg(scene: Scene, view: str) -> str:
+    """The scene seen from ``view`` (a key of :data:`~ai_eda.tools.model3d.iso.VIEWS`) as SVG without its in-figure caption (the page shows it)."""
+    if view not in VIEWS:
+        raise PreviewMissing(NO_MODEL3D_VIEW)
+    return iso_svg(scene, view, width=MODEL3D_SVG_WIDTH, caption=False)
+
+
+def model3d_summary(scene: Scene) -> dict[str, Any]:
+    """What the scene shows, as the page lists it: the caption, the body rule, the board thickness (and whether it is assumed), the notes and one row per part box."""
+    bodies = [
+        {
+            "ref": b.ref,
+            "lib_id": b.lib_id,
+            "side": b.side,
+            "outline_source": b.outline_source,
+            "models": list(b.models),
+            "height_mm": b.height_mm,
+            "reason": b.reason,
+        }
+        for b in scene.bodies
+    ]
+    return {
+        "project": scene.project_id,
+        "caption": scene_caption(scene),
+        "body_caption": BODY_CAPTION,
+        "thickness_mm": scene.thickness_mm,
+        "thickness_assumed": not scene.thickness_grounded,
+        "model_dir_found": scene.model_dir_found,
+        "with_step": len(scene.bodies_with_step),
+        "without_step": len(scene.bodies_without_step),
+        "notes": list(scene.notes),
+        "solids": scene.counts(),
+        "bodies": bodies,
+        "views": list(VIEWS),
+    }
+
+
+def kicad_3d_files(ir: CircuitIR, workdir: Path, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """KiCad's own 3D exports registered in ``ir.artifacts`` (:data:`KICAD_3D_KINDS` order): per kind its label, its artifact facts
+    (:func:`artifact_state`) and its files - each with the download path when it is a regular file inside the workdir, and whether it
+    is a render PNG the page may show (:func:`kicad_render_file`). ``[]`` when kicad-cli never exported them (the stage message says why)."""
+    out: list[dict[str, Any]] = []
+    for kind, what in KICAD_3D_KINDS:
+        art = ir.artifacts.get(kind)
+        if art is None:
+            continue
+        files: list[dict[str, Any]] = []
+        for path in art.files or [art.path]:
+            parts = workdir_parts(path, workdir)
+            download = "/".join(parts) if parts is not None and confined_file(workdir, parts) is not None else None
+            name = Path(path).name
+            image = kind is ArtifactKind.KICAD_RENDER and download is not None and name.lower().endswith(".png")
+            files.append({"name": name, "download": download, "image": image})
+        out.append({"kind": str(kind), "what": what, "label": KICAD_3D_LABEL, "files": files, "state": artifact_state(rows, kind)})
+    return out
+
+
+def kicad_render_file(ir: CircuitIR, workdir: Path, name: str) -> Path | None:
+    """The render PNG ``name`` (a basename) when it is a member of the registered ``KICAD_RENDER`` artifact and a regular file inside the workdir."""
+    art = ir.artifacts.get(ArtifactKind.KICAD_RENDER)
+    if art is None or not safe_part(name) or not name.lower().endswith(".png"):
+        return None
+    for path in art.files or [art.path]:
+        if Path(path).name != name:
+            continue
+        parts = workdir_parts(path, workdir)
+        found = confined_file(workdir, parts) if parts is not None else None
+        if found is not None:
+            return found
+    return None
 
 
 # --------------------------------------------------------------------------- simulation
@@ -600,7 +724,13 @@ __all__ = [
     "BOM_FILE",
     "BOM_FREE_TEXT_COLUMNS",
     "CPL_FILE",
+    "KICAD_3D_KINDS",
+    "KICAD_3D_LABEL",
+    "MODEL3D_SVG_WIDTH",
     "NOT_VERIFIED_CELL",
+    "NO_KICAD_RENDER",
+    "NO_MODEL3D",
+    "NO_MODEL3D_VIEW",
     "PreviewMissing",
     "REPORT_HTML_FILE",
     "WAVEFORM_KINDS",
@@ -619,7 +749,13 @@ __all__ = [
     "confined_file",
     "cpl_rows",
     "cpl_table",
+    "kicad_3d_files",
+    "kicad_render_file",
     "missing_sentence",
+    "model3d_glb",
+    "model3d_scene",
+    "model3d_summary",
+    "model3d_svg",
     "project_schematic_svg",
     "project_zip",
     "read_csv_table",

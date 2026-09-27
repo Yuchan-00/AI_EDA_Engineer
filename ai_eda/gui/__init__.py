@@ -27,7 +27,13 @@ Invariants every module of this package keeps:
   resource; previews are deterministic inline SVG with every text escaped.
   :mod:`ai_eda.gui.schematic_render` draws the ``.kicad_sch`` the compiler
   wrote from its own ``lib_symbols`` - a preview, not a KiCad render, and no
-  ERC is implied.
+  ERC is implied. The 3D tab's viewer is hand-written WebGL in the served
+  ``app.js`` (no library): it draws the glTF binary of the built-in 3D
+  preview (``/preview/<name>/board.glb``, part bodies are boxes of the
+  ``F.Fab`` outline x the STEP height, not the parts' shapes) and falls back
+  to the server's isometric SVG of the same scene where WebGL is missing;
+  KiCad's own STEP / GLB / render files (real part shapes) are only linked /
+  shown when a kicad-cli run registered them.
 * The UI text is Korean; technical identifiers stay as they are and the
   embedded English ``report.html`` is shown unchanged.
 

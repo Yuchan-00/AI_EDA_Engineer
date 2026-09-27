@@ -52,6 +52,26 @@ which ``tests/test_kicad_cli.py`` has demonstrated it (a 5 mm
 ``min_track_width`` produces ``track_width`` violations on the vertical-slice
 board, 0.127 mm none, ERC output unchanged, project file not rewritten) and
 is empty until that run is recorded; the capability check reads it.
+
+3D exports - **NOT measured on 10.0.6**: :meth:`KicadCli.export_step`,
+:meth:`KicadCli.export_glb` and :meth:`KicadCli.render` run ``kicad-cli pcb
+export step``, ``pcb export glb`` and ``pcb render`` with the flags of
+:data:`STEP_EXPORT_FLAGS`, :data:`GLB_EXPORT_FLAGS` and the ``render``
+arguments below, taken from the KiCad command-line documentation (``--output``,
+``--force``, ``--subst-models``, ``--include-tracks`` / ``-pads`` / ``-zones`` /
+``-silkscreen`` / ``-soldermask``; ``render``: ``--side``, ``--width``,
+``--height``, ``--quality``, ``--background``, ``--zoom``, ``--perspective``).
+None of it has been run here: :data:`EXPORT_3D_MEASURED_VERSIONS` lists the
+kicad-cli versions on which ``tests/test_kicad_3d_export.py`` (a canary that
+skips without kicad-cli) found every flag in the subcommand's ``--help`` and
+got a STEP / glTF / PNG file back, and is empty until that run is recorded.
+Each export deletes a stale file at its output path first, accepts only exit
+code 0 (not the 5 of ERC / DRC) and checks the written file's signature
+(``ISO-10303-21`` / ``glTF`` / PNG); anything else is a
+:class:`~ai_eda.errors.ToolExecutionError`, never a crash of the run. The
+STEP header and the glTF carry KiCad's own timestamp / generator data, so
+like the gerbers these files are evidence of *which* file was written, not
+reproducible bytes.
 """
 
 from __future__ import annotations
@@ -59,6 +79,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -87,6 +108,31 @@ WARNING_POLICY = "any violation (error or warning, excluded or not) is FAIL; cou
 #: (``tests/test_kicad_cli.py`` canary). Empty until the measurement is recorded: an unmeasured version can not
 #: prove the fab minimums (``ai_eda.tools.manufacturing.capability``).
 PROJECT_RULES_MEASURED_VERSIONS: frozenset[str] = frozenset()
+
+#: kicad-cli versions on which the 3D export / render flags below were measured (``tests/test_kicad_3d_export.py``
+#: canary). Empty: the flags are the KiCad documentation's, not run on 10.0.6 (module docstring).
+EXPORT_3D_MEASURED_VERSIONS: frozenset[str] = frozenset()
+#: ``pcb export step`` flags (documented, unmeasured): overwrite, substitute STEP for VRML models, and the copper /
+#: silkscreen / mask the board body carries
+STEP_EXPORT_FLAGS: tuple[str, ...] = (
+    "--force",
+    "--subst-models",
+    "--include-tracks",
+    "--include-pads",
+    "--include-zones",
+    "--include-silkscreen",
+    "--include-soldermask",
+)
+#: ``pcb export glb`` flags (documented, unmeasured): the same set as STEP
+GLB_EXPORT_FLAGS: tuple[str, ...] = STEP_EXPORT_FLAGS
+#: ``pcb render --side`` values (documented, unmeasured)
+RENDER_SIDES: tuple[str, ...] = ("top", "bottom", "left", "right", "front", "back")
+RENDER_QUALITIES: tuple[str, ...] = ("basic", "high")
+RENDER_BACKGROUNDS: tuple[str, ...] = ("default", "transparent", "opaque")
+#: file signatures the exports are checked against
+STEP_SIGNATURE = b"ISO-10303-21"
+GLB_SIGNATURE = b"glTF"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def gerber_layers(copper: Iterable[str]) -> tuple[str, ...]:
@@ -189,16 +235,25 @@ class KicadCli:
     def available(self) -> bool:
         return self.binary is not None
 
-    def _run(self, args: list[str], timeout: int = 600) -> subprocess.CompletedProcess[str]:
+    def _run(self, args: list[str], timeout: int = 600, ok_codes: tuple[int, ...] = (0, 5)) -> subprocess.CompletedProcess[str]:
+        """Run kicad-cli; an exit code outside ``ok_codes`` (default 0 and 5 = ERC/DRC found violations) is a ToolExecutionError."""
         if not self.available():
             raise ToolUnavailableError("kicad-cli not found")
         # kicad-cli writes UTF-8 regardless of the console code page (cp949 on Korean Windows)
-        proc = subprocess.run(
-            [self.binary, *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
-        )
-        if proc.returncode not in (0, 5):  # 5 = ERC/DRC found violations (still a valid run)
+        try:
+            proc = subprocess.run(
+                [self.binary, *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ToolExecutionError(f"kicad-cli {' '.join(args)} did not finish within {timeout} s") from exc
+        if proc.returncode not in ok_codes:
             raise ToolExecutionError(f"kicad-cli {' '.join(args)} exited {proc.returncode}: {proc.stderr[-2000:]}")
         return proc
+
+    def accepted_flags(self, subcommand: list[str]) -> set[str]:
+        """Every ``--flag`` the subcommand's ``--help`` lists (e.g. ``["pcb", "export", "step"]``); what the 3D canary records."""
+        proc = self._run([*subcommand, "--help"], ok_codes=(0,))
+        return set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]*", proc.stdout + proc.stderr))
 
     def version(self) -> str:
         if self._version is None:
@@ -375,6 +430,60 @@ class KicadCli:
 
     def export_spice_netlist(self, schematic: Path, out_path: Path) -> Path:
         return self.export_netlist(schematic, out_path, fmt="spice")
+
+    # --- 3D (flags documented, NOT measured on 10.0.6: module docstring) -------------------
+
+    def _export_checked(self, args: list[str], out: Path, signature: bytes, what: str) -> Path:
+        """Run an export that must write ``out`` starting with ``signature``; a stale file there is removed first."""
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.unlink(missing_ok=True)
+        self._run(args, ok_codes=(0,))
+        if not out.is_file():
+            raise ToolExecutionError(f"kicad-cli {what} wrote no file at {out}")
+        with out.open("rb") as fh:
+            head = fh.read(len(signature))
+        if head != signature:
+            raise ToolExecutionError(f"kicad-cli {what} output {out} does not start with {signature!r} (got {head!r})")
+        return out
+
+    def export_step(self, pcb: Path, out: Path, flags: tuple[str, ...] | list[str] = STEP_EXPORT_FLAGS) -> Path:
+        """``kicad-cli pcb export step`` of ``pcb`` to ``out`` (``ISO-10303-21`` checked); the board with KiCad's own 3D part models."""
+        return self._export_checked(["pcb", "export", "step", *flags, "--output", str(out), str(pcb)], out, STEP_SIGNATURE, "pcb export step")
+
+    def export_glb(self, pcb: Path, out: Path, flags: tuple[str, ...] | list[str] = GLB_EXPORT_FLAGS) -> Path:
+        """``kicad-cli pcb export glb`` of ``pcb`` to ``out`` (the ``glTF`` magic checked)."""
+        return self._export_checked(["pcb", "export", "glb", *flags, "--output", str(out), str(pcb)], out, GLB_SIGNATURE, "pcb export glb")
+
+    def render(
+        self,
+        pcb: Path,
+        out_png: Path,
+        side: str = "top",
+        *,
+        width: int = 1600,
+        height: int = 900,
+        quality: str = "basic",
+        background: str = "opaque",
+        zoom: float | None = None,
+        perspective: bool = False,
+    ) -> Path:
+        """``kicad-cli pcb render`` of ``pcb`` seen from ``side`` (:data:`RENDER_SIDES`) to a PNG (signature checked)."""
+        if side not in RENDER_SIDES:
+            raise ValueError(f"side {side!r} is not one of {RENDER_SIDES}")
+        if quality not in RENDER_QUALITIES:
+            raise ValueError(f"quality {quality!r} is not one of {RENDER_QUALITIES}")
+        if background not in RENDER_BACKGROUNDS:
+            raise ValueError(f"background {background!r} is not one of {RENDER_BACKGROUNDS}")
+        if not (isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0):
+            raise ValueError(f"width / height must be positive integers (got {width!r} x {height!r})")
+        args = ["pcb", "render", "--side", side, "--width", str(width), "--height", str(height), "--quality", quality, "--background", background]
+        if zoom is not None:
+            if not (zoom > 0 and zoom < float("inf")):
+                raise ValueError(f"zoom must be a positive finite number (got {zoom!r})")
+            args += ["--zoom", f"{zoom:g}"]
+        if perspective:
+            args.append("--perspective")
+        return self._export_checked([*args, "--output", str(out_png), str(pcb)], out_png, PNG_SIGNATURE, "pcb render")
 
 
 # --- pipeline helpers ---------------------------------------------------------------

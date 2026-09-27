@@ -48,6 +48,31 @@ def drop_in_design_view(*names: str):
     return model_serializer(mode="wrap")(_serialize)
 
 
+def drop_empty_in_design_view(*names: str):
+    """A ``model_serializer`` that leaves ``names`` out of the design view while they hold their empty default.
+
+    For design fields added to a model after IRs were saved with it: a field
+    that is ``None`` or an empty list / dict is absent from the design view,
+    so every IR saved before the field existed keeps its ``content_hash``;
+    as soon as the field holds content it is design content and hashed like
+    any other field. The owning model names its own fields (never a key-name
+    strip over the whole dump), and the saved ``ir.json`` keeps every field.
+    Like any wrap serializer, it makes pydantic's JSON-mode dump write a
+    NaN / inf below the model as ``None``: a finiteness check dumps in python
+    mode (``PCBCompiler.compile``).
+    """
+
+    def _serialize(self, handler: SerializerFunctionWrapHandler, info: SerializationInfo):
+        data = handler(self)
+        if in_design_view(info):
+            for name in names:
+                if name in data and (data[name] is None or data[name] == [] or data[name] == {}):
+                    del data[name]
+        return data
+
+    return model_serializer(mode="wrap")(_serialize)
+
+
 class ProvenanceKind(StrEnum):
     USER_REQUIREMENT = "user_requirement"
     AUTHORITATIVE = "authoritative"

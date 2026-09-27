@@ -28,7 +28,11 @@ no inline event handler (every listener is added by ``app.js``), no
 ``style`` attribute or ``<style>`` element (layer toggles and states are
 classes of ``app.css``), and the preview SVGs it inlines carry presentation
 attributes only. ``img-src 'self' data:`` and ``frame-src 'self'`` are the
-two additions: the sandboxed iframe loads a same-origin document.
+two additions: the sandboxed iframe loads a same-origin document. The 3D
+tab needs nothing more: its WebGL viewer is code in ``app.js`` that fetches
+the same-origin ``/preview/<name>/board.glb`` (``model/gltf-binary``;
+``connect-src`` falls back to ``'self'``) and compiles its two shaders
+through WebGL (no ``eval``); KiCad's render PNGs are same-origin images.
 
 What it serves is a view: every status in the JSON is copied from
 ``ir.validation`` / ``pipeline.json`` through
@@ -84,7 +88,13 @@ from ai_eda.gui.preview import (
     bom_table,
     confined_file,
     cpl_table,
+    kicad_3d_files,
+    kicad_render_file,
     missing_sentence,
+    model3d_glb,
+    model3d_scene,
+    model3d_summary,
+    model3d_svg,
     project_schematic_svg,
     project_zip,
     report_files,
@@ -93,6 +103,7 @@ from ai_eda.gui.preview import (
     waveform_svg,
     NO_BOM,
     NO_CPL,
+    NO_KICAD_RENDER,
     NO_REPORT_FILE,
 )
 from ai_eda.gui.projects import ProjectError, ProjectInfo, ProjectNotFoundError, ProjectsRoot
@@ -118,6 +129,9 @@ TEXT = "text/plain; charset=utf-8"
 JSON_TYPE = "application/json; charset=utf-8"
 SVG_TYPE = "image/svg+xml; charset=utf-8"
 HTML_TYPE = "text/html; charset=utf-8"
+#: the built-in 3D preview the page's WebGL viewer loads (glTF 2.0 binary, the registered media type)
+GLB_TYPE = "model/gltf-binary"
+PNG_TYPE = "image/png"
 #: the longest error line sent (the rest is cut; the log or the page has the detail)
 MAX_ERROR_LINE = 600
 
@@ -287,6 +301,21 @@ class GuiApp:
             case ["preview", name, "board.svg"]:
                 p = self._load(name)
                 return self._svg(lambda: self._board(p.ir), "board")
+            case ["preview", name, "board.glb"]:
+                p = self._load(name)
+                return self._build(lambda: Response(200, model3d_glb(self._scene(p.ir)), GLB_TYPE), "3D preview")
+            case ["preview", name, "board3d", file] if file.endswith(".svg"):
+                p = self._load(name)
+                return self._svg(lambda: model3d_svg(self._scene(p.ir), file[: -len(".svg")]), "3D preview")
+            case ["preview", name, "model3d.json"]:
+                p = self._load(name)
+                return self._build(lambda: json_response(model3d_summary(self._scene(p.ir))), "3D preview")
+            case ["preview", name, "kicad3d", file]:
+                p = self._load(name)
+                path = kicad_render_file(p.ir, p.workdir, file)
+                if path is None:
+                    raise HttpError(404, NO_KICAD_RENDER)
+                return Response(200, path.read_bytes(), PNG_TYPE)
             case ["preview", name, "waveform", file] if file.endswith(".svg"):
                 p = self._load(name)
                 return self._svg(lambda: waveform_svg(p.workdir, file[: -len(".svg")]), "waveform")
@@ -356,6 +385,12 @@ class GuiApp:
         with self._library_lock:  # the library's parse caches are not shared across threads while one fills them
             return board_svg(ir, library)
 
+    def _scene(self, ir: CircuitIR):
+        """The 3D preview scene of ``ir`` (:func:`~ai_eda.gui.preview.model3d_scene`), built under the library lock like the board figure."""
+        library = self.library()
+        with self._library_lock:
+            return model3d_scene(ir, library)
+
     def project_json(self, name: str) -> dict[str, Any]:
         """Everything the page shows about one project (see the module docstring of :mod:`ai_eda.gui`); statuses copied, none computed."""
         from ai_eda.report import pdf as report_pdf
@@ -405,6 +440,12 @@ class GuiApp:
                     "board": board_available(ir),
                     "board_file": artifact_download(ir, workdir, ArtifactKind.PCB),
                     "board_state": artifact_state(rows, ArtifactKind.PCB),
+                    # the 3D tab: drawn from the current IR like the board (same input); the compiled preview GLB's own facts beside it
+                    "model3d": board_available(ir),
+                    "model3d_file": artifact_download(ir, workdir, ArtifactKind.MODEL_3D),
+                    "model3d_state": artifact_state(rows, ArtifactKind.MODEL_3D),
+                    # KiCad's own STEP / GLB / render exports (real part shapes; only where kicad-cli ran), with their facts
+                    "kicad_3d": kicad_3d_files(ir, workdir, rows),
                     "bom_state": artifact_state(rows, ArtifactKind.BOM),
                     "cpl_state": artifact_state(rows, ArtifactKind.CPL),
                     "waveforms": [w["id"] for w in simulation["waveforms"]],

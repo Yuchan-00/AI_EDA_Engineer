@@ -41,8 +41,10 @@ the latest ``kicad.drc`` result, never a session tool):
   ``kicad.drc``; not a second one).
 * ``board_thickness_mm`` and ``copper_weight_oz`` are chosen values, not
   minimums; footprint hole-to-edge and annular ring have no DRC rule this
-  system writes. They are listed under ``details["not_compared"]`` and named
-  in the message, never counted as compared.
+  system writes; the silkscreen limits (``min_silk_text_height_mm`` /
+  ``min_silk_line_width_mm``) are judged by ``pcb.silk.size``. They are listed
+  under ``details["not_compared"]`` and named in the message, never counted
+  as compared.
 * The overall status is the worst row (NOT_APPLICABLE rows do not count);
   without ``ir.pcb`` the result is NOT_VERIFIED. There is no path to PASS
   without DRC evidence.
@@ -70,6 +72,8 @@ NOT_COMPARED: dict[str, str] = {
     "copper_weight_oz": "a chosen value; no DRC rule represents it",
     "footprint_hole_to_edge": "library footprint holes are not in the IR and no DRC rule this system writes proves hole-to-edge (KiCad has copper-to-edge only)",
     "annular_ring": "no DRC rule this system writes constrains the annular width",
+    "min_silk_text_height_mm": "a silkscreen limit: judged by pcb.silk.size (IR geometry), not here",
+    "min_silk_line_width_mm": "a silkscreen limit: judged by pcb.silk.size (IR geometry), not here",
 }
 #: geometry only DRC can prove: row name -> the mapped limits it needs
 GEOMETRY_ROWS: dict[str, tuple[str, ...]] = {

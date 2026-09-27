@@ -1,4 +1,4 @@
-"""PCB Agent: proposes a deterministic placement and a maze-routed board into ``ir.pcb``; DRC is done by KiCad, not here.
+"""PCB Agent: proposes a deterministic placement, a maze-routed board and its silkscreen into ``ir.pcb``; DRC is done by KiCad, not here.
 
 Invariants this agent keeps:
 
@@ -34,11 +34,11 @@ Invariants this agent keeps:
   only a board (the one it just placed, or the user's placements) that has
   no tracks / vias / zones. Otherwise it says why in a note starting
   ``not placed:`` / ``not routed:``.
-* Place then route is **one** proposal, ``target="pcb"``,
+* Place, route and silkscreen are **one** proposal, ``target="pcb"``,
   ``operation="set"``, whose payload is the whole
   :class:`~ai_eda.ir.PCBDesign` (the existing one copied with ``outline``
-  + ``placements`` + ``tracks`` + ``vias`` filled, so layers and
-  manufacturing constraints survive). It never emits a dotted ``pcb.*``
+  + ``placements`` + ``tracks`` + ``vias`` + ``silkscreen`` filled, so
+  layers and manufacturing constraints survive). It never emits a dotted ``pcb.*``
   target: ``apply_proposals`` resolves every target's parent *before* any
   step runs, so a second ``pcb.placements`` proposal in the same result would
   land on the old (replaced) object or raise on ``None``.
@@ -56,13 +56,28 @@ Invariants this agent keeps:
   routing in KiCad (``pcb.routing.connectivity`` then FAILs naming them at
   IR_BUILD: the board is honestly unfinished). Anything else propagates: it
   is a defect, not a verdict.
-* It asks no question. The only steering is the two control keys
-  :data:`PLACEMENT_KEY` (``--answer pcb.placement=skip`` proposes nothing)
-  and :data:`ROUTING_KEY` (``--answer pcb.routing=skip`` proposes the
+* Silkscreen comes last, in the **same** proposal:
+  :func:`ai_eda.tools.silkscreen.place.place_silkscreen` (``silkscreen.place``)
+  puts the reference designators, connector pin labels and the board title
+  on the placed board (the one it just placed and routed, or the user's
+  placements) - only when ``ir.pcb.silkscreen`` is empty: existing
+  silkscreen is never replaced (``silkscreen not placed: ...`` note). On a
+  board the agent neither places nor routes (already placed, already routed
+  or left unrouted) and whose silkscreen is empty, the proposal carries the
+  existing board unchanged plus the silkscreen. The placer's description is
+  the last note and is appended to the proposal description; a placer that
+  cannot read the board leaves the silkscreen out with a
+  ``silkscreen not placed: <reason>`` note, never a guess. Every text
+  carries ``derived`` / ``silkscreen.place`` provenance.
+* It asks no question. The only steering is the three control keys
+  :data:`PLACEMENT_KEY` (``--answer pcb.placement=skip`` proposes nothing),
+  :data:`ROUTING_KEY` (``--answer pcb.routing=skip`` proposes the
   placement without copper, ``--answer pcb.routing=partial`` applies the
-  routed nets of a board the router could not finish); any other value is
-  noted as not understood and the work proceeds; the keys never become
-  requirements (``CONTROL_KEYS`` in :mod:`ai_eda.agents.keys`).
+  routed nets of a board the router could not finish) and
+  :data:`SILKSCREEN_KEY` (``--answer pcb.silkscreen=skip`` proposes no
+  silkscreen); any other value is noted as not understood and the work
+  proceeds; the keys never become requirements (``CONTROL_KEYS`` in
+  :mod:`ai_eda.agents.keys`).
 
 The PLACEMENT stage runs before IR_BUILD, so this agent may see an
 inconsistent IR (a net naming a component that does not exist). The placer
@@ -81,7 +96,7 @@ the copper only through ``mfg.capability`` / DRC, never by a silent re-route.
 from __future__ import annotations
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
-from ai_eda.agents.keys import PLACEMENT_KEY, ROUTING_KEY
+from ai_eda.agents.keys import PLACEMENT_KEY, ROUTING_KEY, SILKSCREEN_KEY
 from ai_eda.errors import CompileError
 from ai_eda.ir import CircuitIR, PCBDesign
 from ai_eda.llm.router import TaskKind
@@ -91,6 +106,7 @@ from ai_eda.tools.placement.core_ring import PLACER_ID as RING_PLACER_ID
 from ai_eda.tools.placement.core_ring import PLACER_VERSION as RING_PLACER_VERSION
 from ai_eda.tools.placement.grid import COLUMNS, MARGIN_MM, PLACER_ID, PLACER_VERSION, SPACING_MM, _resolve, grid_placement
 from ai_eda.tools.routing.maze import FINE_PITCH_MM, ROUTER_ID, ROUTER_VERSION, Routing, RoutingParams, route_board
+from ai_eda.tools.silkscreen.place import SilkParams, place_silkscreen
 
 #: ``--answer pcb.placement=skip`` makes the agent propose nothing, ``--answer pcb.routing=skip`` leaves the placement
 #: without copper (``PLACEMENT_KEY`` / ``ROUTING_KEY``: control keys, never requirements, defined in
@@ -103,6 +119,11 @@ PARTIAL_ANSWER = "partial"
 UNROUTED_NOTE = "unrouted: DRC will report unconnected_items until routed"
 #: the rationale of a proposal whose placement is the grid / the core ring
 GRID_RATIONALE = "row-major grid from verified library footprint extents; placed extents are pairwise disjoint and inside the outline"
+#: the rationale part of a proposal that carries the silkscreen
+SILK_RATIONALE = (
+    "silkscreen placed on estimated text boxes clear of pad copper + 0.15 mm, the outline inset 0.3 mm, the footprints' own silk and each other "
+    "(tracks under solder mask and tented vias are not keep-outs); KiCad DRC decides silk_over_copper / silk_overlap"
+)
 RING_RATIONALE = (
     "core-and-ring placement from verified library footprint extents and the IR nets: the part with the most pads in the centre, "
     "the parts wired only to it on an inner ring by pull angle, the rest on an outer ring at the board edge; "
@@ -116,11 +137,13 @@ class PCBAgent(Agent):
 
     def __init__(
         self, *, spacing_mm: float = SPACING_MM, margin_mm: float = MARGIN_MM, columns: int = COLUMNS, routing: RoutingParams | None = None,
+        silk: SilkParams | None = None,
     ) -> None:
         self.spacing_mm = spacing_mm
         self.margin_mm = margin_mm
         self.columns = columns
         self.routing = routing
+        self.silk = silk
 
     def run(self, ir: CircuitIR, ctx: AgentContext) -> AgentResult:
         notes: list[str] = []
@@ -179,7 +202,7 @@ class PCBAgent(Agent):
         partial = False
         if answer is not None:
             if answer.strip().lower() == SKIP_ANSWER:
-                return self._unrouted(board, notes, ["routing skipped by answer"], placed=placed, description=description, basis=basis)
+                return self._unrouted(ir, ctx, board, notes, ["routing skipped by answer"], placed=placed, description=description, basis=basis)
             if answer.strip().lower() == PARTIAL_ANSWER:
                 partial = True
             else:
@@ -188,11 +211,11 @@ class PCBAgent(Agent):
                 )
         if board.tracks or board.vias or board.zones:
             reason = f"not routed: ir.pcb already has copper ({len(board.tracks)} track(s), {len(board.vias)} via(s), {len(board.zones)} zone(s)); the agent never replaces copper"
-            return self._unrouted(board, notes, [reason], placed=placed, description=description, basis=basis)
+            return self._unrouted(ir, ctx, board, notes, [reason], placed=placed, description=description, basis=basis)
         library = ctx.tools.get("kicad_library")
         if not isinstance(library, KicadLibrary):
             return self._unrouted(
-                board, notes, ["not routed: no KiCad library in ctx.tools['kicad_library']; pad geometry cannot be read"], placed=placed, description=description, basis=basis,
+                ir, ctx, board, notes, ["not routed: no KiCad library in ctx.tools['kicad_library']; pad geometry cannot be read"], placed=placed, description=description, basis=basis,
             )
         board_ir = ir.model_copy(update={"pcb": board})  # a shallow copy: ir itself is never touched
         params: RoutingParams | None = None
@@ -201,12 +224,12 @@ class PCBAgent(Agent):
             routing = route_board(board_ir, library, params)
         except (CompileError, LibraryLookupError, LibraryFormatError) as e:
             rules = [self._rules_note(params)] if params is not None and params.rules is not None else []
-            return self._unrouted(board, notes, [*rules, f"not routed: {e}"], placed=placed, description=description, basis=basis)
+            return self._unrouted(ir, ctx, board, notes, [*rules, f"not routed: {e}"], placed=placed, description=description, basis=basis)
         reasons = [f"not routed: {net}: {why}" for net, why in routing.unrouted.items()]
         if routing.unrouted and not (partial and routing.stats.get("routed_nets")):
             rules = [self._rules_note(routing.params, routing.stats.get("raised"))] if routing.params.rules is not None else []
             dropped = [self._dropped_note(routing)] if routing.stats.get("routed_nets") else []
-            return self._unrouted(board, notes, [*rules, *dropped, *reasons], placed=placed, description=description, basis=basis)
+            return self._unrouted(ir, ctx, board, notes, [*rules, *dropped, *reasons], placed=placed, description=description, basis=basis)
         payload = board.model_copy(update={"tracks": list(routing.tracks), "vias": list(routing.vias)})
         routed = self._routing_description(routing)
         which = "the nets listed as routed" if routing.unrouted else "every net"
@@ -225,14 +248,53 @@ class PCBAgent(Agent):
             full = f"{full}; {left}"
             notes += [left, *reasons]
         proposal = IRProposal(description=full, target="pcb", operation="set", payload=payload, rationale=rationale)
+        return self._with_silk(ir, ctx, payload, proposal, notes)
+
+    def _unrouted(
+        self, ir: CircuitIR, ctx: AgentContext, board: PCBDesign, notes: list[str], reasons: list[str], *, placed: bool, description: str, basis: str = GRID_RATIONALE,
+    ) -> AgentResult:
+        """The placement alone (or nothing when the board was already placed) plus why there is no copper; then the silkscreen."""
+        if not placed:
+            return self._with_silk(ir, ctx, board, None, [*notes, *reasons])
+        proposal = IRProposal(description=description, target="pcb", operation="set", payload=board, rationale=f"{basis}; DRC decides validity")
+        return self._with_silk(ir, ctx, board, proposal, [*notes, f"{description}; {UNROUTED_NOTE}", *reasons])
+
+    def _with_silk(self, ir: CircuitIR, ctx: AgentContext, board: PCBDesign, proposal: IRProposal | None, notes: list[str]) -> AgentResult:
+        """Add the silkscreen to the one ``pcb`` proposal, or propose ``board`` + silkscreen alone when nothing else is proposed (module docstring)."""
+        silk_notes, texts, silk_description = self._silkscreen(ir, ctx, board)
+        notes = [*notes, *silk_notes]
+        if texts is None:
+            return self._result(proposals=[proposal] if proposal is not None else [], notes=notes)
+        payload = board.model_copy(update={"silkscreen": texts})
+        if proposal is None:
+            proposal = IRProposal(description=silk_description, target="pcb", operation="set", payload=payload, rationale=SILK_RATIONALE)
+        else:
+            proposal = proposal.model_copy(update={
+                "payload": payload, "description": f"{proposal.description}; {silk_description}", "rationale": f"{proposal.rationale}; {SILK_RATIONALE}",
+            })
         return self._result(proposals=[proposal], notes=notes)
 
-    def _unrouted(self, board: PCBDesign, notes: list[str], reasons: list[str], *, placed: bool, description: str, basis: str = GRID_RATIONALE) -> AgentResult:
-        """The placement alone (or nothing when the board was already placed) plus why there is no copper."""
-        if not placed:
-            return self._result(notes=[*notes, *reasons])
-        proposal = IRProposal(description=description, target="pcb", operation="set", payload=board, rationale=f"{basis}; DRC decides validity")
-        return self._result(proposals=[proposal], notes=[*notes, f"{description}; {UNROUTED_NOTE}", *reasons])
+    def _silkscreen(self, ir: CircuitIR, ctx: AgentContext, board: PCBDesign) -> tuple[list[str], list | None, str]:
+        """``(notes, texts or None, description)`` of the silkscreen for ``board``; ``None`` = propose none (the notes say why)."""
+        notes: list[str] = []
+        answer = ctx.answers.get(SILKSCREEN_KEY)
+        if answer is not None:
+            if answer.strip().lower() == SKIP_ANSWER:
+                return (["silkscreen skipped by answer"] if board.placements else []), None, ""
+            notes.append(f"{SILKSCREEN_KEY}={answer!r} not understood (the only answer is '{SKIP_ANSWER}'); placing the silkscreen as usual")
+        if not board.placements:
+            return notes, None, ""
+        if board.silkscreen:
+            return [*notes, f"silkscreen not placed: ir.pcb already has {len(board.silkscreen)} silkscreen text(s); the agent never replaces silkscreen"], None, ""
+        library = ctx.tools.get("kicad_library")
+        if not isinstance(library, KicadLibrary):
+            return [*notes, "silkscreen not placed: no KiCad library in ctx.tools['kicad_library']; pad and silk geometry cannot be read"], None, ""
+        try:
+            placed = place_silkscreen(ir.model_copy(update={"pcb": board}), library, self.silk)
+        except (CompileError, LibraryLookupError) as e:  # LibraryFormatError is a CompileError
+            return [*notes, f"silkscreen not placed: {e}"], None, ""
+        description = placed.description()
+        return [*notes, description, *placed.notes], list(placed.texts), description
 
     @staticmethod
     def _rules_note(p: RoutingParams, raised: dict | None = None) -> str:
@@ -301,4 +363,7 @@ class PCBAgent(Agent):
         return None
 
 
-__all__ = ["GRID_RATIONALE", "PARTIAL_ANSWER", "PCBAgent", "PLACEMENT_KEY", "RING_RATIONALE", "ROUTING_KEY", "SKIP_ANSWER", "UNROUTED_NOTE"]
+__all__ = [
+    "GRID_RATIONALE", "PARTIAL_ANSWER", "PCBAgent", "PLACEMENT_KEY", "RING_RATIONALE", "ROUTING_KEY", "SILKSCREEN_KEY", "SILK_RATIONALE", "SKIP_ANSWER",
+    "UNROUTED_NOTE",
+]

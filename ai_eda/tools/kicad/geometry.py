@@ -50,6 +50,7 @@ __all__ = [
     "stored_offset",
     "to_board",
     "pad_center",
+    "pad_copper_center",
     "pad_angle",
     "text_angle",
     "mirrored_layer",
@@ -108,8 +109,18 @@ def to_board(placement: Placement, px: float, py: float) -> tuple[float, float]:
 
 
 def pad_center(placement: Placement, pad: Pad) -> tuple[float, float]:
-    """Absolute centre of ``pad`` (library frame, y down) once its footprint is placed."""
+    """Absolute position of ``pad`` - its ``(at)``, where the hole is - (library frame, y down) once its footprint is placed."""
     return to_board(placement, pad.x, pad.y)
+
+
+def pad_copper_center(placement: Placement, pad: Pad) -> tuple[float, float]:
+    """Absolute centre of ``pad``'s copper shape: its ``(at)`` plus the ``(drill (offset x y))`` rotated by the library pad angle
+    (KiCad's ``PAD::ShapePos``; mirrored with the footprint on the bottom side, as ``PAD::Flip`` mirrors the offset). The same
+    point as :func:`pad_center` for a pad without an offset."""
+    if not pad.offset_x and not pad.offset_y:
+        return pad_center(placement, pad)
+    ox, oy = rotate(pad.offset_x, pad.offset_y, pad.rotation)
+    return to_board(placement, pad.x + ox, pad.y + oy)
 
 
 def pad_angle(placement: Placement, pad: Pad) -> float:
@@ -174,10 +185,11 @@ def courtyard_bbox(placement: Placement, fp: FootprintDef) -> BBox | None:
 
 
 def pads_bbox(placement: Placement, fp: FootprintDef) -> BBox | None:
-    """Board-frame box around all pad copper (exact for pads at multiples of 90 degrees, else conservative)."""
+    """Board-frame box around all pad copper (exact for pads at multiples of 90 degrees, else conservative); a pad's copper sits at
+    :func:`pad_copper_center` (its drill offset applied)."""
     points: list[tuple[float, float]] = []
     for pad in fp.pads:
-        cx, cy = pad_center(placement, pad)
+        cx, cy = pad_copper_center(placement, pad)
         angle = pad_angle(placement, pad)
         if math.isclose(angle % 90.0, 0.0, abs_tol=1e-9):
             w, h = (pad.size_w, pad.size_h) if math.isclose(angle % 180.0, 0.0, abs_tol=1e-9) else (pad.size_h, pad.size_w)

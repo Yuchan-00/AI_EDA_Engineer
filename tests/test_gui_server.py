@@ -329,7 +329,7 @@ class _PageScan(HTMLParser):
         return [attrs for t, attrs in self.tags if t == tag]
 
 
-PAGE_TABS = [("overview", "개요"), ("schematic", "회로도"), ("board", "기판"), ("simulation", "시뮬레이션"),
+PAGE_TABS = [("overview", "개요"), ("schematic", "회로도"), ("board", "기판"), ("model3d", "3D"), ("simulation", "시뮬레이션"),
              ("validation", "검증"), ("parts", "부품"), ("reports", "보고서"), ("files", "파일")]
 
 
@@ -369,7 +369,7 @@ def test_the_page_is_the_korean_app_and_needs_nothing_its_csp_forbids(shared):
                     "setAttribute('style'", ".style.", "cssText", "http://", "https://", "import("):
         assert pattern not in APP_JS, pattern
     assert "@import" not in APP_CSS and "url(" not in APP_CSS
-    # the eight tabs, in order, each controlling its panel
+    # the nine tabs, in order, each controlling its panel
     tabs = [a for a in scan.all("button") if a.get("role") == "tab"]
     assert [(a["data-tab"], a["aria-controls"]) for a in tabs] == [(key, f"panel-{key}") for key, _ in PAGE_TABS]
     for key, label in PAGE_TABS:
@@ -451,12 +451,12 @@ def test_the_page_script_parses(tmp_path: Path):
     assert result.returncode == 0, result.stderr
 
 
-def _dump_dom(browser: Path, url: str, profile: Path) -> tuple[str, str]:
+def _dump_dom(browser: Path, url: str, profile: Path, extra: tuple[str, ...] = ()) -> tuple[str, str]:
     """The DOM a headless browser holds after the page settled, and its log (console lines included); no host but 127.0.0.1 resolves."""
     result = subprocess.run(
         [str(browser), "--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--disable-extensions",
          "--disable-background-networking", "--no-proxy-server", "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
-         f"--user-data-dir={profile}", "--enable-logging=stderr", "--v=0", "--virtual-time-budget=15000", "--dump-dom", url],
+         f"--user-data-dir={profile}", "--enable-logging=stderr", "--v=0", "--virtual-time-budget=15000", *extra, "--dump-dom", url],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
     )
     assert result.returncode == 0, result.stderr[-2000:]
@@ -513,6 +513,11 @@ def test_every_tab_and_the_design_confirmation_form_render_in_a_real_browser(sha
         dom, log = _dump_dom(browser, base + f"#project=divider&tab={tab}", tmp_path / f"t{i}")
         assert "그릴 수 없음" not in dom and "Uncaught" not in log and "Refused to" not in log, tab
         assert f'id="panel-{tab}" class="panel" role="tabpanel" aria-labelledby="tab-{tab}">' in dom, tab
+        if tab == "board":  # the board carries designed silk: its references are silk, the empty 라벨 group gets a disabled toggle
+            labels = re.search(r'<span class="check"[^>]*><input[^>]*id="layer-labels"[^>]*>', dom)
+            assert labels and "disabled" in labels.group(0) and "참조 지정자는 실크 층에 있습니다" in labels.group(0), labels
+            silk = re.search(r'<input[^>]*id="layer-silk"[^>]*>', dom)
+            assert silk and "disabled" not in silk.group(0)
     # a project blocked on confirm_design (the divider example's inputs given as answers, as the page tells the user to)
     lib = template_library(tmp_path / "kicad")
     monkeypatch.setenv("KICAD10_SYMBOL_DIR", str(lib.roots[0] / "symbols"))
@@ -709,13 +714,277 @@ def test_board_preview_carries_the_layer_classes(shared):
     assert status == 200 and headers["content-type"] == "image/svg+xml; charset=utf-8"
     root = parse_svg(body)
     groups = {cls for g in root.iter(f"{SVG_NS}g") for cls in (g.get("class") or "").split()}
-    assert {"layer-F_Cu", "layer-B_Cu", "pads", "vias", "labels"} <= groups
+    # the silk group (both silk layers inside, always drawn) is what the page's 실크 checkbox toggles
+    assert {"layer-F_Cu", "layer-B_Cu", "pads", "vias", "silk", "layer-F_SilkS", "layer-B_SilkS", "labels"} <= groups
     assert len(classed(root, "rect", "outline")) == 1
     for layer in ("F.Cu", "B.Cu"):
         group = next(g for g in root.iter(f"{SVG_NS}g") if g.get("class") == f"layer-{layer.replace('.', '_')}")
         assert group.get("data-layer") == layer
         assert [t.get("data-layer") for t in classed(group, "line", "track")] == [layer] * sum(1 for t in ir.pcb.tracks if t.layer == layer)
     assert len(classed(root, "line", "track")) == len(ir.pcb.tracks) and len(classed(root, "g", "via")) == len(ir.pcb.vias)
+    # designed silk carries the references: the labels group is empty, and the page disables its 라벨 toggle when it is
+    labels = next(g for g in root.iter(f"{SVG_NS}g") if g.get("class") == "labels")
+    assert ir.pcb.silkscreen and len(labels) == 0
+    from ai_eda.gui.page import APP_JS
+
+    board_js = APP_JS.split("async function renderBoard()", 1)[1].split("\n}\n", 1)[0]
+    assert "svg.querySelector('g.labels')" in board_js and "$('layer-labels').disabled = noLabels;" in board_js
+
+
+# --------------------------------------------------------------------------- the 3D tab
+
+
+def parse_glb(body: bytes) -> tuple[dict, bytes]:
+    """``(json, bin)`` of a glTF 2.0 binary, checking the container: magic, version 2, the total length, chunk types and bounds."""
+    import struct
+
+    magic, version, total = struct.unpack_from("<III", body, 0)
+    assert (magic, version, total) == (0x46546C67, 2, len(body))
+    json_len, json_type = struct.unpack_from("<II", body, 12)
+    assert json_type == 0x4E4F534A and 20 + json_len <= total
+    doc = json.loads(body[20 : 20 + json_len])
+    bin_len, bin_type = struct.unpack_from("<II", body, 20 + json_len)
+    assert bin_type == 0x004E4942 and 28 + json_len + bin_len == total
+    return doc, body[28 + json_len :]
+
+
+def test_the_3d_routes_serve_the_preview_glb_its_svg_views_and_its_summary(shared):
+    """``/preview/<name>/board.glb`` is the glTF binary of the current IR's scene (``model/gltf-binary``, the data CSP, no-store):
+    byte for byte the registered ``MODEL_3D`` artifact the PCB stage compiled (same IR, same libraries), deterministic, one node per
+    material naming its group. The SVG fallback has every view of ``VIEWS`` (polygons classed ``g-<group>``, no in-figure caption),
+    an unknown view is the Korean 404, and ``model3d.json`` copies the scene: its caption, the body rule, one row per part box."""
+    from ai_eda.gui.preview import NO_MODEL3D_VIEW
+    from ai_eda.ir import ArtifactKind
+    from ai_eda.tools.model3d import BODY_CAPTION, VIEWS, build_scene, scene_caption, write_glb
+    from ai_eda.tools.model3d.scene import GROUP_LABELS
+
+    running, ir, lib, ir_path = shared
+    port = running.port
+    status, headers, body = get(port, "/preview/divider/board.glb")
+    assert status == 200 and headers["content-type"] == "model/gltf-binary"
+    assert headers["content-security-policy"] == DATA_CSP and headers["cache-control"] == "no-store" and headers["x-content-type-options"] == "nosniff"
+    doc, blob = parse_glb(body)
+    assert doc["asset"]["version"] == "2.0" and doc["scenes"][0]["extras"]["project"] == ir.project.id
+    groups = [n["extras"]["group"] for n in doc["nodes"]]
+    assert groups and set(groups) <= set(GROUP_LABELS) and all(n["extras"]["label"] == GROUP_LABELS[n["extras"]["group"]] for n in doc["nodes"])
+    assert all("matrix" not in n and "translation" not in n and "children" not in n for n in doc["nodes"]), "what the page's viewer reads"
+    assert len(blob) == doc["buffers"][0]["byteLength"] + (-doc["buffers"][0]["byteLength"] % 4)
+    assert get(port, "/preview/divider/board.glb")[2] == body, "deterministic"
+    assert body == write_glb(build_scene(ir, lib)), "the scene of the current IR and the libraries"
+    art = ir.artifacts[ArtifactKind.MODEL_3D]
+    assert not art.is_stale(ir.content_hash()) and Path(art.path).read_bytes() == body, "the preview GLB the PCB stage registered"
+    for view in VIEWS:
+        status, headers, svg = get(port, f"/preview/divider/board3d/{view}.svg")
+        assert status == 200 and headers["content-type"] == "image/svg+xml; charset=utf-8", view
+        root = parse_svg(svg)
+        assert root.find(f"{SVG_NS}g").get("data-view") == view and classed(root, "polygon", "g-board"), view
+        assert not classed(root, "text", "caption"), "the page shows the caption beside the figure"
+    status, _h, svg = get(port, "/preview/divider/board3d/nope.svg")
+    assert status == 404 and one_line(svg) == NO_MODEL3D_VIEW
+    assert get(port, "/preview/divider/board3d/iso.png")[0] == 404
+    summary = get_json(port, "/preview/divider/model3d.json")
+    scene = build_scene(ir, lib)
+    assert summary["body_caption"] == BODY_CAPTION and summary["caption"] == scene_caption(scene) and summary["views"] == list(VIEWS)
+    assert [b["ref"] for b in summary["bodies"]] == [b.ref for b in scene.bodies] and sorted(b["ref"] for b in summary["bodies"]) == sorted(c.ref for c in ir.components)
+    assert summary["with_step"] + summary["without_step"] == len(summary["bodies"]) and summary["thickness_mm"] == scene.thickness_mm
+    # the project JSON: the tab has a board to draw, and the compiled preview's own facts (fresh, on disk) sit beside it
+    previews = get_json(port, "/api/projects/divider")["previews"]
+    assert previews["model3d"] is True and previews["model3d_file"] == Path(art.path).name
+    assert previews["model3d_state"]["freshness"] == "fresh" and previews["model3d_state"]["disk_matches"] is True
+    assert previews["kicad_3d"] == [], "no kicad-cli here: KiCad's own 3D exports were never written"
+
+
+def test_without_a_board_the_3d_routes_say_what_is_missing(tmp_path: Path):
+    from ai_eda.gui.preview import NO_MODEL3D
+
+    running = Running(tmp_path / "root")
+    try:
+        assert post(running.port, "/api/projects", {"name": "empty"})[0] == 201
+        for path in ("/preview/empty/board.glb", "/preview/empty/model3d.json", "/preview/empty/board3d/iso.svg"):
+            status, _h, body = get(running.port, path)
+            assert status == 404 and one_line(body) == NO_MODEL3D, path
+        status, _h, body = get(running.port, "/preview/empty/kicad3d/empty-top.png")
+        assert status == 404 and "KiCad 렌더 없음" in one_line(body)
+        previews = get_json(running.port, "/api/projects/empty")["previews"]
+        assert (previews["model3d"], previews["model3d_file"], previews["model3d_state"], previews["kicad_3d"]) == (False, None, None, [])
+    finally:
+        running.stop()
+
+
+def test_kicad_3d_exports_are_listed_with_their_facts_and_only_registered_renders_are_served(fresh):
+    """KiCad's STEP / GLB / render files (registered by a kicad-cli run: faked here, there is no kicad-cli) are listed under the one
+    label, each with its artifact facts and download paths; a render PNG is served as an image only when it is a member of the
+    registered ``KICAD_RENDER`` artifact inside the workdir - a stray PNG, another kind's file or a path is a 404."""
+    from ai_eda.gui.preview import KICAD_3D_LABEL, NO_KICAD_RENDER
+    from ai_eda.ir import ArtifactKind, ArtifactRef, hash_file_set
+
+    running, ir, _lib, ir_path = fresh
+    port = running.port
+    workdir = ir_path.parent
+    out = workdir / "3d"
+    out.mkdir()
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    files = {
+        "divider.step": b"ISO-10303-21;\nHEADER;\n",
+        "divider.glb": b"glTF\x02\x00\x00\x00" + b"\x00" * 8,
+        "divider-top.png": png + b"top",
+        "divider-bottom.png": png + b"bottom",
+        "stray.png": png + b"stray",
+    }
+    for name, data in files.items():
+        (out / name).write_bytes(data)
+    design = ir.content_hash()
+
+    def single(kind: ArtifactKind, name: str) -> ArtifactRef:
+        path = out / name
+        return ArtifactRef(kind=kind, path=str(path), content_hash="sha256:" + __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+                           generated_from_ir_hash=design, generator="export.test", generator_version="kicad-cli test")
+
+    renders = [out / "divider-top.png", out / "divider-bottom.png"]
+    ir.artifacts[ArtifactKind.KICAD_STEP] = single(ArtifactKind.KICAD_STEP, "divider.step")
+    ir.artifacts[ArtifactKind.KICAD_GLB] = single(ArtifactKind.KICAD_GLB, "divider.glb")
+    ir.artifacts[ArtifactKind.KICAD_RENDER] = ArtifactRef(
+        kind=ArtifactKind.KICAD_RENDER, path=str(renders[0]), files=[str(p) for p in renders], content_hash=hash_file_set(renders),
+        generated_from_ir_hash=design, generator="export.kicad_render", generator_version="kicad-cli test",
+    )
+    ir.save(ir_path)
+    listed = get_json(port, "/api/projects/divider")["previews"]["kicad_3d"]
+    assert [e["kind"] for e in listed] == ["kicad_step", "kicad_glb", "kicad_render"] and {e["label"] for e in listed} == {KICAD_3D_LABEL}
+    assert [f["download"] for e in listed for f in e["files"]] == ["3d/divider.step", "3d/divider.glb", "3d/divider-top.png", "3d/divider-bottom.png"]
+    assert [f["image"] for e in listed for f in e["files"]] == [False, False, True, True]
+    assert all(e["state"]["freshness"] == "fresh" and e["state"]["disk_matches"] for e in listed)
+    for name in ("divider-top.png", "divider-bottom.png"):
+        status, headers, body = get(port, f"/preview/divider/kicad3d/{name}")
+        assert status == 200 and headers["content-type"] == "image/png" and body == files[name]
+    for name in ("stray.png", "divider.step", "..%2Fir.json", "divider-top.PNG.txt"):
+        status, _h, body = get(port, f"/preview/divider/kicad3d/{name}")
+        assert status == 404, name
+        if name != "..%2Fir.json":
+            assert one_line(body) == NO_KICAD_RENDER, name
+    # a render changed on disk is labelled, never passed off as the registered one
+    (out / "divider-top.png").write_bytes(png + b"edited")
+    render = get_json(port, "/api/projects/divider")["previews"]["kicad_3d"][2]
+    assert render["state"]["disk_matches"] is False
+
+
+def test_the_3d_tab_is_a_webgl_viewer_in_app_js_under_the_unchanged_csp(shared):
+    """The tab and its controls (맞춤 / 위 / 아래 / 등각, 보드 / 구리 / 실크 / 부품), the caption naming what a part box is, KiCad's own
+    3D models under their label, and the 기판 tab's 실크 toggle; the viewer is code in app.js that loads only same-origin preview
+    routes (the CSP is the one the page always had: nothing inline, no eval, no other origin), reads the GLB container the writer
+    writes and toggles exactly the writer's groups."""
+    from ai_eda.gui.page import APP_CSS, APP_HTML, APP_JS
+    from ai_eda.gui.preview import KICAD_3D_LABEL
+    from ai_eda.tools.model3d import BODY_CAPTION, VIEWS
+    from ai_eda.tools.model3d.glb import CHUNK_BIN, CHUNK_JSON, GLB_MAGIC
+    from ai_eda.tools.model3d.scene import GROUP_LABELS
+
+    running, *_ = shared
+    assert APP_CSP == "default-src 'self'; img-src 'self' data:; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'"
+    assert get(running.port, "/")[1]["content-security-policy"] == APP_CSP
+    scan = _PageScan()
+    scan.feed(APP_HTML)
+    buttons = {a.get("id"): a for a in scan.all("button")}
+    for key, label in (("fit", "맞춤"), ("top", "위"), ("bottom", "아래"), ("iso", "등각")):
+        assert f"m3d-{key}" in buttons and f'id="m3d-{key}" disabled>{label}</button>' in APP_HTML, key
+    toggles = [a for a in scan.all("input") if "data-group" in a]
+    assert [a["data-group"] for a in toggles] == list(GROUP_LABELS) and all("checked" in a for a in toggles)
+    for group, label in GROUP_LABELS.items():
+        assert f'<label for="m3d-layer-{group}">{label}</label>' in APP_HTML, group
+        assert f".m3d-view.hide-g-{group} .g-{group}" in APP_CSS, group
+    assert BODY_CAPTION in APP_HTML and KICAD_3D_LABEL in APP_HTML
+    # the drag / wheel / key sentence is its own span: the SVG fallback (no pointer, wheel or key handler) replaces it, WebGL restores it
+    gl_hint = re.search(r"const M3D_GL_HINT = '([^']*)';", APP_JS).group(1)
+    svg_hint = re.search(r"const M3D_SVG_HINT = '([^']*)';", APP_JS).group(1)
+    assert f'<span id="m3d-controls-hint">{gl_hint}</span>' in APP_HTML and "끌어서" not in svg_hint and "WebGL 없이 회전·확대 없음" in svg_hint
+    fallback = APP_JS.split("async function m3dShowSvg(", 1)[1].split("\n}\n", 1)[0]
+    viewer = APP_JS.split("async function renderModel3d()", 1)[1].split("\n}\n", 1)[0]
+    assert "$('m3d-controls-hint').textContent = M3D_SVG_HINT;" in fallback and "addEventListener" not in fallback
+    assert viewer.index("m3dAttach(v);") < viewer.index("$('m3d-controls-hint').textContent = M3D_GL_HINT;")
+    assert '<input type="checkbox" id="layer-silk" data-layer-class="silk" checked><label for="layer-silk">실크</label>' in APP_HTML
+    assert ".board-view.hide-silk .silk" in APP_CSS
+    # the viewer: WebGL (2, else 1) on a canvas, the preview routes of this origin only, the GLB constants the writer uses
+    assert "getContext('webgl2', opts) || canvas.getContext('webgl', opts)" in APP_JS
+    for route in ("previewUrl('board.glb')", "previewUrl('model3d.json')", "previewUrl('board3d/' + enc(view) + '.svg')", "previewUrl('kicad3d/' + enc(f.name))"):
+        assert route in APP_JS, route
+    assert re.findall(r"\bfetch\((\w+), ", APP_JS) == ["url", "url"] and APP_JS.count("credentials: 'same-origin'") == 2, "two fetch helpers, both same-origin"
+    assert f"GLB_MAGIC = 0x{GLB_MAGIC:08X}, GLB_JSON = 0x{CHUNK_JSON:08X}, GLB_BIN = 0x{CHUNK_BIN:08X}" in APP_JS
+    groups = json.loads(re.search(r"const M3D_GROUPS = (\[[^\]]*\]);", APP_JS).group(1).replace("'", '"'))
+    assert groups == list(GROUP_LABELS)
+    views = re.search(r"const M3D_VIEWS = \{([^}]*)\};", APP_JS).group(1)
+    assert set(re.findall(r"(\w+): \[", views)) <= set(VIEWS)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_the_page_reads_the_served_glb_as_the_writer_wrote_it(shared, tmp_path: Path):
+    """The viewer's own GLB reader (``parseGlb`` / ``glbMeshes`` of app.js, run in node on the served bytes) finds one mesh per node,
+    each with the vertex / index counts the accessors declare, every index inside its mesh, and the group each node names; its camera
+    basis is a proper rotation for every preset view (r x u = d), so the WebGL frame keeps the writer's counter-clockwise faces."""
+    from ai_eda.gui.page import APP_JS
+
+    running, *_ = shared
+    body = get(running.port, "/preview/divider/board.glb")[2]
+    doc, _bin = parse_glb(body)
+    (tmp_path / "board.glb").write_bytes(body)
+    script = tmp_path / "read_glb.js"
+    script.write_text(
+        "const fs = require('fs'); const vm = require('vm');\n"
+        "globalThis.document = {addEventListener() {}}; globalThis.window = {};\n"
+        f"vm.runInThisContext({json.dumps(APP_JS)} + '\\n;globalThis.__m3d = {{parseGlb, glbMeshes, m3dBasis, M3D_VIEWS}};');\n"
+        "const {parseGlb, glbMeshes, m3dBasis, M3D_VIEWS} = globalThis.__m3d;\n"
+        f"const raw = fs.readFileSync({json.dumps(str(tmp_path / 'board.glb'))});\n"
+        "const buf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);\n"
+        "const meshes = glbMeshes(parseGlb(buf));\n"
+        "const out = meshes.map((m) => ({name: m.name, group: m.group, blend: m.blend, vertices: m.pos.length / 3, normals: m.nor.length / 3,\n"
+        "  indices: m.idx.length, maxIndex: m.idx.reduce((a, b) => Math.max(a, b), 0), wide: m.idx instanceof Uint32Array}));\n"
+        "const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];\n"
+        "const frames = Object.entries(M3D_VIEWS).map(([k, [yaw, pitch]]) => { const b = m3dBasis({yaw, pitch}); const c = cross(b.r, b.u);\n"
+        "  return [k, Math.max(...c.map((x, i) => Math.abs(x - b.d[i])))]; });\n"
+        "console.log(JSON.stringify({out, frames}));\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(["node", str(script)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    acc = doc["accessors"]
+    expected = []
+    for node in doc["nodes"]:
+        prim = doc["meshes"][node["mesh"]]["primitives"][0]
+        mat = doc["materials"][prim["material"]]
+        expected.append({
+            "name": node["name"], "group": node["extras"]["group"], "blend": mat.get("alphaMode") == "BLEND",
+            "vertices": acc[prim["attributes"]["POSITION"]]["count"], "normals": acc[prim["attributes"]["NORMAL"]]["count"],
+            "indices": acc[prim["indices"]]["count"], "wide": acc[prim["indices"]]["componentType"] == 5125,
+        })
+    assert [{k: v for k, v in m.items() if k != "maxIndex"} for m in data["out"]] == expected
+    assert all(m["maxIndex"] < m["vertices"] for m in data["out"])
+    assert [k for k, _ in data["frames"]] == ["iso", "top", "bottom"] and all(err < 1e-12 for _, err in data["frames"])
+
+
+@pytest.mark.browser
+def test_the_3d_tab_draws_with_webgl_or_falls_back_to_the_svg_in_a_real_browser(shared, tmp_path: Path):
+    """With a software WebGL (SwiftShader) the tab draws board.glb on a canvas; with WebGL off it shows the server's isometric SVG of
+    the same scene under a notice. Either way the CSP refuses nothing and no script error is logged."""
+    from ai_eda.report.pdf import find_browser
+
+    browser = find_browser()
+    if browser is None:
+        pytest.skip("no headless Chromium / Chrome / Edge found")
+    running, *_ = shared
+    url = f"http://127.0.0.1:{running.port}/#project=divider&tab=model3d"
+    dom, log = _dump_dom(browser, url, tmp_path / "gl", ("--use-angle=swiftshader", "--enable-unsafe-swiftshader"))
+    assert "Refused to" not in log and "Uncaught" not in log and "그릴 수 없음" not in dom
+    status = dom.split('id="m3d-status"', 1)[1].split("</p>", 1)[0]
+    if "WebGL 보기: 메시" in status:  # SwiftShader gave a context: the canvas is the view
+        assert 'class="m3d-canvas"' in dom.split('id="m3d-view"', 1)[1].split('id="m3d-summary"', 1)[0]
+    else:  # this browser build has no software WebGL: the fallback must be complete
+        assert "SVG 보기" in status
+    dom, log = _dump_dom(browser, url, tmp_path / "nogl", ("--disable-webgl", "--disable-3d-apis"))
+    assert "Refused to" not in log and "Uncaught" not in log and "그릴 수 없음" not in dom
+    view = dom.split('id="m3d-view"', 1)[1].split('id="m3d-summary"', 1)[0]
+    assert "SVG 보기: iso" in dom and "WebGL 없이 그림" in view and "g-board" in view and "<canvas" not in view
+    hint = dom.split('id="m3d-controls-hint"', 1)[1].split("</span>", 1)[0]
+    assert "WebGL 없이 회전·확대 없음" in hint and "끌어서" not in hint  # no drag / wheel / key instruction where nothing answers them
+    assert "부품 상자 " in dom.split('id="m3d-summary"', 1)[1] and "KiCad 3D 모델 없음" in dom
 
 
 def test_waveform_previews_draw_every_recorded_analysis(shared):
@@ -954,7 +1223,9 @@ def test_empty_state_sentences_name_the_missing_file_and_real_stages():
     from ai_eda.gui.page import APP_HTML, APP_JS
 
     names = {s.name for s in Stage}
-    for sentence in (NO_SCHEMATIC, NO_BOARD, NO_RESULTS, NO_BOM, NO_CPL):
+    from ai_eda.gui.preview import NO_MODEL3D
+
+    for sentence in (NO_SCHEMATIC, NO_BOARD, NO_RESULTS, NO_BOM, NO_CPL, NO_MODEL3D):
         assert "아직 실행되지 않았습니다" not in sentence, sentence
         stages = re.findall(r"\b([A-Z][A-Z_]+) 단계", sentence)
         assert stages and set(stages) <= names, sentence

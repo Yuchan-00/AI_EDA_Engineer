@@ -87,6 +87,14 @@ class ArtifactKind(StrEnum):
     ERC_REPORT = "erc_report"
     DRC_REPORT = "drc_report"
     REVIEW_REPORT = "review_report"
+    #: the built-in 3D preview ``<project>.preview.glb`` compiled from the IR + the KiCad libraries (``ai_eda.tools.model3d``;
+    #: byte-deterministic; a picture, no status is claimed)
+    MODEL_3D = "model_3d"
+    #: KiCad's own 3D outputs of the compiled board (``kicad-cli pcb export step`` / ``export glb`` / ``render``; flags not
+    #: measured on 10.0.6); like the gerbers they carry KiCad's timestamps: the hash says which file, not reproducibility
+    KICAD_STEP = "kicad_step"
+    KICAD_GLB = "kicad_glb"
+    KICAD_RENDER = "kicad_render"
 
 
 def hash_file_set(paths: Iterable[Path]) -> str:

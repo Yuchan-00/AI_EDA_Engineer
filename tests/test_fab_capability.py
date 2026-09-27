@@ -93,6 +93,8 @@ CAPABILITY_HTML = """<!DOCTYPE html><html><head><title>Example Fab PCB capabilit
 <tr><td>Layers</td><td>1, 2, 4, 6</td></tr>
 <tr><td>Copper weight</td><td>1 oz</td></tr>
 <tr><td>Board thickness</td><td>1.6 mm</td></tr>
+<tr><td>Min silkscreen text height</td><td>0.8 mm</td></tr>
+<tr><td>Min silkscreen line width</td><td>0.1mm</td></tr>
 <tr><td>Fine line trace</td><td>0.127mm(5mil)</td></tr>
 <tr><td>Drill range</td><td>0.15mm/0.25mm</td></tr>
 <tr><td>Test voltage</td><td>500 V</td></tr>
@@ -220,7 +222,7 @@ def test_ground_capability_html_online(tmp_path: Path, fake: FakeSources):
     session = _session(tmp_path, ir, fake, online=True, file=DATA)
     try:
         assert session.policy.user_urls[FAB_CAPABILITY_KEY] == URL and "fab.example.com" not in session.policy.trusted_hosts  # exact URL, never the host
-        assert "fab_capability_file" in session.tools() and "fab capability: fab_capability.json (Example Fab, 8 limit(s)" in session.summary()
+        assert "fab_capability_file" in session.tools() and "fab capability: fab_capability.json (Example Fab, 10 limit(s)" in session.summary()
         assert session.describe()["fab_capability"]["fab"] == "Example Fab"
         res = _run_agent(ir, session)
     finally:
@@ -399,7 +401,7 @@ def test_no_board_means_no_proposal(tmp_path: Path, fake: FakeSources):
     finally:
         session.close()
     src = res.validation[0]
-    assert src.status is S.NOT_VERIFIED and "not recorded: nothing to lay out" in src.message and len(src.details["accepted"]) == 8 and src.details["rejected"] == []
+    assert src.status is S.NOT_VERIFIED and "not recorded: nothing to lay out" in src.message and len(src.details["accepted"]) == 10 and src.details["rejected"] == []
     assert res.proposals == [] and any("not recorded" in n for n in res.notes) and ir.pcb is None
 
 
@@ -518,7 +520,7 @@ def test_reverification_re_reads_the_number_and_reports_an_edited_value(tmp_path
     assert "0.09 um" in checks["min_clearance_mm"].reason and "0.09 mm" in checks["min_clearance_mm"].reason
     # the agent (no file): NOT_VERIFIED naming the mismatch, not a PASS 're-verified'
     src = FabCapabilityAgent().run(edited, AgentContext(workdir=tmp_path, tools={"archive": archive})).validation[0]
-    assert src.check_id == "mfg.capability_source" and src.status is S.NOT_VERIFIED and "4 not: copper_weight_oz: value_mismatch" in src.message and src.message.startswith("4 authoritative")
+    assert src.check_id == "mfg.capability_source" and src.status is S.NOT_VERIFIED and "4 not: copper_weight_oz: value_mismatch" in src.message and src.message.startswith("6 authoritative")
     assert {c["key"]: c["status"] for c in src.details["reverified"]}["min_track_width_mm"] == "value_mismatch"
     # the stored mfg.capability reads the IR's provenance (a grounded PASS against the edited number); the reviewer's re-verification is the gate: FAIL, a human looks
     edited.validation.extend(ManufacturingAgent().run(edited, AgentContext(workdir=tmp_path, tools={})).validation)
@@ -803,7 +805,7 @@ def test_reviewer_reverifies_sources_and_fails_on_disagreement(tmp_path: Path):
     # the stage's own verdict, agreeing with the live one: passed through with every limit's page re-hashed and quote re-located
     ir.validation.extend(ManufacturingAgent().run(ir, AgentContext(workdir=tmp_path, tools=tools)).validation)
     r = review()
-    assert r.status is S.NOT_VERIFIED and "kicad.drc has not been run" in r.message and "8 limit source(s) re-verified" in r.message
+    assert r.status is S.NOT_VERIFIED and "kicad.drc has not been run" in r.message and "10 limit source(s) re-verified" in r.message
     assert all(c["status"] == "ok" for c in r.details["sources"]) and r.evidence[0].content_hash == doc.sha256 and r.tool == "independent_reviewer"
     # a stored PASS that the live check does not reproduce: FAIL, a human looks
     ir.validation.add(ValidationResult(check_id="mfg.capability", status=S.PASS, tool="mfg.capability_check", ir_hash=ir.content_hash()))
@@ -907,7 +909,7 @@ def test_full_offline_pipeline_records_limits_and_ends_not_verified_for_lack_of_
     assert state.outcome(Stage.RELEASE).status is S.NOT_VERIFIED and "mfg.capability" in state.outcome(Stage.RELEASE).message
     # the reviewer agrees, re-verifying the sources from the workdir's archive alone (ai-eda review has no session flags)
     review = {r.check_id: r for r in IndependentReviewer().review(ir, tmp_path).results}
-    assert review[ReviewArea.MANUFACTURING_CAPABILITIES].status is S.NOT_VERIFIED and "8 limit source(s) re-verified" in review[ReviewArea.MANUFACTURING_CAPABILITIES].message
+    assert review[ReviewArea.MANUFACTURING_CAPABILITIES].status is S.NOT_VERIFIED and "10 limit source(s) re-verified" in review[ReviewArea.MANUFACTURING_CAPABILITIES].message
     # a second run without the file re-verifies the limits (fresh evidence), proposes nothing, moves no hash
     ctx2 = AgentContext(workdir=tmp_path, tools={"kicad_library": lib}, answers=ANSWERS)
     state2 = Orchestrator(ctx2).run(ir)
@@ -940,7 +942,7 @@ def test_cli_run_takes_the_fab_capability_flag(tmp_path: Path):
     p = _write_file(tmp_path, source={"file": "saved.html", "retrieved_at": "2026-09-20"})
     code, out, err = cli("run", str(tmp_path / "ir.json"), "--fab-capability", str(p), "--answer", "application=x", "--answer", "jurisdiction=EU")
     assert code == 0, err
-    assert "fab capability: cap.json (Example Fab, 8 limit(s), saved.html)" in out and "fab_capability" in out
+    assert "fab capability: cap.json (Example Fab, 10 limit(s), saved.html)" in out and "fab_capability" in out
     saved = CircuitIR.load(tmp_path / "ir.json")
     assert saved.pcb.manufacturing.min_track_width_mm.value == 0.09 and saved.validation.latest("mfg.capability_source").status is S.PASS
     assert saved.validation.latest("mfg.capability").status is S.NOT_VERIFIED

@@ -67,6 +67,25 @@ What the file contains (verified with kicad-cli 10.0.6 ``pcb drc
   order (KiCad re-sorts them by layer/type/geometry on save; no semantic
   difference).
 * Outline: one ``gr_rect`` on ``Edge.Cuts`` from ``ir.pcb.outline``.
+* Silkscreen from ``ir.pcb.silkscreen`` (:class:`~ai_eda.ir.SilkText`): a
+  ``reference`` text sets that footprint's ``Reference`` property - the
+  library template is kept, its ``(at ..)`` becomes the IR position as KiCad
+  stores it (relative to the footprint, un-rotated; the angle is the IR
+  angle), its ``(layer ..)`` the IR layer (``F.Fab`` / ``B.Fab`` for a
+  reference that did not fit on the silk), any ``(hide ..)`` is dropped and
+  its ``(effects ..)`` is written from the IR (stroke font of the IR size and
+  stroke, ``(justify left|right)``, ``mirror`` on a ``B.*`` layer); a
+  footprint without one keeps the library position. ``title`` / ``pin_label``
+  / ``user`` texts become ``gr_text`` items after the outline, in IR order,
+  uuid ``net_item_uuid(project, "silk", index)``. An IR silk text the rules
+  of :func:`~ai_eda.tools.silkscreen.geometry.silk_text_problems` refuse (a
+  layer that is neither a silk nor a fab layer of the board, a non-finite
+  number, a reference to no component, ...) is a CompileError. The
+  ``gr_text`` / property forms follow KiCad's board writer
+  (``PCB_IO_KICAD_SEXPR::format(PCB_TEXT)``); what kicad-cli 10.0.6 DRC says
+  about them (``silk_over_copper`` / ``silk_overlap`` = 0 on the demo boards)
+  is NOT measured - the gated canary in ``tests/test_silkscreen.py`` runs it
+  where kicad-cli exists.
 * Tracks / vias / zones straight from ``ir.pcb`` (zones are emitted with a
   solid pad connection because thermal reliefs on 2.54 mm headers starve).
   Zones are written *unfilled* (no ``filled_polygon``): ``KicadCli.run_drc``
@@ -85,11 +104,12 @@ from ai_eda.compilers import ids
 from ai_eda.compilers.base import CompileContext, Compiler, check_finite
 from ai_eda.compilers.pins import load_verified_symbol, pad_pin_types
 from ai_eda.errors import CompileError, NothingToCompileError
-from ai_eda.ir import ArtifactKind, ArtifactRef, BoardSide, CircuitIR, Component, Placement, Track, Via, Zone
+from ai_eda.ir import ArtifactKind, ArtifactRef, BoardSide, CircuitIR, Component, Placement, SilkKind, SilkText, Track, Via, Zone
 from ai_eda.tools.kicad import sexpr
-from ai_eda.tools.kicad.geometry import footprint_angle, mirrored_layer, normalize_angle, text_angle
+from ai_eda.tools.kicad.geometry import footprint_angle, mirrored_layer, normalize_angle, rotate, text_angle
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary
 from ai_eda.tools.kicad.sexpr import Q, S
+from ai_eda.tools.silkscreen.geometry import KICAD_TEXT_SIZE_MM, KICAD_TEXT_THICKNESS_MM, silk_text_problems
 
 __all__ = [
     "PCBCompiler",
@@ -260,7 +280,9 @@ class PCBCompiler(Compiler):
 
     def compile(self, ir: CircuitIR, ctx: CompileContext) -> ArtifactRef:
         if ir.pcb is not None:
-            check_finite(ir.pcb.model_dump(mode="json"), "ir.pcb")
+            # python mode: a model with a wrap serializer (PCBDesign drops an empty silkscreen from the design view) turns
+            # NaN / inf into None in JSON mode, which would hide exactly what this check looks for
+            check_finite(ir.pcb.model_dump(), "ir.pcb")
         node = self.build(ir, ctx)
         path = Path(ctx.workdir) / f"{ir.project.id}.kicad_pcb"
         return self._write(ir, path, sexpr.dumps(node))
@@ -278,6 +300,7 @@ class PCBCompiler(Compiler):
         library = self._library(ctx)
         net_numbers(ir)  # validates net names
         placed = self._resolve_components(ir, library)
+        references = self._silk_references(ir)
         copper = self._copper_layers(ir)
         sheetfile = f"{ir.project.id}.kicad_sch"
         node = S(
@@ -295,8 +318,11 @@ class PCBCompiler(Compiler):
         # net code on save, which depends on load order - not replicated, no semantic effect).
         footprints = [(0 if p.placement.side == BoardSide.TOP else 2, ids.footprint_uuid(ir.project.id, p.component.ref), p) for p in placed]
         for _, _, p in sorted(footprints, key=lambda t: (t[0], t[1])):
-            node.append(self._footprint(ir.project.id, p, sheetfile))
+            node.append(self._footprint(ir.project.id, p, sheetfile, references.get(p.component.ref)))
         node.append(self._outline(ir))
+        for i, text in enumerate(ir.pcb.silkscreen):
+            if text.kind != SilkKind.REFERENCE:
+                node.append(self._gr_text(ir.project.id, i, text))
         net_names = {n.name for n in ir.nets}
         copper_names = [name for _, name, _ in copper]
         for i, track in enumerate(ir.pcb.tracks):
@@ -386,6 +412,17 @@ class PCBCompiler(Compiler):
                 raise CompileError(f"net {net_name!r} references {ref}.{pin_number} but footprint {fp_id} has no pad {pin_number!r}")
             pad_nets[pin_number] = net_name
         return pad_nets
+
+    @staticmethod
+    def _silk_references(ir: CircuitIR) -> dict[str, SilkText]:
+        """``{ref: reference text}`` of ``ir.pcb.silkscreen``; any silk text the rules refuse is a CompileError."""
+        assert ir.pcb is not None
+        sides = {c.ref: (pl.side if (pl := ir.pcb.placement(c.ref)) is not None else None) for c in ir.components}
+        problems = silk_text_problems(ir.pcb.silkscreen, sides)
+        if problems:
+            i = min(problems)
+            raise CompileError(f"ir.pcb.silkscreen[{i}]: {problems[i]}")
+        return {t.component_ref: t for t in ir.pcb.silkscreen if t.kind == SilkKind.REFERENCE and t.component_ref is not None}
 
     @staticmethod
     def _copper_layers(ir: CircuitIR) -> list[tuple[int, str, str]]:
@@ -565,8 +602,46 @@ class PCBCompiler(Compiler):
 
     # --- footprint embedding ---------------------------------------------------------
 
+    @staticmethod
+    def _text_effects(text: SilkText) -> list:
+        """``(effects (font (size s s) (thickness t)) [(justify left|right [mirror])])`` of an IR silk text."""
+        justify = [text.justify] if text.justify in ("left", "right") else []
+        if text.layer.startswith("B."):
+            justify.append("mirror")
+        return S("effects", S("font", S("size", float(text.size_mm), float(text.size_mm)), S("thickness", float(text.thickness_mm))),
+                 S("justify", *justify) if justify else None)
+
     @classmethod
-    def _footprint(cls, project_id: str, p: _Placed, sheetfile: str) -> list:
+    def _gr_text(cls, project_id: str, index: int, text: SilkText) -> list:
+        return S(
+            "gr_text", Q(text.text),
+            S("at", float(text.x_mm), float(text.y_mm), normalize_angle(text.rotation_deg)),
+            S("layer", Q(text.layer)),
+            S("uuid", Q(ids.net_item_uuid(project_id, "silk", index))),
+            cls._text_effects(text),
+        )
+
+    @classmethod
+    def _reference_property(cls, project_id: str, ref: str, template: list, placement: Placement, text: SilkText) -> list:
+        """The footprint's ``Reference`` property placed by the IR text (module docstring); the library template's other children are kept."""
+        node = sexpr.deep_copy(template)
+        node[1] = Q("Reference")
+        node[2] = Q(ref)
+        # KiCad stores a footprint text relative to the footprint and un-rotated (geometry.to_board inverted); the angle is the text's own
+        sx, sy = rotate(float(text.x_mm) - float(placement.x_mm), float(text.y_mm) - float(placement.y_mm), -float(placement.rotation_deg))
+        kept = [child for child in node[3:] if sexpr.head(child) not in ("at", "layer", "hide", "effects", "uuid")]
+        node[3:] = [S("at", sx, sy, normalize_angle(text.rotation_deg))]
+        head_order = [child for child in kept if sexpr.head(child) in ("unlocked", "locked")]
+        rest = [child for child in kept if child not in head_order]
+        node.extend(head_order)
+        node.append(S("layer", Q(text.layer)))
+        node.extend(rest)
+        node.append(cls._text_effects(text))
+        cls._insert_uuid(node, ids.net_item_uuid(project_id, "fp_property", ref, "Reference"))
+        return node
+
+    @classmethod
+    def _footprint(cls, project_id: str, p: _Placed, sheetfile: str, reference: SilkText | None = None) -> list:
         comp, placement, fp = p.component, p.placement, p.footprint
         lib = fp.node
         side = placement.side
@@ -582,7 +657,7 @@ class PCBCompiler(Compiler):
             child = sexpr.find(lib, head_name)
             if child is not None:
                 node.append(sexpr.deep_copy(child))
-        node.extend(cls._properties(project_id, comp, placement, lib, p.description))
+        node.extend(cls._properties(project_id, comp, placement, lib, p.description, reference))
         node.append(S("path", Q("/" + ids.symbol_uuid(project_id, comp.ref))))
         node.append(S("sheetname", Q("/")))
         node.append(S("sheetfile", Q(sheetfile)))
@@ -617,7 +692,7 @@ class PCBCompiler(Compiler):
         return node
 
     @classmethod
-    def _properties(cls, project_id: str, comp: Component, placement: Placement, lib: list, description: str) -> list[list]:
+    def _properties(cls, project_id: str, comp: Component, placement: Placement, lib: list, description: str, reference: SilkText | None = None) -> list[list]:
         lib_props: dict[str, list] = {}
         for prop in sexpr.find_all(lib, "property"):
             lib_props.setdefault(str(prop[1]), prop)
@@ -632,6 +707,9 @@ class PCBCompiler(Compiler):
             template = lib_props.get(key)
             if template is None:
                 template = cls._default_property(key)
+            if key == "Reference" and reference is not None:
+                out.append(cls._reference_property(project_id, comp.ref, template, placement, reference))
+                continue
             out.append(cls._property(project_id, comp.ref, key, values[key], template, placement))
         for key, prop in lib_props.items():
             if key in _STANDARD_PROPERTIES or key in _DROPPED_PROPERTIES:
@@ -641,9 +719,9 @@ class PCBCompiler(Compiler):
 
     @staticmethod
     def _default_property(key: str) -> list:
-        if key == "Reference":
+        if key == "Reference":  # the silk geometry reads the same fallback (silkscreen.geometry.default_reference_template)
             return S("property", Q(key), Q(""), S("at", 0, 0, 0), S("layer", Q("F.SilkS")),
-                     S("effects", S("font", S("size", 1, 1), S("thickness", 0.15))))
+                     S("effects", S("font", S("size", KICAD_TEXT_SIZE_MM, KICAD_TEXT_SIZE_MM), S("thickness", KICAD_TEXT_THICKNESS_MM))))
         if key == "Value":
             return S("property", Q(key), Q(""), S("at", 0, 0, 0), S("layer", Q("F.Fab")),
                      S("effects", S("font", S("size", 1, 1), S("thickness", 0.15))))

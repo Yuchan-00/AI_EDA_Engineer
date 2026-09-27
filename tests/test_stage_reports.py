@@ -83,6 +83,7 @@ from ai_eda.report.stages import (
     template_for,
 )
 from ai_eda.tools.kicad.library import KicadLibrary
+from ai_eda.tools.model3d import BODY_CAPTION
 from ai_eda.tools.spice import NgspiceShared
 from ai_eda.workflow import STAGE_ORDER, Orchestrator, PipelineState, Stage
 from tests.fixtures_kicad import divider_with_connector_ir
@@ -1006,8 +1007,11 @@ def test_parts_report_says_it_has_no_chart(astable):
 def test_circuit_report_figures_placement_board_and_copper_bars(astable_release, tmp_path: Path):
     ir, lib, state = astable_release
     doc = build_stage_document(Stage.PCB, ir, lib, state)
-    assert _figure_ids(doc.markdown) == ["placement", "board", "copper_bars"] and doc.html.count("<figure>") == 3
-    placement, board, bars = (doc.figures.figures[k].svg for k in ("placement", "board", "copper_bars"))
+    assert _figure_ids(doc.markdown) == ["placement", "board", "copper_bars", "iso3d"] and doc.html.count("<figure>") == 4
+    placement, board, bars, iso = (doc.figures.figures[k].svg for k in ("placement", "board", "copper_bars", "iso3d"))
+    # the 3D preview: one flat outline or body per component (no STEP here), its caption carries the body rule
+    assert doc.figures.scene is not None and len(doc.figures.scene.bodies) == len(ir.components) and "k-slab" in iso
+    assert BODY_CAPTION in doc.figures.figures["iso3d"].caption and _caption_after(doc.markdown, "iso3d").startswith("*astable: 3D 미리보기 (등각) — ")
     n_pads = sum(len(lib.load_footprint(c.footprint).pads) for c in ir.components)
     assert placement.count('class="pad"') == n_pads and placement.count('class="track"') == 0 and placement.count('class="via"') == 0
     assert board.count('class="pad"') == n_pads and board.count('class="track"') == len(ir.pcb.tracks) and board.count('class="via"') == len(ir.pcb.vias)
@@ -1018,6 +1022,7 @@ def test_circuit_report_figures_placement_board_and_copper_bars(astable_release,
     # without a library the board figures are one sentence each; the copper bars need no library
     md = circuit_report(ir, None, state)
     assert md.count(NO_LIBRARY_FIGURE) == 2 and "fig:placement" not in md and "fig:board" not in md and "![fig](fig:copper_bars)" in md
+    assert "fig:iso3d" not in md and "3D 미리보기 그림이 없습니다: KiCad 라이브러리를 열 수 없습니다." in md
 
 
 def test_final_report_tolerance_figure_without_measurements(astable_release, tmp_path: Path):
@@ -1040,9 +1045,10 @@ def test_routed_board_with_a_footprint_missing_from_the_library_says_so_in_both_
     assert ir.pcb.tracks and ir.pcb.vias
     ir.component("R1").footprint = LibraryRef(library="Nope", name="Missing")
     figures = stages_module.stage_figures(Stage.PCB, ir, lib)
-    assert sorted(figures.slots) == ["copper_bars"] and sorted(figures.missing) == ["board", "placement"]
+    assert sorted(figures.slots) == ["copper_bars"] and sorted(figures.missing) == ["board", "iso3d", "placement"]
     reason = "보드 그림을 그릴 수 없습니다 (footprint Nope:Missing of 'R1' was not found in a KiCad library; refusing to guess its pads)."
     assert figures.missing["placement"] == reason and figures.missing["board"] == reason
+    assert figures.missing["iso3d"] == "3D 미리보기를 그릴 수 없습니다 (footprint Nope:Missing of 'R1' was not found in a KiCad library)." and figures.scene is None
     md = circuit_report(ir, lib, None)
     placement_section = md.split("## 배치", 1)[1].split("## 배선", 1)[0]
     routing_section = md.split("## 배선", 1)[1]
@@ -1121,7 +1127,7 @@ def test_write_stage_report_without_a_browser_or_with_no_pdf_leaves_no_pdf(astab
     stale.write_bytes(b"%PDF-1.4 stale")
     result = write_stage_report(Stage.PCB, ir, lib, state, tmp_path / "out")  # conftest: no browser is discovered
     assert result.pdf is None and result.pdf_reason == NO_BROWSER_REASON and not stale.exists() and result.summary() == f"(+ .html; pdf not produced: {NO_BROWSER_REASON})"
-    assert result.paths == [result.markdown, result.html] and result.figure_ids == ("placement", "board", "copper_bars")
+    assert result.paths == [result.markdown, result.html] and result.figure_ids == ("placement", "board", "copper_bars", "iso3d")
     stale.write_bytes(b"%PDF-1.4 stale")
     result = write_stage_report(Stage.PCB, ir, lib, state, tmp_path / "out", pdf=False)
     assert result.pdf is None and result.pdf_reason == PDF_NOT_REQUESTED and not stale.exists()

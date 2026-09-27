@@ -26,10 +26,25 @@ them into the CLI's own flags; the page never adds a flag the user did not
 set, never asks for a key or a login, and deletes nothing.
 
 Layout: the projects column (root path, the project list with the last run,
-the "새 프로젝트" form with example requests) and the project's eight tabs
-(개요, 회로도, 기판, 시뮬레이션, 검증, 부품, 보고서, 파일). The location hash
+the "새 프로젝트" form with example requests) and the project's nine tabs
+(개요, 회로도, 기판, 3D, 시뮬레이션, 검증, 부품, 보고서, 파일). The location hash
 ``#project=<name>&tab=<tab>[&report=<stage|full>]`` selects a project, a tab
 and a report, so a link (or a headless screenshot) can open any of them.
+
+The 3D tab is a hand-written WebGL viewer (no library): it parses the glTF
+binary the server serves (``/preview/<name>/board.glb``: the built-in
+preview of the current IR, one mesh per material, each node naming its
+group ``board`` / ``copper`` / ``silk`` / ``parts``), draws it with one
+Lambert shader (opaque meshes, then the translucent mask), orbits on drag,
+pans on shift-drag, zooms on the wheel (and the arrow / + / − / 0 keys), and
+has the 맞춤 / 위 / 아래 / 등각 buttons and the 보드 / 구리 / 실크 / 부품
+toggles. It draws exactly the file's triangles and judges nothing; its
+caption says what a part box is (the ``F.Fab`` outline x the STEP height,
+not the part's shape). Without WebGL (or when the context is lost) it
+shows the server's isometric SVG of the same scene
+(``/preview/<name>/board3d/<view>.svg``), with the same buttons and
+toggles. KiCad's own STEP / GLB / render files, when a kicad-cli run
+registered them, are listed below as KiCad's real part shapes.
 """
 
 from __future__ import annotations
@@ -94,7 +109,7 @@ APP_HTML = r"""<!doctype html>
 <main id="main" tabindex="-1">
 <div id="welcome" class="welcome">
 <h2>프로젝트를 고르십시오</h2>
-<p class="muted">왼쪽 목록에서 프로젝트를 고르거나 '새 프로젝트'로 만듭니다. 프로젝트마다 개요(단계·질문·실행), 회로도, 기판, 시뮬레이션, 검증, 부품, 보고서, 파일을 볼 수 있습니다.</p>
+<p class="muted">왼쪽 목록에서 프로젝트를 고르거나 '새 프로젝트'로 만듭니다. 프로젝트마다 개요(단계·질문·실행), 회로도, 기판, 3D, 시뮬레이션, 검증, 부품, 보고서, 파일을 볼 수 있습니다.</p>
 </div>
 <div id="project-view" hidden>
 <div class="project-head">
@@ -106,6 +121,7 @@ APP_HTML = r"""<!doctype html>
 <button type="button" role="tab" id="tab-overview" data-tab="overview" aria-controls="panel-overview" aria-selected="true">개요</button>
 <button type="button" role="tab" id="tab-schematic" data-tab="schematic" aria-controls="panel-schematic" aria-selected="false" tabindex="-1">회로도</button>
 <button type="button" role="tab" id="tab-board" data-tab="board" aria-controls="panel-board" aria-selected="false" tabindex="-1">기판</button>
+<button type="button" role="tab" id="tab-model3d" data-tab="model3d" aria-controls="panel-model3d" aria-selected="false" tabindex="-1">3D</button>
 <button type="button" role="tab" id="tab-simulation" data-tab="simulation" aria-controls="panel-simulation" aria-selected="false" tabindex="-1">시뮬레이션</button>
 <button type="button" role="tab" id="tab-validation" data-tab="validation" aria-controls="panel-validation" aria-selected="false" tabindex="-1">검증</button>
 <button type="button" role="tab" id="tab-parts" data-tab="parts" aria-controls="panel-parts" aria-selected="false" tabindex="-1">부품</button>
@@ -290,11 +306,36 @@ APP_HTML = r"""<!doctype html>
 <span class="check"><input type="checkbox" id="layer-pads" data-layer-class="pads" checked><label for="layer-pads">패드</label></span>
 <span class="check"><input type="checkbox" id="layer-vias" data-layer-class="vias" checked><label for="layer-vias">비아</label></span>
 <span class="check"><input type="checkbox" id="layer-outline" data-layer-class="outline" checked><label for="layer-outline">외곽</label></span>
+<span class="check"><input type="checkbox" id="layer-silk" data-layer-class="silk" checked><label for="layer-silk">실크</label></span>
 <span class="check"><input type="checkbox" id="layer-labels" data-layer-class="labels" checked><label for="layer-labels">라벨</label></span>
 <span id="board-download" class="toolbar-link"></span>
 </fieldset>
 <div id="board-facts"></div>
 <div id="board-view"></div>
+</section>
+
+<section id="panel-model3d" class="panel" role="tabpanel" aria-labelledby="tab-model3d" hidden>
+<div class="toolbar" id="m3d-toolbar" role="group" aria-label="3D 보기">
+<button type="button" id="m3d-fit" disabled>맞춤</button>
+<button type="button" id="m3d-top" disabled>위</button>
+<button type="button" id="m3d-bottom" disabled>아래</button>
+<button type="button" id="m3d-iso" disabled>등각</button>
+<span id="m3d-download" class="toolbar-link"></span>
+</div>
+<fieldset class="layers" id="m3d-layers" disabled>
+<legend>보이는 층</legend>
+<span class="check"><input type="checkbox" id="m3d-layer-board" data-group="board" checked><label for="m3d-layer-board">보드</label></span>
+<span class="check"><input type="checkbox" id="m3d-layer-copper" data-group="copper" checked><label for="m3d-layer-copper">구리</label></span>
+<span class="check"><input type="checkbox" id="m3d-layer-silk" data-group="silk" checked><label for="m3d-layer-silk">실크</label></span>
+<span class="check"><input type="checkbox" id="m3d-layer-parts" data-group="parts" checked><label for="m3d-layer-parts">부품</label></span>
+</fieldset>
+<p class="hint" id="m3d-rule"><strong>부품 = F.Fab 외곽 × STEP 최대 높이의 상자, 실제 모양 아님</strong> — 상자의 가로·세로는 풋프린트의 F.Fab 그림(없으면 코트야드), 높이는 풋프린트가 가리키는 STEP 파일의 최대 높이이고, STEP 파일이 없으면 평면 외곽선입니다. 판정이 아니라 그림입니다. <span id="m3d-controls-hint">끌어서 회전, Shift+끌기로 이동, 휠로 확대/축소; 그림을 고른 뒤 화살표(회전) / Shift+화살표(이동) / + / − / 0(맞춤).</span></p>
+<p id="m3d-status" class="hint" role="status"></p>
+<div id="m3d-facts"></div>
+<div id="m3d-view" class="m3d-view"></div>
+<div id="m3d-summary"></div>
+<h3 id="m3d-kicad-title">KiCad 3D 모델(실제 부품 모양)</h3>
+<div id="m3d-kicad"></div>
 </section>
 
 <section id="panel-simulation" class="panel" role="tabpanel" aria-labelledby="tab-simulation" hidden>
@@ -542,7 +583,17 @@ pre.log { font-family: var(--mono); font-size: 12px; line-height: 1.45; backgrou
 .board-view.hide-pads .pads,
 .board-view.hide-vias .vias,
 .board-view.hide-outline .outline,
+.board-view.hide-silk .silk,
 .board-view.hide-labels .labels { display: none; }
+/* 3D: the WebGL canvas fills its stage; the SVG fallback's polygons carry g-<group> like the GLB nodes' extras.group */
+.m3d-stage { height: 68vh; min-height: 420px; border: 1px solid var(--border); border-radius: 6px; background: #f6f5f1; overflow: hidden; margin: 8px 0 14px; }
+.m3d-canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+.m3d-canvas.dragging { cursor: grabbing; }
+.m3d-view.hide-g-board .g-board,
+.m3d-view.hide-g-copper .g-copper,
+.m3d-view.hide-g-silk .g-silk,
+.m3d-view.hide-g-parts .g-parts { display: none; }
+.kicad-render { display: block; max-width: 100%; height: auto; margin: 6px 0; border: 1px solid var(--border); border-radius: 4px; background: #fff; }
 dl.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 14px; margin: 6px 0 12px; font-size: 13px; }
 dl.facts dt { color: var(--muted); }
 dl.facts dd { margin: 0; overflow-wrap: anywhere; }
@@ -561,7 +612,7 @@ APP_JS = r"""'use strict';
 // AI EDA 엔지니어 GUI. A view of the server's JSON: every status word is copied from the API (ir.validation /
 // pipeline.json through build_report_data); nothing here computes a status. Text goes through text nodes only.
 
-const TAB_IDS = ['overview', 'schematic', 'board', 'simulation', 'validation', 'parts', 'reports', 'files'];
+const TAB_IDS = ['overview', 'schematic', 'board', 'model3d', 'simulation', 'validation', 'parts', 'reports', 'files'];
 const REPORTS = [
   {key: 'architecture', label: '이론', after: 'ARCHITECTURE'},
   {key: 'component_selection', label: '부품선정', after: 'COMPONENT_SELECTION'},
@@ -574,6 +625,7 @@ const POLL_MS = 1000;
 const state = {
   projects: [], name: null, data: null, tab: 'overview', report: null,
   rendered: new Set(), loadSeq: 0, log: null, pollTimer: null, taskRow: 0, schematic: null, labels: {},
+  m3d: null, m3dSeq: 0,
 };
 
 // ------------------------------------------------------------------ small helpers
@@ -887,6 +939,7 @@ function showWelcome() {
 
 async function openProject(name, tab) {
   stopPolling();
+  m3dDispose();
   state.name = name; state.data = null; state.log = null; state.rendered.clear(); state.schematic = null;
   resetRunForm();
   $('welcome').hidden = true;
@@ -963,7 +1016,7 @@ function renderTab(tab) {
   if (!state.data || state.rendered.has(tab)) return;
   state.rendered.add(tab);
   const renderers = {
-    overview: renderOverview, schematic: renderSchematic, board: renderBoard, simulation: renderSimulation,
+    overview: renderOverview, schematic: renderSchematic, board: renderBoard, model3d: renderModel3d, simulation: renderSimulation,
     validation: renderValidation, parts: renderParts, reports: renderReports, files: renderFiles,
   };
   Promise.resolve().then(() => renderers[tab]()).catch((e) => {
@@ -1472,6 +1525,11 @@ async function renderBoard() {
   const svg = await loadSvg(box, previewUrl('board.svg'));
   $('board-layers').disabled = !svg;
   if (!svg) { box.className = ''; return; }
+  // a board with designed silk carries its references in the silk group: the labels group is empty and 라벨 would toggle nothing
+  const labels = svg.querySelector('g.labels');
+  const noLabels = !labels || labels.childElementCount === 0;
+  $('layer-labels').disabled = noLabels;
+  $('layer-labels').parentElement.title = noLabels ? '참조 지정자는 실크 층에 있습니다 (실크 토글로 보이고 숨김)' : '';
   svg.setAttribute('aria-label', svg.querySelector('title') ? svg.querySelector('title').textContent : '기판');
   fitFigure(svg);
   applyLayers();
@@ -1490,6 +1548,429 @@ function applyLayers() {
   for (const input of document.querySelectorAll('#board-layers input[data-layer-class]')) {
     box.classList.toggle('hide-' + input.dataset.layerClass, !input.checked);
   }
+}
+
+// ------------------------------------------------------------------ 3D: the built-in preview (glTF binary) in a hand-written WebGL viewer
+// The GLB is the server's picture of the current IR (board, mask, drills, copper, the footprints' silk strokes, part boxes = the
+// F.Fab outline x the STEP height). The viewer draws exactly its triangles, shows or hides the groups its nodes name
+// (extras.group) and judges nothing. Frame (the writer's): metres, X = board x, Y = up out of the top side, Z = board y.
+
+const M3D_GROUPS = ['board', 'copper', 'silk', 'parts'];
+// [yaw, pitch] in degrees: yaw 0 = the eye in front of the board (board +y side), positive = to the right; the bottom view is
+// the board flipped like KiCad's (x runs to the left)
+const M3D_VIEWS = {iso: [35, 35.264], top: [0, 90], bottom: [180, -90]};
+const M3D_FOV = 30 * Math.PI / 180;
+const M3D_ORBIT_DEG_PER_PX = 0.4;
+// what the controls do: the WebGL viewer answers drag / wheel / keys; the SVG fallback only its view buttons and layer toggles
+const M3D_GL_HINT = '끌어서 회전, Shift+끌기로 이동, 휠로 확대/축소; 그림을 고른 뒤 화살표(회전) / Shift+화살표(이동) / + / − / 0(맞춤).';
+const M3D_SVG_HINT = '위 / 아래 / 등각 버튼으로 보기를 바꿉니다 (WebGL 없이 회전·확대 없음).';
+const GLB_MAGIC = 0x46546C67, GLB_JSON = 0x4E4F534A, GLB_BIN = 0x004E4942;
+const GLB_TYPES = {5126: Float32Array, 5125: Uint32Array, 5123: Uint16Array};
+const GLB_WIDTH = {SCALAR: 1, VEC3: 3};
+const M3D_VS = [
+  'attribute vec3 aPos;', 'attribute vec3 aNor;', 'uniform mat4 uMvp;', 'varying vec3 vNor;',
+  'void main() { vNor = aNor; gl_Position = uMvp * vec4(aPos, 1.0); }',
+].join('\n');
+// Lambert with a light that follows the eye (two-sided: a decal seen from below is lit like one seen from above)
+const M3D_FS = [
+  'precision mediump float;', 'uniform vec4 uColor;', 'uniform vec3 uLight;', 'varying vec3 vNor;',
+  'void main() { float k = 0.55 + 0.45 * abs(dot(normalize(vNor), uLight)); gl_FragColor = vec4(uColor.rgb * k, uColor.a); }',
+].join('\n');
+
+async function fetchBytes(url) {
+  const r = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
+  if (!r.ok) throw new HttpError(r.status, (await r.text()).trim());
+  return r.arrayBuffer();
+}
+
+// the GLB container: 12-byte header, then chunks (JSON first, BIN next), little-endian
+function parseGlb(buf) {
+  const dv = new DataView(buf);
+  if (buf.byteLength < 20 || dv.getUint32(0, true) !== GLB_MAGIC || dv.getUint32(4, true) !== 2 || dv.getUint32(8, true) !== buf.byteLength) {
+    throw new Error('glTF 2.0 바이너리가 아닙니다');
+  }
+  let json = null, bin = null, off = 12;
+  while (off + 8 <= buf.byteLength) {
+    const len = dv.getUint32(off, true), type = dv.getUint32(off + 4, true), start = off + 8;
+    if (start + len > buf.byteLength) throw new Error('GLB 청크가 파일 밖으로 나갑니다');
+    if (type === GLB_JSON && json === null) json = JSON.parse(new TextDecoder('utf-8').decode(new Uint8Array(buf, start, len)));
+    else if (type === GLB_BIN && bin === null) bin = {start, len};
+    off = start + len;
+  }
+  if (!json) throw new Error('GLB에 JSON 청크가 없습니다');
+  return {json, buf, bin};
+}
+
+// one accessor as a typed array (copied, so it is aligned); only the shapes the ai-eda writer produces
+function glbAccessor(g, index) {
+  const a = (g.json.accessors || [])[index];
+  const v = a ? (g.json.bufferViews || [])[a.bufferView] : null;
+  const Type = a ? GLB_TYPES[a.componentType] : null;
+  const width = a ? GLB_WIDTH[a.type] : null;
+  if (!a || !v || !Type || !width || !g.bin || (v.buffer || 0) !== 0 || v.byteStride) throw new Error('이 뷰어가 읽지 않는 accessor ' + index);
+  const viewStart = v.byteOffset || 0;
+  const begin = viewStart + (a.byteOffset || 0);
+  const bytes = a.count * width * Type.BYTES_PER_ELEMENT;
+  if (begin + bytes > viewStart + v.byteLength || viewStart + v.byteLength > g.bin.len) throw new Error('accessor ' + index + '가 버퍼 밖으로 나갑니다');
+  return new Type(g.buf.slice(g.bin.start + begin, g.bin.start + begin + bytes));
+}
+
+// the meshes of the default scene, one per node: the preview writer's nodes have no transform and no child
+function glbMeshes(g) {
+  const scene = (g.json.scenes || [])[g.json.scene || 0];
+  const out = [];
+  for (const ni of (scene && scene.nodes) || []) {
+    const node = (g.json.nodes || [])[ni];
+    if (!node || node.matrix || node.translation || node.rotation || node.scale || (node.children && node.children.length)) {
+      throw new Error('이 뷰어는 변환·자식이 없는 노드만 그립니다 (ai-eda의 미리보기 GLB)');
+    }
+    if (node.mesh === undefined) continue;
+    const group = node.extras && M3D_GROUPS.includes(node.extras.group) ? node.extras.group : 'board';
+    for (const prim of g.json.meshes[node.mesh].primitives) {
+      if ((prim.mode !== undefined && prim.mode !== 4) || prim.indices === undefined) throw new Error('삼각형 목록이 아닌 primitive');
+      const mat = (g.json.materials || [])[prim.material] || {};
+      const pbr = mat.pbrMetallicRoughness || {};
+      out.push({
+        name: node.name || '', group, color: pbr.baseColorFactor || [0.8, 0.8, 0.8, 1], blend: mat.alphaMode === 'BLEND',
+        pos: glbAccessor(g, prim.attributes.POSITION), nor: glbAccessor(g, prim.attributes.NORMAL), idx: glbAccessor(g, prim.indices),
+      });
+    }
+  }
+  if (!out.length) throw new Error('GLB에 그릴 메시가 없습니다');
+  return out;
+}
+
+// column-major 4x4 matrices (WebGL's layout)
+function m4mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0;
+    for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+    o[c * 4 + r] = s;
+  }
+  return o;
+}
+function m4perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) / (near - far), -1, 0, 0, 2 * far * near / (near - far), 0]);
+}
+function dot3(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+// the eye's frame: d points from the target to the eye, r to the right, u up (r x u = d: a proper rotation, windings kept)
+function m3dBasis(cam) {
+  const y = cam.yaw * Math.PI / 180, p = cam.pitch * Math.PI / 180;
+  const d = [Math.sin(y) * Math.cos(p), Math.sin(p), Math.cos(y) * Math.cos(p)];
+  const r = [Math.cos(y), 0, -Math.sin(y)];
+  const u = [d[1] * r[2] - d[2] * r[1], d[2] * r[0] - d[0] * r[2], d[0] * r[1] - d[1] * r[0]];
+  return {d, r, u};
+}
+function m4view(eye, b) {
+  const {r, u, d} = b;
+  return new Float32Array([r[0], u[0], d[0], 0, r[1], u[1], d[1], 0, r[2], u[2], d[2], 0, -dot3(r, eye), -dot3(u, eye), -dot3(d, eye), 1]);
+}
+
+function m3dContext(canvas) {
+  const opts = {antialias: true, alpha: false, preserveDrawingBuffer: true};
+  try { return canvas.getContext('webgl2', opts) || canvas.getContext('webgl', opts); } catch (e) { return null; }
+}
+
+function m3dShader(gl, type, text) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, text);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error('셰이더 컴파일 실패: ' + gl.getShaderInfoLog(sh));
+  return sh;
+}
+
+// the viewer: buffers uploaded once, the camera fitted to the board, a frame drawn on request
+function m3dViewer(canvas, gl, glb) {
+  const meshes = glbMeshes(glb);
+  const webgl2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+  const wide = webgl2 || Boolean(gl.getExtension('OES_element_index_uint'));
+  const prog = gl.createProgram();
+  gl.attachShader(prog, m3dShader(gl, gl.VERTEX_SHADER, M3D_VS));
+  gl.attachShader(prog, m3dShader(gl, gl.FRAGMENT_SHADER, M3D_FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('셰이더 연결 실패: ' + gl.getProgramInfoLog(prog));
+  const loc = {
+    pos: gl.getAttribLocation(prog, 'aPos'), nor: gl.getAttribLocation(prog, 'aNor'),
+    mvp: gl.getUniformLocation(prog, 'uMvp'), light: gl.getUniformLocation(prog, 'uLight'), color: gl.getUniformLocation(prog, 'uColor'),
+  };
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  let triangles = 0;
+  for (const m of meshes) {
+    for (let i = 0; i < m.pos.length; i += 3) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], m.pos[i + k]); hi[k] = Math.max(hi[k], m.pos[i + k]); }
+    if (m.idx instanceof Uint32Array && !wide) throw new Error('이 WebGL은 32비트 인덱스(OES_element_index_uint)를 지원하지 않습니다');
+    m.pbuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, m.pbuf); gl.bufferData(gl.ARRAY_BUFFER, m.pos, gl.STATIC_DRAW);
+    m.nbuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, m.nbuf); gl.bufferData(gl.ARRAY_BUFFER, m.nor, gl.STATIC_DRAW);
+    m.ibuf = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.ibuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.idx, gl.STATIC_DRAW);
+    m.itype = m.idx instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+    m.count = m.idx.length;
+    triangles += m.count / 3;
+  }
+  if (!isFinite(lo[0])) throw new Error('GLB에 꼭짓점이 없습니다');
+  const center = [0, 1, 2].map((k) => (lo[k] + hi[k]) / 2);
+  const radius = Math.max(1e-6, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2);
+  const v = {
+    canvas, gl, prog, loc, meshes, center, radius, triangles, frame: 0, disposed: false, fallback: false,
+    visible: Object.fromEntries(M3D_GROUPS.map((g) => [g, true])),
+    cam: {yaw: M3D_VIEWS.iso[0], pitch: M3D_VIEWS.iso[1], dist: radius * 4, target: center.slice()},
+  };
+  m3dFit(v);
+  return v;
+}
+
+// the whole board in view (the angles kept): the bounding sphere inside the narrower field of view
+function m3dFit(v) {
+  const aspect = Math.max(1, v.canvas.clientWidth) / Math.max(1, v.canvas.clientHeight);
+  const half = Math.min(M3D_FOV / 2, Math.atan(Math.tan(M3D_FOV / 2) * aspect));
+  v.cam.target = v.center.slice();
+  v.cam.dist = v.radius / Math.sin(half) * 1.05;
+}
+
+function m3dRequest(v) {
+  if (v.fallback || v.disposed || v.frame) return;
+  v.frame = requestAnimationFrame(() => m3dDraw(v));
+}
+
+function m3dDraw(v) {
+  v.frame = 0;
+  if (v.disposed) return;
+  const gl = v.gl, c = v.canvas;
+  const ratio = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(c.clientWidth * ratio)), ht = Math.max(1, Math.round(c.clientHeight * ratio));
+  if (c.width !== w || c.height !== ht) { c.width = w; c.height = ht; }
+  gl.viewport(0, 0, w, ht);
+  gl.clearColor(0.965, 0.961, 0.945, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const b = m3dBasis(v.cam);
+  const t = v.cam.target, dist = v.cam.dist;
+  const eye = [t[0] + b.d[0] * dist, t[1] + b.d[1] * dist, t[2] + b.d[2] * dist];
+  // near / far hug the board's bounding sphere: the copper, mask and silk decals lie 0.01 mm apart
+  const near = Math.max(dist - v.radius * 1.5, dist * 0.05), far = dist + v.radius * 1.5;
+  const mvp = m4mul(m4perspective(M3D_FOV, w / ht, near, far), m4view(eye, b));
+  const l = [0, 1, 2].map((k) => b.d[k] * 0.8 + b.u[k] * 0.5 + b.r[k] * 0.3);
+  const ln = Math.hypot(l[0], l[1], l[2]);
+  gl.useProgram(v.prog);
+  gl.uniformMatrix4fv(v.loc.mvp, false, mvp);
+  gl.uniform3f(v.loc.light, l[0] / ln, l[1] / ln, l[2] / ln);
+  gl.enable(gl.DEPTH_TEST);
+  gl.enableVertexAttribArray(v.loc.pos);
+  gl.enableVertexAttribArray(v.loc.nor);
+  // opaque meshes first, then the translucent ones (the solder mask) without writing depth
+  for (const translucent of [false, true]) {
+    if (translucent) { gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false); }
+    else { gl.disable(gl.BLEND); gl.depthMask(true); }
+    for (const m of v.meshes) {
+      if (m.blend !== translucent || !v.visible[m.group]) continue;
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.pbuf);
+      gl.vertexAttribPointer(v.loc.pos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.nbuf);
+      gl.vertexAttribPointer(v.loc.nor, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.ibuf);
+      gl.uniform4f(v.loc.color, m.color[0], m.color[1], m.color[2], m.color.length > 3 ? m.color[3] : 1);
+      gl.drawElements(gl.TRIANGLES, m.count, m.itype, 0);
+    }
+  }
+  gl.depthMask(true);
+  gl.disable(gl.BLEND);
+}
+
+function m3dOrbit(v, dyaw, dpitch) {
+  v.cam.yaw = ((v.cam.yaw + dyaw) % 360 + 360) % 360;
+  v.cam.pitch = Math.max(-90, Math.min(90, v.cam.pitch + dpitch));
+  m3dRequest(v);
+}
+
+// move the target with the picture: dx / dy in CSS pixels at the target's depth
+function m3dPan(v, dx, dy) {
+  const b = m3dBasis(v.cam);
+  const k = 2 * v.cam.dist * Math.tan(M3D_FOV / 2) / Math.max(1, v.canvas.clientHeight);
+  for (let i = 0; i < 3; i++) v.cam.target[i] += (-dx * b.r[i] + dy * b.u[i]) * k;
+  m3dRequest(v);
+}
+
+function m3dZoom(v, factor) {
+  v.cam.dist = Math.min(v.radius * 30, Math.max(v.radius * 0.05, v.cam.dist * factor));
+  m3dRequest(v);
+}
+
+function m3dAttach(v) {
+  const c = v.canvas;
+  let drag = null;
+  c.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    c.focus();
+    drag = {id: ev.pointerId, x: ev.clientX, y: ev.clientY};
+    c.setPointerCapture(ev.pointerId);
+    c.classList.add('dragging');
+  });
+  c.addEventListener('pointermove', (ev) => {
+    if (!drag || ev.pointerId !== drag.id) return;
+    const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+    drag.x = ev.clientX; drag.y = ev.clientY;
+    if (ev.shiftKey) m3dPan(v, dx, dy);
+    else m3dOrbit(v, -dx * M3D_ORBIT_DEG_PER_PX, dy * M3D_ORBIT_DEG_PER_PX);
+  });
+  const end = (ev) => { if (drag && ev.pointerId === drag.id) { drag = null; c.classList.remove('dragging'); } };
+  c.addEventListener('pointerup', end);
+  c.addEventListener('pointercancel', end);
+  c.addEventListener('wheel', (ev) => { ev.preventDefault(); m3dZoom(v, ev.deltaY > 0 ? 1.15 : 1 / 1.15); }, {passive: false});
+  c.addEventListener('keydown', (ev) => {
+    const step = 15, px = 40;
+    const keys = {
+      'ArrowLeft': () => (ev.shiftKey ? m3dPan(v, -px, 0) : m3dOrbit(v, step, 0)),
+      'ArrowRight': () => (ev.shiftKey ? m3dPan(v, px, 0) : m3dOrbit(v, -step, 0)),
+      'ArrowUp': () => (ev.shiftKey ? m3dPan(v, 0, -px) : m3dOrbit(v, 0, -step)),
+      'ArrowDown': () => (ev.shiftKey ? m3dPan(v, 0, px) : m3dOrbit(v, 0, step)),
+      '+': () => m3dZoom(v, 1 / 1.25), '=': () => m3dZoom(v, 1 / 1.25), '-': () => m3dZoom(v, 1.25),
+      '0': () => { m3dFit(v); m3dRequest(v); },
+    };
+    const f = keys[ev.key];
+    if (f) { ev.preventDefault(); f(); }
+  });
+  c.addEventListener('webglcontextlost', (ev) => {
+    ev.preventDefault();
+    if (v.disposed || state.m3d !== v) return;
+    m3dShowSvg($('m3d-view'), 'iso', 'WebGL 컨텍스트를 잃었습니다: 서버가 같은 장면으로 그린 등각 SVG를 보여 줍니다', state.m3dSeq);
+  });
+  if (window.ResizeObserver) {
+    v.resize = new ResizeObserver(() => m3dRequest(v));
+    v.resize.observe(c);
+  }
+}
+
+function m3dDispose() {
+  const v = state.m3d;
+  state.m3d = null;
+  if (!v || v.fallback) return;
+  v.disposed = true;
+  if (v.resize) v.resize.disconnect();
+  if (v.frame) cancelAnimationFrame(v.frame);
+  const lose = v.gl.isContextLost() ? null : v.gl.getExtension('WEBGL_lose_context');
+  if (lose) lose.loseContext();  // a replaced viewer gives its context back (browsers cap the live ones)
+}
+
+function m3dControls(on, svg) {
+  for (const id of ['m3d-fit', 'm3d-top', 'm3d-bottom', 'm3d-iso']) $(id).disabled = !on;
+  if (on && svg) $('m3d-fit').disabled = true;  // an SVG view always fits its column
+  $('m3d-layers').disabled = !on;
+}
+
+function m3dApplyLayers() {
+  const box = $('m3d-view');
+  const v = state.m3d;
+  for (const input of document.querySelectorAll('#m3d-layers input[data-group]')) {
+    box.classList.toggle('hide-g-' + input.dataset.group, !input.checked);
+    if (v && v.visible) v.visible[input.dataset.group] = input.checked;
+  }
+  if (v && !v.fallback) m3dRequest(v);
+}
+
+function m3dSetView(name) {
+  const v = state.m3d;
+  if (!v) return;
+  if (v.fallback) { m3dShowSvg($('m3d-view'), name, v.why, state.m3dSeq); return; }
+  v.cam.yaw = M3D_VIEWS[name][0];
+  v.cam.pitch = M3D_VIEWS[name][1];
+  m3dFit(v);
+  m3dRequest(v);
+}
+
+// without WebGL: the server's painter's-algorithm SVG of the same scene (views iso / top / bottom), the same toggles
+async function m3dShowSvg(box, view, why, seq) {
+  m3dDispose();
+  const fig = h('div', {class: 'figure', role: 'group', 'aria-label': '3D 미리보기 (등각 SVG)'});
+  fill(box, notice('warn', 'WebGL 없이 그림', why), fig);
+  state.m3d = {fallback: true, view, why};
+  $('m3d-controls-hint').textContent = M3D_SVG_HINT;
+  $('m3d-status').textContent = 'SVG 보기: ' + view + ' (서버가 GLB와 같은 장면으로 그린 그림)';
+  const svg = await loadSvg(fig, previewUrl('board3d/' + enc(view) + '.svg'));
+  if (seq !== state.m3dSeq) return;
+  if (svg) fitFigure(svg);
+  m3dApplyLayers();
+  m3dControls(Boolean(svg), true);
+}
+
+function m3dSummary(info) {
+  const rows = (info.bodies || []).map((b) => h('tr', {},
+    td(code(b.ref), 'id'), td(idCode(b.lib_id), 'id'), td(b.side, 'word'), td(b.outline_source || '없음', 'word'),
+    td(b.height_mm === null || b.height_mm === undefined ? h('span', {class: 'muted'}, '평면 외곽선: ' + (b.reason || '높이 없음')) : fmtNum(b.height_mm) + ' mm', 'msg'),
+    td(b.models.length ? b.models.map((m, i) => [i ? ', ' : '', code(m.split('/').pop())]) : h('span', {class: 'muted'}, '없음'), 'msg')));
+  return [
+    h('p', {class: 'facts-line'}, info.caption),
+    rows.length ? h('details', {class: 'more'}, h('summary', {}, '부품 상자 ' + rows.length + '개 (STEP 높이 ' + info.with_step + '개, 평면 외곽선 ' + info.without_step + '개)'),
+      table(['부품', '풋프린트', '면', '상자 외곽', '높이 (STEP 최댓값)', '3D 모델 파일'], rows, info.body_caption)) : null,
+  ];
+}
+
+function renderKicad3d() {
+  const list = state.data.previews.kicad_3d || [];
+  const box = $('m3d-kicad');
+  if (!list.length) {
+    fill(box, empty('KiCad 3D 모델 없음: kicad-cli가 있는 PC에서 MANUFACTURING_OUTPUTS 단계가 거버 다음에 STEP·GLB·렌더 PNG를 씁니다 '
+      + '(이 프로젝트의 기록은 개요의 manufacturing_outputs 줄 - kicad-cli가 없으면 "3D export skipped: kicad-cli not found"). '
+      + '그 파일은 풋프린트의 실제 3D 모델로 만든 KiCad의 결과이고, 위 그림은 상자 미리보기입니다.'));
+    return;
+  }
+  fill(box, h('p', {class: 'hint'}, 'kicad-cli가 풋프린트의 3D 모델(STEP)로 만든 파일입니다: 실제 부품 모양. 이 GUI는 그 모델을 그리지 않고 파일과 렌더를 보여 줍니다.'),
+    list.map((a) => [
+      h('h4', {}, a.label + ' - ' + a.what),
+      fileFacts(a.state, a.what),
+      h('ul', {class: 'file-list'}, a.files.map((f) => h('li', {}, f.download ? downloadLink(f.download, f.name) : [f.name, h('span', {class: 'muted'}, ' (작업 폴더에 없음)')]))),
+      a.files.filter((f) => f.image).map((f) => h('img', {class: 'kicad-render', src: previewUrl('kicad3d/' + enc(f.name)), alt: a.label + ': ' + f.name})),
+    ]));
+}
+
+async function renderModel3d() {
+  m3dDispose();
+  const seq = ++state.m3dSeq;
+  const p = state.data.previews;
+  fill($('m3d-download'), p.model3d_file ? downloadLink(p.model3d_file, p.model3d_file + ' 내려받기') : null);
+  fill($('m3d-facts'), h('p', {class: 'hint'}, '그림은 지금의 ir.json과 디스크의 KiCad 라이브러리·3D 모델(STEP)로 그립니다 (기판 탭과 같은 입력). 내려받는 .preview.glb는 PCB 단계가 컴파일한 파일입니다:'),
+    p.model3d_state ? fileFacts(p.model3d_state, '3D 미리보기') : h('p', {class: 'hint'}, '등록된 .preview.glb 없음: PCB 단계가 보드를 컴파일한 뒤 IR에서 컴파일해 등록합니다.'));
+  renderKicad3d();
+  const box = $('m3d-view');
+  m3dControls(false);
+  fill($('m3d-summary'));
+  $('m3d-status').textContent = '';
+  fill(box, h('p', {class: 'muted'}, '불러오는 중…'));
+  const r = await fetchText(previewUrl('model3d.json'));
+  if (seq !== state.m3dSeq) return;
+  if (!r.ok) { fill(box, r.status === 404 ? empty(r.text.trim()) : notice('error', '그릴 수 없음', r.text.trim())); return; }
+  fill($('m3d-summary'), m3dSummary(JSON.parse(r.text)));
+  const canvas = h('canvas', {class: 'm3d-canvas', tabindex: '0', role: 'img',
+    'aria-label': '3D 미리보기: 끌어서 회전, Shift+끌기로 이동, 휠로 확대/축소, 화살표 / Shift+화살표 / + / − / 0'});
+  const gl = m3dContext(canvas);
+  if (!gl) { await m3dShowSvg(box, 'iso', '이 브라우저에서 WebGL을 쓸 수 없습니다: 서버가 같은 장면으로 그린 등각 SVG를 보여 줍니다', seq); return; }
+  let glb;
+  try {
+    glb = parseGlb(await fetchBytes(previewUrl('board.glb')));
+  } catch (e) {
+    if (seq !== state.m3dSeq) return;
+    const line = String(e.message || e);
+    fill(box, e.status === 404 ? empty(line) : notice('error', '그릴 수 없음', line));
+    return;
+  }
+  if (seq !== state.m3dSeq) return;
+  fill(box, h('div', {class: 'm3d-stage'}, canvas));
+  let v;
+  try {
+    v = m3dViewer(canvas, gl, glb);
+  } catch (e) {
+    const lose = gl.getExtension('WEBGL_lose_context');
+    if (lose) lose.loseContext();
+    await m3dShowSvg(box, 'iso', 'WebGL로 그리지 못했습니다 (' + String(e.message || e) + '): 서버가 같은 장면으로 그린 등각 SVG를 보여 줍니다', seq);
+    return;
+  }
+  state.m3d = v;
+  m3dAttach(v);
+  $('m3d-controls-hint').textContent = M3D_GL_HINT;
+  m3dApplyLayers();
+  m3dControls(true, false);
+  $('m3d-status').textContent = 'WebGL 보기: 메시 ' + v.meshes.length + '개, 삼각형 ' + v.triangles + '개 (board.glb 그대로)';
+  m3dFit(v);
+  m3dRequest(v);
 }
 
 // ------------------------------------------------------------------ 시뮬레이션
@@ -1778,6 +2259,9 @@ document.addEventListener('DOMContentLoaded', () => {
   $('sch-zoom-out').addEventListener('click', () => { if (state.schematic) zoomAt(state.schematic, 1.25); });
   $('sch-fit').addEventListener('click', () => { if (state.schematic) fitView(state.schematic); });
   $('board-layers').addEventListener('change', applyLayers);
+  $('m3d-fit').addEventListener('click', () => { if (state.m3d && !state.m3d.fallback) { m3dFit(state.m3d); m3dRequest(state.m3d); } });
+  for (const view of ['top', 'bottom', 'iso']) $('m3d-' + view).addEventListener('click', () => m3dSetView(view));
+  $('m3d-layers').addEventListener('change', m3dApplyLayers);
   $('val-filter').addEventListener('change', drawValidation);
   $('project-notices').addEventListener('click', (ev) => {
     const a = ev.target.closest('a[data-local]');

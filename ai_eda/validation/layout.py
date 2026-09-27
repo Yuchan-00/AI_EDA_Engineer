@@ -1,9 +1,10 @@
-"""IR-geometry checks of the routed board: ``pcb.routing.connectivity`` and ``pcb.routing.clearance``.
+"""IR-geometry checks of the board: ``pcb.routing.connectivity`` / ``pcb.routing.clearance`` and ``pcb.silk.*``.
 
-Invariant: these two results judge the *IR geometry* - the tracks and vias
-in ``ir.pcb``, the placements, and the pad geometry read from the KiCad
-footprints on disk (``ctx.tools["kicad_library"]``, never model memory) -
-and nothing else. They are not ERC / DRC and every message says so:
+Invariant: these results judge the *IR geometry* - the tracks, vias and
+silkscreen texts in ``ir.pcb``, the placements, and the pad / silk geometry
+read from the KiCad footprints on disk (``ctx.tools["kicad_library"]``,
+never model memory) - and nothing else. They are not ERC / DRC and every
+message says so:
 KiCad's verdict on the compiled board comes only from
 :mod:`ai_eda.tools.kicad.cli` (CLAUDE.md invariant 3), and whether the
 fab's limits are grounded is ``mfg.capability``'s question. The geometry
@@ -69,6 +70,55 @@ placement or footprint, or whose footprint is not on disk: its copper is
 unknown, and a check that skipped it would claim more than it measured. Every distance is rounded
 to KiCad's 1e-6 mm resolution before it is compared, and the derived
 numbers stay in ``details``, never in the IR.
+
+Silkscreen (:class:`SilkscreenValidator`, tool ``pcb.silk``) - three checks
+on what the compiled board's silk layers will carry: every IR
+:class:`~ai_eda.ir.SilkText` on ``F.SilkS`` / ``B.SilkS``, the library
+default ``Reference`` of every footprint without a designed reference text
+(where the compiler leaves it), and every footprint's library silk graphics
+and visible silk texts, all read as shapes by
+:mod:`ai_eda.tools.silkscreen.geometry` (texts as the documented
+conservative text-box *estimate*, not KiCad's font metrics). References on
+``F.Fab`` / ``B.Fab`` are not silk and are only counted.
+
+* ``pcb.silk.clearance`` - every IR silk text and every library-default
+  ``Reference`` keeps :data:`SILK_TO_PAD_MM` (0.15) from every pad's copper
+  on its side and lies inside the outline inset by :data:`SILK_TO_EDGE_MM`
+  (0.3) - the placer's own margins, stated in the message, not a fab rule;
+  every library silk graphic must not touch pad copper and must lie inside
+  the outline. A library item (graphic or the footprint's own visible
+  ``fp_text``) closer than the margins is listed under
+  ``details["below_margin"]``, not failed: it is the footprint's own design
+  and the design cannot move it - KiCad 10's ``BarrelJack_Horizontal`` has a
+  silk line 0.09 mm from its pad 1, ``AMASS_XT60PW-M`` its ``+`` / ``-``
+  0.12 mm from its pads. A library text whose *estimated* box meets pad
+  copper or leaves the outline is not a violation either way (the estimate
+  is conservative by design; a real glyph is narrower): it is listed under
+  ``details["library_text_estimates"]`` and makes the result NOT_VERIFIED -
+  KiCad's ``silk_over_copper`` decides. FAIL on a violation; PASS only when
+  every item was checked (a footprint that cannot be read, a ``custom`` /
+  ``trapezoid`` pad whose copper is unknown, or a missing outline make it
+  NOT_VERIFIED). Tracks are not compared (silk over mask-covered copper is
+  normal) and neither are vias (the compiled board tents them).
+* ``pcb.silk.overlap`` - silk texts pairwise, and silk texts against the
+  footprints' silk graphics, on one side: FAIL when two touch or overlap -
+  except a footprint's own library text against that same footprint's own
+  library silk (``WS2812B-Mini``'s pin ``1`` beside its outline: the
+  footprint's design, judged only by the estimated box), which is listed
+  under ``details["library_own_overlaps"]``. A pair with an IR text, a
+  library-default ``Reference`` or another footprint's silk still FAILs.
+* ``pcb.silk.size`` - every silk text's height against
+  ``ir.pcb.manufacturing.min_silk_text_height_mm`` and every text stroke and
+  library silk line width against ``min_silk_line_width_mm`` (any
+  provenance: a limit is a limit, like ``min_clearance_mm`` above; the
+  message names the provenance). A key without a limit in the IR is a
+  NOT_VERIFIED row naming it; the result is the worst row.
+
+An IR silk text the compiler refuses
+(:func:`~ai_eda.tools.silkscreen.geometry.silk_text_problems`: a layer the
+board lacks, a non-finite number, a reference to no component ...) FAILs all
+three. KiCad's DRC ``silk_over_copper`` / ``silk_overlap`` /
+``text_height`` stay kicad-cli's (``kicad.drc``).
 """
 
 from __future__ import annotations
@@ -82,6 +132,20 @@ from ai_eda.errors import CompileError
 from ai_eda.ir import CircuitIR, PCBDesign, Track, ValidationResult, ValidationStatus, Via
 from ai_eda.tools.kicad.geometry import _q, pad_angle, pad_center, pad_layers
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError
+from ai_eda.tools.silkscreen.geometry import (
+    FAB_LAYERS,
+    SILK_LAYERS,
+    PadCopper,
+    Shape,
+    footprint_silk,
+    inside_box,
+    ir_text_box,
+    pad_copper,
+    shape_distance,
+    side_of_layer,
+    silk_text_problems,
+)
+from ai_eda.tools.silkscreen.place import SilkParams
 from ai_eda.validation.base import ValidationContext, Validator
 from ai_eda.validation.registry import default_registry
 
@@ -93,6 +157,14 @@ __all__ = [
     "RoutingValidator",
     "connectivity_rows",
     "clearance_rows",
+    "SILK_TOOL_ID",
+    "SILK_TOOL_VERSION",
+    "SILK_CLEARANCE_CHECK",
+    "SILK_OVERLAP_CHECK",
+    "SILK_SIZE_CHECK",
+    "SILK_TO_PAD_MM",
+    "SILK_TO_EDGE_MM",
+    "SilkscreenValidator",
 ]
 
 TOOL_ID = "pcb.routing"
@@ -620,3 +692,254 @@ class RoutingValidator(Validator):
 
 
 default_registry.register(RoutingValidator())
+
+
+# --------------------------------------------------------------------------- silkscreen
+
+SILK_TOOL_ID = "pcb.silk"
+SILK_TOOL_VERSION = "0.1"
+SILK_CLEARANCE_CHECK = "pcb.silk.clearance"
+SILK_OVERLAP_CHECK = "pcb.silk.overlap"
+SILK_SIZE_CHECK = "pcb.silk.size"
+#: the margins the check holds silk texts to: the silkscreen placer's own (not a fab rule; the message says so)
+SILK_TO_PAD_MM = SilkParams().silk_to_pad_mm
+SILK_TO_EDGE_MM = SilkParams().silk_to_edge_mm
+SILK_SIZE_KEYS = ("min_silk_text_height_mm", "min_silk_line_width_mm")
+#: rows listed per result at most (the counts are complete)
+_MAX_ROWS = 200
+
+
+@dataclass(frozen=True, slots=True)
+class _SilkEntry:
+    label: str
+    side: str  # "F" / "B"
+    kind: str  # "text" | "graphic"
+    source: str  # "ir" | "library default" | "library"
+    shape: Shape
+    box: tuple[float, float, float, float]
+    width: float | None  # text stroke / graphic stroke width (None: a fill without a stroke)
+    size: float | None  # text height
+    ref: str | None = None  # the footprint a library item belongs to / the component an IR text names
+
+
+class _SilkBoard:
+    """Everything the compiled board's silk layers will carry, the pad copper, and what could not be read."""
+
+    def __init__(self, ir: CircuitIR, library: KicadLibrary | None) -> None:
+        pcb: PCBDesign = ir.pcb  # the validator checked it exists
+        o = pcb.outline
+        self.outline = None if o is None else (o.origin_x_mm, o.origin_y_mm, o.origin_x_mm + o.width_mm, o.origin_y_mm + o.height_mm)
+        self.entries: list[_SilkEntry] = []
+        self.pads: list[PadCopper] = []
+        self.unknown: list[str] = []  # footprints / silk constructs that could not be read
+        self.unknown_copper: list[str] = []  # pads whose copper is not modelled
+        self.malformed: list[dict[str, Any]] = []
+        self.on_fab: list[str] = []
+        sides = {c.ref: (p.side if (p := pcb.placement(c.ref)) is not None else None) for c in ir.components}
+        problems = silk_text_problems(pcb.silkscreen, sides)
+        designed: set[str] = set()
+        for i, t in enumerate(pcb.silkscreen):
+            label = f"silk[{i}:{t.kind}:{t.text}]"
+            if i in problems:
+                self.malformed.append({"item": label, "status": str(ValidationStatus.FAIL), "message": f"{label}: {problems[i]} (the compiler refuses it)"})
+                continue
+            if t.kind == "reference" and t.component_ref is not None:
+                designed.add(t.component_ref)
+            if t.layer in FAB_LAYERS:
+                self.on_fab.append(t.component_ref or t.text)
+                continue
+            shape = ir_text_box(t)
+            self.entries.append(_SilkEntry(label, side_of_layer(t.layer), "text", "ir", shape, shape.bbox(), t.thickness_mm, t.size_mm, t.component_ref))
+        if not pcb.placements:
+            return
+        if library is None:
+            self.unknown.append("no KiCad library: footprint silk and pad geometry unknown")
+            return
+        for comp in sorted(ir.components, key=lambda c: natural_ref_key(c.ref)):
+            placement = pcb.placement(comp.ref)
+            if placement is None:
+                self.unknown.append(f"{comp.ref} has no placement")
+                continue
+            if comp.footprint is None:
+                self.unknown.append(f"{comp.ref} has no footprint")
+                continue
+            try:
+                fp = library.load_footprint(comp.footprint)
+            except LibraryLookupError:
+                self.unknown.append(f"footprint {comp.footprint.library}:{comp.footprint.name} of {comp.ref} was not found in a KiCad library")
+                continue
+            except CompileError as e:
+                self.unknown.append(f"footprint {comp.footprint.library}:{comp.footprint.name} of {comp.ref}: {e}")
+                continue
+            for pad in pad_copper(comp.ref, fp, placement):
+                if pad.shape is None:
+                    self.unknown_copper.append(f"pad {pad.label} of {fp.lib_id} has shape {pad.pad_shape!r}, whose copper is not read (custom primitives / trapezoid rect_delta)")
+                else:
+                    self.pads.append(pad)
+            values = {"Value": comp.value, "Datasheet": (comp.datasheet.url or "") if comp.datasheet is not None else ""}
+            silk = footprint_silk(comp.ref, fp, placement, values)
+            for item in silk.items:
+                if item.shape is None:
+                    self.unknown.append(f"{item.label} of {fp.lib_id}: {item.why}")
+                    continue
+                self.entries.append(_SilkEntry(item.label, side_of_layer(item.layer), item.kind, "library", item.shape, item.shape.bbox(), item.width, item.size, comp.ref))
+            ref = silk.reference
+            if comp.ref not in designed and ref is not None and not ref.hidden and ref.layer in SILK_LAYERS:
+                shape = ref.box()
+                self.entries.append(_SilkEntry(f"{comp.ref}:Reference (library position)", side_of_layer(ref.layer), "text", "library default", shape, shape.bbox(), ref.thickness, ref.size, comp.ref))
+
+
+def _near(a: tuple[float, float, float, float], b: tuple[float, float, float, float], margin: float) -> bool:
+    return not (a[0] - margin > b[2] or b[0] - margin > a[2] or a[1] - margin > b[3] or b[1] - margin > a[3])
+
+
+class SilkscreenValidator(Validator):
+    """``pcb.silk.clearance`` / ``pcb.silk.overlap`` / ``pcb.silk.size`` (module docstring): IR geometry, not DRC."""
+
+    id = SILK_TOOL_ID
+    description = "silkscreen texts and footprint silk keep clear of pad copper, the board edge and each other, at the fab's minimum sizes (IR geometry, not DRC)"
+
+    def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
+        pcb = ir.pcb
+        if pcb is None:
+            return self._all(ValidationStatus.NOT_APPLICABLE, "no ir.pcb: no silkscreen to check")
+        if not pcb.placements and not pcb.silkscreen:
+            return self._all(ValidationStatus.NOT_APPLICABLE, "ir.pcb has no placements and no silkscreen texts: no silkscreen to check")
+        library = ctx.tools.get("kicad_library")
+        board = _SilkBoard(ir, library if isinstance(library, KicadLibrary) else None)
+        return [self._clearance(board), self._overlap(board), self._size(pcb, board)]
+
+    def _all(self, status: ValidationStatus, message: str) -> list[ValidationResult]:
+        return [self._result(check, status, f"{message} ({NOT_DRC})") for check in (SILK_CLEARANCE_CHECK, SILK_OVERLAP_CHECK, SILK_SIZE_CHECK)]
+
+    @staticmethod
+    def _result(check_id: str, status: ValidationStatus, message: str, **details: Any) -> ValidationResult:
+        return ValidationResult(check_id=check_id, status=status, message=message, tool=SILK_TOOL_ID, tool_version=SILK_TOOL_VERSION, details={"kind": KIND, **details})
+
+    @staticmethod
+    def _common(board: _SilkBoard) -> dict[str, Any]:
+        return {
+            "texts": sum(1 for e in board.entries if e.kind == "text"),
+            "graphics": sum(1 for e in board.entries if e.kind == "graphic"),
+            "designed_texts": sum(1 for e in board.entries if e.source == "ir"),
+            "library_default_references": [e.label.split(":")[0] for e in board.entries if e.source == "library default"],
+            "on_fab": board.on_fab,
+            "malformed": board.malformed,
+            "unknown": board.unknown,
+            "estimate": "text boxes are a conservative estimate (characters x size x 0.9 + stroke by size x 1.2 + stroke), not KiCad's font metrics",
+        }
+
+    def _verdict(self, check_id: str, board: _SilkBoard, rows: list[dict[str, Any]], what: str, passed: str, unknown: list[str], **details: Any) -> ValidationResult:
+        details = {**self._common(board), "violations": rows[:_MAX_ROWS], "violation_count": len(rows), **details}
+        if board.malformed or rows:
+            parts = []
+            if board.malformed:
+                parts.append(f"{len(board.malformed)} silk text(s) the compiler refuses: " + "; ".join(r["message"] for r in board.malformed[:5]))
+            if rows:
+                parts.append(f"{len(rows)} {what}: " + "; ".join(r["message"] for r in rows[:5]) + (" ..." if len(rows) > 5 else ""))
+            return self._result(check_id, ValidationStatus.FAIL, "; ".join(parts) + f" ({NOT_DRC})", **details)
+        if unknown:
+            return self._result(check_id, ValidationStatus.NOT_VERIFIED, "not every silk item could be checked: " + "; ".join(unknown[:5]) + (" ..." if len(unknown) > 5 else "") + f" ({NOT_DRC})", **details)
+        if not board.entries:
+            return self._result(check_id, ValidationStatus.NOT_APPLICABLE, f"nothing on the silk layers ({len(board.on_fab)} reference(s) on the fab layer) ({NOT_DRC})", **details)
+        return self._result(check_id, ValidationStatus.PASS, f"{passed} (IR geometry with estimated text boxes, not DRC)", **details)
+
+    def _clearance(self, board: _SilkBoard) -> ValidationResult:
+        rows: list[dict[str, Any]] = []
+        below: list[dict[str, Any]] = []
+        estimated: list[str] = []  # library texts whose over-estimated box meets copper / leaves the outline: not a proof either way
+        compared = 0
+        for e in board.entries:
+            margined = e.kind == "text" and e.source != "library"  # designed / default-position texts: the placer's margins
+            library_text = e.kind == "text" and e.source == "library"
+            limit = SILK_TO_PAD_MM if margined else 0.0
+            for pad in board.pads:
+                if e.side not in pad.sides or pad.shape is None:
+                    continue
+                compared += 1
+                if not _near(e.box, pad.shape.bbox(), SILK_TO_PAD_MM):
+                    continue
+                d = shape_distance(e.shape, pad.shape)
+                if library_text and d <= 0.0:
+                    estimated.append(f"the estimated box of library text {e.label} meets pad {pad.label} copper (the estimate is conservative; KiCad's silk_over_copper decides)")
+                elif d <= 0.0 or (margined and d < _q(limit)):
+                    what = "overlaps" if d <= 0.0 else f"is {d:g} mm from"
+                    rows.append({"a": e.label, "b": f"pad {pad.label}", "distance_mm": d, "limit_mm": limit, "status": str(ValidationStatus.FAIL),
+                                 "message": f"{e.label} {what} pad {pad.label} copper" + ("" if d <= 0.0 else f" (< {limit:g} mm)")})
+                elif d < _q(SILK_TO_PAD_MM):
+                    below.append({"a": e.label, "b": f"pad {pad.label}", "distance_mm": d, "message": f"library silk {e.label} is {d:g} mm from pad {pad.label} (the footprint's own design; below the {SILK_TO_PAD_MM:g} mm text margin)"})
+            if board.outline is not None:
+                inset = (board.outline[0] + SILK_TO_EDGE_MM, board.outline[1] + SILK_TO_EDGE_MM, board.outline[2] - SILK_TO_EDGE_MM, board.outline[3] - SILK_TO_EDGE_MM)
+                if margined and not inside_box(e.shape, inset):
+                    rows.append({"a": e.label, "b": "board edge", "status": str(ValidationStatus.FAIL), "message": f"{e.label} is not inside the outline inset by {SILK_TO_EDGE_MM:g} mm"})
+                elif library_text and not inside_box(e.shape, board.outline):
+                    estimated.append(f"the estimated box of library text {e.label} leaves the outline (the estimate is conservative; KiCad's DRC decides)")
+                elif not margined and not library_text and not inside_box(e.shape, board.outline):
+                    rows.append({"a": e.label, "b": "board edge", "status": str(ValidationStatus.FAIL), "message": f"{e.label} leaves the outline"})
+                elif not margined and not inside_box(e.shape, inset):
+                    below.append({"a": e.label, "b": "board edge", "message": f"library silk {e.label} is within {SILK_TO_EDGE_MM:g} mm of the outline (the footprint's own design)"})
+        unknown = [*board.unknown, *board.unknown_copper, *estimated] + ([] if board.outline is not None else ["ir.pcb has no outline: edge distances not judged"])
+        passed = (
+            f"{sum(1 for e in board.entries if e.kind == 'text' and e.source != 'library')} silk text(s) keep >= {SILK_TO_PAD_MM:g} mm from pad copper and >= {SILK_TO_EDGE_MM:g} mm inside the outline "
+            f"(the silkscreen placer's margins, not a fab rule), {sum(1 for e in board.entries if e.source == 'library')} footprint silk graphic(s) / library text(s) touch no pad copper and stay inside the outline"
+            + (f"; {len(below)} library item(s) closer than the text margins, listed" if below else "")
+        )
+        return self._verdict(SILK_CLEARANCE_CHECK, board, rows, "silk item(s) too close to pad copper or the board edge", passed, unknown,
+                             pairs_compared=compared, silk_to_pad_mm=SILK_TO_PAD_MM, silk_to_edge_mm=SILK_TO_EDGE_MM, below_margin=below[:_MAX_ROWS],
+                             library_text_estimates=estimated[:_MAX_ROWS],
+                             not_compared=["tracks (silk over mask-covered copper is normal)", "vias (tented by the compiled board)"])
+
+    def _overlap(self, board: _SilkBoard) -> ValidationResult:
+        rows: list[dict[str, Any]] = []
+        own: list[dict[str, Any]] = []  # a footprint's library text against its own library silk: its own design, listed
+        texts = [e for e in board.entries if e.kind == "text"]
+        graphics = [e for e in board.entries if e.kind == "graphic"]
+        compared = 0
+        for i, a in enumerate(texts):
+            for b in [*texts[i + 1:], *graphics]:
+                if a.side != b.side:
+                    continue
+                compared += 1
+                if not _near(a.box, b.box, 0.0):
+                    continue
+                if shape_distance(a.shape, b.shape) <= 0.0:
+                    if a.source == b.source == "library" and a.ref is not None and a.ref == b.ref:
+                        own.append({"a": a.label, "b": b.label, "message": f"library text {a.label} meets {b.label} of the same footprint (the footprint's own design, judged by the estimated text box)"})
+                        continue
+                    rows.append({"a": a.label, "b": b.label, "status": str(ValidationStatus.FAIL), "message": f"{a.label} touches or overlaps {b.label}"})
+        passed = (f"{len(texts)} silk text(s) overlap no other silk text and no footprint silk graphic ({compared} pair(s) compared)"
+                  + (f"; {len(own)} library text(s) meeting their own footprint's silk, listed" if own else ""))
+        return self._verdict(SILK_OVERLAP_CHECK, board, rows, "silk overlap(s)", passed, list(board.unknown), pairs_compared=compared, library_own_overlaps=own[:_MAX_ROWS])
+
+    def _size(self, pcb: PCBDesign, board: _SilkBoard) -> ValidationResult:
+        mfg = pcb.manufacturing
+        rows: list[dict[str, Any]] = []
+        limits: dict[str, Any] = {}
+        missing: list[str] = []
+        for key in SILK_SIZE_KEYS:
+            traced = getattr(mfg, key)
+            if traced is None:
+                missing.append(f"no {key} in ir.pcb.manufacturing (ground it with --fab-capability): not judged")
+                limits[key] = None
+                continue
+            lim = float(traced.value)
+            limits[key] = {"value_mm": lim, "provenance": str(traced.provenance.kind)}
+            for e in board.entries:
+                if key == "min_silk_text_height_mm" and e.kind == "text" and e.size is not None and _q(e.size) < _q(lim):
+                    rows.append({"item": e.label, "key": key, "value_mm": e.size, "limit_mm": lim, "status": str(ValidationStatus.FAIL),
+                                 "message": f"{e.label} text height {e.size:g} mm < {key} {lim:g}"})
+                if key == "min_silk_line_width_mm" and e.width is not None and _q(e.width) < _q(lim):
+                    what = "stroke" if e.kind == "text" else "line width"
+                    rows.append({"item": e.label, "key": key, "value_mm": e.width, "limit_mm": lim, "status": str(ValidationStatus.FAIL),
+                                 "message": f"{e.label} {what} {e.width:g} mm < {key} {lim:g}"})
+        grounded = ", ".join(f"{k} {v['value_mm']:g} mm ({v['provenance']})" for k, v in limits.items() if v is not None)
+        passed = f"every silk text and line meets {grounded}"
+        missing = missing if board.entries else []  # nothing on the silk layers: nothing to size, whatever the limits
+        result = self._verdict(SILK_SIZE_CHECK, board, rows, "silk item(s) below the fab's minimum size", passed, [*missing, *board.unknown], limits=limits)
+        if result.status is ValidationStatus.NOT_VERIFIED and missing and not board.unknown:
+            checked = f"; checked: {grounded}" if grounded else ""
+            result.message = "; ".join(missing) + checked + f" ({NOT_DRC})"
+        return result
+
+
+default_registry.register(SilkscreenValidator())

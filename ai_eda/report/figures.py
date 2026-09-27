@@ -42,7 +42,12 @@ Chart rules (from the data-visualization skill, applied throughout):
 Board figures read pad geometry only through the KiCad library on disk
 (:mod:`ai_eda.tools.kicad.geometry` places it), exactly as the PCB compiler
 does: a footprint that is not in a library, a component without a placement
-or a board without an outline is a ``ValueError``, never a guess.
+or a board without an outline is a ``ValueError``, never a guess. The
+silkscreen on the board figure is the footprints' library silk graphics and
+the IR's silk texts at their IR positions (:func:`board_figure`), the 3D
+preview figure (:func:`model3d_figure`) the scene of
+:mod:`ai_eda.tools.model3d` (body heights from the STEP files the footprints
+name; a part without one is a flat outline, said in the caption).
 """
 
 from __future__ import annotations
@@ -52,13 +57,19 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from types import EllipsisType
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape
 
-from ai_eda.ir import CircuitIR, Expectation, ValidationStatus
+from ai_eda.ir import CircuitIR, Expectation, SilkKind, ValidationStatus
 from ai_eda.tools.calc.si import parse_spice_number
-from ai_eda.tools.kicad.geometry import footprint_bbox, pad_angle, pad_center, pad_layers
+from ai_eda.tools.kicad import sexpr
+from ai_eda.tools.kicad.geometry import footprint_bbox, mirrored_layer, pad_angle, pad_center, pad_copper_center, pad_layers, to_board
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary, Pad
+from ai_eda.tools.model3d.iso import iso_svg
+from ai_eda.tools.model3d.scene import GRAPHIC_HEADS, Scene, build_scene, graphic_paths, scene_caption, stroke_width
+from ai_eda.tools.silkscreen.geometry import SILK_LAYERS, Shape, footprint_silk, ir_text_box, silk_text_problems
 from ai_eda.tools.spice.rawfile import canonical_name
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK
 
@@ -77,6 +88,8 @@ __all__ = [
     "Marker",
     "NO_MEASUREMENT",
     "SERIES_COLOURS",
+    "SILK_COLOUR",
+    "SILK_LAYER_ORDER",
     "STATUS_COLOURS",
     "STATUS_OTHER",
     "SURFACE",
@@ -91,6 +104,8 @@ __all__ = [
     "expectation_limit",
     "layer_class",
     "log_ticks",
+    "model3d_figure",
+    "model3d_figure_from_scene",
     "nice_ticks",
     "plot_vector",
     "si_format",
@@ -127,6 +142,10 @@ THT_COLOUR = "#eda100"
 VIA_COLOUR = "#8a8983"
 DRILL_COLOUR = "#ffffff"
 BOARD_FILL = "#f3f1ea"
+#: silkscreen strokes and texts on the board figure: ink on the light board, at their true stroke width / text height
+SILK_COLOUR = INK
+#: the silk layer groups of the board figure, back first (the front is drawn over it)
+SILK_LAYER_ORDER: tuple[str, ...] = ("B.SilkS", "F.SilkS")
 #: points per series after :func:`downsample`
 MAX_POINTS = 2000
 #: the width every figure is authored at: the report page's 178 mm column at 96 dpi, so the HTML / PDF shows it 1:1
@@ -997,6 +1016,118 @@ def _pad_fill(pad: Pad, layers: list[str]) -> tuple[str, bool]:
     return OTHER_COPPER, False
 
 
+#: SVG em per mm of KiCad text height: a sans-serif capital is about 0.7 em tall, so the drawn capitals are as tall as the KiCad size
+_SILK_EM_PER_MM = 1.4
+
+
+@dataclass
+class _SilkDrawing:
+    """The silkscreen of a board figure: markup per silk layer and what it counts."""
+
+    by_layer: dict[str, list[str]]
+    graphics: int = 0
+    texts: int = 0  # IR silk texts drawn
+    library_texts: int = 0  # library texts drawn (footprint silk texts, default-position references of undesigned footprints)
+    designed: bool = False
+    refused: int = 0  # IR texts the compiler refuses (not drawn; the pcb.silk.* checks name them)
+    on_fab: int = 0  # IR references placed on the fab layer (not silk)
+
+
+def _silk_text(text: str, box: Shape, angle: float, size: float, stroke: float, layer: str, X: Any, Y: Any, scale: float, *, kind: str, ref: str | None) -> str:
+    """One silk text centred in its estimated box (the IR's / the library's anchor, justification and mirroring already applied), turned ``angle`` degrees counter-clockwise on screen, mirrored on a ``B.*`` layer."""
+    cx = sum(p[0] for p in box.points) / len(box.points)
+    cy = sum(p[1] for p in box.points) / len(box.points)
+    transform = f"translate({_f(X(cx))} {_f(Y(cy))})"
+    if not math.isclose(angle % 360.0, 0.0, abs_tol=1e-9) and not math.isclose(angle % 360.0, 360.0, abs_tol=1e-9):
+        transform += f" rotate({_f(-angle)})"
+    if layer.startswith("B."):
+        transform += " scale(-1 1)"
+    ref_attr = f' data-ref="{esc(ref)}"' if ref else ""
+    return (
+        f'<text class="silk-text" data-kind="{esc(kind)}"{ref_attr} data-size-mm="{_g(size)}" data-stroke-mm="{_g(stroke)}" transform="{transform}" '
+        f'x="0" y="0" text-anchor="middle" dominant-baseline="central" font-size="{_f(size * scale * _SILK_EM_PER_MM)}" fill="{SILK_COLOUR}">{esc(text)}</text>'
+    )
+
+
+def _box_angle(box: Shape) -> float:
+    """The text angle of an estimated text box: the direction of its first edge (the text's own +x), counter-clockwise on screen."""
+    (x0, y0), (x1, y1) = box.points[0], box.points[1]
+    return math.degrees(math.atan2(-(y1 - y0), x1 - x0))
+
+
+def _board_silk(ir: CircuitIR, placed: Sequence[tuple[Any, Any, FootprintDef]], X: Any, Y: Any, scale: float) -> _SilkDrawing:
+    """What the compiled board's silk layers carry, as markup per layer (:func:`board_figure`).
+
+    Always: every footprint's own ``F.SilkS`` / ``B.SilkS`` graphics from the
+    library (the strokes the 3D preview draws, :func:`~ai_eda.tools.model3d.scene.graphic_paths`,
+    mirrored with the footprint), at their stroke width. With a designed
+    silkscreen (``ir.pcb.silkscreen`` not empty) also every silk text: the
+    IR texts at their IR positions (a reference on ``F.Fab`` / ``B.Fab`` is
+    not silk and only counted; a text the compiler refuses is not drawn and
+    counted), the library position of the ``Reference`` of a footprint
+    without a designed one, and the footprints' visible library silk texts -
+    each centred in the estimated box the ``pcb.silk.*`` checks measured
+    (:mod:`ai_eda.tools.silkscreen.geometry`), in the browser's sans-serif,
+    not KiCad's stroke font.
+    """
+    pcb = ir.pcb
+    assert pcb is not None
+    out = _SilkDrawing(by_layer={layer: [] for layer in SILK_LAYER_ORDER}, designed=bool(pcb.silkscreen))
+    for comp, placement, fp in placed:
+        for item in fp.node:
+            if sexpr.head(item) not in GRAPHIC_HEADS:
+                continue
+            layer = sexpr.get(item, "layer")
+            if layer not in SILK_LAYERS:
+                continue
+            board_layer = mirrored_layer(str(layer), placement.side)
+            width = stroke_width(item)
+            lines, fills = graphic_paths(item)
+            for poly in fills:
+                pts = " ".join(f"{_f(X(x))},{_f(Y(y))}" for x, y in (to_board(placement, u, v) for u, v in poly))
+                out.by_layer[board_layer].append(f'<polygon class="silk-fill" data-ref="{esc(comp.ref)}" points="{pts}" fill="{SILK_COLOUR}"/>')
+                out.graphics += 1
+            if width <= 0:
+                continue
+            for path in lines:
+                pts = " ".join(f"{_f(X(x))},{_f(Y(y))}" for x, y in (to_board(placement, u, v) for u, v in path))
+                out.by_layer[board_layer].append(
+                    f'<polyline class="silk-line" data-ref="{esc(comp.ref)}" points="{pts}" fill="none" stroke="{SILK_COLOUR}" '
+                    f'stroke-width="{_f(width * scale)}" stroke-linecap="round" stroke-linejoin="round"/>'
+                )
+                out.graphics += 1
+    if not out.designed:
+        return out
+    sides = {c.ref: (pl.side if (pl := pcb.placement(c.ref)) is not None else None) for c in ir.components}
+    problems = silk_text_problems(pcb.silkscreen, sides)
+    designed_refs: set[str] = set()
+    for i, t in enumerate(pcb.silkscreen):
+        if i in problems:
+            out.refused += 1
+            continue
+        if t.kind == SilkKind.REFERENCE and t.component_ref is not None:
+            designed_refs.add(t.component_ref)
+        if t.layer not in SILK_LAYERS:
+            out.on_fab += 1
+            continue
+        out.by_layer[t.layer].append(_silk_text(t.text, ir_text_box(t), t.rotation_deg, t.size_mm, t.thickness_mm, t.layer, X, Y, scale, kind=str(t.kind), ref=t.component_ref))
+        out.texts += 1
+    for comp, placement, fp in placed:
+        values = {"Value": comp.value, "Datasheet": (comp.datasheet.url or "") if comp.datasheet is not None else ""}
+        silk = footprint_silk(comp.ref, fp, placement, values)
+        for item in silk.items:
+            # a text item with a size (fp_text / a visible property); an fp_text_box has no single text size and is left out
+            if item.kind != "text" or item.shape is None or not item.text or item.size is None or item.layer not in SILK_LAYERS or len(item.shape.points) != 4:
+                continue
+            out.by_layer[item.layer].append(_silk_text(item.text, item.shape, _box_angle(item.shape), item.size, item.width or 0.0, item.layer, X, Y, scale, kind="library", ref=comp.ref))
+            out.library_texts += 1
+        ref = silk.reference
+        if comp.ref not in designed_refs and ref is not None and not ref.hidden and ref.layer in SILK_LAYERS:
+            out.by_layer[ref.layer].append(_silk_text(ref.text, ref.box(), ref.rotation, ref.size, ref.thickness, ref.layer, X, Y, scale, kind="library_reference", ref=comp.ref))
+            out.library_texts += 1
+    return out
+
+
 def layer_class(layer: str) -> str:
     """The class of a copper layer's track group in a board figure: ``F.Cu`` -> ``layer-F_Cu`` (every character outside ``[A-Za-z0-9_-]`` becomes ``_``)."""
     return "layer-" + _ID_SAFE_RE.sub("_", layer)
@@ -1022,11 +1153,23 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     layer inside ``<g class="tracks">`` (:func:`layer_class`: ``layer-B_Cu``
     and ``layer-F_Cu`` always, empty when unused, plus any other layer that
     carries a track; ``copper=False`` draws no layer group), ``pads``,
-    ``vias`` and ``labels``; the labels wear a surface-coloured
+    ``vias``, ``silk`` and ``labels``; the labels wear a surface-coloured
     halo so they stay legible over copper, and the caption line inside the
     figure wraps to the figure's width (one ``<text class="caption">`` per
     line). ``copper=False`` draws the placement only (id default
     ``placement``, else ``board``).
+
+    The silkscreen (:func:`_board_silk`) is drawn over the copper in
+    :data:`SILK_COLOUR` inside ``<g class="silk">``, one group per silk layer
+    (:func:`layer_class`: ``layer-B_SilkS`` then ``layer-F_SilkS``, always
+    both, empty when unused): the footprints' library silk graphics always
+    (``silk-line`` / ``silk-fill``), and - when the IR carries a designed
+    silkscreen - every silk text at its IR position (``silk-text``, with
+    ``data-kind``); the reference designators then come from the IR, so the
+    figure's own ref / value labels are drawn only for a board without
+    designed silk (the ``labels`` group is always there, empty otherwise).
+    The figure draws the silk; it judges nothing (``pcb.silk.*`` and KiCad's
+    DRC do).
     """
     pcb = ir.pcb
     if pcb is None or pcb.outline is None:
@@ -1060,6 +1203,7 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     kind = "board" if copper else "placement"
     what = "보드 그림 (동박 포함)" if copper else "배치도 (동박 제외)"
     title = f"{ir.project.id}: {what}"
+    silk = _board_silk(ir, placed, X, Y, scale)
     tracks = list(pcb.tracks) if copper else []
     vias = list(pcb.vias) if copper else []
     other_layers = sorted({t.layer for t in tracks if t.layer not in COPPER_COLOURS})
@@ -1075,6 +1219,17 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     else:
         stats = f"부품 {len(placed)}개, 동박 제외 (배치만)"
         key = "빨강 = F.Cu 패드, 파랑 = B.Cu 패드, 노랑 = 관통 패드(흰 원 = 드릴)"
+    if silk.designed:
+        stats += f", 실크 문자 {silk.texts}개 (IR 위치)"
+        if silk.library_texts:
+            stats += f" + 라이브러리 실크 문자 {silk.library_texts}개"
+        if silk.on_fab:
+            stats += f", F.Fab 참조 {silk.on_fab}개 (실크 아님)"
+        if silk.refused:
+            stats += f", 그리지 않은 실크 문자 {silk.refused}개 (컴파일러 거부)"
+        key += ", 검정 = 실크스크린 (B.SilkS 문자는 거울상)"
+    else:
+        key += ", 검정 선 = 라이브러리 실크 (설계된 실크 문자 없음: 참조·값 라벨은 그림용)"
     caption_lines = _wrap_caption(f"{ir.project.id}: {size}, {stats}; {key}", width - 2 * _BOARD_MARGIN, _SMALL_PX)
     caption_h = _BOARD_CAPTION_PAD + _BOARD_CAPTION_LINE_H * len(caption_lines)
     height = int(round(outline.height_mm * scale + 2 * _BOARD_MARGIN + caption_h))
@@ -1105,7 +1260,7 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
         own_pads: list[_Box] = []
         own_copper: list[_Box] = []
         for pad in fp.pads:
-            cx, cy = pad_center(placement, pad)
+            cx, cy = pad_copper_center(placement, pad)  # the copper; the hole is at pad_center (they differ by a drill offset)
             angle = pad_angle(placement, pad)
             reach = max(pad.size_w, pad.size_h) / 2 * scale
             own_pads.append((X(cx) - reach, Y(cy) - reach, X(cx) + reach, Y(cy) + reach))
@@ -1120,7 +1275,8 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
             parts = [f'<g class="pad" data-ref="{esc(comp.ref)}" data-pad="{esc(pad.number)}" data-tht="{"true" if tht else "false"}">']
             parts.append(_pad_shape(pad, X(cx), Y(cy), angle, scale, fill))
             if pad.drill:
-                parts.append(f'<circle class="drill" cx="{_f(X(cx))}" cy="{_f(Y(cy))}" r="{_f(pad.drill / 2 * scale)}" fill="{DRILL_COLOUR}"/>')
+                hx, hy = pad_center(placement, pad)
+                parts.append(f'<circle class="drill" cx="{_f(X(hx))}" cy="{_f(Y(hy))}" r="{_f(pad.drill / 2 * scale)}" fill="{DRILL_COLOUR}"/>')
             parts.append("</g>")
             pad_items.append((order, "".join(parts)))
         box = footprint_bbox(placement, fp)
@@ -1136,18 +1292,57 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
             f'<circle class="drill" cx="{_f(X(v.x_mm))}" cy="{_f(Y(v.y_mm))}" r="{_f(v.drill_mm / 2 * scale)}" fill="{DRILL_COLOUR}"/></g>'
         )
     out.append("</g>")
-    out.append('<g class="labels">')
-    out += _board_labels(label_parts, width)
+    out.append('<g class="silk">')
+    for layer in SILK_LAYER_ORDER:
+        out.append(f'<g class="{layer_class(layer)}" data-layer="{esc(layer)}">')
+        out += silk.by_layer[layer]
+        out.append("</g>")
+    out.append("</g>")
+    out.append('<g class="labels">')  # always there (a viewer toggles it by class); empty when the silk carries the references
+    if not silk.designed:
+        out += _board_labels(label_parts, width)
     out.append("</g>")
     for i, line in enumerate(caption_lines):
         y = height - 10 - _BOARD_CAPTION_LINE_H * (len(caption_lines) - 1 - i)
         out.append(f'<text class="caption" x="{_BOARD_MARGIN}" y="{_f(y)}" font-size="{_SMALL_PX}" fill="{INK_SECONDARY}">{esc(line)}</text>')
     out.append("</svg>")
     caption = (
-        f"{what}: 외곽 {size}, {stats}. 패드 형상은 KiCad 라이브러리에서 읽은 것이고 위치는 IR 의 배치 그대로입니다. 색: {key}. "
+        f"{what}: 외곽 {size}, {stats}. 패드 형상과 실크 선은 KiCad 라이브러리에서 읽은 것이고 위치는 IR 의 배치 그대로입니다"
+        + (" (실크 문자는 IR 의 위치·크기·회전에 브라우저 글꼴로 그림; KiCad 의 스트로크 글꼴이 아님)" if silk.designed else "")
+        + f". 색: {key}. "
         "그림은 보드의 유효성을 판정하지 않습니다 (DRC 결과는 별도 표)."
     )
     return Figure(fig_id or kind, title, caption, "\n".join(out) + "\n")
+
+
+# --------------------------------------------------------------------------- the 3D preview
+
+
+def model3d_figure(
+    ir: CircuitIR, library: KicadLibrary, *, model_dir: Path | None | EllipsisType = ..., view: str = "iso", fig_id: str = "iso3d", width: int = COLUMN_PX,
+) -> Figure:
+    """The board's built-in 3D preview seen from ``view`` (:data:`~ai_eda.tools.model3d.iso.VIEWS`) as a figure.
+
+    The scene is :func:`~ai_eda.tools.model3d.scene.build_scene` of the IR
+    and the libraries on disk - the one the ``MODEL_3D`` artifact (the preview
+    GLB) is written from - and the SVG is :func:`~ai_eda.tools.model3d.iso.iso_svg`
+    at the column width without its in-figure caption: the caption is the
+    figure's (:func:`~ai_eda.tools.model3d.scene.scene_caption`: size, the part
+    boxes with / without a STEP height, the body rule
+    :data:`~ai_eda.tools.model3d.scene.BODY_CAPTION`, the assumptions). The 3D
+    library is ``model_dir`` when given (``None`` = none), else the one
+    :func:`~ai_eda.tools.model3d.models.find_3dmodel_dir` finds. Refuses what
+    the scene refuses (:class:`~ai_eda.tools.model3d.scene.SceneError` is a
+    ``ValueError``); judges nothing.
+    """
+    return model3d_figure_from_scene(build_scene(ir, library, model_dir=model_dir), ir, view=view, fig_id=fig_id, width=width)
+
+
+def model3d_figure_from_scene(scene: Scene, ir: CircuitIR, *, view: str = "iso", fig_id: str = "iso3d", width: int = COLUMN_PX) -> Figure:
+    """:func:`model3d_figure` of a scene already built from ``ir`` (a report that also tabulates the scene's bodies builds it once)."""
+    svg = iso_svg(scene, view, width=width, caption=False)
+    title = f"{ir.project.id}: 3D 미리보기 ({'등각' if view == 'iso' else view})"
+    return Figure(fig_id, title, scene_caption(scene), svg)
 
 
 # --------------------------------------------------------------------------- tolerance figure

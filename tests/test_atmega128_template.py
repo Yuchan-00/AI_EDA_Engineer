@@ -640,12 +640,21 @@ def test_stage_reports_and_gui_previews_render_the_64_pin_board(tmp_path: Path):
     assert len(pins) == 64 and sorted(p.get("data-number") for p in pins if p.get("data-hidden") == "yes") == ["52", "53", "63"]
     labels = [g for g in root.iter(f"{ns}g") if g.get("class") == "global-label"]
     assert len(labels) == sum(len(n.pins) for n in ir.nets) - 3 and root.get("viewBox") != "0 0 297 210"  # the sheet grew past A4
-    # the board preview: all 64 TQFP pads, the pitch at least 5 px at the preview scale, U1's labels inside its pad ring, no labels on top of each other
+    # the board preview: all 64 TQFP pads, the pitch at least 5 px at the preview scale; the PLACEMENT stage designed the silkscreen, so every
+    # reference on the silk is drawn at its IR position (silk texts) and the figure's own ref / value labels are not
     board = ET.fromstring(board_svg(ir, lib))
     pads = [g for g in board.iter(f"{ns}g") if g.get("class") == "pad" and g.get("data-ref") == "U1"]
     assert len(pads) == 64
     scale = float(next(e for e in board.iter(f"{ns}rect") if e.get("class") == "outline").get("width")) / ir.pcb.outline.width_mm
     assert 0.8 * scale >= 5.0
+    on_silk = {t.component_ref for t in ir.pcb.silkscreen if t.kind == "reference" and t.layer.endswith(".SilkS")}
+    drawn = {t.get("data-ref") for t in board.iter(f"{ns}text") if t.get("class") == "silk-text" and t.get("data-kind") == "reference"}
+    assert on_silk and drawn == on_silk and not [t for t in board.iter(f"{ns}text") if t.get("class") in ("ref", "value")]
+    # without designed silk (pcb.silkscreen=skip) the figure's own labels come back: U1's inside its pad ring, no labels on top of each other
+    bare = ir.model_copy(deep=True)
+    bare.pcb.silkscreen = []
+    board = ET.fromstring(board_svg(bare, lib))
+    pads = [g for g in board.iter(f"{ns}g") if g.get("class") == "pad" and g.get("data-ref") == "U1"]
     texts = [t for t in board.iter(f"{ns}text") if t.get("class") in ("ref", "value")]
     boxes = []
     for t in texts:

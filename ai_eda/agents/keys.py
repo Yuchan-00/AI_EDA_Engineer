@@ -35,6 +35,9 @@ PROPOSE_REGS_KEY = "propose_regulations"
 #: placement alone: all or nothing)
 PLACEMENT_KEY = "pcb.placement"
 ROUTING_KEY = "pcb.routing"
+#: PCB agent: ``--answer pcb.silkscreen=skip`` proposes the board without designed silkscreen (the compiled board keeps
+#: the library's reference positions)
+SILKSCREEN_KEY = "pcb.silkscreen"
 
 #: the answer keys that decide on something the requirement extraction showed: they can turn a model's value into the
 #: user's within one run, so a design confirmation given beside them refers to a table that was never shown
@@ -45,7 +48,7 @@ CONTROL_KEYS: frozenset[str] = frozenset({
     CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY,
     CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY,
     ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY,
-    PLACEMENT_KEY, ROUTING_KEY, CONFIRM_DESIGN_KEY,
+    PLACEMENT_KEY, ROUTING_KEY, SILKSCREEN_KEY, CONFIRM_DESIGN_KEY,
 })
 
 __all__ = [
@@ -64,4 +67,5 @@ __all__ = [
     "REJECT_REGS_KEY",
     "REQUIREMENT_DECISION_KEYS",
     "ROUTING_KEY",
+    "SILKSCREEN_KEY",
 ]

@@ -36,9 +36,10 @@ Each report is delivered three ways from the one Markdown text: ``<name>.md``,
 ``<name>.html`` (the Markdown rendered by :mod:`ai_eda.report.pdf` with the
 report's figures inline as SVG - :mod:`ai_eda.report.figures`: the
 template's theory curves and the measured waveform in the theory report,
-the placement, the routed board and the per-net copper length in the
-circuit report, the theory-vs-simulation tolerance chart and the waveform
-in the final report; the parts report has none and says so) and, when a
+the placement, the routed board (both with the silkscreen drawn on them),
+the per-net copper length and the isometric 3D preview in the circuit
+report, the theory-vs-simulation tolerance chart and the waveform in the
+final report; the parts report has none and says so) and, when a
 headless Chromium / Chrome / Edge is found or given, ``<name>.pdf`` (the HTML
 printed; no browser means no PDF and a reason, never a failure). The
 Markdown holds a placeholder line ``![fig](fig:<id>)`` followed by the
@@ -47,7 +48,12 @@ figure whose data is missing is one Korean sentence saying what is missing
 (:class:`ReportFigures`). The waveform is read from the fresh ``SPICE_RESULT``
 artifact only through :func:`~ai_eda.tools.spice.evidence.fresh_spice_run`
 (the rule every SPICE-reading validator follows), the board from the KiCad
-library the pipeline resolved. ``.md`` and ``.html`` are deterministic; the
+library the pipeline resolved, the 3D preview from the scene the ``MODEL_3D``
+artifact is compiled from (:func:`~ai_eda.tools.model3d.scene.build_scene`:
+the same library plus the STEP files of the 3D model library it finds). The
+circuit report's silkscreen section copies the IR's silk texts, the placer's
+recorded parameters and the latest ``pcb.silk.*`` results; it judges
+nothing. ``.md`` and ``.html`` are deterministic; the
 PDF bytes carry the browser's own creation date and are a derived document
 like a rawfile. None of the three is an artifact or hashed.
 """
@@ -63,9 +69,10 @@ from typing import Any
 from ai_eda.design import TEMPLATES
 from ai_eda.design.base import CHOICE_NOTE_PREFIX, NO_RECORD, TOOL_ID, PartNote, Template, TheorySection, parameter_value, quantity
 from ai_eda.design.templates import display_spelled
-from ai_eda.ir import CircuitIR, Component, Provenance, ProvenanceKind, Reduce, Traced, ValidationResult, ValidationStatus
+from ai_eda.errors import CompileError
+from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, Component, Provenance, ProvenanceKind, Reduce, SilkKind, Traced, ValidationResult, ValidationStatus
 from ai_eda.parts.existence import CHECK_PREFIX as EXISTENCE_PREFIX
-from ai_eda.report.figures import Figure, bar_figure, board_figure, expectation_limit, plot_vector, tolerance_figure, tolerance_rows, waveform_figures
+from ai_eda.report.figures import Figure, bar_figure, board_figure, expectation_limit, model3d_figure_from_scene, plot_vector, tolerance_figure, tolerance_rows, waveform_figures
 from ai_eda.report.pdf import NO_BROWSER_REASON, find_browser, html_to_pdf, markdown_to_html
 from ai_eda.report.pipeline_log import PipelineRecord
 from ai_eda.tools.calc.part_value import PART_VALUE_DIGITS
@@ -73,9 +80,13 @@ from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, Library
 from ai_eda.tools.placement.core_ring import BODY_OVERHANG_MM, CORE_MIN_PADS, EDGE_REF_PREFIXES, INNER_MAX_PADS
 from ai_eda.tools.placement.core_ring import PLACER_ID as RING_PLACER_ID
 from ai_eda.tools.placement.grid import PLACER_ID
+from ai_eda.tools.model3d.scene import BODY_CAPTION, Scene, build_scene
+from ai_eda.tools.silkscreen.geometry import TEXT_HEIGHT_FACTOR, TEXT_WIDTH_FACTOR
+from ai_eda.tools.silkscreen.place import CONNECTOR_LIBRARY_PREFIX, REFERENCE_CANDIDATES, TITLE_SLIDE_STEP_MM
+from ai_eda.tools.silkscreen.place import PLACER_ID as SILK_PLACER_ID
 from ai_eda.tools.spice.evidence import fresh_spice_run
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK
-from ai_eda.validation.layout import CLEARANCE_CHECK, CONNECTIVITY_CHECK
+from ai_eda.validation.layout import CLEARANCE_CHECK, CONNECTIVITY_CHECK, SILK_CLEARANCE_CHECK, SILK_OVERLAP_CHECK, SILK_SIZE_CHECK
 from ai_eda.workflow.orchestrator import PipelineState, StageOutcome
 from ai_eda.workflow.stages import STAGE_ORDER, Stage
 
@@ -260,6 +271,7 @@ SLOT_PLACEMENT = "placement"
 SLOT_BOARD = "board"
 SLOT_COPPER = "copper_bars"
 SLOT_TOLERANCE = "tolerance"
+SLOT_ISO3D = "iso3d"
 #: the missing-data sentences (one per slot; the reason, when there is one, is appended in parentheses)
 NO_WAVEFORM = "시뮬레이션 결과가 아직 없어 파형 그림이 없습니다"
 NO_PLACEMENT_FIGURE = "배치가 없어 배치도가 없습니다"
@@ -267,6 +279,7 @@ NO_BOARD_FIGURE = "배선이 없어 보드 그림이 없습니다"
 NO_COPPER_FIGURE = "배선이 없어 넷별 동박 길이 그래프가 없습니다"
 NO_TOLERANCE_FIGURE = "기대값이 없어 이론값 대 시뮬레이션 그림이 없습니다"
 NO_LIBRARY_FIGURE = "KiCad 라이브러리를 열 수 없어 보드 그림이 없습니다"
+NO_ISO3D_FIGURE = "3D 미리보기 그림이 없습니다"
 
 
 @dataclass
@@ -281,6 +294,8 @@ class ReportFigures:
     figures: dict[str, Figure] = field(default_factory=dict)
     slots: dict[str, list[str]] = field(default_factory=dict)
     missing: dict[str, str] = field(default_factory=dict)
+    #: the 3D scene the ``iso3d`` figure was drawn from (the circuit report's body table reads it; built once per report)
+    scene: Scene | None = None
 
     def add(self, slot: str, *figures: Figure) -> None:
         for fig in figures:
@@ -414,6 +429,30 @@ def board_figures_of(ir: CircuitIR, library: KicadLibrary | None, figures: Repor
     figures.add(SLOT_COPPER, bar_figure([s["net"] for s in stats], [s["length_mm"] for s in stats], title="넷별 동박 길이", y_label="길이 (mm)", unit="mm", fig_id=SLOT_COPPER))
 
 
+def model3d_figure_of(ir: CircuitIR, library: KicadLibrary | None, figures: ReportFigures) -> None:
+    """The built-in 3D preview (isometric) into the ``iso3d`` slot and its scene into ``figures.scene``; each missing input is a sentence.
+
+    The scene is the one the ``MODEL_3D`` artifact is compiled from
+    (:func:`~ai_eda.tools.model3d.scene.build_scene` of the IR, the KiCad
+    library and the 3D model library it finds); a scene that cannot be built
+    is the reason in the sentence.
+    """
+    pcb = ir.pcb
+    if pcb is None or not pcb.placements:
+        figures.miss(SLOT_ISO3D, f"{NO_ISO3D_FIGURE}: IR 에 부품 위치가 없습니다")
+        return
+    if library is None:
+        figures.miss(SLOT_ISO3D, f"{NO_ISO3D_FIGURE}: KiCad 라이브러리를 열 수 없습니다")
+        return
+    try:
+        scene = build_scene(ir, library)
+    except (ValueError, CompileError, LibraryLookupError) as e:  # SceneError is both a ValueError and a CompileError
+        figures.miss(SLOT_ISO3D, "3D 미리보기를 그릴 수 없습니다", str(e))
+        return
+    figures.scene = scene
+    figures.add(SLOT_ISO3D, model3d_figure_from_scene(scene, ir, fig_id=SLOT_ISO3D))
+
+
 def tolerance_figure_of(ir: CircuitIR, figures: ReportFigures) -> None:
     """The theory-vs-simulation tolerance chart into the ``tolerance`` slot (rows from :func:`~ai_eda.report.figures.tolerance_rows`, nothing recomputed)."""
     rows = tolerance_rows(ir)
@@ -424,13 +463,14 @@ def tolerance_figure_of(ir: CircuitIR, figures: ReportFigures) -> None:
 
 
 def stage_figures(stage: Stage, ir: CircuitIR, library: KicadLibrary | None) -> ReportFigures:
-    """Every figure the report of ``stage`` shows (theory: template curves + waveform; circuit: placement, board, copper bars; final: tolerance + waveform; parts: none)."""
+    """Every figure the report of ``stage`` shows (theory: template curves + waveform; circuit: placement, board, copper bars, 3D preview; final: tolerance + waveform; parts: none)."""
     figures = ReportFigures()
     if stage is Stage.ARCHITECTURE:
         theory_figures_of(ir, figures)
         waveform_figures_of(ir, figures)
     elif stage is Stage.PCB:
         board_figures_of(ir, library, figures)
+        model3d_figure_of(ir, library, figures)
     elif stage is Stage.RELEASE:
         tolerance_figure_of(ir, figures)
         waveform_figures_of(ir, figures)
@@ -1065,6 +1105,191 @@ def _routing_results(ir: CircuitIR) -> list[str]:
     return out
 
 
+#: the silk text kinds in the words of the circuit report
+SILK_KIND_WORDS: dict[str, str] = {SilkKind.REFERENCE: "참조", SilkKind.TITLE: "제목", SilkKind.PIN_LABEL: "핀 라벨", SilkKind.USER: "사용자"}
+#: the silkscreen placer's candidate names (``REFERENCE_CANDIDATES``) in the words of the circuit report
+SILK_CANDIDATE_WORDS: dict[str, str] = {
+    "above": "위", "below": "아래", "left": "왼쪽", "right": "오른쪽",
+    "top-left": "왼쪽 위 모서리", "top-right": "오른쪽 위 모서리", "bottom-left": "왼쪽 아래 모서리", "bottom-right": "오른쪽 아래 모서리",
+}
+#: rows of a silk check's details the circuit report prints at most (the counts are complete)
+_SILK_ROWS = 20
+#: the KiCad 3D exports the circuit report lists (MANUFACTURING_OUTPUTS registers them when kicad-cli runs)
+KICAD_3D_KINDS: tuple[ArtifactKind, ...] = (ArtifactKind.KICAD_STEP, ArtifactKind.KICAD_GLB, ArtifactKind.KICAD_RENDER)
+
+
+def silk_params_of(ir: CircuitIR) -> dict[str, str] | None:
+    """The silkscreen placer's parameters as the first silk text's provenance records them (``params:silk_to_pad=0.15,...``); ``None`` without one."""
+    if ir.pcb is None:
+        return None
+    for t in ir.pcb.silkscreen:
+        for entry in t.provenance.derived_from:
+            if entry.startswith("params:"):
+                out: dict[str, str] = {}
+                for kv in entry[len("params:"):].split(","):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        out[k.strip()] = v.strip()
+                return out
+    return None
+
+
+def _artifact_freshness(a: ArtifactRef, design_hash: str) -> str:
+    if a.generated_from_ir_hash is None:
+        return "생성 IR 해시 없음"
+    return "현재 IR 에서 생성" if a.generated_from_ir_hash == design_hash else f"오래됨 (IR {a.generated_from_ir_hash[:16]})"
+
+
+def _silk_rules(params: dict[str, str]) -> list[str]:
+    """The placer's rules with the recorded parameter values (``silkscreen.place`` 0.1); the fixed parts are the placer's own constants."""
+    get = params.get
+    sizes = get("reference_sizes", NO_RECORD).replace("/", " mm → ")
+    candidates = ", ".join(f"{SILK_CANDIDATE_WORDS.get(name, name)} {rot:g}°" for name, rot in REFERENCE_CANDIDATES)
+    return [
+        "### 실크 배치 규칙 (파라미터 값을 넣은 것)", "",
+        f"`{SILK_PLACER_ID}` 는 배치·배선이 끝난 보드에 참조 지정자, 커넥터 핀 라벨, 보드 제목을 놓습니다. IR 에 실크가 비어 있을 때만 놓고, 이미 있는 실크는 바꾸지 않습니다. "
+        "면(F / B)마다 다음을 금지 영역(keep-out)으로 둡니다:", "",
+        f"    패드 구리 (라이브러리 형상: 사각 / 둥근 사각 / 원 / 캡슐) + silk_to_pad = {get('silk_to_pad', NO_RECORD)} mm",
+        f"    보드 외곽을 silk_to_edge = {get('silk_to_edge', NO_RECORD)} mm 안쪽으로 줄인 사각형의 바깥",
+        f"    풋프린트 자신의 실크 선·문자 (1번 핀·극성 표시) + gap = {get('gap', NO_RECORD)} mm",
+        f"    먼저 놓은 문자 + gap = {get('gap', NO_RECORD)} mm", "",
+        "트랙은 금지 영역이 아닙니다(솔더 마스크 아래 구리 위의 실크는 정상). 비아도 아닙니다: 컴파일된 보드가 모든 비아를 마스크로 덮습니다(텐팅). "
+        f"참조 지정자는 자연 순서(C1, C2, …, R10)로, 코트야드 둘레의 후보 {len(REFERENCE_CANDIDATES)}곳({candidates})을 문자 크기 {sizes} mm 순으로 시험해 "
+        f"금지 영역에 닿지 않고 다른 풋프린트의 코트야드에서 gap = {get('gap', NO_RECORD)} mm 이상 떨어진 첫 곳에 놓습니다(굵기는 KiCad 기본 0.15 mm; "
+        "이웃의 코트야드 안에 있는 참조 지정자는 그 이웃의 것으로 읽히기 때문 — 모든 후보가 이웃의 코트야드에 걸리면 금지 영역만 피한 첫 곳에 놓고 그 코트야드를 메모에 적습니다). "
+        "빈 곳이 없으면 조립도 층(F.Fab / B.Fab)으로 옮기고 이름을 적습니다. "
+        f"핀 라벨을 받을 커넥터(`{CONNECTOR_LIBRARY_PREFIX}*` 심볼 라이브러리)의 참조는 그 라벨 쪽을 마지막에 시험합니다. "
+        f"커넥터 핀 라벨: 패드마다 넷 이름(이름 없는 넷, `Net-(…)` 제외)을 {get('pin_label', NO_RECORD)} mm 문자로 코트야드 바깥, 패드 옆에 놓으며, "
+        "충돌하는 라벨은 겹치지 않고 건너뛴 뒤 이름을 적습니다. "
+        f"제목: 프로젝트 이름(ASCII 만)을 {get('title', NO_RECORD)} mm 로 여유가 가장 큰 보드 모서리에 놓고, 모서리가 모두 막히면 위·아래 변을 따라 "
+        f"{TITLE_SLIDE_STEP_MM:g} mm 씩 밀어 모서리에 가장 가까운 빈 자리에 놓습니다. 날짜·해시는 넣지 않습니다(결정성).", "",
+        f"문자 상자는 추정입니다: 폭 = 글자 수 × 크기 × {TEXT_WIDTH_FACTOR:g} + 굵기, 높이 = 크기 × {TEXT_HEIGHT_FACTOR:g} + 굵기 (KiCad 스트로크 글꼴의 실제 치수가 아님). "
+        "이 여유는 배치기의 것이지 fab 규칙이 아니며, 컴파일된 보드의 실크 판정(`silk_over_copper` / `silk_overlap` / `text_height`)은 kicad-cli DRC 의 몫입니다 "
+        "(KiCad 10.0.6 에서 이 보드들에 대한 실크 DRC 는 아직 측정되지 않았습니다).", "",
+    ]
+
+
+def _silk_results(ir: CircuitIR) -> list[str]:
+    """The latest ``pcb.silk.*`` results with their violation rows, copied (IR geometry, not DRC)."""
+    out = ["### IR 기하 검사 결과 (`pcb.silk.*`; DRC 아님)", ""]
+    for check in (SILK_CLEARANCE_CHECK, SILK_OVERLAP_CHECK, SILK_SIZE_CHECK):
+        r = ir.validation.latest(check)
+        if r is None:
+            out.append(f"- `{check}`: {NO_RECORD}")
+            continue
+        out.append(f"- `{check}`: **{r.status}** ({_tool_text(r.tool, r.tool_version)}) — {_cell(r.message)}")
+        details = r.details if isinstance(r.details, dict) else {}
+        rows = details.get("violations")
+        if isinstance(rows, list):
+            for row in rows[:_SILK_ROWS]:
+                if isinstance(row, dict):
+                    out.append(f"  - {row.get('status', '?')}: {_cell(row.get('message', ''))}")
+            count = details.get("violation_count", len(rows))
+            if isinstance(count, int) and count > _SILK_ROWS:
+                out.append(f"  - … 위반 {count}개 중 {_SILK_ROWS}개만 적음 (나머지는 검사 결과의 details)")
+        below = details.get("below_margin")
+        if check == SILK_CLEARANCE_CHECK and isinstance(below, list) and below:
+            out.append(f"  - 문자 여유보다 가까운 라이브러리 실크 {len(below)}곳 (풋프린트 자체의 설계; 패드와 닿지 않으면 실패가 아님):")
+            out += [f"    - {_cell(row.get('message', ''))}" for row in below[:_SILK_ROWS] if isinstance(row, dict)]
+        own = details.get("library_own_overlaps")
+        if check == SILK_OVERLAP_CHECK and isinstance(own, list) and own:
+            out.append(f"  - 같은 풋프린트의 라이브러리 문자와 실크가 (추정 문자 상자로) 닿는 곳 {len(own)}곳 (풋프린트 자체의 설계; 실패가 아님):")
+            out += [f"    - {_cell(row.get('message', ''))}" for row in own[:_SILK_ROWS] if isinstance(row, dict)]
+    out.append("")
+    return out
+
+
+def _silkscreen_section(ir: CircuitIR) -> list[str]:
+    """The designed silkscreen (counts, table, the placer's rules with its recorded parameters) and the ``pcb.silk.*`` verdicts, copied."""
+    out = ["## 실크스크린", ""]
+    pcb = ir.pcb
+    if pcb is None or not pcb.placements:
+        out += [f"실크스크린 {NO_RECORD}: IR 에 배치된 보드가 없습니다.", ""]
+        return out + _silk_results(ir)
+    texts = list(pcb.silkscreen)
+    if not texts:
+        out += [
+            "IR 에 설계된 실크 문자가 없습니다(`--answer pcb.silkscreen=skip` 으로 건너뛰었거나 실크를 놓기 전의 보드). 컴파일된 보드의 참조 지정자는 "
+            "풋프린트 라이브러리의 기본 위치에 있고, 풋프린트 자신의 실크 선(외곽, 1번 핀·극성 표시)은 라이브러리 그대로입니다. 배치도·보드 그림의 검정 선이 그 실크 선이며, "
+            "그림의 참조·값 라벨은 읽기용 배치일 뿐 실크가 아닙니다.", "",
+        ]
+        return out + _silk_results(ir)
+    tools = sorted({(t.provenance.tool or "", t.provenance.tool_version or "") for t in texts})
+    if any(t for t, _v in tools):
+        out.append("- 실크 도구: " + ", ".join(_tool_text(t, v) for t, v in tools if t))
+    else:
+        out.append(f"- 실크 도구 {NO_RECORD}: 문자의 출처는 {_provenance_text(texts[0].provenance)}")
+    params = silk_params_of(ir)
+    if params:
+        out.append("- 실크 파라미터 (첫 문자의 provenance `params:` 항목): " + ", ".join(f"`{k}` = {v}" for k, v in params.items()))
+    refs = [t for t in texts if t.kind == SilkKind.REFERENCE]
+    on_fab = [t.component_ref or t.text for t in refs if not t.layer.endswith(".SilkS")]
+    labels = [t for t in texts if t.kind == SilkKind.PIN_LABEL]
+    titles = [t for t in texts if t.kind == SilkKind.TITLE]
+    users = [t for t in texts if t.kind == SilkKind.USER]
+    fab_text = f"조립도 층 {len(on_fab)}개" + (f" ({', '.join(on_fab)})" if on_fab else "")
+    title_text = ", ".join(f"'{t.text}'" for t in titles) or "없음"
+    out.append(f"- 실크 문자 {len(texts)}개: 참조 {len(refs)}개 (실크 {len(refs) - len(on_fab)}개, {fab_text}), 커넥터 핀 라벨 {len(labels)}개, 제목 {title_text}, 사용자 문자 {len(users)}개")
+    out.append("- 건너뛴 핀 라벨과 그 이유, 제목의 위치 설명은 아래 단계 기록의 `placement` 메시지에 그대로 있습니다. 위의 배치도·보드 그림에 검정으로 그려진 것이 이 실크입니다.")
+    out.append("")
+    origins = [_provenance_text(t.provenance) for t in texts]
+    shared = len(set(origins)) == 1  # one origin for every text: said once, not in every row
+    if shared:
+        out += [f"모든 실크 문자의 출처: {origins[0]}.", ""]
+    rows = []
+    for t, origin in zip(texts, origins):
+        rows.append([SILK_KIND_WORDS.get(t.kind, str(t.kind)), f"`{t.text}`", t.component_ref or "-", f"{t.x_mm:g}", f"{t.y_mm:g}", f"{t.rotation_deg:g}", t.layer,
+                     f"{t.size_mm:g} / {t.thickness_mm:g}", t.justify, *([] if shared else [origin])])
+    header = ["종류", "문자", "부품", "x (mm)", "y (mm)", "회전 (°)", "층", "크기 / 굵기 (mm)", "정렬", *([] if shared else ["출처"])]
+    out += [_table(header, rows), ""]
+    if params and any(t == SILK_PLACER_ID for t, _v in tools):
+        out += _silk_rules(params)
+    return out + _silk_results(ir)
+
+
+def _model3d_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
+    """The built-in 3D preview (figure, the body rule, one row per part box from the scene), the registered preview GLB and KiCad's own 3D exports."""
+    out = ["## 3D 미리보기", ""]
+    out += figures.lines(SLOT_ISO3D)
+    design_hash = ir.content_hash()
+    preview = ir.artifacts.get(ArtifactKind.MODEL_3D)
+    if preview is not None:
+        out.append(f"- 내장 미리보기 파일: `{Path(preview.path).name}` (산출물 `{ArtifactKind.MODEL_3D.value}`, {_artifact_freshness(preview, design_hash)}) — glTF 2.0 바이너리. "
+                   "같은 IR 과 같은 라이브러리에서 바이트 단위로 같은 파일이며, 그림이지 검사가 아니므로 판정을 기록하지 않습니다.")
+    else:
+        out.append("- 내장 미리보기 파일: 등록되지 않음 (PCB 단계가 보드를 컴파일한 뒤 만듭니다; 이유는 아래 단계 기록의 `pcb` 메시지).")
+    out += [
+        f"- 부품 상자 규칙: {BODY_CAPTION}. 상자의 x·y 는 풋프린트 F.Fab 그래픽의 경계상자(없으면 코트야드)이고, 높이는 풋프린트의 `(model …)` 이 가리키는 STEP 파일의 "
+        "좌표점과 원에서 읽은 외곽 상자(모델의 offset / scale / rotate 적용)의 가장 높은 점입니다. 이 외곽은 근사이지 측정이 아니며, STEP 파일을 찾지 못한 부품은 "
+        "평면 외곽선만 그립니다. 실크 문자는 3D 에서 생략하고(실크 선은 라이브러리의 것), 구리·마스크·실크의 두께는 그림용 값입니다.",
+    ]
+    scene = figures.scene
+    if scene is not None:
+        out.append("")
+        rows = []
+        for b in scene.bodies:
+            height = f"{b.height_mm:.2f}" if b.height_mm is not None else "없음 (평면 외곽선)"
+            models = ", ".join(f"`{Path(m.replace(chr(92), '/')).name}`" for m in b.models) or "-"
+            rows.append([f"`{b.ref}`", f"`{b.lib_id}`", "앞" if b.side == "top" else "뒤", height, b.outline_source or "-", models, b.reason or "-"])
+        out += [_table(["부품", "풋프린트", "면", "높이 (mm)", "x·y 출처", "STEP 모델", "비고"], rows)]
+    out.append("")
+    exports = [(kind, ir.artifacts.get(kind)) for kind in KICAD_3D_KINDS]
+    if any(a is not None for _k, a in exports):
+        out.append("KiCad 3D 모델(실제 부품 모양), MANUFACTURING_OUTPUTS 단계가 kicad-cli 로 내보낸 파일 (플래그는 KiCad 10.0.6 에서 아직 측정되지 않음; 파일에 KiCad 의 시각이 들어가 해시는 재현성이 아니라 어느 파일인지를 말함):")
+        out.append("")
+        for kind, a in exports:
+            if a is None:
+                out.append(f"- `{kind.value}`: 등록되지 않음")
+            else:
+                names = ", ".join(f"`{Path(f).name}`" for f in (a.files or [a.path]))
+                out.append(f"- `{kind.value}`: {names} ({_artifact_freshness(a, design_hash)})")
+    else:
+        out.append("KiCad 3D 모델(실제 부품 모양): 등록된 파일 없음. MANUFACTURING_OUTPUTS 단계가 kicad-cli 가 있을 때 `kicad-cli pcb export step` / `pcb export glb` / "
+                   "`pcb render` 로 만들며, 이 명령의 플래그는 KiCad 10.0.6 에서 아직 측정되지 않았습니다.")
+    out.append("")
+    return out
+
+
 def _stage_record_section(record: RunRecord, stages: tuple[Stage, ...], title: str) -> list[str]:
     out = [f"## {title}", ""]
     outcomes = _outcomes(record)
@@ -1082,9 +1307,13 @@ def _stage_record_section(record: RunRecord, stages: tuple[Stage, ...], title: s
 
 
 def circuit_report(ir: CircuitIR, library: KicadLibrary | None, record: RunRecord, *, figures: ReportFigures | None = None) -> str:
-    """Report 3: the schematic (nets and roles), the placement (rule, positions, limits) and the routing (parameters, per-net statistics, reference copper values, ``pcb.routing.*`` verdicts).
+    """Report 3: the schematic (nets and roles), the placement (rule, positions, limits), the routing (parameters, per-net statistics, reference copper values,
+    ``pcb.routing.*`` verdicts), the silkscreen (texts, the placer's rules with its recorded parameters, ``pcb.silk.*`` verdicts) and the 3D preview
+    (the isometric figure with its caption, one row per part box, the registered preview GLB and KiCad's own 3D exports).
 
-    The text reads no library fact (every geometry number is in the IR);
+    The text reads no library fact (every geometry number is in the IR)
+    except the 3D section's part boxes, which are the preview scene's (the
+    footprints and the STEP files on disk, built once with the figure);
     ``library`` is what the board figures read pad shapes from
     (:func:`stage_figures`, built here when ``figures`` is not given) - the
     library the pipeline resolved, exactly as the PCB compiler reads it.
@@ -1099,6 +1328,8 @@ def circuit_report(ir: CircuitIR, library: KicadLibrary | None, record: RunRecor
     out += _schematic_section(ir)
     out += _placement_section(ir, figures)
     out += _routing_section(ir, figures)
+    out += _silkscreen_section(ir)
+    out += _model3d_section(ir, figures)
     out += _stage_record_section(record, CIRCUIT_STAGES, "단계 기록 (PLACEMENT / SCHEMATIC / PCB / DRC)")
     return "\n".join(out).rstrip("\n") + "\n"
 

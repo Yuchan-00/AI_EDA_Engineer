@@ -13,6 +13,8 @@
     {"key": "min_hole_to_edge_mm", "value": 0.5, "unit": "mm", "page": 1, "quote": "Hole to board edge 0.5mm"},
     {"key": "layer_count_options", "value": [1, 2, 4, 6], "unit": null, "page": 1, "quote": "Layers 1, 2, 4, 6"},
     {"key": "copper_weight_oz", "value": 1, "unit": "oz", "page": 1, "quote": "Copper weight 1 oz"},
-    {"key": "board_thickness_mm", "value": 1.6, "unit": "mm", "page": 1, "quote": "Board thickness 1.6 mm"}
+    {"key": "board_thickness_mm", "value": 1.6, "unit": "mm", "page": 1, "quote": "Board thickness 1.6 mm"},
+    {"key": "min_silk_text_height_mm", "value": 0.8, "unit": "mm", "page": 1, "quote": "Min silkscreen text height 0.8 mm"},
+    {"key": "min_silk_line_width_mm", "value": 0.1, "unit": "mm", "page": 1, "quote": "Min silkscreen line width 0.1mm"}
   ]
 }

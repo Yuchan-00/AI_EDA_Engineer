@@ -71,7 +71,9 @@ CAPABILITY_FILE_VERSION = "0.1"
 GROUNDING_TOOL = "mfg.capability_grounding"
 SOURCE_CHECK_ID = "mfg.capability_source"
 
-#: the eight ``ManufacturingConstraints`` fields a file may set (``fab`` is the file's own field)
+#: the ten ``ManufacturingConstraints`` fields a file may set (``fab`` is the file's own field); the silk limits
+#: ``min_silk_text_height_mm`` / ``min_silk_line_width_mm`` are lengths like the others and are judged by
+#: ``pcb.silk.size`` (IR geometry), not by ``mfg.capability``
 CAPABILITY_KEYS: frozenset[str] = frozenset(k for k in ManufacturingConstraints.model_fields if k != "fab")
 #: limits stated in millimetres (grounded through the quantity parser, stored in mm)
 MM_KEYS: frozenset[str] = frozenset(k for k in CAPABILITY_KEYS if k.endswith("_mm"))
@@ -103,7 +105,8 @@ class CapabilityLimit(_Strict):
     """One limit the user claims the vendor page states."""
 
     key: str = Field(description="a ManufacturingConstraints field: min_track_width_mm, min_clearance_mm, min_via_drill_mm, min_via_diameter_mm, "
-                                 "min_hole_to_edge_mm, board_thickness_mm, layer_count_options, copper_weight_oz")
+                                 "min_hole_to_edge_mm, board_thickness_mm, layer_count_options, copper_weight_oz, "
+                                 "min_silk_text_height_mm, min_silk_line_width_mm")
     value: float | list[int] = Field(description="the number as written in the quote (mm keys: any length unit, stored in mm), or the layer options")
     unit: str | None = Field(default=None, description="the unit as written in the quote (mm, um, ...; oz); null for layer_count_options")
     page: int = Field(description="1-based page of the archived document the quote stands on (1 for an HTML page)")

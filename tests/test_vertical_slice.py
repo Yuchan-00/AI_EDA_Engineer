@@ -11,7 +11,8 @@ IR (divider + 3-pin header, naive tracks, SPICE bindings + simulation setup)
 
 Then the staleness scenario: the design changes after the run (a component
 with its nets, placement and tracks is added), the reviewer flags every
-derived artifact as stale, and the repair loop regenerates them and re-runs
+derived artifact it reviews as stale (not the 3D preview pictures, which it
+does not review), and the repair loop regenerates them and re-runs
 ERC / DRC / SPICE / output checks until the review is clean again - without
 ever touching the IR.
 
@@ -105,7 +106,9 @@ def _blocking(release_message: str) -> list[str]:
 
 def _routed_ir(tmp_path: Path) -> CircuitIR:
     ir = divider_with_connector_ir(tmp_path, LIB)
-    ir.pcb.tracks = route_naive(ir, LIB)  # copper of its own: the PLACEMENT stage then leaves the board alone (it never replaces copper)
+    # copper of its own: the PLACEMENT stage leaves the placement and the copper alone (it never replaces either), but the silkscreen
+    # is empty, so it adds `silkscreen.place` silk (references, pin labels) in its one `pcb` proposal
+    ir.pcb.tracks = route_naive(ir, LIB)
     return ir
 
 
@@ -264,7 +267,11 @@ def test_compiled_artifacts_are_byte_deterministic_across_runs(tmp_path: Path):
 def test_design_change_is_detected_and_repaired_by_regeneration_only(tmp_path: Path):
     ir, state, ctx = _run(tmp_path)
     assert state.outcomes[-1].status is S.NOT_VERIFIED
-    before = {k: v.content_hash for k, v in ir.artifacts.items()}
+    # the review judges what the fab builds from; the 3D preview and kicad-cli's own 3D exports are pictures it does not review, so
+    # the repair loop does not regenerate them (they stay stale until the next pipeline run)
+    pictures = {ArtifactKind.MODEL_3D, ArtifactKind.KICAD_STEP, ArtifactKind.KICAD_GLB, ArtifactKind.KICAD_RENDER}
+    assert ArtifactKind.MODEL_3D in ir.artifacts
+    before = {k: v.content_hash for k, v in ir.artifacts.items() if k not in pictures}
 
     add_r3_vout_to_gnd(ir)
     changed_hash = ir.content_hash()
