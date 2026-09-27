@@ -215,7 +215,8 @@ class CircuitIR(BaseModel):
         ``validation`` / ``artifacts`` (state about the design);
         ``project.workdir`` / ``project.created_at`` (where and when it was built);
         ``requirements.extraction_cache`` (what a model said, not what the design is) and
-        ``requirements.presented`` (which question texts the user has been shown - bookkeeping of the dialogue);
+        ``requirements.presented`` (which question texts the user has been shown - bookkeeping of the dialogue) and
+        ``requirements.llm_model_spec`` (which model the project's runs are pinned to - bookkeeping of the runs);
         every ``Provenance.created_at`` (a clock default);
         the locators ``SourceRef.document_path``, ``LibraryRef.library_path`` and
         ``RegulatoryProvenance.source_document`` (where a copy lives - the hashes that pin the copies stay);

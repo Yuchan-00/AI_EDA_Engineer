@@ -27,4 +27,5 @@ include = ["ai_eda*"]
 testpaths = ["tests"]
 markers = [
     "browser: the test may discover and run the real headless browser for stage-report PDFs (tests/conftest.py disables that discovery otherwise)",
+    "real_claude_cli: the test may discover and run the real Claude Code CLI (tests/conftest.py lets discovery find only the fake otherwise)",
 ]

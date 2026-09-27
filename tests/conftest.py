@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import ai_eda.llm.claude_cli as _claude_cli
 import ai_eda.report.stages as _stages
 from ai_eda.ir import (
     CircuitDomain,
@@ -51,6 +52,32 @@ def stage_reports_find_no_browser(request: pytest.FixtureRequest, monkeypatch: p
     """
     if request.node.get_closest_marker("browser") is None:
         monkeypatch.setattr(_stages, "find_browser", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def claude_cli_discovery_finds_only_the_fake(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``find_claude_cli`` finds only the fake ``claude`` of ``tests/fake_claude_cli.py`` unless the test is marked ``real_claude_cli``.
+
+    ``doctor`` and ``describe_providers`` probe whatever discovery returns
+    (``claude --version``, ``claude auth status``), so without this a test
+    that runs them without installing the fake would spawn the machine's real
+    CLI and read its credential store. Discovery itself runs unchanged; a
+    result that is not a fake (no :data:`~tests.fake_claude_cli.FAKE_MARKER`
+    beside it) reads as "not found". An explicit ``ClaudeCodeClient(cli=...)``
+    / ``--llm-claude-cli`` is untouched, and only
+    ``tests/test_claude_cli_live.py`` is marked ``real_claude_cli``.
+    """
+    if request.node.get_closest_marker("real_claude_cli") is not None:
+        return
+    from tests.fake_claude_cli import is_fake_claude_cli
+
+    real = _claude_cli.find_claude_cli
+
+    def fake_only() -> str | None:
+        found = real()
+        return found if found is not None and is_fake_claude_cli(found) else None
+
+    monkeypatch.setattr(_claude_cli, "find_claude_cli", fake_only)
 
 
 def _pin(n: str) -> Pin:

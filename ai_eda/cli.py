@@ -1,9 +1,10 @@
 """Command line entry point.
 
-    ai-eda doctor [--online]  check external tools (kicad-cli, KiCad's ngspice.dll, whether the LLM key is
-                             set - never its value; --online additionally fetches the key's limit/usage,
-                             which sends the key to OPENROUTER_BASE_URL and is recorded as a SECRET_ACCESS
-                             approval granted by the flag)
+    ai-eda doctor [--online]  check external tools (kicad-cli, KiCad's ngspice.dll, whether the OpenRouter key
+                             is set - never its value - and the Claude Code CLI: its path, version and login
+                             state, never a token, and the model is never called; --online additionally
+                             fetches the key's limit/usage, which sends the key to OPENROUTER_BASE_URL and is
+                             recorded as a SECRET_ACCESS approval granted by the flag)
     ai-eda new NAME          create an empty project IR
     ai-eda run IR.json       run the pipeline until it blocks or finishes (exit 1 when blocked or the
                              final stage is FAIL; NOT_VERIFIED is exit 0 - nothing wrong, nothing proven;
@@ -16,10 +17,50 @@
                                          extract_datasheet_facts=yes / propose_regulations=yes ask the model (billed);
                                          confirm_facts=yes|no for the model's datasheet-facts table;
                                          accept_regulations=id1,id2 / reject_regulations=id3)
-        --llm openrouter | fake:<json>   let the requirement agent extract from the free-text request
-        --llm-model ID                   primary model (default anthropic/claude-sonnet-5)
-        --llm-budget-usd X / --llm-budget-tokens N   the budget you grant; without one no call is made
-                                         (0 USD allows only the free fake client)
+        --llm openrouter | claude | openrouter,claude | claude,openrouter | fake:<json>
+                                         let the requirement agent extract from the free-text request. Every
+                                         named provider is built before anything runs (a missing
+                                         OPENROUTER_API_KEY or claude binary names the provider in the error)
+                                         and the FIRST one is the default provider of an unprefixed model spec.
+                                         openrouter is billed per call and needs a budget flag; claude is the
+                                         locally installed Claude Code CLI (`claude -p`) on the user's own
+                                         login - a subscription, not billed per call, so no budget is required
+                                         (the flag itself is the SUBSCRIPTION_USE approval, recorded in the
+                                         gate's audit log) but the run SHOWS the tokens and the CLI's
+                                         API-equivalent cost estimate in its "LLM usage:" line. Caveat: when
+                                         that CLI is authenticated with an API key instead of a subscription
+                                         login (doctor's "auth:" says which; oauth_token is the subscription),
+                                         the same estimate is a real charge on that key - the client cannot
+                                         tell per call. fake:<json> replays a script offline (provider name
+                                         script; billed per call by contract, so it needs a budget flag -
+                                         0 USD allows it, it is free)
+        --llm-model SPEC                 primary model as provider:model (openrouter:anthropic/claude-sonnet-5,
+                                         claude:claude-sonnet-5, the CLI aliases claude:sonnet / claude:opus;
+                                         unprefixed = the default provider; default: Sonnet on the default
+                                         provider). anthropic: is reserved (no direct Messages-API client)
+        --llm-fallback SPEC|same|none    a fallback candidate tried after a retryable failure (repeatable;
+                                         default none - one project uses one model; a fallback exists only when
+                                         you ask for one); `same` = the primary model on the other configured
+                                         provider (openrouter:anthropic/<id> <-> claude:<id>, only for an id
+                                         claude-<family>-<major>; others must be named explicitly)
+        --llm-task-model TASK=SPEC       the model of one task (repeatable; TASK is a TaskKind value such as
+                                         requirement_analysis, review; an unknown TASK is exit 2 listing them)
+        --llm-allow-model-change         run with a primary spec other than the project's pin. The first run
+                                         that serves at least one call pins its primary spec in
+                                         ir.requirements.llm_model_spec (bookkeeping, outside the design hash);
+                                         a later run with another primary spec is refused (exit 2, before any
+                                         call) unless this flag is given, which re-pins after a served call
+        --llm-claude-cli PATH            the claude binary (default $AI_EDA_CLAUDE_CLI when it exists, then
+                                         `claude` on PATH); needs --llm claude
+        --llm-claude-fallback-model LIST passthrough to the CLI's own --fallback-model (its cross-model
+                                         fallback; off by default); needs --llm claude
+        --llm-budget-usd X / --llm-budget-tokens N   the budget you grant (= the PAID_API_CALL approval);
+                                         required whenever a per-call provider (openrouter, fake) is
+                                         configured - without one no call is made (0 USD allows only the free
+                                         fake client); with claude alone it is optional: the USD limit binds
+                                         charges only (a subscription call adds none) and the token limit
+                                         binds every call. --llm-budget-usd is also passed to the CLI as its own
+                                         --max-budget-usd, a second safety net
         --online                         open an online session: the one NETWORK_FETCH approval of this run;
                                          datasheets and official regulatory texts are then fetched (https only)
                                          from the trusted hosts - KiCad library Datasheet hosts of the parts,
@@ -66,8 +107,10 @@
                              stage reports are printed with ($AI_EDA_BROWSER, PATH, a Playwright install,
                              the Windows / macOS install paths)
 
-Without ``--llm`` the pipeline is exactly what it was before the LLM stage;
-without ``--online`` no code of ours opens a socket, and the headless
+Without ``--llm`` the pipeline is exactly what it was before the LLM stage.
+The ``run`` options live in one table, :data:`RUN_OPTIONS`, that builds the
+parser and :func:`run_option_flags` (the flag builder a GUI reuses, so the
+flag names exist once). Without ``--online`` no code of ours opens a socket, and the headless
 browser that ``run`` / ``stage-reports`` print the stage reports with runs
 with name resolution and the proxy switched off
 (``ai_eda.report.pdf.PRINT_FLAGS``), so it cannot reach any host either
@@ -76,9 +119,10 @@ altogether). ``serve`` is the one command
 that opens a socket without a flag: a loopback *listening* socket on
 127.0.0.1 that answers only requests whose Host header names this machine -
 no outbound connection is ever made, so no ``ExternalAction`` is involved.
-The budget flags are the user's approval of paid calls and ``--online`` the
-approval of network fetches: both are recorded in the approval gate's audit
-log. The IR is saved (and the LLM usage printed) whatever happens after the
+The budget flags are the user's approval of paid calls, ``--llm claude`` the
+approval of using the subscription login and ``--online`` the approval of
+network fetches: all are recorded in the approval gate's audit log. The IR
+is saved (and the LLM usage printed) whatever happens after the
 pipeline starts, so a paid extraction or an archived fetch is never lost to
 a later crash; ``run`` then records its stage outcomes in
 ``<workdir>/pipeline.json`` (a run log like ``ir.validation``: not an
@@ -90,12 +134,137 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, NamedTuple
 
 from ai_eda import __version__
 from ai_eda.errors import IRSchemaError
 
 FAKE_PREFIX = "fake:"
+#: the ``--llm`` provider names that are real routes (the fake is ``fake:<json>``, provider name ``script``)
+LLM_PROVIDER_CHOICES = ("openrouter", "claude")
+#: ``--llm-fallback`` words that are not specs
+FALLBACK_NONE = "none"
+FALLBACK_SAME = "same"
+#: what ``--llm-fallback same`` / ``--llm-task-model`` resolve against when the fake is configured
+SCRIPT_PROVIDER = "script"
+
+
+class RunOption(NamedTuple):
+    """One ``run`` option: the flag, the parsed attribute, its kind (``str`` / ``float`` / ``int`` / ``append`` / ``flag``), metavar and help."""
+
+    flag: str
+    dest: str
+    kind: str
+    metavar: str | None
+    help: str
+
+
+#: every option of ``ai-eda run`` in one place: the parser is built from it and :func:`run_option_flags` renders it
+RUN_OPTIONS: tuple[RunOption, ...] = (
+    RunOption(
+        "--answer", "answer", "append", "KEY=VALUE",
+        "answer an open question; confirm_requirements=yes, accept_implicit=k1,k2, reject_implicit=k3 steer the LLM extraction; "
+        "mains_powered=yes|no, radio=yes|no, finished_apparatus=yes|no, evaluation_kit=yes|no, digital_device=yes|no, "
+        "highest_rated_voltage='12 V DC', intended_use=... are the regulatory scope answers; "
+        "confirm_parts=yes|no decides the candidate-parts table; datasheet_facts_file=<json> grounds your datasheet facts "
+        "(layouts: ai_eda.parts.datasheet_facts.load_facts_file); extract_datasheet_facts=yes and propose_regulations=yes ask the model (billed); "
+        "confirm_facts=yes|no decides the model's datasheet-facts table; accept_regulations=id1,id2 / reject_regulations=id3 decide shown model proposals",
+    ),
+    RunOption(
+        "--llm", "llm", "str", "openrouter|claude|openrouter,claude|claude,openrouter|fake:<json>",
+        "extract requirements from the request with a model. Comma-separated providers are all built and the first is the default "
+        "provider of an unprefixed model spec: openrouter needs OPENROUTER_API_KEY and a budget flag (billed per call); claude is the "
+        "Claude Code CLI on your own login (a subscription: no per-call charge, so no budget is needed - the flag is the SUBSCRIPTION_USE "
+        "approval - but the tokens and the CLI's API-equivalent cost estimate are shown); fake:<json> replays a script offline "
+        "(provider name script; needs a budget flag, 0 USD allows it)",
+    ),
+    RunOption(
+        "--llm-model", "llm_model", "str", "SPEC",
+        "primary model as provider:model (openrouter:anthropic/claude-sonnet-5, claude:claude-sonnet-5, claude:sonnet; unprefixed = the "
+        "default provider; default Sonnet on the default provider). The first run that serves a call pins this spec in "
+        "ir.requirements.llm_model_spec; a later run with another spec is refused unless --llm-allow-model-change is given",
+    ),
+    RunOption(
+        "--llm-fallback", "llm_fallback", "append", "SPEC|same|none",
+        "a fallback candidate for retryable failures (repeatable; default none: one project, one model). 'same' is the primary model on "
+        "the other configured provider (openrouter:anthropic/<id> <-> claude:<id>, only for an id claude-<family>-<major>); 'none' adds nothing",
+    ),
+    RunOption(
+        "--llm-task-model", "llm_task_model", "append", "TASK=SPEC",
+        "the model of one task (repeatable; TASK is a TaskKind value: requirement_analysis, component_proposal, circuit_design, "
+        "regulatory_research, result_interpretation, review, repair_planning, chat)",
+    ),
+    RunOption(
+        "--llm-allow-model-change", "llm_allow_model_change", "flag", None,
+        "run with a primary model spec other than the project's pin (ir.requirements.llm_model_spec) and re-pin it after a served call",
+    ),
+    RunOption("--llm-claude-cli", "llm_claude_cli", "str", "PATH", "the claude binary (default $AI_EDA_CLAUDE_CLI when it exists, else claude on PATH); needs --llm claude"),
+    RunOption("--llm-claude-fallback-model", "llm_claude_fallback_model", "str", "LIST", "passthrough to the Claude Code CLI's own --fallback-model (off by default); needs --llm claude"),
+    RunOption(
+        "--llm-budget-usd", "llm_budget_usd", "float", "X",
+        "approve up to X USD of provider-reported cost for this run (required with a per-call provider: openrouter, fake; counts charges only - "
+        "a subscription call adds none; also passed to the Claude Code CLI as its own --max-budget-usd)",
+    ),
+    RunOption("--llm-budget-tokens", "llm_budget_tokens", "int", "N", "approve up to N prompt+completion tokens for this run (binds every call, subscription calls included)"),
+    RunOption("--online", "online", "flag", None, "approve network fetches for this run (NETWORK_FETCH 'online session'): datasheets and official regulatory texts are fetched from trusted hosts only and archived by sha256; without it nothing is fetched"),
+    RunOption("--trust-host", "trust_host", "append", "HOST", "trust every URL on HOST for fetching (repeatable; KiCad library datasheet hosts and the candidate list's official domains are trusted already)"),
+    RunOption("--datasheet-url", "datasheet_url", "append", "REF=URL", "the datasheet of component REF is exactly this URL (repeatable; trusted as that URL only)"),
+    RunOption("--source-url", "source_url", "append", "ID=URL", "an official text is exactly this URL (repeatable; trusted as that URL only)"),
+    RunOption("--sources-dir", "sources_dir", "str", "DIR", "the document archive directory (default <workdir>/sources)"),
+    RunOption("--catalog", "catalog", "str", "CSV", "your distributor catalog export (columns mpn, manufacturer, package + optional supplier_part_number, stock, unit_price, currency, assembly_class; JLCPCB/LCSC header spellings are mapped)"),
+    RunOption("--catalog-date", "catalog_date", "str", "ISO8601", "the date you exported the catalog (required with --catalog)"),
+    RunOption("--catalog-authority", "catalog_authority", "str", "TEXT", "who produced the catalog data, e.g. 'JLCPCB export'"),
+    RunOption("--catalog-supplier", "catalog_supplier", "str", "NAME", "the supplier label for sourcing entries, e.g. JLCPCB"),
+    RunOption("--regulatory-candidates", "regulatory_candidates", "str", "PATH", "a regulatory candidate list other than the packaged ai_eda/regulatory/candidates.json"),
+    RunOption("--fab-capability", "fab_capability", "str", "FILE", "JSON file naming the fab's capability page (source.url, or source.file + retrieved_at for a saved page) and its limits (key, value, unit, page, quote); the URL is trusted exactly, the limits are grounded verbatim on the archived page"),
+    RunOption("--no-pdf", "no_pdf", "flag", None, "write the stage reports as .md + .html only (no headless browser print)"),
+    RunOption("--browser", "browser", "str", "PATH", "the Chromium / Chrome / Edge binary that prints the stage reports to PDF (default: discovered - $AI_EDA_BROWSER, PATH, Playwright, install paths)"),
+)
+
+
+def _add_run_option(parser: argparse.ArgumentParser, option: RunOption) -> None:
+    if option.kind == "flag":
+        parser.add_argument(option.flag, dest=option.dest, action="store_true", help=option.help)
+    elif option.kind == "append":
+        parser.add_argument(option.flag, dest=option.dest, action="append", metavar=option.metavar, help=option.help)
+    else:
+        typ = {"str": str, "float": float, "int": int}[option.kind]
+        parser.add_argument(option.flag, dest=option.dest, type=typ, metavar=option.metavar, help=option.help)
+
+
+def run_option_flags(**values: Any) -> list[str]:
+    """The ``ai-eda run`` flags for ``values`` keyed by option name (:data:`RUN_OPTIONS` dests: ``llm``, ``llm_model``, ``answer``, ...).
+
+    The GUI's run panel builds its command line with this, so the flag names
+    exist in one place. ``None`` / ``False`` / an empty list render nothing;
+    an ``append`` option takes a list (or a dict for ``KEY=VALUE`` options,
+    rendered as ``key=value`` pairs); a ``flag`` option takes a bool. A name
+    that is not a run option is a ``TypeError``, never silently dropped.
+    Round trip: ``build_parser().parse_args(["run", ir, *run_option_flags(**v)])``
+    yields ``v`` again.
+    """
+    known = {o.dest: o for o in RUN_OPTIONS}
+    unknown = sorted(set(values) - set(known))
+    if unknown:
+        raise TypeError(f"not a run option: {', '.join(unknown)} (known: {', '.join(known)})")
+    argv: list[str] = []
+    for option in RUN_OPTIONS:
+        value = values.get(option.dest)
+        if value is None or value is False:
+            continue
+        if option.kind == "flag":
+            if value is not True:
+                raise TypeError(f"{option.flag} takes a bool, not {value!r}")
+            argv.append(option.flag)
+        elif option.kind == "append":
+            items = [f"{k}={v}" for k, v in value.items()] if isinstance(value, dict) else list(value)
+            for item in items:
+                argv += [option.flag, str(item)]
+        else:
+            argv += [option.flag, str(value)]
+    return argv
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -124,6 +293,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(_browser_line())
     key_set = OpenRouterClient.key_present()
     print(f"LLM key   : {'set' if key_set else 'OPENROUTER_API_KEY not set'}")
+    print(_claude_cli_line())
     if key_set and getattr(args, "online", False):
         from ai_eda.llm.client import LLMError
         from ai_eda.llm.openrouter import default_base_url
@@ -151,6 +321,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     elif getattr(args, "online", False):
         print("LLM account: not fetched (no key)")
     return 0
+
+
+def _claude_cli_line() -> str:
+    """``claude cli : <path> (<version>, logged in: yes|no|unknown, auth: <method>)`` or ``NOT FOUND`` with what would make one found.
+
+    Runs ``claude --version`` and ``claude auth status`` only (through
+    :func:`~ai_eda.llm.providers.describe_providers`); the model is never
+    called and no token is printed.
+    """
+    from ai_eda.llm.claude_cli import ENV_CLI, find_claude_cli
+    from ai_eda.llm.providers import describe_providers
+
+    if find_claude_cli() is None:
+        return f"claude cli : NOT FOUND (install Claude Code and run `claude login`, or set {ENV_CLI})"
+    row = next(r for r in describe_providers() if r.name == "claude")
+    return f"claude cli : {row.reason}"
 
 
 def _browser_line() -> str:
@@ -218,30 +404,191 @@ def project_workdir(ir, ir_path: str | Path) -> Path:
     )
 
 
-def build_llm_service(args: argparse.Namespace):
-    """The :class:`~ai_eda.llm.service.LLMService` for ``--llm``, or ``None`` when the flag is absent.
+@dataclass
+class LLMOptions:
+    """What the ``--llm*`` flags asked for, resolved before any client exists (see :func:`parse_llm_options`)."""
 
-    Raises ``ApprovalRequiredError`` when no budget flag was given (the flags
-    are the approval), ``ToolUnavailableError`` when ``--llm openrouter`` has
-    no key, ``ValueError`` for an unknown ``--llm`` value.
-    """
-    spec = getattr(args, "llm", None)
-    if not spec:
-        return None
-    from ai_eda.llm.router import default_router
-    from ai_eda.llm.service import LLMBudget, LLMService
+    #: the ``--llm`` text as given
+    label: str
+    #: provider names in configuration order (the first is the default provider); ``("script",)`` for the fake
+    providers: tuple[str, ...]
+    #: the fake's script path (``fake:<json>``), else ``None``
+    script: str | None
+    router: Any
+    budget: Any
+    allow_model_change: bool
+    #: constructor options routed to the clients by signature (``cli`` / ``fallback_model`` for the CLI client)
+    client_kw: dict[str, Any] = field(default_factory=dict)
 
-    budget = LLMBudget(max_usd=getattr(args, "llm_budget_usd", None), max_tokens=getattr(args, "llm_budget_tokens", None))
-    router = default_router(getattr(args, "llm_model", None))
-    approved_by = "cli --llm-budget-usd/--llm-budget-tokens"
-    if spec == "openrouter":
-        return LLMService.from_env(budget, router=router, approved_by=approved_by)
+    @property
+    def primary_spec(self) -> str:
+        """The primary ``provider:model`` spec - what the project pin records and compares."""
+        return self.router.default.spec
+
+    @property
+    def per_call_providers(self) -> list[str]:
+        """The configured providers billed per call (they need the budget flags)."""
+        from ai_eda.llm.providers import PROVIDER_BILLING
+        from ai_eda.llm.usage import SUBSCRIPTION
+
+        return [p for p in self.providers if PROVIDER_BILLING.get(p, "per_call") != SUBSCRIPTION]
+
+    def describe(self) -> str:
+        """One line for the run log: the primary spec, the explicit fallbacks and the task overrides."""
+        text = self.primary_spec
+        fallbacks = [c.spec for c in self.router.fallbacks]
+        if fallbacks:
+            text += f"; fallback by --llm-fallback: {', '.join(fallbacks)}"
+        overrides = [f"{task}={cfg.spec}" for task, cfg in self.router.by_task.items() if cfg.spec != self.primary_spec]
+        if overrides:
+            text += f"; task models: {', '.join(overrides)}"
+        return text
+
+
+def _llm_providers(spec: str) -> tuple[tuple[str, ...], str | None]:
+    """``(providers, script path)`` for the ``--llm`` value; ``ValueError`` for anything but the documented forms."""
     if spec.startswith(FAKE_PREFIX):
         path = spec[len(FAKE_PREFIX):]
         if not path:
             raise ValueError("--llm fake:<json file> needs a path")
-        return LLMService.from_script(path, budget, router=router, approved_by=approved_by)
-    raise ValueError(f"unknown --llm {spec!r}: use 'openrouter' or 'fake:<json file>'")
+        return (SCRIPT_PROVIDER,), path
+    names = tuple(p.strip().lower() for p in spec.split(","))
+    bad = [n for n in names if n not in LLM_PROVIDER_CHOICES]
+    if bad or not names:
+        raise ValueError(
+            f"unknown --llm {spec!r}: use 'openrouter', 'claude', 'openrouter,claude', 'claude,openrouter' or 'fake:<json file>'"
+        )
+    if len(set(names)) != len(names):
+        raise ValueError(f"--llm {spec!r} names a provider twice")
+    return names, None
+
+
+def _task_models(items: list[str] | None) -> dict[str, str]:
+    """``TASK=SPEC`` pairs from ``--llm-task-model``; ``ValueError`` names the offending item (an unknown TASK is refused by the router)."""
+    out: dict[str, str] = {}
+    for item in items or []:
+        if "=" not in item:
+            raise ValueError(f"--llm-task-model expects TASK=SPEC, got {item!r}")
+        task, spec = item.split("=", 1)
+        if not task.strip() or not spec.strip():
+            raise ValueError(f"--llm-task-model expects TASK=SPEC with both parts, got {item!r}")
+        out[task.strip()] = spec.strip()
+    return out
+
+
+def parse_llm_options(args: argparse.Namespace) -> LLMOptions | None:
+    """The :class:`LLMOptions` of the ``--llm*`` flags, or ``None`` without ``--llm``. Builds no client, sends nothing.
+
+    ``ValueError`` (a usage error, exit 2) for an unknown ``--llm`` value, a
+    provider named twice, a spec naming an unconfigured or reserved provider,
+    ``--llm-fallback same`` without a second provider, an unknown task in
+    ``--llm-task-model``, a ``--llm-claude-*`` flag without ``--llm claude``,
+    and a per-call provider (openrouter, the fake) without a budget flag -
+    the message names the provider that needs it. A subscription provider
+    alone needs no budget: the ``--llm claude`` flag is its approval.
+    """
+    spec = getattr(args, "llm", None)
+    if not spec:
+        return None
+    from ai_eda.llm.router import default_model, default_router, parse_model_spec, same_model_fallback
+    from ai_eda.llm.service import LLMBudget, check_router_providers
+
+    providers, script = _llm_providers(spec)
+    default_provider = providers[0]
+    budget = LLMBudget(max_usd=getattr(args, "llm_budget_usd", None), max_tokens=getattr(args, "llm_budget_tokens", None))
+    model = getattr(args, "llm_model", None)
+    primary = parse_model_spec(model or default_model(default_provider), default_provider)
+    fallbacks: list[str] = []
+    for item in getattr(args, "llm_fallback", None) or []:
+        word = item.strip()
+        if word.lower() == FALLBACK_NONE:
+            continue
+        fallbacks.append(same_model_fallback(primary, providers).spec if word.lower() == FALLBACK_SAME else word)
+    router = default_router(model, fallback=fallbacks, default_provider=default_provider, by_task=_task_models(getattr(args, "llm_task_model", None)))
+    check_router_providers(router, providers)
+    client_kw: dict[str, Any] = {}
+    for flag, dest, key in (("--llm-claude-cli", "llm_claude_cli", "cli"), ("--llm-claude-fallback-model", "llm_claude_fallback_model", "fallback_model")):
+        value = getattr(args, dest, None)
+        if value:
+            if "claude" not in providers:
+                raise ValueError(f"{flag} needs --llm claude (configured: {spec})")
+            if key == "cli" and not Path(value).is_file():
+                raise ValueError(f"{flag} {value}: not a file")
+            client_kw[key] = value
+    options = LLMOptions(
+        label=spec, providers=providers, script=script, router=router, budget=budget,
+        allow_model_change=bool(getattr(args, "llm_allow_model_change", False)), client_kw=client_kw,
+    )
+    per_call = options.per_call_providers
+    if per_call and not budget.granted:
+        who = f"the scripted client {spec}" if script else f"the per-call provider {'+'.join(per_call)} in --llm {spec}"
+        raise ValueError(
+            f"{who} needs an explicit budget: pass --llm-budget-usd X and/or --llm-budget-tokens N (that is the approval"
+            + ("; 0 USD allows the free fake client)" if script else "; only a subscription provider such as claude alone needs none)")
+        )
+    return options
+
+
+def build_llm_service(options: LLMOptions | argparse.Namespace | None):
+    """The :class:`~ai_eda.llm.service.LLMService` for the ``--llm*`` flags (a :class:`LLMOptions` or the parsed args), or ``None``.
+
+    Every configured provider's client is built here: ``ToolUnavailableError``
+    when ``openrouter`` has no key or ``claude`` no binary (the message names
+    the provider), ``OSError`` for a missing fake script. Construction records
+    the approvals (``PAID_API_CALL`` for the budget, ``SUBSCRIPTION_USE`` for a
+    subscription member) in the default gate; no model is called.
+    """
+    if isinstance(options, argparse.Namespace):
+        options = parse_llm_options(options)
+    if options is None:
+        return None
+    from ai_eda.llm.service import LLMService
+
+    approved_by = "cli --llm-budget-usd/--llm-budget-tokens"
+    if options.script is not None:
+        return LLMService.from_script(options.script, options.budget, router=options.router, approved_by=approved_by)
+    return LLMService.from_env(options.budget, router=options.router, providers=options.providers, approved_by=approved_by, **options.client_kw)
+
+
+def model_pin_refusal(pinned: str, configured: str) -> str:
+    """The Korean refusal of a run whose primary spec differs from the project's pin (exit 2, before any call)."""
+    return (
+        f"이 프로젝트는 지금까지 `{pinned}` 모델로 실행되었습니다. 다른 모델로 계속하려면 --llm-allow-model-change 를 주십시오. "
+        f"(이번 실행의 모델: `{configured}`)"
+    )
+
+
+def _model_line(ir, options: LLMOptions) -> str:
+    """``LLM model: <spec> (...)``: the run's models against the project pin (printed with leading spaces: not a stage line)."""
+    pinned = ir.requirements.llm_model_spec
+    if pinned is None:
+        state = "not pinned yet: the first run that serves a call pins it"
+    elif pinned == options.primary_spec:
+        state = "the project pin"
+    else:
+        state = f"replacing the project pin {pinned} by --llm-allow-model-change; re-pinned after a served call"
+    return f"  LLM model: {options.describe()} ({state})"
+
+
+def _pin_model(ir, llm, options: LLMOptions) -> str | None:
+    """Set / re-pin ``ir.requirements.llm_model_spec`` after a run that served at least one call; returns the new pin or ``None``."""
+    served = any(r.outcome == "served" for r in llm.usage.records)
+    if not served:
+        return None
+    if ir.requirements.llm_model_spec is None or (options.allow_model_change and ir.requirements.llm_model_spec != options.primary_spec):
+        ir.requirements.llm_model_spec = options.primary_spec
+        return options.primary_spec
+    return None
+
+
+def _close_llm(llm) -> None:
+    """Close the client(s) behind a service: the HTTP pool, the CLI client's kept temp directory."""
+    close = getattr(getattr(llm, "client", None), "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as e:  # noqa: BLE001 - reported, never masks the run's own outcome
+            print(f"could not close the LLM client: {e}", file=sys.stderr)
 
 
 def parse_answers(items: list[str] | None) -> dict[str, str]:
@@ -288,11 +635,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 2
     try:
-        llm = build_llm_service(args)
-    except ApprovalRequiredError:
-        print("LLM use needs an explicit budget: pass --llm-budget-usd X and/or --llm-budget-tokens N (that is the approval).", file=sys.stderr)
-        return 2
-    except (ToolUnavailableError, ValueError, OSError) as e:
+        llm_options = parse_llm_options(args)
+    except ValueError as e:
         print(f"--llm: {e}", file=sys.stderr)
         return 2
     browser_option = _browser_option(args)
@@ -305,6 +649,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     except IRSchemaError as e:
         print(str(e), file=sys.stderr)
         return 2
+    if llm_options is not None:
+        # the project pin: one project, one model - refused before any client exists or any call is made
+        pinned = ir.requirements.llm_model_spec
+        if pinned is not None and pinned != llm_options.primary_spec and not llm_options.allow_model_change:
+            print(model_pin_refusal(pinned, llm_options.primary_spec), file=sys.stderr)
+            return 2
+    try:
+        llm = build_llm_service(llm_options)
+    except ApprovalRequiredError as e:
+        print(f"--llm: {e}: pass --llm-budget-usd X and/or --llm-budget-tokens N (that is the approval).", file=sys.stderr)
+        return 2
+    except (ToolUnavailableError, ValueError, OSError) as e:
+        print(f"--llm: {e}", file=sys.stderr)
+        return 2
     library = KicadLibrary()
     try:
         session = build_source_session(args, ir, workdir, library)
@@ -314,6 +672,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(session.summary())
     for note in session.notes:
         print(f"  note: {note}")
+    if llm is not None and llm_options is not None:
+        print(_model_line(ir, llm_options))
     ctx = AgentContext(
         workdir=workdir,
         tools={"kicad_cli": KicadCli(), "kicad_library": library, "spice": NgspiceShared(), **session.tools()},
@@ -339,6 +699,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"{o.stage:<24} {o.status:<20} {o.message}")
         if llm is not None:
             print(f"\nLLM usage: {llm.summary()}")
+            if llm_options is not None:
+                pin = _pin_model(ir, llm, llm_options)
+                if pin is not None:
+                    print(f"  LLM model pinned to this project: {pin} (ir.requirements.llm_model_spec; --llm-allow-model-change changes it)")
+            _close_llm(llm)
         saved = False
         try:
             ir.save(args.ir)
@@ -560,7 +925,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return serve(Path(args.ir), args.port)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The ``ai-eda`` argument parser (``run``'s options come from :data:`RUN_OPTIONS`)."""
     p = argparse.ArgumentParser(prog="ai-eda", description="AI EDA ENGINEER")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -577,34 +943,8 @@ def main(argv: list[str] | None = None) -> int:
 
     r = sub.add_parser("run", help="run the pipeline")
     r.add_argument("ir")
-    r.add_argument(
-        "--answer", action="append", metavar="KEY=VALUE",
-        help=(
-            "answer an open question; confirm_requirements=yes, accept_implicit=k1,k2, reject_implicit=k3 steer the LLM extraction; "
-            "mains_powered=yes|no, radio=yes|no, finished_apparatus=yes|no, evaluation_kit=yes|no, digital_device=yes|no, "
-            "highest_rated_voltage='12 V DC', intended_use=... are the regulatory scope answers; "
-            "confirm_parts=yes|no decides the candidate-parts table; datasheet_facts_file=<json> grounds your datasheet facts "
-            "(layouts: ai_eda.parts.datasheet_facts.load_facts_file); extract_datasheet_facts=yes and propose_regulations=yes ask the model (billed); "
-            "confirm_facts=yes|no decides the model's datasheet-facts table; accept_regulations=id1,id2 / reject_regulations=id3 decide shown model proposals"
-        ),
-    )
-    r.add_argument("--llm", metavar="openrouter|fake:<json>", help="extract requirements from the request with a model (openrouter needs OPENROUTER_API_KEY; fake:<json> replays a script offline)")
-    r.add_argument("--llm-model", metavar="ID", help="primary model id (default anthropic/claude-sonnet-5; fallback anthropic/claude-haiku-4.5)")
-    r.add_argument("--llm-budget-usd", type=float, metavar="X", help="approve up to X USD of provider-reported cost for this run")
-    r.add_argument("--llm-budget-tokens", type=int, metavar="N", help="approve up to N prompt+completion tokens for this run")
-    r.add_argument("--online", action="store_true", help="approve network fetches for this run (NETWORK_FETCH 'online session'): datasheets and official regulatory texts are fetched from trusted hosts only and archived by sha256; without it nothing is fetched")
-    r.add_argument("--trust-host", action="append", metavar="HOST", help="trust every URL on HOST for fetching (repeatable; KiCad library datasheet hosts and the candidate list's official domains are trusted already)")
-    r.add_argument("--datasheet-url", action="append", metavar="REF=URL", help="the datasheet of component REF is exactly this URL (repeatable; trusted as that URL only)")
-    r.add_argument("--source-url", action="append", metavar="ID=URL", help="an official text is exactly this URL (repeatable; trusted as that URL only)")
-    r.add_argument("--sources-dir", metavar="DIR", help="the document archive directory (default <workdir>/sources)")
-    r.add_argument("--catalog", metavar="CSV", help="your distributor catalog export (columns mpn, manufacturer, package + optional supplier_part_number, stock, unit_price, currency, assembly_class; JLCPCB/LCSC header spellings are mapped)")
-    r.add_argument("--catalog-date", metavar="ISO8601", help="the date you exported the catalog (required with --catalog)")
-    r.add_argument("--catalog-authority", metavar="TEXT", help="who produced the catalog data, e.g. 'JLCPCB export'")
-    r.add_argument("--catalog-supplier", metavar="NAME", help="the supplier label for sourcing entries, e.g. JLCPCB")
-    r.add_argument("--regulatory-candidates", metavar="PATH", help="a regulatory candidate list other than the packaged ai_eda/regulatory/candidates.json")
-    r.add_argument("--fab-capability", metavar="FILE", help="JSON file naming the fab's capability page (source.url, or source.file + retrieved_at for a saved page) and its limits (key, value, unit, page, quote); the URL is trusted exactly, the limits are grounded verbatim on the archived page")
-    r.add_argument("--no-pdf", action="store_true", help="write the stage reports as .md + .html only (no headless browser print)")
-    r.add_argument("--browser", metavar="PATH", help="the Chromium / Chrome / Edge binary that prints the stage reports to PDF (default: discovered - $AI_EDA_BROWSER, PATH, Playwright, install paths)")
+    for option in RUN_OPTIONS:
+        _add_run_option(r, option)
     r.set_defaults(fn=cmd_run)
 
     v = sub.add_parser("review", help="independent review only")
@@ -628,8 +968,11 @@ def main(argv: list[str] | None = None) -> int:
     sr.add_argument("--no-pdf", action="store_true", help="write .md + .html only (no headless browser print)")
     sr.add_argument("--browser", metavar="PATH", help="the Chromium / Chrome / Edge binary to print the PDFs with (default: discovered - $AI_EDA_BROWSER, PATH, Playwright, install paths)")
     sr.set_defaults(fn=cmd_stage_reports)
+    return p
 
-    args = p.parse_args(argv)
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return args.fn(args)
 
 

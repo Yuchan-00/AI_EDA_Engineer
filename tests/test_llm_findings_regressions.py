@@ -95,9 +95,14 @@ def _service(fake: FakeOpenRouter, budget: LLMBudget | None = None, *, router: M
     return LLMService(OpenRouterClient(fake.api_key, fake.base_url, timeout=5.0), router or default_router(), usage or UsageTracker(), budget or LLMBudget(max_usd=1.0), gate=ApprovalGate(), sleep=lambda s: None)
 
 
-def _scripted(items: list[Any], budget: LLMBudget | None = None) -> tuple[LLMService, ScriptedLLMClient]:
+def _scripted(items: list[Any], budget: LLMBudget | None = None, *, router: ModelRouter | None = None) -> tuple[LLMService, ScriptedLLMClient]:
     client = ScriptedLLMClient(items)
-    return LLMService(client, default_router(), UsageTracker(), budget or LLMBudget(max_usd=1.0), gate=ApprovalGate()), client
+    return LLMService(client, router or default_router(), UsageTracker(), budget or LLMBudget(max_usd=1.0), gate=ApprovalGate()), client
+
+
+def _with_fallback() -> ModelRouter:
+    """Decision 4: no fallback by default - the tests that exercise fallback ask for one explicitly."""
+    return default_router(fallback=DEFAULT_FALLBACK_MODEL)
 
 
 def _req(key: str, quote: str | None, number: float | None = None, unit: str | None = None, *, kind: str = "explicit", value_quote: str | None = None, rationale: str | None = None, number_high: float | None = None, category: str = "electrical", text: str | None = None) -> dict[str, Any]:
@@ -336,7 +341,7 @@ def test_5_every_request_carries_max_tokens(fake: FakeOpenRouter):
 def test_6_usd_only_budget_falls_back_after_a_committed_error_that_reported_its_cost(fake: FakeOpenRouter):
     fake.add_committed_error(code=502)
     fake.add_completion("from the fallback")
-    svc = _service(fake, LLMBudget(max_usd=1.0))  # no token budget
+    svc = _service(fake, LLMBudget(max_usd=1.0), router=_with_fallback())  # no token budget
     resp = svc.complete(TASK, MSGS)
     assert resp.content == "from the fallback" and resp.model_used == DEFAULT_FALLBACK_MODEL
     failed, served = svc.usage.records
@@ -363,7 +368,7 @@ def test_6_mid_stream_error_frame_usage_is_kept(fake: FakeOpenRouter, client: Op
 def test_6_usd_only_budget_refuses_the_fallback_when_the_error_reported_no_cost(fake: FakeOpenRouter):
     fake.add_committed_error(code=502, omit_usage=True)
     fake.add_completion("never reached")
-    svc = _service(fake, LLMBudget(max_usd=1.0))
+    svc = _service(fake, LLMBudget(max_usd=1.0), router=_with_fallback())
     with pytest.raises(BudgetExceededError, match="unknown and no token budget"):
         svc.complete(TASK, MSGS)
     assert len(fake.chat_requests) == 1
@@ -371,7 +376,7 @@ def test_6_usd_only_budget_refuses_the_fallback_when_the_error_reported_no_cost(
     fake.reset()
     fake.add_committed_error(code=502, omit_usage=True)
     fake.add_completion("recovered")
-    svc = _service(fake, LLMBudget(max_usd=1.0, max_tokens=10_000))
+    svc = _service(fake, LLMBudget(max_usd=1.0, max_tokens=10_000), router=_with_fallback())
     assert svc.complete(TASK, MSGS).content == "recovered"
     assert "counted as 0 USD against the USD budget" in svc.summary() and "1 failed call(s) possibly billed" in svc.summary()
 
@@ -702,15 +707,15 @@ def test_18_reviewer_neither_fails_on_nor_passes_an_llm_generated_requirement(tm
 
 
 def test_20_transport_failure_after_send_is_accounted_and_extraction_cost_is_honest(tmp_path: Path):
-    svc, client = _scripted([LLMError("timeout after 5s: ReadTimeout", kind="transport", sent=True), {"content": "fallback"}], LLMBudget(max_usd=1.0))
+    svc, client = _scripted([LLMError("timeout after 5s: ReadTimeout", kind="transport", sent=True), {"content": "fallback"}], LLMBudget(max_usd=1.0), router=_with_fallback())
     with pytest.raises(BudgetExceededError, match="unknown and no token budget"):
         svc.complete(TASK, MSGS)  # the timed-out request may be billed: the USD-only budget can not cover a fallback
     assert [r.outcome for r in svc.usage.records] == ["failed"] and len(client.calls) == 1
-    svc, client = _scripted([LLMError("timeout after 5s: ReadTimeout", kind="transport", sent=True), {"content": "fallback"}], LLMBudget(max_usd=1.0, max_tokens=1000))
+    svc, client = _scripted([LLMError("timeout after 5s: ReadTimeout", kind="transport", sent=True), {"content": "fallback"}], LLMBudget(max_usd=1.0, max_tokens=1000), router=_with_fallback())
     assert svc.complete(TASK, MSGS).content == "fallback"
     assert [r.outcome for r in svc.usage.records] == ["failed", "served"] and "possibly billed" in svc.summary()
     # the extraction's cost is unknown when any billed attempt has an unknown cost, even if the served one is priced
-    svc, client = _scripted([LLMError("upstream", kind="response", status=200, code=502), {"structured": CANNED, "usage": USAGE}], LLMBudget(max_usd=1.0, max_tokens=100_000))
+    svc, client = _scripted([LLMError("upstream", kind="response", status=200, code=502), {"structured": CANNED, "usage": USAGE}], LLMBudget(max_usd=1.0, max_tokens=100_000), router=_with_fallback())
     ir = _ir(tmp_path)
     _run(ir, svc, tmp_path)
     res = ir.validation.latest("requirements.extraction")
@@ -745,6 +750,7 @@ def test_21_doctor_online_goes_through_the_gate_and_the_fake_server(fake: FakeOp
     before = len(default_gate().audit)
     code, out, _ = _cli("doctor", "--online")
     assert code == 0 and "LLM account: label='fake-key'" in out and "limit=10.0" in out and fake.api_key not in out
+    assert "claude cli : NOT FOUND (" in out  # tests/conftest.py: discovery finds only the fake claude, never the machine's CLI
     [req] = [r for r in fake.requests if r.path.endswith("/auth/key")]
     assert req.authorization == f"Bearer {fake.api_key}"
     events = [(e["event"], e["action"]) for e in default_gate().audit[before:] if e["action"] == ExternalAction.SECRET_ACCESS]
@@ -753,7 +759,7 @@ def test_21_doctor_online_goes_through_the_gate_and_the_fake_server(fake: FakeOp
     # without --online nothing is sent, even with the base URL pointed at the fake
     fake.reset()
     code, out, _ = _cli("doctor")
-    assert code == 0 and fake.requests == [] and "LLM account" not in out
+    assert code == 0 and fake.requests == [] and "LLM account" not in out and "claude cli : NOT FOUND (" in out
 
 
 def test_21_base_url_env_override_is_used_by_from_env(fake: FakeOpenRouter, monkeypatch: pytest.MonkeyPatch):

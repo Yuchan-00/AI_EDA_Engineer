@@ -105,8 +105,14 @@ class RequirementSet(BaseModel):
     #: content (a table names library paths; the same design shown on two machines must hash the same): excluded
     #: from the design hash like ``extraction_cache``.
     presented: dict[str, str] = Field(default_factory=dict)
+    #: the project's model pin: the primary ``provider:model`` spec of the first run that made at least one served
+    #: model call (``ai-eda run`` sets it; ``--llm-allow-model-change`` re-pins after a served call). A later run
+    #: with another primary spec is refused before any call, so one project's model proposals come from one model
+    #: unless the user says otherwise. Bookkeeping of the runs, not design content: excluded from the design hash
+    #: like ``extraction_cache`` / ``presented`` (the same design run through another provider hashes the same).
+    llm_model_spec: str | None = None
 
-    _design = drop_in_design_view("extraction_cache", "presented")
+    _design = drop_in_design_view("extraction_cache", "presented", "llm_model_spec")
 
 
     def request_text(self) -> str:
