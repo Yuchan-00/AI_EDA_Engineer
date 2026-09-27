@@ -13,6 +13,12 @@ The copied value keeps the requirement's provenance kind, records the
 requirement id in ``derived_from`` and starts its note with
 :data:`PARSED_NOTE_PREFIX`, so a later run can prove the parameter is still
 the requirement (:func:`~ai_eda.design.checks.check_inputs_vs_requirements`).
+
+The board's layer count (``pcb_layers``, alias ``layer_count``) is an
+optional input of every template, read by :func:`read_layer_count`: a plain
+integer, one of :data:`LAYER_COUNT_OPTIONS`; without one the template uses
+:data:`DEFAULT_LAYER_COUNT` and must show that choice in its confirmation
+table (:mod:`ai_eda.design.stackup` builds the stack for either count).
 """
 
 from __future__ import annotations
@@ -48,6 +54,20 @@ UNIT_OF: dict[str, str] = {
 #: how the note of a value copied from a requirement starts (followed by the requirement id)
 PARSED_NOTE_PREFIX = "parsed from "
 
+#: the board's copper layer count: an optional input every template reads through :func:`read_layer_count` (the
+#: stack itself is :mod:`ai_eda.design.stackup`); a count, not a quantity, so it is not in :data:`KEY_ALIASES`
+LAYER_COUNT_KEY = "pcb_layers"
+#: requirement keys that mean the layer count
+LAYER_COUNT_ALIASES: tuple[str, ...] = ("pcb_layers", "layer_count")
+#: the layer counts the generic stackups exist for
+LAYER_COUNT_OPTIONS: tuple[int, ...] = (2, 4)
+#: the count a template uses when no requirement states one (and says so in its confirmation table)
+DEFAULT_LAYER_COUNT = 2
+#: the ``unit`` of a copied layer count (``read_value(req, LAYER_UNIT)`` reads a plain integer)
+LAYER_UNIT = "layers"
+#: board-level keys (canonical key -> the requirement keys that mean it); every template serves them through the stackup
+BOARD_KEY_ALIASES: dict[str, tuple[str, ...]] = {LAYER_COUNT_KEY: LAYER_COUNT_ALIASES}
+
 
 @dataclass(frozen=True)
 class DesignInput:
@@ -59,8 +79,8 @@ class DesignInput:
 
 
 def canonical_key(key: str) -> str | None:
-    """The canonical template key a requirement key means, or ``None``."""
-    for canon, aliases in KEY_ALIASES.items():
+    """The canonical template key a requirement key means (a quantity key or a board key such as ``pcb_layers``), or ``None``."""
+    for canon, aliases in (*KEY_ALIASES.items(), *BOARD_KEY_ALIASES.items()):
         if key in aliases:
             return canon
     return None
@@ -83,7 +103,11 @@ def _why_not_answer(text: str) -> str:
 
 
 def read_value(req: Requirement, unit: str) -> tuple[Traced | None, str | None]:
-    """``(traced, None)`` with ``req``'s value as a number in ``unit``, or ``(None, why)``."""
+    """``(traced, None)`` with ``req``'s value as a number in ``unit``, or ``(None, why)``.
+
+    ``unit`` :data:`LAYER_UNIT` reads a layer count: a plain positive integer
+    (``4`` or ``"4"``; ``"4 layers"`` is not read), with no unit.
+    """
     value = req.value
     if value is None:
         return None, f"{req.id}: has no value"
@@ -91,6 +115,8 @@ def read_value(req: Requirement, unit: str) -> tuple[Traced | None, str | None]:
     if not prov.is_authoritative:
         return None, f"{req.id}: value is {prov.kind.value}, not yet the user's (confirm it, or answer {req.key} directly)"
     raw = value.value
+    if unit == LAYER_UNIT:
+        return _read_count(req, raw, value.unit, prov)
     if isinstance(raw, str):
         q = parse_answer(raw)
         if q is None:
@@ -115,6 +141,75 @@ def read_value(req: Requirement, unit: str) -> tuple[Traced | None, str | None]:
         note = f"{PARSED_NOTE_PREFIX}{req.id}: {raw!r} {value.unit} -> {number:.12g} {unit}"
     traced = Traced(value=number, unit=unit, provenance=Provenance(kind=prov.kind, source=prov.source, derived_from=[req.id], note=note))
     return traced, None
+
+
+def _read_count(req: Requirement, raw: object, unit: str | None, prov: Provenance) -> tuple[Traced | None, str | None]:
+    """A layer count as the user stated it: an int, or text that is one plain integer; nothing else is read."""
+    if unit is not None and unit != LAYER_UNIT:
+        return None, f"{req.id}: a layer count has no unit, got {unit!r}"
+    if isinstance(raw, bool):
+        return None, f"{req.id}: value {raw!r} is not a layer count"
+    if isinstance(raw, int):
+        count = raw
+    elif isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
+        count = int(raw.strip())
+    else:
+        return None, f"{req.id}: {raw!r} is not one plain layer count (answer {LAYER_COUNT_KEY}=2 or {LAYER_COUNT_KEY}=4)"
+    if count <= 0:
+        return None, f"{req.id}: {raw!r} is not a positive layer count"
+    note = f"{PARSED_NOTE_PREFIX}{req.id}: {raw!r} -> {count} {LAYER_UNIT}"
+    return Traced(value=count, unit=LAYER_UNIT, provenance=Provenance(kind=prov.kind, source=prov.source, derived_from=[req.id], note=note)), None
+
+
+@dataclass(frozen=True)
+class LayerCountInput:
+    """The board's copper layer count and where it came from.
+
+    ``requirement`` / ``traced`` are the confirmed requirement and its copy
+    (``derived_from`` the requirement id, :data:`PARSED_NOTE_PREFIX` note, unit
+    :data:`LAYER_UNIT`); both are ``None`` when no requirement states a count
+    and the template uses :data:`DEFAULT_LAYER_COUNT` - a choice it must show.
+    """
+
+    value: int
+    requirement: Requirement | None = None
+    traced: Traced | None = None
+
+    @property
+    def is_default(self) -> bool:
+        return self.requirement is None
+
+
+def read_layer_count(ir: CircuitIR) -> tuple[LayerCountInput | None, str | None]:
+    """``(input, None)`` with the board's layer count, or ``(None, why)`` when a stated count is unusable.
+
+    No requirement under :data:`LAYER_COUNT_ALIASES` -> the default
+    (:data:`DEFAULT_LAYER_COUNT`, ``is_default``). A stated count must be
+    confirmed (the user's or authoritative), one plain integer, one of
+    :data:`LAYER_COUNT_OPTIONS`, and every requirement that states one must
+    state the same (two different counts are ambiguous, never a pick).
+    """
+    candidates = [r for r in ir.requirements.requirements if r.key in LAYER_COUNT_ALIASES]
+    if not candidates:
+        return LayerCountInput(value=DEFAULT_LAYER_COUNT), None
+    readings: list[tuple[Requirement, Traced]] = []
+    reasons: list[str] = []
+    for r in candidates:
+        traced, why = read_value(r, LAYER_UNIT)
+        if traced is None:
+            reasons.append(why or f"{r.id}: unreadable")
+        else:
+            readings.append((r, traced))
+    if reasons:
+        return None, "; ".join(reasons)
+    counts = {int(t.value) for _, t in readings}
+    if len(counts) > 1:
+        return None, "ambiguous: " + ", ".join(f"{r.id} says {int(t.value)}" for r, t in readings)
+    count = counts.pop()
+    if count not in LAYER_COUNT_OPTIONS:
+        return None, f"{readings[0][0].id}: {count} layers is not one of the stackups this version builds ({', '.join(map(str, LAYER_COUNT_OPTIONS))})"
+    req, traced = readings[0]
+    return LayerCountInput(value=count, requirement=req, traced=traced), None
 
 
 def read_inputs(ir: CircuitIR) -> tuple[dict[str, DesignInput], dict[str, str]]:
@@ -159,4 +254,21 @@ def is_template_input(t: Traced) -> bool:
     return p.is_authoritative and len(p.derived_from) == 1 and p.derived_from[0].startswith("req.") and (p.note or "").startswith(PARSED_NOTE_PREFIX)
 
 
-__all__ = ["KEY_ALIASES", "PARSED_NOTE_PREFIX", "UNIT_OF", "DesignInput", "canonical_key", "is_template_input", "read_inputs", "read_value"]
+__all__ = [
+    "BOARD_KEY_ALIASES",
+    "DEFAULT_LAYER_COUNT",
+    "KEY_ALIASES",
+    "LAYER_COUNT_ALIASES",
+    "LAYER_COUNT_KEY",
+    "LAYER_COUNT_OPTIONS",
+    "LAYER_UNIT",
+    "PARSED_NOTE_PREFIX",
+    "UNIT_OF",
+    "DesignInput",
+    "LayerCountInput",
+    "canonical_key",
+    "is_template_input",
+    "read_inputs",
+    "read_layer_count",
+    "read_value",
+]

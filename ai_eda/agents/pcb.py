@@ -69,6 +69,37 @@ Invariants this agent keeps:
   cannot read the board leaves the silkscreen out with a
   ``silkscreen not placed: <reason>`` note, never a guess. Every text
   carries ``derived`` / ``silkscreen.place`` provenance.
+* Signal integrity is need-driven and happens inside the same proposal
+  (``ir.si`` net classes, :mod:`ai_eda.tools.si`): the router gets the
+  per-net rules the classes map to (:func:`ai_eda.tools.si.rules.net_rules`:
+  a controlled-impedance width from ``calc.tline.width_for_z0`` over the
+  stackup's plane, a minimum width, length / delay budgets, declared pairs);
+  a board whose classes constrain nothing is routed with no rule - routing.maze
+  0.2's copper, byte for byte (once any net has a rule, every net is routed
+  in the same negotiation, stamped 0.3, and a net without a rule may take
+  another path than 0.2 gave it). After the routing pass every routed net's
+  line - its longest pad-to-pad path, extracted from the copper and the
+  library's pad boxes (:mod:`ai_eda.tools.si.paths`), or a 2-pad net's copper -
+  is measured and the critical-length rule
+  (:func:`ai_eda.tools.si.promote.promote`) promotes each electrically long
+  net of a class that names ``promote_to`` into that controlled class (a net
+  whose whole copper exceeds l_crit but whose path was not extracted is only
+  possibly long and is never promoted); the
+  promotions are a second proposal (``target="si"``, the whole
+  :class:`~ai_eda.ir.SIConstraints` with ``derived`` promotion records), and
+  when they change the rules the board is re-routed **once** with them. A
+  re-route that leaves a net unrouted which the first pass routed keeps the
+  first pass's copper (a note says so; ``si.impedance`` then judges the
+  promoted nets at the width they have). On a board without a reference
+  plane a promoted net gets no controlled width, so nothing is re-routed and
+  ``si.impedance`` / ``spice.si`` say why. A 4-layer board (a stackup whose
+  inner layers are planes, listed in ``ir.pcb.layers``) is routed on its outer
+  layers (``inner_layers=True``) and gets its plane zones
+  (:func:`ai_eda.design.stackup.plane_zones`, the ``plane_edge_clearance``
+  parameter) in the same ``pcb`` proposal, after the routing and before the
+  silkscreen; the planes are return paths and impedance references, never a
+  reason to route a net with fewer tracks, and they are not "existing
+  copper" for a later run. The silkscreen is placed on the final copper.
 * It asks no question. The only steering is the three control keys
   :data:`PLACEMENT_KEY` (``--answer pcb.placement=skip`` proposes nothing),
   :data:`ROUTING_KEY` (``--answer pcb.routing=skip`` proposes the
@@ -97,15 +128,19 @@ from __future__ import annotations
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
 from ai_eda.agents.keys import PLACEMENT_KEY, ROUTING_KEY, SILKSCREEN_KEY
+from ai_eda.design.board import PLANE_CLEARANCE_KEY
+from ai_eda.design.stackup import STACKUP_TOOL, plane_zones
 from ai_eda.errors import CompileError
-from ai_eda.ir import CircuitIR, PCBDesign
+from ai_eda.ir import CircuitIR, PCBDesign, SIConstraints
 from ai_eda.llm.router import TaskKind
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, LibraryLookupError
 from ai_eda.tools.placement.core_ring import CORE_MIN_PADS, RingPlacement, core_ring_placement, find_core
 from ai_eda.tools.placement.core_ring import PLACER_ID as RING_PLACER_ID
 from ai_eda.tools.placement.core_ring import PLACER_VERSION as RING_PLACER_VERSION
 from ai_eda.tools.placement.grid import COLUMNS, MARGIN_MM, PLACER_ID, PLACER_VERSION, SPACING_MM, _resolve, grid_placement
-from ai_eda.tools.routing.maze import FINE_PITCH_MM, ROUTER_ID, ROUTER_VERSION, Routing, RoutingParams, route_board
+from ai_eda.tools.routing.maze import FINE_PITCH_MM, INNER_LAYER_RE, ROUTER_ID, Routing, RoutingParams, route_board
+from ai_eda.tools.si.promote import promote
+from ai_eda.tools.si.rules import SIRules, net_rules
 from ai_eda.tools.silkscreen.place import SilkParams, place_silkscreen
 
 #: ``--answer pcb.placement=skip`` makes the agent propose nothing, ``--answer pcb.routing=skip`` leaves the placement
@@ -209,28 +244,50 @@ class PCBAgent(Agent):
                 notes.append(
                     f"{ROUTING_KEY}={answer!r} not understood (the only answers are '{SKIP_ANSWER}' and '{PARTIAL_ANSWER}'); routing as usual"
                 )
-        if board.tracks or board.vias or board.zones:
-            reason = f"not routed: ir.pcb already has copper ({len(board.tracks)} track(s), {len(board.vias)} via(s), {len(board.zones)} zone(s)); the agent never replaces copper"
+        foreign = [z for z in board.zones if not _is_plane(z)]
+        if board.tracks or board.vias or foreign:
+            reason = f"not routed: ir.pcb already has copper ({len(board.tracks)} track(s), {len(board.vias)} via(s), {len(foreign)} zone(s)); the agent never replaces copper"
             return self._unrouted(ir, ctx, board, notes, [reason], placed=placed, description=description, basis=basis)
         library = ctx.tools.get("kicad_library")
         if not isinstance(library, KicadLibrary):
             return self._unrouted(
-                ir, ctx, board, notes, ["not routed: no KiCad library in ctx.tools['kicad_library']; pad geometry cannot be read"], placed=placed, description=description, basis=basis,
+                ir, ctx, board, notes, ["not routed: no KiCad library in ctx.tools['kicad_library']; pad geometry cannot be read"],
+                placed=placed, description=description, basis=basis,
             )
         board_ir = ir.model_copy(update={"pcb": board})  # a shallow copy: ir itself is never touched
+        inner = _routes_around_planes(board)
         params: RoutingParams | None = None
+        si_rules = SIRules()
         try:
             params = self.routing if self.routing is not None else RoutingParams.for_board(board_ir, library)
-            routing = route_board(board_ir, library, params)
+            si_rules = net_rules(board_ir, params)
+            routing = route_board(board_ir, library, params, rules=si_rules.rules or None, inner_layers=inner)
         except (CompileError, LibraryLookupError, LibraryFormatError) as e:
             rules = [self._rules_note(params)] if params is not None and params.rules is not None else []
-            return self._unrouted(ir, ctx, board, notes, [*rules, f"not routed: {e}"], placed=placed, description=description, basis=basis)
+            return self._unrouted(ir, ctx, board, notes, [*rules, *self._si_rule_notes(si_rules), f"not routed: {e}"],
+                                  placed=placed, description=description, basis=basis)
+        si_notes = self._si_rule_notes(si_rules)
         reasons = [f"not routed: {net}: {why}" for net, why in routing.unrouted.items()]
         if routing.unrouted and not (partial and routing.stats.get("routed_nets")):
             rules = [self._rules_note(routing.params, routing.stats.get("raised"))] if routing.params.rules is not None else []
             dropped = [self._dropped_note(routing)] if routing.stats.get("routed_nets") else []
-            return self._unrouted(ir, ctx, board, notes, [*rules, *dropped, *reasons], placed=placed, description=description, basis=basis)
+            return self._unrouted(ir, ctx, board, notes, [*rules, *si_notes, *dropped, *reasons],
+                                  placed=placed, description=description, basis=basis)
+        # --- the critical-length rule on the routed copper, and one re-route with the promoted rules
+        extra: list[IRProposal] = []
+        routed_ir = ir.model_copy(update={"pcb": board.model_copy(update={"tracks": list(routing.tracks), "vias": list(routing.vias)})})
+        new_si, promotions, promo_notes = promote(routed_ir, library=library)
+        si_notes += [f"si promotion: {n}" for n in promo_notes]
+        if new_si is not None:
+            extra.append(IRProposal(
+                description=f"si: {len(promotions)} electrically long net(s) promoted ({', '.join(p.net for p in promotions)})", target="si", operation="set",
+                payload=new_si, rationale="critical-length rule on the routed delays (derived; the numbers are in each promotion's provenance)",
+            ))
+            routing, rerouted = self._reroute(board_ir, library, params, si_rules, new_si, inner, routing)
+            si_notes.append(rerouted)
+            reasons = [f"not routed: {net}: {why}" for net, why in routing.unrouted.items()]
         payload = board.model_copy(update={"tracks": list(routing.tracks), "vias": list(routing.vias)})
+        payload = self._with_planes(ir, payload, si_notes)
         routed = self._routing_description(routing)
         which = "the nets listed as routed" if routing.unrouted else "every net"
         if placed:
@@ -243,28 +300,99 @@ class PCBAgent(Agent):
             full = routed
             rationale = f"{which} maze-routed on F.Cu/B.Cu from the existing placements and the library pad geometry at the recorded width / clearance / via sizes; DRC decides validity"
         notes.append(routed)
+        notes.extend(si_notes)
         if routing.unrouted:  # the opt-in partial board: whole nets only, the rest named
             left = self._partial_note(routing)
             full = f"{full}; {left}"
             notes += [left, *reasons]
         proposal = IRProposal(description=full, target="pcb", operation="set", payload=payload, rationale=rationale)
-        return self._with_silk(ir, ctx, payload, proposal, notes)
+        return self._with_silk(ir, ctx, payload, proposal, notes, extra)
+
+    def _reroute(
+        self, board_ir: CircuitIR, library: KicadLibrary, params: RoutingParams | None, before: SIRules, new_si: SIConstraints, inner: bool,
+        first: Routing,
+    ) -> tuple[Routing, str]:
+        """Route once more with the promoted classes' rules; ``(routing to apply, note)`` - the first pass's when nothing changed or the re-route is worse."""
+        promoted_ir = board_ir.model_copy(update={"si": new_si})
+        try:
+            after = net_rules(promoted_ir, params)
+        except CompileError as e:
+            return first, f"si re-route: not attempted ({e}); the first pass's copper is kept"
+        if after.signature() == before.signature():
+            missing = "; ".join(after.notes) or "the promoted nets' class adds no routing rule"
+            return first, f"si re-route: not needed - the promotions change no routing rule ({missing})"
+        try:
+            second = route_board(promoted_ir, library, params, rules=after.rules or None, inner_layers=inner)
+        except (CompileError, LibraryLookupError, LibraryFormatError) as e:
+            return first, f"si re-route refused ({e}); the first pass's copper is kept (si.impedance judges the promoted nets at the width they have)"
+        lost = sorted(set(second.unrouted) - set(first.unrouted))
+        if lost:  # never trade a routed net for a controlled width, not even on an opt-in partial board
+            why = "; ".join(f"{n}: {second.unrouted[n]}" for n in lost)
+            return first, f"si re-route left {len(lost)} net(s) unrouted ({why}); the first pass's copper is kept (si.impedance judges the promoted nets at the width they have)"
+        widths = ", ".join(f"{n} {r.width_mm:g} mm" for n, r in sorted(after.rules.items()) if r.width_mm is not None and before.rules.get(n) != r)
+        return second, f"si re-route: routed once more with the promoted rules ({widths or 'new budgets'}): {self._routing_description(second)}"
+
+    def _with_planes(self, ir: CircuitIR, board: PCBDesign, notes: list[str]) -> PCBDesign:
+        """``board`` with its stackup's plane zones (a 4-layer board the agent routes), unless it has them already (module docstring)."""
+        stack = board.stackup
+        if stack is None or not stack.plane_layers() or board.outline is None or any(_is_plane(z) for z in board.zones):
+            return board
+        names = {layer.name for layer in board.layers}
+        missing = [c.name for c in stack.plane_layers() if c.name not in names]
+        if missing:
+            notes.append(f"plane zones not added: ir.pcb.layers does not list the plane layer(s) {missing}")
+            return board
+        clearance = ir.parameters.get(PLANE_CLEARANCE_KEY)
+        if clearance is None:
+            notes.append(f"plane zones not added: no {PLANE_CLEARANCE_KEY} parameter says how far inside the board edge they end")
+            return board
+        try:
+            zones = plane_zones(stack, board.outline, clearance)
+        except (ValueError, TypeError) as e:
+            notes.append(f"plane zones not added: {e}")
+            return board
+        notes.append("plane zones: " + ", ".join(f"{z.net} on {z.layer}" for z in zones) + f" (outline inset {float(clearance.value):g} mm; KiCad fills them)")
+        return board.model_copy(update={"zones": [*board.zones, *zones]})
+
+    @staticmethod
+    def _si_rule_notes(si_rules: SIRules) -> list[str]:
+        out = [f"si: {n}" for n in si_rules.notes]
+        if si_rules.rules:
+            per: dict[str, list[str]] = {}
+            for net, rule in sorted(si_rules.rules.items()):
+                per.setdefault(rule.net_class or "?", []).append(net)
+            out.insert(0, "si rules: " + "; ".join(
+                f"{cls} ({len(nets)} net(s)): " + " / ".join(si_rules.classes[cls].derivation) if cls in si_rules.classes else f"{cls}: {len(nets)} net(s)"
+                for cls, nets in per.items()
+            ))
+        return out
 
     def _unrouted(
         self, ir: CircuitIR, ctx: AgentContext, board: PCBDesign, notes: list[str], reasons: list[str], *, placed: bool, description: str, basis: str = GRID_RATIONALE,
     ) -> AgentResult:
-        """The placement alone (or nothing when the board was already placed) plus why there is no copper; then the silkscreen."""
+        """The placement alone (or nothing when the board was already placed) plus why there is no copper; then the silkscreen.
+
+        A board this run placed gets its stackup's plane zones here too (they are not routed copper).
+        """
         if not placed:
             return self._with_silk(ir, ctx, board, None, [*notes, *reasons])
+        plane_notes: list[str] = []
+        board = self._with_planes(ir, board, plane_notes)
         proposal = IRProposal(description=description, target="pcb", operation="set", payload=board, rationale=f"{basis}; DRC decides validity")
-        return self._with_silk(ir, ctx, board, proposal, [*notes, f"{description}; {UNROUTED_NOTE}", *reasons])
+        return self._with_silk(ir, ctx, board, proposal, [*notes, f"{description}; {UNROUTED_NOTE}", *reasons, *plane_notes])
 
-    def _with_silk(self, ir: CircuitIR, ctx: AgentContext, board: PCBDesign, proposal: IRProposal | None, notes: list[str]) -> AgentResult:
-        """Add the silkscreen to the one ``pcb`` proposal, or propose ``board`` + silkscreen alone when nothing else is proposed (module docstring)."""
+    def _with_silk(
+        self, ir: CircuitIR, ctx: AgentContext, board: PCBDesign, proposal: IRProposal | None, notes: list[str], extra: list[IRProposal] | None = None,
+    ) -> AgentResult:
+        """Add the silkscreen to the one ``pcb`` proposal, or propose ``board`` + silkscreen alone when nothing else is proposed (module docstring).
+
+        ``extra`` (the ``si`` promotion proposal) follows the ``pcb`` one.
+        """
+        extra = list(extra or [])
         silk_notes, texts, silk_description = self._silkscreen(ir, ctx, board)
         notes = [*notes, *silk_notes]
         if texts is None:
-            return self._result(proposals=[proposal] if proposal is not None else [], notes=notes)
+            return self._result(proposals=[*([proposal] if proposal is not None else []), *extra], notes=notes)
         payload = board.model_copy(update={"silkscreen": texts})
         if proposal is None:
             proposal = IRProposal(description=silk_description, target="pcb", operation="set", payload=payload, rationale=SILK_RATIONALE)
@@ -272,7 +400,7 @@ class PCBAgent(Agent):
             proposal = proposal.model_copy(update={
                 "payload": payload, "description": f"{proposal.description}; {silk_description}", "rationale": f"{proposal.rationale}; {SILK_RATIONALE}",
             })
-        return self._result(proposals=[proposal], notes=notes)
+        return self._result(proposals=[proposal, *extra], notes=notes)
 
     def _silkscreen(self, ir: CircuitIR, ctx: AgentContext, board: PCBDesign) -> tuple[list[str], list | None, str]:
         """``(notes, texts or None, description)`` of the silkscreen for ``board``; ``None`` = propose none (the notes say why)."""
@@ -313,7 +441,7 @@ class PCBAgent(Agent):
         s = routing.stats
         total = s["routed_nets"] + s["unrouted_nets"]
         return (
-            f"not applied: {ROUTER_ID} {ROUTER_VERSION} connected {s['routed_nets']} of {total} net(s) ({s['track_count']} track(s), {s['via_count']} via(s), "
+            f"not applied: {ROUTER_ID} {routing.version} connected {s['routed_nets']} of {total} net(s) ({s['track_count']} track(s), {s['via_count']} via(s), "
             f"{s['total_length_mm']} mm of copper, {s['iterations']} iteration(s)) but not the {s['unrouted_nets']} below; a half-routed board is never proposed, "
             f"so the proposal carries the placement only (--answer {ROUTING_KEY}={PARTIAL_ANSWER} applies the routed nets, each whole)"
         )
@@ -334,7 +462,7 @@ class PCBAgent(Agent):
         p = routing.params
         s = routing.stats
         text = (
-            f"{ROUTER_ID} {ROUTER_VERSION}: {s['routed_nets']} net(s) routed on F.Cu/B.Cu, {s['track_count']} track(s), {s['via_count']} via(s), "
+            f"{ROUTER_ID} {routing.version}: {s['routed_nets']} net(s) routed on F.Cu/B.Cu, {s['track_count']} track(s), {s['via_count']} via(s), "
             f"{s['total_length_mm']} mm of copper, {s['iterations']} negotiation iteration(s); grid {p.grid_mm} mm, width {p.track_width_mm} mm, "
             f"clearance {p.clearance_mm} mm, via {p.via_diameter_mm}/{p.via_drill_mm} mm, edge {p.edge_clearance_mm} mm"
         )
@@ -344,6 +472,10 @@ class PCBAgent(Agent):
             text += f"; {len(s['skipped_nets'])} net(s) with fewer than 2 pads skipped ({', '.join(s['skipped_nets'])})"
         if s["raised"]:
             text += "; raised to ir.pcb.manufacturing minimums: " + ", ".join(f"{name} {req} -> {eff}" for name, (req, eff) in s["raised"].items())
+        if routing.rules:
+            text += f"; {len(routing.rules)} net(s) with net-class rules"
+        if s.get("inner_layers"):
+            text += f"; inner layers {', '.join(s['inner_layers'])} carry planes, not tracks"
         return text
 
     @staticmethod
@@ -361,6 +493,20 @@ class PCBAgent(Agent):
         if not isinstance(ctx.tools.get("kicad_library"), KicadLibrary):
             return "no KiCad library in ctx.tools['kicad_library']; footprint extents cannot be read"
         return None
+
+
+def _is_plane(zone) -> bool:
+    """Whether ``zone`` is a stackup plane this agent drew (:func:`ai_eda.design.stackup.plane_zones`), not routed copper."""
+    return zone.provenance.tool == STACKUP_TOOL
+
+
+def _routes_around_planes(board: PCBDesign) -> bool:
+    """Whether ``board``'s inner layers are exactly its stackup's plane layers: then the router may accept them (it never routes them)."""
+    inner = [layer.name for layer in board.layers if INNER_LAYER_RE.match(layer.name)]
+    if not inner or board.stackup is None:
+        return False
+    planes = {c.name for c in board.stackup.plane_layers()}
+    return set(inner) <= planes
 
 
 __all__ = [

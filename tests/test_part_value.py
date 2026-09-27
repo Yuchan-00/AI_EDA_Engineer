@@ -165,7 +165,7 @@ def test_the_formatter_never_writes_a_value_that_reads_back_as_infinity():
 
 def test_template_version_moved_with_the_value_spelling():
     """The same inputs now build different ``value`` text, so the template provenance names a new version."""
-    assert TEMPLATE_VERSION == "0.2"
+    assert TEMPLATE_VERSION == "0.3"  # 0.2: the value spelling; 0.3: the board stack and SI classes (tests/test_si_templates.py)
 
 
 #: template -> (answers, library factory, the part values it must write)

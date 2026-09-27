@@ -66,7 +66,14 @@ from ai_eda.ir.pcb import (
     ManufacturingConstraints,
     PCBDesign,
     unrecorded_origin,
+    CopperRole,
+    DielectricKind,
+    StackupCopper,
+    StackupDielectric,
+    SolderMask,
+    Stackup,
 )
+from ai_eda.ir.si import DiffPair, NetClass, Promotion, SIConstraints, TimingPath
 from ai_eda.ir.regulatory import (
     Jurisdiction,
     RegulatoryProvenance,
@@ -89,6 +96,8 @@ __all__ = [
     "ConstraintKind", "Constraint",
     "BoardSide", "Layer", "BoardOutline", "Placement", "Track", "Via", "Zone", "SilkKind", "SilkText",
     "ManufacturingConstraints", "PCBDesign", "UNRECORDED_ORIGIN", "unrecorded_origin",
+    "CopperRole", "DielectricKind", "StackupCopper", "StackupDielectric", "SolderMask", "Stackup",
+    "DiffPair", "NetClass", "Promotion", "SIConstraints", "TimingPath",
     "Jurisdiction", "RegulatoryProvenance", "RegulatoryRequirement", "RegulatoryState",
     "ArtifactKind", "ArtifactRef", "ProjectMeta", "CircuitIR", "hash_file_set",
 ]

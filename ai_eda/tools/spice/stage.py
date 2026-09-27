@@ -99,6 +99,8 @@ from ai_eda.tools.spice.measure import ABSTOL, VNTOL, rising_edge_frequency
 from ai_eda.tools.spice.runner import Interpolation, SpiceAnalysis, SpiceResult, SpiceRunner
 
 CHECK_ID = "spice"
+#: the SI transients' check ids (``spice.si.<net>``): not expectations, never retired here
+SI_CHECK_PREFIX = "spice.si"
 #: subdirectory of the workdir that holds ``results.json`` and one rawfile directory per analysis id
 RESULTS_DIR = "spice"
 RESULTS_FILE = "results.json"
@@ -252,12 +254,16 @@ def retire_expectation_results(ir: CircuitIR, keep: set[str], status: Validation
     ``ValidationState`` never forgets a check id, so an expectation that was
     removed or renamed would otherwise keep its last verdict in
     ``overall()`` forever. Returns the results (the caller appends them).
+    ``spice.si.<net>`` (:data:`SI_CHECK_PREFIX`, the SI transients) is not an
+    expectation and is left to :func:`ai_eda.tools.spice.si_check.spice_si_results`.
     """
     out: list[ValidationResult] = []
     prefix = f"{CHECK_ID}."
     for check_id, last in ir.validation.latest_by_check().items():
         if not check_id.startswith(prefix) or check_id[len(prefix):] in keep:
             continue
+        if check_id == SI_CHECK_PREFIX or check_id.startswith(SI_CHECK_PREFIX + "."):
+            continue  # the SI transients (ai_eda.tools.spice.si_check) retire their own results
         if last.status is status or last.status is ValidationStatus.NOT_APPLICABLE:
             continue  # already superseded
         out.append(ValidationResult(check_id=check_id, status=status, message=why, details={"superseded": last.status.value}, **stamp))

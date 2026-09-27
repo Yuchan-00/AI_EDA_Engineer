@@ -20,7 +20,11 @@ verdict.
   copper: pad geometry from the KiCad library on disk, never guessed; its
   layer groups carry the classes ``layer-F_Cu`` / ``layer-B_Cu`` / ``pads``
   / ``vias`` / ``outline`` / ``silk`` (``layer-F_SilkS`` / ``layer-B_SilkS``
-  inside) / ``labels`` so the page can toggle them.
+  inside) / ``labels`` (and ``planes``: the hatched inner-plane zones of a
+  4-layer board) so the page can toggle them; each track of a design with
+  ``ir.si`` carries its net class (``data-class`` / ``data-nc``), which the
+  page's 넷 클래스 색 toggle colours by, and :func:`board_classes` lists the
+  classes for its legend (read from ``ir.si``, no status).
 * :func:`model3d_scene` is the scene of the built-in 3D preview
   (:func:`ai_eda.tools.model3d.scene.build_scene` of the current IR, the
   KiCad library and the 3D model library this process finds - the same
@@ -87,7 +91,7 @@ from ai_eda.gui.projects import IR_FILE, safe_part
 from ai_eda.gui.schematic_render import render_kicad_sch_file
 from ai_eda.ir import ArtifactKind, CircuitIR
 from ai_eda.report.data import FRESH, ON_DISK, STALE, artifact_disk_state
-from ai_eda.report.figures import MAX_SERIES, board_figure, vector_kind, waveform_figure
+from ai_eda.report.figures import MAX_SERIES, board_figure, net_class_styles, vector_kind, waveform_figure
 from ai_eda.report.pipeline_log import PIPELINE_FILE
 from ai_eda.report.stages import REPORT_SUFFIXES, REPORT_TITLES, REPORTS_DIR, STAGE_REPORTS
 from ai_eda.tools.kicad.library import KicadLibrary
@@ -255,6 +259,14 @@ def board_svg(ir: CircuitIR, library: KicadLibrary) -> str:
     if not board_available(ir):
         raise PreviewMissing(NO_BOARD)
     return board_figure(ir, library, copper=True, fig_id="board").svg
+
+
+def board_classes(ir: CircuitIR) -> list[dict[str, Any]]:
+    """The net classes of ``ir.si`` for the board tab's legend: name, colour token, default?, how many nets each routes, the promoted nets (``[]`` without ``ir.si``)."""
+    return [
+        {"name": st.name, "token": st.token, "default": st.default, "nets": len(st.nets), "promoted": list(st.promoted)}
+        for st in net_class_styles(ir)
+    ]
 
 
 # --------------------------------------------------------------------------- the built-in 3D preview and KiCad's 3D exports
@@ -742,6 +754,7 @@ __all__ = [
     "artifact_rows",
     "artifact_state",
     "board_available",
+    "board_classes",
     "board_svg",
     "bom_rows",
     "bom_table",

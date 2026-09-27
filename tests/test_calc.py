@@ -95,6 +95,24 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
         "calc.regulator.p_dissipation": (user_requirement(9.0), user_requirement(5.0), user_requirement(0.05)),
         "calc.crystal.load_capacitance": (user_requirement(22e-12), user_requirement(22e-12), user_requirement(4e-12)),
         "calc.lc.cutoff": (user_requirement(10e-6), user_requirement(100e-9)),
+        # transmission lines (CALC_VERSION 0.8): mm, um copper, er
+        "calc.tline.microstrip.z0": (user_requirement(0.35), user_requirement(0.2), user_requirement(35.0), user_requirement(4.5)),
+        "calc.tline.microstrip.e_eff": (user_requirement(0.35), user_requirement(0.2), user_requirement(35.0), user_requirement(4.5)),
+        "calc.tline.stripline.z0": (user_requirement(0.3), user_requirement(1.0), user_requirement(17.5), user_requirement(4.5)),
+        "calc.tline.edge_coupled_microstrip.z_even": (user_requirement(0.15), user_requirement(0.2), user_requirement(0.2), user_requirement(0.0), user_requirement(4.3)),
+        "calc.tline.edge_coupled_microstrip.z_odd": (user_requirement(0.15), user_requirement(0.2), user_requirement(0.2), user_requirement(0.0), user_requirement(4.3)),
+        "calc.tline.edge_coupled_microstrip.z_diff": (user_requirement(0.15), user_requirement(0.2), user_requirement(0.2), user_requirement(0.0), user_requirement(4.3)),
+        "calc.tline.edge_coupled_microstrip.e_eff_even": (user_requirement(0.15), user_requirement(0.2), user_requirement(0.2), user_requirement(0.0), user_requirement(4.3)),
+        "calc.tline.edge_coupled_microstrip.e_eff_odd": (user_requirement(0.15), user_requirement(0.2), user_requirement(0.2), user_requirement(0.0), user_requirement(4.3)),
+        "calc.tline.width_for_z0.microstrip": (user_requirement(50.0), user_requirement(0.2), user_requirement(35.0), user_requirement(4.5)),
+        "calc.tline.width_for_z0.stripline": (user_requirement(50.0), user_requirement(1.0), user_requirement(17.5), user_requirement(4.5)),
+        "calc.tline.edge_coupled_microstrip.s_for_zdiff": (user_requirement(100.0), user_requirement(0.3), user_requirement(0.2), user_requirement(0.0), user_requirement(4.3)),
+        "calc.tline.edge_coupled_microstrip.w_for_zdiff": (user_requirement(100.0), user_requirement(0.2), user_requirement(0.2), user_requirement(0.0), user_requirement(4.3)),
+        "calc.tline.tpd": (user_requirement(3.2),),
+        "calc.tline.delay": (user_requirement(100.0), user_requirement(6e-9)),
+        "calc.tline.critical_length": (user_requirement(1e-9), user_requirement(6e-9), user_requirement(0.5)),
+        "calc.ipc2221.width_for_current": (user_requirement(1.0), user_requirement(10.0), user_requirement(35.0)),
+        "calc.clock.divided": (user_requirement(16e6), user_requirement(4.0)),
     }
     assert set(CALCULATORS) == set(sample) == set(ROLES) == set(ROLE_UNITS)
     for tool, (fn, keys) in CALCULATORS.items():
@@ -153,7 +171,7 @@ def test_led_resistor_guards():
 
 
 def test_regulator_crystal_lc_and_rc_window_calculators():
-    """The four calculators the ATmega128 board adds (CALC_VERSION 0.7): values, units, roles and the inputs each refuses."""
+    """The four calculators the ATmega128 board adds (added in CALC_VERSION 0.7): values, units, roles and the inputs each refuses."""
     p = regulator_dissipation(user_requirement(9.0, "V"), user_requirement(5.0, "V"), user_requirement(0.05, "A"), ("v_in", "v_out_reg", "i_load_budget"))
     assert p.value == pytest.approx(0.2) and p.unit == "W" and p.provenance.inputs == {"v_in": "v_in", "v_out": "v_out_reg", "i_load": "i_load_budget"}
     assert regulator_dissipation(user_requirement(5.0), user_requirement(5.0), user_requirement(0.05)).value == 0.0  # no headroom, no loss (dropout is not this calculator's business)
@@ -182,4 +200,4 @@ def test_regulator_crystal_lc_and_rc_window_calculators():
     for fn in (rc_tran_step, rc_tran_stop):
         with pytest.raises(ValueError, match="time constant must be positive"):
             fn(user_requirement(0.0, "s"))
-    assert CALC_VERSION == "0.7" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")
+    assert CALC_VERSION == "0.8" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")

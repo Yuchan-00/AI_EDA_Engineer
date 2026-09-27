@@ -154,12 +154,15 @@ class RFImpedanceValidator(Validator):
 
 
 class SignalIntegrityValidator(Validator):
+    """The crosstalk placeholder of a high-speed design: impedance, length, delay, skew, pairs and timing are the ``si.*`` checks
+    (:mod:`ai_eda.validation.si`, when ``ir.si`` states constraints) and ``spice.si.*``; crosstalk is judged nowhere yet."""
+
     id = "domain.high_speed.si"
     domains = frozenset({CircuitDomain.HIGH_SPEED})
-    description = "Length matching, impedance control, crosstalk"
+    description = "Crosstalk (impedance, length, delay, skew, pairs and timing are the si.* / spice.si.* checks)"
 
     def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
-        return [self.not_verified("signal integrity backend not implemented")]
+        return [self.not_verified("crosstalk analysis not implemented (impedance / length / delay / skew / timing: si.* and spice.si.* when ir.si states constraints)")]
 
 
 class PowerIntegrityValidator(Validator):

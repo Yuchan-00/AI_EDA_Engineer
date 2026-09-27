@@ -38,12 +38,19 @@ class SpiceDevice(StrEnum):
     Q = "Q"
     M = "M"
     X = "X"  # subcircuit instance
+    T = "T"  # lossless transmission line: port 1 (+, -), port 2 (+, -); params z0 (ohm) and td (s)
 
 
 #: devices whose element line carries a plain value (ohm / F / H / V / A)
 VALUE_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.R, SpiceDevice.C, SpiceDevice.L, SpiceDevice.V, SpiceDevice.I})
 #: devices whose element line names a ``.model`` (D, Q, M) or ``.subckt`` (X)
 MODEL_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.D, SpiceDevice.Q, SpiceDevice.M, SpiceDevice.X})
+#: devices whose element line carries only named params, each one required (no value, no model): the lossless line
+#: ``T<ref> p1+ p1- p2+ p2- td=<s> z0=<ohm>`` - ngspice-42 simulates a T line without ``td`` with a delay of its own
+#: choosing and no error (measured), so the compiler never writes one without both
+PARAM_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.T})
+#: the params each :data:`PARAM_DEVICES` device requires, exactly (sorted: the order the netlist writes them), with their units
+DEVICE_PARAMS: dict[SpiceDevice, dict[str, str]] = {SpiceDevice.T: {"td": "s", "z0": "ohm"}}
 #: devices with exactly two nodes
 TWO_TERMINAL_DEVICES: frozenset[SpiceDevice] = frozenset(
     {SpiceDevice.R, SpiceDevice.C, SpiceDevice.L, SpiceDevice.V, SpiceDevice.I, SpiceDevice.D}
@@ -59,6 +66,7 @@ NODE_COUNTS: dict[SpiceDevice, tuple[int, ...] | None] = {
     SpiceDevice.Q: (3, 4),  # collector base emitter [substrate]
     SpiceDevice.M: (4,),  # drain gate source bulk
     SpiceDevice.X: None,
+    SpiceDevice.T: (4,),  # port 1 +, port 1 -, port 2 +, port 2 -
 }
 
 #: unit the compiler expects on ``SpiceBinding.value`` per value device (informational; the value itself is SI)
@@ -103,7 +111,10 @@ class SpiceBinding(BaseModel):
       schematic connects such a pin and the netlist does not, so the compiler
       refuses a connected pin that is neither in ``pin_order`` nor listed here,
       and reports the listed ones.
-    * ``params`` - extra ``name=value`` tokens (``ic``, ``area``, ``m``, subckt params).
+    * ``params`` - extra ``name=value`` tokens (``ic``, ``area``, ``m``, subckt params);
+      for a lossless line (``device=T``, four pins in ``pin_order``: port 1
+      +/-, port 2 +/-) exactly ``z0`` (ohm) and ``td`` (s), both positive
+      (:data:`DEVICE_PARAMS`), and no value or model.
     * ``provenance`` - who decided this binding (device, pin order, exclusion). An
       ``llm_generated`` binding is refused by the compiler like an
       ``llm_generated`` value; an ``assumption`` is reported.
@@ -279,10 +290,12 @@ __all__ = [
     "ANALYSIS_OPTIONAL_PARAMS",
     "ANALYSIS_PARAMS",
     "AnalysisSpec",
+    "DEVICE_PARAMS",
     "ELECTRICAL_KEYS",
     "Expectation",
     "MODEL_DEVICES",
     "NODE_COUNTS",
+    "PARAM_DEVICES",
     "Reduce",
     "SINE_OPTIONAL_PARAMS",
     "STIMULUS_PARAMS",

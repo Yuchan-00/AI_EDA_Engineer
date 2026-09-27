@@ -7,7 +7,10 @@ live in ``ir.simulation`` (traced, and refused by the netlist compiler when
 (:class:`~ai_eda.ir.ValidationResult` ``spice`` + ``spice.<expectation>``,
 each with the netlist hash, the engine version and the rawfiles) produced by
 :func:`ai_eda.tools.spice.stage.run_spice_for`, the same function the repair
-loop's ``RerunTool`` uses.
+loop's ``RerunTool`` uses. A design with SI constraints (``ir.si``) also gets
+``spice.si.<net>`` - one lossless-line transient per electrically long net
+over a plane (:func:`ai_eda.tools.spice.si_check.spice_si_results`), whatever
+the circuit's own setup says.
 
 Verdicts when it cannot simulate: no simulation setup, no engine, no compiler
 or nothing bound yet -> NOT_VERIFIED; an IR the netlist compiler refuses
@@ -26,6 +29,7 @@ from ai_eda.errors import CompileError, NothingToCompileError, ToolUnavailableEr
 from ai_eda.ir import ArtifactKind, CircuitIR, ValidationResult, ValidationStatus
 from ai_eda.llm.router import TaskKind
 from ai_eda.tools.spice import SpiceRunner
+from ai_eda.tools.spice.si_check import spice_si_results
 from ai_eda.tools.spice.stage import CHECK_ID, retire_expectation_results, run_spice_for
 
 
@@ -46,6 +50,17 @@ class SimulationAgent(Agent):
         return self._superseding(ir, ValidationResult(check_id=CHECK_ID, status=ValidationStatus.NOT_VERIFIED, message=message))
 
     def run(self, ir: CircuitIR, ctx: AgentContext) -> AgentResult:
+        result = self._run_setup(ir, ctx)
+        si = spice_si_results(ir, ctx.tools, ctx.workdir)
+        if si:
+            judged = {}
+            for r in si:
+                judged[r.status.value] = judged.get(r.status.value, 0) + 1
+            result.validation.extend(si)
+            result.notes.append(f"spice.si: {len(si)} electrically long net(s) as lossless lines: " + ", ".join(f"{n} {s}" for s, n in sorted(judged.items())))
+        return result
+
+    def _run_setup(self, ir: CircuitIR, ctx: AgentContext) -> AgentResult:
         if ir.simulation is None:
             return self._not_verified(ir, "no simulation setup in IR")
         runner: SpiceRunner | None = ctx.tools.get("spice")

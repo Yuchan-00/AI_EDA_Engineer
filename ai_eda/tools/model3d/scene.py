@@ -17,6 +17,18 @@ top at the thickness ``T``):
   as an assumption (``가정``) in :attr:`Scene.notes`;
 * a solder-mask sheet on each side (translucent; the board's vias are tented,
   so via copper stays under it, as in ``compilers/pcb.py`` ``_setup``);
+* the **inner planes** of a multilayer board: every zone on an inner copper
+  layer (``In1.Cu`` ...) - the plane zones the PCB agent draws from the
+  stackup - as a translucent copper sheet (material ``plane``, a top and a
+  bottom face) at the layer's depth in ``ir.pcb.stackup`` (copper and
+  dielectric thicknesses from the top, scaled to the drawn thickness when the
+  stack's own total differs), over the zone's polygon. The fill (the
+  clearances KiCad cuts around other nets' pads and vias) is KiCad's
+  computation and is not drawn. So the sheets can be seen, the slab of such a
+  board is drawn translucent (material ``board_clear``); a board without an
+  inner plane keeps the opaque slab and gives exactly the scene it gave
+  before. An inner zone without a stackup has no depth and is not drawn
+  (said in the notes);
 * copper: tracks on F.Cu / B.Cu (inner layers are hidden in the board and not
   drawn), via rings on the outer layers they reach, pads from the library
   footprint on every outer copper layer they are on (above the mask when the
@@ -52,6 +64,7 @@ measurements.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import EllipsisType
@@ -109,6 +122,9 @@ _BEZIER_SEGMENTS = 8
 _DECAL_MAX_MM = 0.1
 _DECIMALS = 6
 
+#: an inner copper layer (``In1.Cu`` ...): its zones are the planes drawn as sheets (the router's ``INNER_LAYER_RE``)
+INNER_LAYER_RE = re.compile(r"^In[1-9][0-9]*\.Cu$")
+
 GROUP_LABELS: dict[str, str] = {"board": "보드", "copper": "구리", "silk": "실크", "parts": "부품"}
 
 
@@ -124,6 +140,9 @@ class Material:
 #: every material in the order the writers emit them
 MATERIALS: tuple[Material, ...] = (
     Material("board", (0.45, 0.41, 0.25, 1.0), "board"),
+    # a board with inner planes: the slab translucent so the plane sheets inside it show (drawn before the sheets and the mask)
+    Material("board_clear", (0.45, 0.41, 0.25, 0.55), "board"),
+    Material("plane", (0.42, 0.24, 0.12, 0.5), "copper", 0.6, 0.4),
     Material("mask", (0.06, 0.36, 0.18, 0.72), "board"),
     Material("drill", (0.10, 0.10, 0.10, 1.0), "board"),
     Material("copper", (0.95, 0.66, 0.35, 1.0), "copper", 0.6, 0.4),
@@ -150,7 +169,7 @@ class Solid:
     decal (only the face at ``z1`` / ``z0`` exists).
     """
 
-    kind: str  # slab | mask | track | via | pad | drill | silk | body | outline
+    kind: str  # slab | mask | plane | track | via | pad | drill | silk | body | outline
     material: str
     polygon: tuple[Point, ...]
     z0: float
@@ -588,9 +607,51 @@ class _Builder:
     def board(self) -> None:
         x, y, w, h = self.scene.outline
         rect = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-        self.solid("slab", "board", rect, 0.0, self.T, "all", "board")
+        drawn = self.planes()
+        self.solid("slab", "board_clear" if drawn else "board", rect, 0.0, self.T, "all", "board")
         self.decal("mask", "mask", rect, True, MASK_MM, "F.Mask")
         self.decal("mask", "mask", rect, False, MASK_MM, "B.Mask")
+
+    def planes(self) -> bool:
+        """The inner-layer zones as translucent sheets at their stackup depth (module docstring); whether any was drawn."""
+        pcb = self.ir.pcb
+        assert pcb is not None
+        inner = [z for z in pcb.zones if INNER_LAYER_RE.match(z.layer)]
+        if not inner:
+            return False
+        stack = pcb.stackup
+        depth: dict[str, tuple[float, float]] = {}  # layer -> (top, bottom) depth below the top face, mm
+        if stack is not None:
+            d = 0.0
+            for i, c in enumerate(stack.copper):
+                t = float(c.thickness_um.value) / 1000.0
+                depth[c.name] = (d, d + t)
+                d += t + (float(stack.dielectrics[i].thickness_mm.value) if i < len(stack.dielectrics) else 0.0)
+            total = stack.board_thickness_mm()
+            k = self.T / total if total > 0 else 1.0
+            depth = {name: (a * k, b * k) for name, (a, b) in depth.items()}
+        drawn: list[str] = []
+        skipped: list[str] = []
+        for z in inner:
+            span = depth.get(z.layer)
+            if span is None:
+                skipped.append(f"{z.net} ({z.layer})")
+                continue
+            z_top, z_bottom = self.T - span[0], self.T - span[1]
+            poly = [(float(px), float(py)) for px, py in z.polygon]
+            label = f"{z.net} {z.layer}"
+            self.solid("plane", "plane", poly, z_bottom, z_top, "top", label)
+            self.solid("plane", "plane", poly, z_bottom, z_top, "bottom", label)
+            drawn.append(f"{z.layer} {z.net}")
+        if drawn:
+            scaled = "" if stack is None or math.isclose(stack.board_thickness_mm(), self.T, abs_tol=1e-6) else f"; 적층 두께 {stack.board_thickness_mm():g} mm 를 보드 두께 {self.T:g} mm 에 맞춰 비례"
+            self.scene.notes.append(
+                f"내층 평면 {', '.join(drawn)}: 영역 외곽을 적층의 깊이에 반투명 구리 판으로 그림 (채움과 다른 넷 둘레의 빈틈은 KiCad 가 계산하므로 그리지 않음{scaled}); "
+                "내층이 보이도록 보드 판을 반투명으로 그림"
+            )
+        if skipped:
+            self.scene.notes.append(f"내층 영역 {', '.join(skipped)} 은 적층(ir.pcb.stackup)이 없어 깊이를 몰라 그리지 않음")
+        return bool(drawn)
 
     def copper(self) -> None:
         pcb = self.ir.pcb
@@ -610,8 +671,9 @@ class _Builder:
             self.drill(v.x_mm, v.y_mm, v.drill_mm, v.net)
         if inner:
             self.scene.notes.append(f"안쪽 층 트랙 {inner}개는 보드 속에 있어 그리지 않음")
-        if pcb.zones:
-            self.scene.notes.append(f"구리 영역(zone) {len(pcb.zones)}개는 채움 계산이 KiCad 의 몫이라 그리지 않음")
+        outer = [z for z in pcb.zones if not INNER_LAYER_RE.match(z.layer)]
+        if outer:
+            self.scene.notes.append(f"구리 영역(zone) {len(outer)}개는 채움 계산이 KiCad 의 몫이라 그리지 않음")
 
     # --- components -------------------------------------------------------------------------------
 

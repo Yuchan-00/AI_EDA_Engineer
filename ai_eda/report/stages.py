@@ -53,7 +53,14 @@ artifact is compiled from (:func:`~ai_eda.tools.model3d.scene.build_scene`:
 the same library plus the STEP files of the 3D model library it finds). The
 circuit report's silkscreen section copies the IR's silk texts, the placer's
 recorded parameters and the latest ``pcb.silk.*`` results; it judges
-nothing. ``.md`` and ``.html`` are deterministic; the
+nothing. A design with ``ir.si`` also gets the circuit report's
+"임피던스·타이밍" section and the theory report's transmission-line section
+(:mod:`ai_eda.report.si_report`) with four more circuit figures
+(:mod:`ai_eda.report.si_figures`: the board coloured by net class, Z0 against
+width over the plane, the ``si.critical_length`` delay bars, the step
+response of each fresh ``spice.si.<net>`` result read from its rawfile) -
+the same rule: the ``si.*`` / ``spice.si.*`` statuses copied, a display
+value named as one. ``.md`` and ``.html`` are deterministic; the
 PDF bytes carry the browser's own creation date and are a derived document
 like a rawfile. None of the three is an artifact or hashed.
 """
@@ -75,6 +82,7 @@ from ai_eda.parts.existence import CHECK_PREFIX as EXISTENCE_PREFIX
 from ai_eda.report.figures import Figure, bar_figure, board_figure, expectation_limit, model3d_figure_from_scene, plot_vector, tolerance_figure, tolerance_rows, waveform_figures
 from ai_eda.report.pdf import NO_BROWSER_REASON, find_browser, html_to_pdf, markdown_to_html
 from ai_eda.report.pipeline_log import PipelineRecord
+from ai_eda.report.si_figures import delay_bar_figure, delay_rows, fresh_si_rawfile, step_response_figure, z0_width_figure
 from ai_eda.tools.calc.part_value import PART_VALUE_DIGITS
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, LibraryLookupError
 from ai_eda.tools.placement.core_ring import BODY_OVERHANG_MM, CORE_MIN_PADS, EDGE_REF_PREFIXES, INNER_MAX_PADS
@@ -462,14 +470,75 @@ def tolerance_figure_of(ir: CircuitIR, figures: ReportFigures) -> None:
     figures.add(SLOT_TOLERANCE, tolerance_figure(rows, fig_id=SLOT_TOLERANCE))
 
 
+def si_figures_of(ir: CircuitIR, library: KicadLibrary | None, figures: ReportFigures) -> None:
+    """The signal-integrity figures of the circuit report (a design with ``ir.si`` only): the board coloured by net class, Z0 against width,
+    the per-net delay bars of the ``si.critical_length`` record and the SPICE step response of every fresh ``spice.si.<net>`` result
+    (:mod:`ai_eda.report.si_figures`); each missing input is a sentence."""
+    from ai_eda.report.si_report import SLOT_SI_BOARD, SLOT_SI_DELAY, SLOT_SI_STEP, SLOT_SI_Z0, _safe_id
+
+    if ir.si is None:
+        return
+    pcb = ir.pcb
+    routed = pcb is not None and bool(pcb.tracks or pcb.vias) and bool(pcb.placements)
+    if not routed:
+        figures.miss(SLOT_SI_BOARD, "배선이 없어 넷 클래스 색 보드 그림이 없습니다")
+    elif library is None:
+        figures.miss(SLOT_SI_BOARD, NO_LIBRARY_FIGURE)
+    else:
+        try:
+            figures.add(SLOT_SI_BOARD, board_figure(ir, library, copper=True, colour_by="class", fig_id=SLOT_SI_BOARD))
+        except (ValueError, LibraryLookupError, LibraryFormatError) as e:
+            figures.miss(SLOT_SI_BOARD, "넷 클래스 색 보드 그림을 그릴 수 없습니다", str(e))
+    z0 = z0_width_figure(ir, fig_id=SLOT_SI_Z0)
+    if isinstance(z0, str):
+        lead = "기준 평면이 없어 임피던스가 정의되지 않으므로 Z0–폭 곡선이 없습니다" if "reference plane" in z0 else "Z0–폭 곡선이 없습니다"
+        figures.miss(SLOT_SI_Z0, lead, z0)
+    else:
+        figures.add(SLOT_SI_Z0, z0)
+    crit = ir.validation.latest("si.critical_length")
+    rows = delay_rows(crit) if crit is not None else []
+    if rows:
+        figures.add(SLOT_SI_DELAY, delay_bar_figure(rows, title=f"{ir.project.id}: 넷별 배선 지연과 임계 길이 문턱", fig_id=SLOT_SI_DELAY))
+    else:
+        figures.miss(SLOT_SI_DELAY, "넷별 지연 그림이 없습니다", "si.critical_length 기록에 배선 지연이 있는 넷이 없습니다" if crit is not None else "si.critical_length 기록 없음")
+    results = [r for k, r in sorted(ir.validation.latest_by_check().items()) if k.startswith("spice.si.") and r.status is not ValidationStatus.NOT_APPLICABLE]
+    reasons: list[str] = []
+    not_verified: list[str] = []
+    used: set[str] = set()
+    for r in results:
+        if r.status is ValidationStatus.NOT_VERIFIED:
+            not_verified.append(r.check_id.removeprefix("spice.si."))
+            continue
+        raw = fresh_si_rawfile(ir, r)
+        if isinstance(raw, str):
+            reasons.append(raw)
+            continue
+        fig_id = f"{SLOT_SI_STEP}_{_safe_id(r.check_id.removeprefix('spice.si.'))}"
+        while fig_id in used:
+            fig_id += "_"
+        used.add(fig_id)
+        try:
+            figures.add(SLOT_SI_STEP, step_response_figure(r, raw, fig_id=fig_id))
+        except (ValueError, OSError) as e:
+            reasons.append(f"{r.check_id}: {e}")
+    if not_verified:
+        reasons.append(f"spice.si 결과 {len(not_verified)}개({', '.join(not_verified)})는 NOT_VERIFIED 라 파형이 없습니다 (이유는 각 결과의 메시지)")
+    if not figures.slots.get(SLOT_SI_STEP):
+        figures.miss(SLOT_SI_STEP, "SPICE 계단 응답 그림이 없습니다", "; ".join(reasons) or "spice.si 결과 없음: 기준 평면 위의 전기적으로 긴 넷이 없습니다")
+    elif reasons:
+        figures.miss(SLOT_SI_STEP, "그리지 않은 결과: " + "; ".join(reasons))
+
+
 def stage_figures(stage: Stage, ir: CircuitIR, library: KicadLibrary | None) -> ReportFigures:
-    """Every figure the report of ``stage`` shows (theory: template curves + waveform; circuit: placement, board, copper bars, 3D preview; final: tolerance + waveform; parts: none)."""
+    """Every figure the report of ``stage`` shows (theory: template curves + waveform; circuit: placement, board, copper bars, the SI figures,
+    3D preview; final: tolerance + waveform; parts: none)."""
     figures = ReportFigures()
     if stage is Stage.ARCHITECTURE:
         theory_figures_of(ir, figures)
         waveform_figures_of(ir, figures)
     elif stage is Stage.PCB:
         board_figures_of(ir, library, figures)
+        si_figures_of(ir, library, figures)
         model3d_figure_of(ir, library, figures)
     elif stage is Stage.RELEASE:
         tolerance_figure_of(ir, figures)
@@ -582,6 +651,10 @@ def theory_report(ir: CircuitIR, library: KicadLibrary | None = None, *, figures
         out += [f"## {sec.title}", "", sec.body, ""]
     out += ["## 이론 그림", "", "템플릿의 이론 식을 이 설계의 파라미터 값으로 그린 곡선입니다(IR 의 `parameters` 만 읽음). 시뮬레이션 결과가 아니며 판정도 아닙니다.", ""]
     out += figures.lines(SLOT_THEORY)
+    if ir.si is not None:
+        from ai_eda.report.si_report import si_theory_section
+
+        out += si_theory_section(ir)
     out += ["## 제약 조건", ""]
     if ir.constraints:
         rows = [[f"`{c.id}`", c.kind.value, c.target, c.description, ", ".join(f"{k} = {_traced_text(v)}" for k, v in c.parameters.items()) or "-"] for c in ir.constraints]
@@ -1328,6 +1401,10 @@ def circuit_report(ir: CircuitIR, library: KicadLibrary | None, record: RunRecor
     out += _schematic_section(ir)
     out += _placement_section(ir, figures)
     out += _routing_section(ir, figures)
+    if ir.si is not None:
+        from ai_eda.report.si_report import si_circuit_section
+
+        out += si_circuit_section(ir, figures)
     out += _silkscreen_section(ir)
     out += _model3d_section(ir, figures)
     out += _stage_record_section(record, CIRCUIT_STAGES, "단계 기록 (PLACEMENT / SCHEMATIC / PCB / DRC)")

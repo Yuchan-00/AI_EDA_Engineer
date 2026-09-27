@@ -84,8 +84,8 @@ from ai_eda.llm.service import LLMService
 from ai_eda.tools.calc.quantity import format_quantity
 from ai_eda.tools.sources import ArchivedDocument
 
-#: bumped when the grounding rules, the default keys or the schema change
-FACTS_VERSION = "0.3"
+#: bumped when the grounding rules, the default keys or the schema change (0.4: the signal-integrity keys t_rise ... t_h)
+FACTS_VERSION = "0.4"
 TOOL = "parts.datasheet_facts"
 CHECK_PREFIX = "component.facts."
 
@@ -94,7 +94,14 @@ RESERVED_KEYS: frozenset[str] = frozenset({"mpn", "ref", "value", "datasheet", "
 #: text facts that target a ``Component`` field rather than ``electrical``
 IDENTITY_KEYS: frozenset[str] = frozenset({"manufacturer", "package"})
 #: keys a model is asked for by default (any other canonical key with a known unit family is accepted too)
-DEFAULT_FACT_KEYS: tuple[str, ...] = ("manufacturer", "package", "v_max", "i_max", "power_rating", "tolerance", "operating_temperature", "theta_ja", "t_j_max")
+DEFAULT_FACT_KEYS: tuple[str, ...] = (
+    "manufacturer", "package", "v_max", "i_max", "power_rating", "tolerance", "operating_temperature", "theta_ja", "t_j_max",
+    # signal integrity (ir.si): the driver's edge and output resistance, the receiver's input capacitance, the interface timing
+    "t_rise", "t_fall", "r_out", "c_in", "t_co", "t_su", "t_h",
+)
+#: the signal-integrity fact keys the ``si.*`` checks and ``spice.si`` read from a component's grounded facts (``electrical[key]``):
+#: without them offline, every check that needs one is NOT_VERIFIED naming the key
+SI_FACT_KEYS: tuple[str, ...] = ("t_rise", "t_fall", "r_out", "v_oh", "i_oh", "c_in", "t_co", "t_co_min", "t_su", "t_h")
 
 #: canonical unit (of :mod:`ai_eda.tools.calc.quantity`) a numeric fact key must carry: exact keys, then prefixes, then suffixes.
 #: ``theta_ja`` (junction-to-ambient thermal resistance, K/W - datasheets write °C/W, the same unit) and ``t_j_max``
@@ -105,6 +112,8 @@ KEY_UNITS: dict[str, str] = {
     "resistance": "ohm", "capacitance": "F", "inductance": "H", "frequency": "Hz", "voltage": "V", "current": "A", "power": "W", "temperature": "degC",
     "esr": "ohm", "rds_on": "ohm", "quiescent_current": "A", "dropout_voltage": "V",
     "theta_ja": "K/W", "t_j_max": "degC",
+    # times, not temperatures (the ``t_`` prefix below is a temperature): edges and interface timing in seconds
+    "t_rise": "s", "t_fall": "s", "t_co": "s", "t_co_min": "s", "t_su": "s", "t_h": "s",
 }
 KEY_PREFIX_UNITS: dict[str, str] = {"thermal_resistance": "K/W", "v_": "V", "i_": "A", "p_": "W", "r_": "ohm", "c_": "F", "l_": "H", "f_": "Hz", "t_": "degC"}
 KEY_SUFFIX_UNITS: dict[str, str] = {
@@ -482,6 +491,7 @@ __all__ = [
     "KEY_SUFFIX_UNITS",
     "KEY_UNITS",
     "RESERVED_KEYS",
+    "SI_FACT_KEYS",
     "TOOL",
     "AcceptedFact",
     "DatasheetFact",

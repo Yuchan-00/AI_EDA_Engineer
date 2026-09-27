@@ -236,7 +236,7 @@ def test_confirm_applies_the_divider_with_the_choices_as_user_values(tmp_path: P
     ids_before = [r.id for r in ir.requirements.requirements]
     state, ctx = _confirm(ir, tmp_path, lib, None)
     out = state.outcome(Stage.ARCHITECTURE)
-    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"15 proposal(s) applied, nothing verified; template divider v{TEMPLATE_VERSION} confirmed by the user: 15 proposal(s)")
+    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"17 proposal(s) applied, nothing verified; template divider v{TEMPLATE_VERSION} confirmed by the user: 17 proposal(s)")
     assert "design choices recorded as the user's values: r2 = 10000 ohm" in out.message
     assert [q.key for q in out.questions] == ["output_current"] and not out.questions[0].required  # advisory, the real key
     assert not state.blocked and state.outcomes[-1].stage is Stage.RELEASE and state.outcomes[-1].status is not S.PASS
@@ -526,7 +526,7 @@ def test_led_template_wires_by_pin_name_and_models_the_led_as_a_confirmed_choice
     assert "led_model: ideal constant-V_f LED: D1 is excluded from the netlist and replaced by the stimulus VLED = v_f" in question
     assert "req.led_forward_current: led_forward_current = 0.01 A (stated as '10 mA')" in question and "r_led = 300 ohm [calc.led.R from v_in, v_f, i_f]" in question
     state, ctx = _confirm(ir, tmp_path, lib, None)
-    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"14 proposal(s) applied, nothing verified; template led v{TEMPLATE_VERSION} confirmed by the user: 14 proposal(s)")
+    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"16 proposal(s) applied, nothing verified; template led v{TEMPLATE_VERSION} confirmed by the user: 16 proposal(s)")
     assert [c.ref for c in ir.components] == ["R1", "D1", "J1"]
     p = ir.parameters
     assert list(p) == ["v_in", "v_f", "i_f", "r_led", "i_led", "tol_rel"]
@@ -595,7 +595,7 @@ def test_rc_template_ties_the_corner_expectation_to_the_users_requirement(tmp_pa
     assert "r = 1591.54943092 ohm [calc.rc.r_for_cutoff from f_c, c]" in question and "expectation h_fc: v(OUT) at 1000 Hz = 0.707106781187 +/- 2% verifies req.cutoff_frequency" in question
     ids_before = [r.id for r in ir.requirements.requirements]
     state, ctx = _confirm(ir, tmp_path, lib, None)
-    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"18 proposal(s) applied, nothing verified; template rc_lowpass v{TEMPLATE_VERSION} confirmed by the user: 18 proposal(s)")
+    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"20 proposal(s) applied, nothing verified; template rc_lowpass v{TEMPLATE_VERSION} confirmed by the user: 20 proposal(s)")
     assert [r.id for r in ir.requirements.requirements] == ids_before and ir.requirements.get("cutoff_gain") is None  # no fabricated requirement
     p = ir.parameters
     assert list(p) == ["f_c", "c", "r", "tau", "h_fc", "tol_rel", "ac_fstart", "ac_fstop", "ac_probe"]
@@ -688,7 +688,7 @@ ASTABLE_C_VALUE = "64.817n"
 
 def test_astable_calculators_refuse_out_of_domain_inputs():
     c = astable_c_for_frequency(user_requirement(1000.0, "Hz"), user_requirement(10_000.0, "ohm"), user_requirement(5.0, "V"), user_requirement(0.7, "V"))
-    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.7"
+    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.8"
     assert c.provenance.inputs == {"f_osc": "f_osc", "r_b": "r_b", "v_cc": "v_cc", "v_be": "v_be"}
     f = astable_frequency(user_requirement(10_000.0, "ohm"), c, user_requirement(5.0, "V"), user_requirement(0.7, "V"))
     assert f.value == pytest.approx(1000.0) and f.unit == "Hz" and f.provenance.tool == "calc.astable.f"
@@ -740,7 +740,7 @@ def test_confirm_applies_the_astable_with_the_model_card_ic_and_uic_as_the_users
     ids_before = [r.id for r in ir.requirements.requirements]
     state, ctx = _confirm(ir, tmp_path, lib, None)
     out = state.outcome(Stage.ARCHITECTURE)
-    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"34 proposal(s) applied, nothing verified; template astable v{TEMPLATE_VERSION} confirmed by the user: 34 proposal(s)") and out.questions == []
+    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"36 proposal(s) applied, nothing verified; template astable v{TEMPLATE_VERSION} confirmed by the user: 36 proposal(s)") and out.questions == []
     assert [r.id for r in ir.requirements.requirements] == ids_before and not state.blocked and state.outcomes[-1].stage is Stage.RELEASE
     assert [c.ref for c in ir.components] == ["Q1", "Q2", "R1", "R2", "R3", "R4", "C1", "C2", "J1"] and [n.name for n in ir.nets] == ["VCC", "Q1_C", "Q2_B", "OUT", "Q1_B", "GND"]
     assert ir.topology.name == "BJT astable multivibrator" and ir.topology.blocks[0].component_refs == ["Q1", "Q2", "R1", "R2", "R3", "R4", "C1", "C2"]
@@ -987,7 +987,7 @@ def test_confirm_design_beside_confirm_requirements_in_one_run_asks_the_table_an
     assert state.blocked and ir.components == [] and f"answer(s) ['{ACCEPT_KEY}'] were given in this run" in state.outcome(Stage.ARCHITECTURE).message
     assert len(client.calls) == 1  # the extraction was never re-run: every run above hit the cache
     state = _llm_run(ir, svc, tmp_path, lib, {CONFIRM_DESIGN_KEY: "yes", PLACEMENT_KEY: "skip"})
-    assert not state.blocked and [c.ref for c in ir.components] == ["R1", "R2", "J1"] and ir.pcb is None
+    assert not state.blocked and [c.ref for c in ir.components] == ["R1", "R2", "J1"] and ir.pcb.placements == []  # the template's stack only: nothing placed
 
 
 def test_confirmation_is_content_based_a_requirement_edited_between_the_runs_re_asks(tmp_path: Path):
@@ -1024,10 +1024,10 @@ def test_inputs_check_is_unstamped_so_a_later_stage_of_the_same_run_cannot_make_
     ir = _ir(tmp_path)
     _present(ir, tmp_path, lib, DIVIDER)
     _run(ir, tmp_path, lib, {CONFIRM_DESIGN_KEY: "yes", PLACEMENT_KEY: "skip"}, None)
-    assert len(ir.components) == 3 and ir.pcb is None
+    assert len(ir.components) == 3 and ir.pcb.placements == []  # the template's stack only: nothing placed
     state, _ = _run(ir, tmp_path, lib, {}, None)  # PLACEMENT now applies a proposal after ARCHITECTURE produced the check
     check = ir.validation.latest(INPUTS_CHECK)
-    assert check.status is S.PASS and check.ir_hash is None and ir.pcb is not None
+    assert check.status is S.PASS and check.ir_hash is None and ir.pcb.placements
     release = state.outcomes[-1]
     assert release.stage is Stage.RELEASE and "another IR version" not in release.message and INPUTS_CHECK not in release.message
 

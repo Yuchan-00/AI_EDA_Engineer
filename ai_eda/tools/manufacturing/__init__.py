@@ -6,6 +6,7 @@ from ai_eda.tools.manufacturing.capability_file import (
     CapabilityFileError,
     CapabilityLimit,
     CapabilitySource,
+    CapabilityStackup,
     FabCapabilityFile,
     GroundedCapability,
     capability_source_result,
@@ -14,6 +15,7 @@ from ai_eda.tools.manufacturing.capability_file import (
     mm_from_token,
     quote_from_note,
     relocate_limits,
+    relocate_stackup,
 )
 from ai_eda.tools.manufacturing.csv_cells import FORMULA_PREFIXES, TEXT_PREFIX, bom_cell_text, free_text_cell, unsafe_cell
 from ai_eda.tools.manufacturing.outputs import OUTPUT_CHECKS, check_drill_files, check_gerber_set, check_output_artifact
@@ -23,6 +25,7 @@ __all__ = [
     "CapabilityFileError",
     "CapabilityLimit",
     "CapabilitySource",
+    "CapabilityStackup",
     "FabCapability",
     "FabCapabilityFile",
     "FORMULA_PREFIXES",
@@ -37,6 +40,7 @@ __all__ = [
     "mm_from_token",
     "quote_from_note",
     "relocate_limits",
+    "relocate_stackup",
     "unsafe_cell",
     "jlcpcb_capability_unverified",
     "OUTPUT_CHECKS",

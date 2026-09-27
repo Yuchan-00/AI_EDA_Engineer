@@ -100,6 +100,8 @@ class Preview3DCompiler(Compiler):
             raise NothingToCompileError("ir.pcb is None: no board to picture in 3D")
         if not ir.components:
             raise NothingToCompileError("IR has no components: no board to picture in 3D")
+        if ir.pcb.outline is None and not ir.pcb.placements:
+            raise NothingToCompileError("ir.pcb has no outline or placements yet: no board to picture in 3D")
         if not ir.project.id or _BAD_STEM_RE.search(ir.project.id):
             raise CompileError(f"project id {ir.project.id!r} is not usable as a file stem (it names the preview file)")
         library = PCBCompiler._library(ctx)

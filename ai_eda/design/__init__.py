@@ -30,11 +30,37 @@ from ai_eda.design.base import (
     unverified,
 )
 from ai_eda.design.checks import INPUTS_CHECK, check_inputs_vs_requirements
-from ai_eda.design.inputs import KEY_ALIASES, PARSED_NOTE_PREFIX, UNIT_OF, DesignInput, canonical_key, is_template_input, read_inputs, read_value
+from ai_eda.design.inputs import (
+    DEFAULT_LAYER_COUNT,
+    KEY_ALIASES,
+    LAYER_COUNT_KEY,
+    LAYER_COUNT_OPTIONS,
+    PARSED_NOTE_PREFIX,
+    UNIT_OF,
+    DesignInput,
+    LayerCountInput,
+    canonical_key,
+    is_template_input,
+    read_inputs,
+    read_layer_count,
+    read_value,
+)
+from ai_eda.design.stackup import GENERIC_STACKS, board_layers, generic_stackup, plane_zones, stackup_choices, with_planes
 from ai_eda.design.library_parts import TemplateRefusal, library_component, pin_by_name
 from ai_eda.design.templates import TEMPLATES, Atmega128DevboardTemplate, AstableTemplate, DividerTemplate, LateLoad, LedTemplate, RcLowpassTemplate, design_from_requirements, late_load_changes, template_keys_text
 
 __all__ = [
+    "DEFAULT_LAYER_COUNT",
+    "GENERIC_STACKS",
+    "LAYER_COUNT_KEY",
+    "LAYER_COUNT_OPTIONS",
+    "LayerCountInput",
+    "board_layers",
+    "generic_stackup",
+    "plane_zones",
+    "read_layer_count",
+    "stackup_choices",
+    "with_planes",
     "CHOICE_NOTE_PREFIX",
     "CONFIRM_DESIGN_KEY",
     "DESIGN_CATEGORIES",

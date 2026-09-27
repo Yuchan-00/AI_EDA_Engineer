@@ -116,7 +116,7 @@ from ai_eda.ir import (
 )
 from ai_eda.review.areas import ReviewArea
 from ai_eda.tools.calc.quantity import QUANTITY_VERSION, parse_answer
-from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters
+from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters, resolve_input
 from ai_eda.tools.kicad.board import BoardFootprint, read_board_footprints
 from ai_eda.tools.kicad.geometry import normalize_angle
 from ai_eda.tools.manufacturing.capability import CHECK_ID as CAPABILITY_CHECK_ID, check_capability
@@ -343,7 +343,7 @@ class IndependentReviewer:
     # --- specific checks ----------------------------------------------------------
 
     def check_requirements_vs_ir(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
-        """Every *authoritative* design requirement is served by a component or net.
+        """Every *authoritative* design requirement is served by a component or net (or, for the layer count, by the board's stackup).
 
         A requirement whose value still needs verification (``llm_generated``
         - a model's implicit inference the user has not accepted - or an
@@ -359,6 +359,8 @@ class IndependentReviewer:
             return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no structured requirements")
         served = {rid for c in ir.components for rid in c.serves_requirements}
         served |= {rid for n in ir.nets for rid in n.serves_requirements}
+        if ir.pcb is not None and ir.pcb.stackup is not None:  # the board's layer count (req.pcb_layers) is served by the stack built from it
+            served |= set(ir.pcb.stackup.served_requirements())
         # Only design-level requirements must map to components / nets; application / regulatory
         # requirements are covered by the regulatory and manufacturing checks.
         design_categories = {"electrical", "thermal", "mechanical", "signal_integrity", "power_integrity", "rf"}
@@ -749,7 +751,7 @@ class IndependentReviewer:
                 if not p.tool:
                     broken.append(f"{key}: derived without tool")
                 for src in p.derived_from:
-                    if src not in ir.parameters and ir.requirements.get(src) is None:
+                    if resolve_input(ir, src) is None:  # ir.parameters, ir.si, the stackup (pcb.stackup...), ir.requirements
                         broken.append(f"{key}: input '{src}' not found in IR")
         if broken:
             return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="calculation provenance broken", details={"broken": broken, "repair": "human"})

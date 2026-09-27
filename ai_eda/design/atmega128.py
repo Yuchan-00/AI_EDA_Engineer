@@ -100,6 +100,8 @@ from typing import TYPE_CHECKING
 
 from ai_eda.ir import (
     AnalysisSpec,
+    NetClass,
+    TimingPath,
     Block,
     CircuitDomain,
     CircuitIR,
@@ -178,6 +180,7 @@ from ai_eda.design.templates import (
 )
 
 if TYPE_CHECKING:
+    from ai_eda.design.board import BoardContext, SIDeclarations
     from ai_eda.report.figures import Figure
 
 MCU = (("MCU_Microchip_ATmega", "ATmega128-16A"), ("Package_QFP", "TQFP-64_14x14mm_P0.8mm"))
@@ -223,6 +226,7 @@ class Atmega128DevboardTemplate(Template):
 
     id = "atmega128_devboard"
     title = "ATmega128 development board"
+    plane_nets = ("GND", "+5V")
     triggers = ("clock_frequency",)
     needs = ("clock_frequency", "input_voltage")
     serves = ("clock_frequency", "input_voltage")
@@ -665,6 +669,90 @@ class Atmega128DevboardTemplate(Template):
     def _p_at(self, n: dict[str, float | None], v: float) -> float | None:
         """(V − V_out)·I_load at a display voltage ``v`` (the formula of ``calc.regulator.p_dissipation``)."""
         return _mul(_sub(v, n["v_out_reg"]), n["i_load_budget"])
+
+    # --- signal integrity: only what this circuit needs ------------------------------------
+
+    #: the crystal loop's copper budget per XTAL net (MCU pin, crystal, load capacitor): a layout rule, not a datasheet number
+    XTAL_MAX_LENGTH_MM = 25.0
+    #: the temperature rise the supply rails' IPC-2221 minimum width is sized for
+    POWER_TEMP_RISE_C = 10.0
+    #: SCK of serial programming at f_clk / 4: faster than the ATmega128 accepts (its serial-programming rule: SCK high and low each
+    #: > 2 CPU clock cycles below 12 MHz, >= 3 at 12 MHz and above; f_clk / 4 gives exactly 2), so the timing margins computed at
+    #: this rate are pessimistic - a conservative choice, not the device's highest rate (stated by the template, not grounded)
+    ISP_SCK_DIVIDER = 4.0
+    #: SPI mode 0: MOSI changes on the falling SCK edge and is sampled on the rising one, half a period later
+    ISP_CAPTURE_FRACTION = 0.5
+    #: the supply / ground nets of the POWER class
+    POWER_NETS: tuple[str, ...] = ("VIN_RAW", "VIN", "+5V", "GND", "AVCC")
+
+    def si_declarations(self, ir: CircuitIR, ctx: BoardContext) -> SIDeclarations:
+        """The crystal-loop length, the supply rails' IPC-2221 minimum width, the ISP SPI timing path (module docstring of :mod:`ai_eda.design.board`).
+
+        U1 is the driver of the default class: its grounded datasheet facts
+        (``t_rise``, ``r_out``, ``c_in``) replace the conservative choices on
+        the nets it drives (an output / bidirectional pin there,
+        :mod:`ai_eda.tools.si.driver`) - MISO (PDO, ``PE1``) among them. SCK
+        and MOSI (``PB1`` / ``PE0``) are driven by the programmer behind J2
+        during serial programming (and by U1 as port pins otherwise), so the
+        ``ISP_SPI`` class names no driver: the conservative edge stands. The
+        programmer is not a part of this IR, so its clock-to-output time is
+        named ``J2.t_co`` (grounded, if ever, on the programmer's own
+        document); ``U1.t_su`` / ``U1.t_h`` are U1's. Offline they are absent
+        and the timing path is NOT_VERIFIED naming them. ``RESET`` is the RC
+        reset (R2 to +5V, C8 to GND: ``tau_reset`` = R2·C8, pulled low by SW1
+        or the programmer) - no fast driven edge, so its class states no edge
+        and the critical-length rule and ``spice.si`` leave it alone, like the
+        crystal loop.
+        """
+        from ai_eda.design.board import SIDeclarations
+        from ai_eda.tools.calc.basic import clock_divided, ipc2221_width_for_current
+
+        out = SIDeclarations(driver="U1")
+        xtal = ctx.choice("si.xtal_max_length", self.XTAL_MAX_LENGTH_MM, "mm", (
+            "keep the oscillator loop short: at most this much copper per XTAL net (U1 pin, crystal Y1, load capacitor C9 / C10) - "
+            "a layout rule of thumb, not a datasheet number"))
+        out.classes.append(NetClass(name="XTAL", nets=["XTAL1", "XTAL2"], max_length_mm=xtal, description="the crystal loop: short copper, no driven edge",
+                                    provenance=ctx.structural("crystal loop length budget")))
+        dt = ctx.choice("power_temp_rise", self.POWER_TEMP_RISE_C, "degC", (
+            "temperature rise the supply rails' IPC-2221 minimum width is sized for (at the i_load_budget current)"), param=True)
+        if ctx.stackup is not None:
+            t_id = "pcb.stackup.copper[F.Cu].thickness_um"
+            layer = ctx.stackup.copper_layer("F.Cu")
+            assert layer is not None
+            w = ctx.computed_param("w_power_min", ipc2221_width_for_current(ctx.params["i_load_budget"], dt, layer.thickness_um, ("i_load_budget", "power_temp_rise", t_id)))
+            out.classes.append(NetClass(
+                name="POWER", nets=list(self.POWER_NETS), min_width_mm=w, power_current_a=ctx.params["i_load_budget"], power_temp_rise_c=dt,
+                description="the supply and ground rails: at least the IPC-2221 width for the load budget", provenance=ctx.structural("supply rails' minimum width"),
+            ))
+        div = ctx.choice("isp_sck_divider", self.ISP_SCK_DIVIDER, None, (
+            "serial programming clock SCK = f_clk / 4 for the timing path: faster than the ATmega128 accepts (its serial-programming rule: "
+            "SCK high and low each > 2 CPU clock cycles below 12 MHz, >= 3 at 12 MHz and above; f_clk / 4 gives exactly 2), so the margins "
+            "are pessimistic - a conservative choice, not the device's highest rate; stated by the template, not grounded"), param=True)
+        capture = ctx.choice("si.isp_capture_fraction", self.ISP_CAPTURE_FRACTION, None, (
+            "SPI mode 0: MOSI is launched on the falling SCK edge and sampled on the rising one, half a period later"))
+        f_sck = ctx.computed_param("f_sck", clock_divided(ctx.params["f_clk"], div, ("f_clk", "isp_sck_divider")))
+        drv = ctx.driver
+        out.classes.append(NetClass(
+            name="ISP_SPI", nets=["PB1", "PE0"],
+            description=("the ISP header's SCK and MOSI (PDI): driven by the programmer at J2 during serial programming (off-board) and by U1 "
+                         "as port pins otherwise - no single driver's facts apply, the conservative edge stands; MISO (PDO, PE1) is U1's output "
+                         "and stays in the default class"),
+            t_rise_s=drv["t_rise_s"], r_drive_ohm=drv["r_drive_ohm"], c_load_f=drv["c_load_f"], ringing_tol_rel=drv["ringing_tol_rel"], driver=None,
+            promote_to="Z50", provenance=ctx.structural("ISP interface nets"),
+        ))
+        out.classes.append(NetClass(
+            name="RC_RESET", nets=["RESET"],
+            description=("~RESET: the RC reset (R2 to +5V, C8 to GND, tau_reset = R2*C8 from calc.rc.tau), pulled low by SW1 or the programmer "
+                         "at J2 - no fast driven edge, so no critical length and no SPICE line check"),
+            provenance=ctx.structural("RC reset net"),
+        ))
+        out.timing_paths.append(TimingPath(
+            name="ISP", clock_net="PB1", data_nets=["PE0"], direction="ISP programmer at J2 -> U1 (MOSI / PDI sampled by U1 on the rising SCK edge)",
+            f_clk_hz=f_sck, capture_fraction=capture,
+            terms_from={"t_co_max_s": "J2.t_co", "t_co_min_s": "J2.t_co_min", "t_su_min_s": "U1.t_su", "t_h_min_s": "U1.t_h"},
+            provenance=ctx.structural("ISP serial programming: SCK -> MOSI"),
+        ))
+        return out
 
     def theory(self, ir: CircuitIR) -> list[TheorySection]:
         n = self._numbers(ir)

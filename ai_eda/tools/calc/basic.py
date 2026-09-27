@@ -17,7 +17,9 @@ import math
 
 from ai_eda.ir.provenance import Traced, derived
 
-CALC_VERSION = "0.7"
+#: 0.8: the transmission-line calculators of :mod:`ai_eda.tools.calc.tline` (``calc.tline.*``), the IPC-2221 current-capacity
+#: width (``calc.ipc2221.width_for_current``) and a divided clock (``calc.clock.divided``)
+CALC_VERSION = "0.8"
 
 #: tool id -> input roles, in the calculator's parameter order
 ROLES: dict[str, tuple[str, ...]] = {
@@ -49,6 +51,24 @@ ROLES: dict[str, tuple[str, ...]] = {
     "calc.regulator.p_dissipation": ("v_in", "v_out", "i_load"),
     "calc.crystal.load_capacitance": ("c1", "c2", "c_stray"),
     "calc.lc.cutoff": ("l", "c"),
+    # transmission lines (ai_eda.tools.calc.tline): lengths in mm, copper thickness in um (as the stackup states them)
+    "calc.tline.microstrip.z0": ("w", "h", "t", "er"),
+    "calc.tline.microstrip.e_eff": ("w", "h", "t", "er"),
+    "calc.tline.stripline.z0": ("w", "b", "t", "er"),
+    "calc.tline.edge_coupled_microstrip.z_even": ("w", "s", "h", "t", "er"),
+    "calc.tline.edge_coupled_microstrip.z_odd": ("w", "s", "h", "t", "er"),
+    "calc.tline.edge_coupled_microstrip.z_diff": ("w", "s", "h", "t", "er"),
+    "calc.tline.edge_coupled_microstrip.e_eff_even": ("w", "s", "h", "t", "er"),
+    "calc.tline.edge_coupled_microstrip.e_eff_odd": ("w", "s", "h", "t", "er"),
+    "calc.tline.width_for_z0.microstrip": ("z0", "h", "t", "er"),
+    "calc.tline.width_for_z0.stripline": ("z0", "b", "t", "er"),
+    "calc.tline.edge_coupled_microstrip.s_for_zdiff": ("z_diff", "w", "h", "t", "er"),
+    "calc.tline.edge_coupled_microstrip.w_for_zdiff": ("z_diff", "s", "h", "t", "er"),
+    "calc.tline.tpd": ("e_eff",),
+    "calc.tline.delay": ("length", "t_pd"),
+    "calc.tline.critical_length": ("t_r", "t_pd", "fraction"),
+    "calc.ipc2221.width_for_current": ("i", "dt", "t"),
+    "calc.clock.divided": ("f", "n"),
 }
 #: tool id -> the unit each role's input is expected to carry (``None``: any); an input whose unit is set
 #: and differs is refused by the recompute (a swapped voltage / resistance would otherwise be computed)
@@ -81,6 +101,23 @@ ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.regulator.p_dissipation": ("V", "V", "A"),
     "calc.crystal.load_capacitance": ("F", "F", "F"),
     "calc.lc.cutoff": ("H", "F"),
+    "calc.tline.microstrip.z0": ("mm", "mm", "um", None),
+    "calc.tline.microstrip.e_eff": ("mm", "mm", "um", None),
+    "calc.tline.stripline.z0": ("mm", "mm", "um", None),
+    "calc.tline.edge_coupled_microstrip.z_even": ("mm", "mm", "mm", "um", None),
+    "calc.tline.edge_coupled_microstrip.z_odd": ("mm", "mm", "mm", "um", None),
+    "calc.tline.edge_coupled_microstrip.z_diff": ("mm", "mm", "mm", "um", None),
+    "calc.tline.edge_coupled_microstrip.e_eff_even": ("mm", "mm", "mm", "um", None),
+    "calc.tline.edge_coupled_microstrip.e_eff_odd": ("mm", "mm", "mm", "um", None),
+    "calc.tline.width_for_z0.microstrip": ("ohm", "mm", "um", None),
+    "calc.tline.width_for_z0.stripline": ("ohm", "mm", "um", None),
+    "calc.tline.edge_coupled_microstrip.s_for_zdiff": ("ohm", "mm", "mm", "um", None),
+    "calc.tline.edge_coupled_microstrip.w_for_zdiff": ("ohm", "mm", "mm", "um", None),
+    "calc.tline.tpd": (None,),
+    "calc.tline.delay": ("mm", "s/m"),
+    "calc.tline.critical_length": ("s", "s/m", None),
+    "calc.ipc2221.width_for_current": ("A", "degC", "um"),
+    "calc.clock.divided": ("Hz", None),
 }
 
 
@@ -355,3 +392,50 @@ def lc_cutoff(l: Traced[float], c: Traced[float], ids: tuple[str, str] = ("l", "
     if product == 0:
         raise ValueError("calc.lc.cutoff underflows: L C is zero in float arithmetic for these inputs")
     return _derived(1.0 / (2.0 * math.pi * math.sqrt(product)), "calc.lc.cutoff", ids, "Hz", "f_0 = 1 / (2 pi sqrt(L C))")
+
+
+# --------------------------------------------------------------------------- IPC-2221 current capacity, divided clock
+
+#: IPC-2221 (2012) conductor current capacity, external layers: I = k dT^0.44 A^0.725 (I in A, dT in degC, A in mil^2)
+IPC2221_K_EXTERNAL = 0.048
+IPC2221_DT_EXPONENT = 0.44
+IPC2221_AREA_EXPONENT = 0.725
+#: the range of the IPC-2221 design charts the curve fit reproduces (current up to 35 A, temperature rise 10..100 degC)
+IPC2221_MAX_CURRENT_A = 35.0
+IPC2221_DT_RANGE_C = (10.0, 100.0)
+#: one mil in mm
+MIL_MM = 0.0254
+
+
+def ipc2221_width_for_current(i: Traced[float], dt: Traced[float], t: Traced[float], ids: tuple[str, str, str] = ("i", "dt", "t")) -> Traced[float]:
+    """The minimum external-layer track width (mm) that carries ``i`` A at a temperature rise ``dt`` degC with copper ``t`` um thick.
+
+    IPC-2221 (2012), section 6.2 / the curve fit of its external-conductor
+    chart: I = k dT^0.44 A^0.725, k = 0.048, A the cross-section in mil^2,
+    solved for A and divided by the copper thickness in mil. The fit is
+    stated for up to 35 A and a rise of 10..100 degC; outside that the
+    calculator refuses (``ValueError``) instead of extrapolating.
+    """
+    current, rise, thick = float(i.value), float(dt.value), float(t.value)
+    if not current > 0:
+        raise ValueError("current must be positive")
+    if current > IPC2221_MAX_CURRENT_A:
+        raise ValueError(f"current {current:g} A is above the {IPC2221_MAX_CURRENT_A:g} A the IPC-2221 chart covers")
+    lo, hi = IPC2221_DT_RANGE_C
+    if not lo <= rise <= hi:
+        raise ValueError(f"temperature rise {rise:g} degC is outside the {lo:g}..{hi:g} degC the IPC-2221 chart covers")
+    if not thick > 0:
+        raise ValueError("copper thickness must be positive")
+    area_mil2 = (current / (IPC2221_K_EXTERNAL * rise ** IPC2221_DT_EXPONENT)) ** (1.0 / IPC2221_AREA_EXPONENT)
+    width_mil = area_mil2 / (thick / 1000.0 / MIL_MM)
+    return _derived(width_mil * MIL_MM, "calc.ipc2221.width_for_current", ids, "mm",
+                    "w = (I / (0.048 dT^0.44))^(1/0.725) / t (IPC-2221 external layer; A in mil^2, t in mil)")
+
+
+def clock_divided(f: Traced[float], n: Traced[float], ids: tuple[str, str] = ("f", "n")) -> Traced[float]:
+    """A clock of ``f`` Hz divided by ``n``: f / n (a prescaler, or a peripheral clock such as SPI's SCK at f_clk / 4)."""
+    if not float(f.value) > 0:
+        raise ValueError("frequency must be positive")
+    if not float(n.value) >= 1:
+        raise ValueError("a clock divider is at least 1")
+    return _derived(float(f.value) / float(n.value), "calc.clock.divided", ids, "Hz", "f_out = f / n")

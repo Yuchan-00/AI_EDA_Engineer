@@ -68,6 +68,14 @@ these facts:
 10. Rawfiles carry a ``Date`` line, so they are evidence (path + sha256), not
     deterministic artifacts. ASCII rawfiles have 15 significant digits
     (~1e-15 relative); binary ones are bit-exact.
+11. The lossless transmission line ``T<name> n1+ n1- n2+ n2- z0=<ohm> td=<s>``
+    runs through this runner (measured on ngspice-42, 2026-09-27: a
+    ``pulse(0 5 0 1n 1n ...)`` source through 40 ohm into ``z0=50 td=1n``
+    with 5 pF at the far end, ``tran 10p 20n``: max v(far) 5.5757 V, 11.51 %
+    overshoot; the plot adds ``t1#i1``, ``t1#i2``, ``t1#int1``, ``t1#int2``).
+    Without ``td`` ngspice-42 simulates the line with a delay of its own and
+    no error, so :func:`validate_deck` refuses a ``T`` line that does not
+    carry exactly ``z0=`` and ``td=``.
 """
 
 from __future__ import annotations
@@ -272,6 +280,24 @@ _ELEMENT_NODES: dict[str, int] = {
 }
 _NEEDS_VALUE = frozenset("RCL")
 _NEEDS_MODEL = frozenset("DQJZM")
+#: the params a lossless transmission line (``T``) must carry - and the only ones accepted on it. Measured on ngspice-42
+#: (2026-09-27): ``t1 a 0 b 0 z0=50`` (no ``td``) is simulated with a delay ngspice picks itself and no error line (a
+#: silent wrong result); without ``z0`` the analysis aborts with "transmission line z0 must be given"
+TLINE_PARAMS = frozenset({"z0", "td"})
+
+
+def _tline_problem(toks: list[str]) -> str | None:
+    """Why a ``T`` element line is not the ``T<name> n1 n2 n3 n4 z0=<v> td=<v>`` form the runner accepts, else ``None``."""
+    seen: list[str] = []
+    for tok in toks[5:]:
+        key, eq, value = tok.partition("=")
+        if not eq or not key or not value:
+            return f"{toks[0]!r}: a lossless line takes only z0=<ohm> td=<s> after its four nodes, got {tok!r}"
+        seen.append(key.lower())
+    if sorted(seen) != sorted(TLINE_PARAMS):
+        return (f"{toks[0]!r}: a lossless line needs exactly z0= and td= (got {seen or 'no params'}); "
+                "ngspice simulates a line without td with a delay of its own choosing and no error")
+    return None
 
 
 def _element_nodes(letter: str, toks: list[str]) -> list[str] | None:
@@ -304,7 +330,8 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
     characters; no analysis cards (the runner issues the analysis as a
     command, so a card would be inert and misleading), no ``.control`` /
     ``.include`` / ``.lib`` / ``.title`` / ``.save``; element lines with a
-    name, their nodes and a value (R C L) or model (D Q J Z M); node names in
+    name, their nodes and a value (R C L) or model (D Q J Z M); a lossless
+    line (T) with exactly ``z0=`` and ``td=`` (:data:`TLINE_PARAMS`); node names in
     ``A-Z a-z 0-9 _ . / + - : # @ [ ]`` (:data:`NODE_RE`); no duplicate element names; at least one
     non-ground node; no two node names that collide after lowercasing.
     """
@@ -367,6 +394,10 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
                     "(ngspice ignores such a line with only a warning and simulates the rest)"
                 )
                 continue
+        if letter == "T":
+            tline = _tline_problem(toks)
+            if tline is not None:
+                problems.append(f"line {i}: {tline}")
         element_nodes = _element_nodes(letter, toks)
         if element_nodes is None:
             continue
@@ -1132,6 +1163,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_S",
     "ENGINE_ID",
     "NODE_RE",
+    "TLINE_PARAMS",
     "NgspiceShared",
     "check_path_for_command",
     "find_codemodel_dir",

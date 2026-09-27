@@ -36,6 +36,12 @@ Invariants this module enforces:
   value or decision that rests on an ``assumption``) are listed by
   :func:`build_report`; the SPICE stage reports results that rest on an
   assumption as NOT_VERIFIED.
+* **A lossless line is fully stated.** A ``T`` element (``SpiceDevice.T``,
+  four pins: port 1 +/-, port 2 +/-) carries exactly ``z0`` (ohm) and
+  ``td`` (s), both positive, and no value or model; ngspice-42 simulates a
+  ``T`` line without ``td`` with a delay of its own choosing and no error
+  (measured), so such a binding is a ``CompileError`` and the runner's deck
+  check refuses such a line too.
 * **A tolerance must be a tolerance.** An expectation whose ``nominal`` is 0
   needs ``tol_abs``: ``tol_rel`` alone would be a zero tolerance.
 * **A reduction must fit its analysis.** ``reduce=value`` only on ``op``,
@@ -74,6 +80,7 @@ Netlist layout::
     [.temp <t>]
     <model cards, verbatim, sorted by model name>
     <elements: "<NAME> <nodes in pin_order> <value|model_name> [k=v ...]">
+               (a lossless line: "T<ref> <p1+> <p1-> <p2+> <p2-> td=<s> z0=<ohm>")
     <stimuli:  "V<id>|I<id> <net node> <reference node> DC <v> | PULSE(...) | SINE(...) | PWL(...) [AC <mag>]">
     .end
 
@@ -108,9 +115,11 @@ from ai_eda.ir.simulation import (
     AC_VARIATIONS,
     ANALYSIS_OPTIONAL_PARAMS,
     ANALYSIS_PARAMS,
+    DEVICE_PARAMS,
     ELECTRICAL_KEYS,
     MODEL_DEVICES,
     NODE_COUNTS,
+    PARAM_DEVICES,
     SINE_OPTIONAL_PARAMS,
     STIMULUS_PARAMS,
     VALUE_DEVICES,
@@ -542,6 +551,26 @@ def _is_number(value) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float))
 
 
+def _check_param_device(ref: str, dev: SpiceDevice, b) -> None:
+    """A :data:`~ai_eda.ir.simulation.PARAM_DEVICES` element (the lossless ``T`` line): exactly its params, each a positive number in its unit, no value, no model."""
+    if b.value is not None or b.model_name is not None or b.model_card is not None:
+        raise CompileError(f"{ref}: a {dev.value} element takes its params {sorted(DEVICE_PARAMS[dev])}, not a value or a model")
+    required = DEVICE_PARAMS[dev]
+    missing = sorted(set(required) - set(b.params))
+    extra = sorted(set(b.params) - set(required))
+    if missing or extra:
+        raise CompileError(
+            f"{ref}: a {dev.value} element needs exactly the params {sorted(required)} (missing {missing}, not allowed {extra}); "
+            "ngspice would simulate a line without td with a delay of its own choosing"
+        )
+    for key, unit in required.items():
+        traced = b.params[key]
+        if not _is_number(traced.value) or not math.isfinite(float(traced.value)) or float(traced.value) <= 0.0:
+            raise CompileError(f"{ref} param {key} must be a positive finite number, got {traced.value!r}")
+        if traced.unit is not None and _unit_key(traced.unit) != _unit_key(unit):
+            raise CompileError(f"{ref} param {key} carries unit {traced.unit!r}, a {dev.value} element takes {key} in {unit}")
+
+
 def _check_expectation(exp: Expectation, ir: CircuitIR, setup: SimulationSetup, ledger: _Ledger) -> str:
     what = f"expectation {exp.id}"
     ledger.accept_provenance(exp.provenance, what)
@@ -699,7 +728,9 @@ def _compile(ir: CircuitIR) -> _Compiled:
         name = element_name(c.ref, dev)
         claim(name, f"component {c.ref}")
         rest: list[str] = []
-        if dev in VALUE_DEVICES:
+        if dev in PARAM_DEVICES:
+            _check_param_device(c.ref, dev, b)
+        elif dev in VALUE_DEVICES:
             if b.value is None and b.model_name is None:
                 raise CompileError(f"{c.ref}: a {dev.value} element needs a value (or a model_name)")
             if b.value is not None:
@@ -859,7 +890,8 @@ def netlist_elements(text: str) -> list[tuple[str, list[str], str]]:
 
     The title line, dot cards, comments and the inside of ``.subckt`` blocks
     are skipped; ``+`` continuations are joined. Two-terminal letters
-    (R C L V I D) take two nodes; Q, M and X take every token up to the model
+    (R C L V I D) take two nodes, a lossless line (T) four (its ``rest`` is
+    the ``td=... z0=...`` params); Q, M and X take every token up to the model
     / subcircuit name (trailing ``k=v`` params excluded).
     """
     lines = _join_continuations(text.splitlines())
@@ -884,6 +916,10 @@ def netlist_elements(text: str) -> list[tuple[str, list[str], str]]:
             if len(toks) < 4:
                 raise ValueError(f"malformed element line {s!r}")
             out.append((toks[0], toks[1:3], " ".join(toks[3:])))
+        elif letter == "T":
+            if len(toks) < 5:
+                raise ValueError(f"malformed element line {s!r}")
+            out.append((toks[0], toks[1:5], " ".join(toks[5:])))
         elif letter in "QMX":
             body = toks[1:]
             while body and "=" in body[-1]:

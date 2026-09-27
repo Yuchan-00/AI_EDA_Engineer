@@ -15,6 +15,10 @@ requirement text (``M`` = mega, units required, never guessed).
 :mod:`ai_eda.tools.calc.part_value` writes the readable part value
 (``Component.value``: KiCad style, 5 significant digits, ``100n``) and reads
 it back with the quantity parser to compare within that display rounding.
+:mod:`ai_eda.tools.calc.tline` holds the transmission-line calculators
+(``calc.tline.*``: microstrip / stripline / edge-coupled impedance, the
+inverse width and gap solutions, propagation delay, the critical length) and
+reads a routed layer's geometry from the stackup (``line_geometry``).
 """
 
 from ai_eda.tools.calc.basic import (
@@ -27,9 +31,11 @@ from ai_eda.tools.calc.basic import (
     astable_tran_step,
     astable_tran_stop,
     astable_v_be_reverse,
+    clock_divided,
     crystal_load_capacitance,
     current_from_voltage_resistance,
     divider_r1_for_v_out,
+    ipc2221_width_for_current,
     junction_temperature,
     lc_cutoff,
     led_current,
@@ -72,6 +78,28 @@ from ai_eda.tools.calc.quantity import (
     parse_unit,
 )
 from ai_eda.tools.calc.recompute import CALCULATORS, derived_values, recompute_parameters
+from ai_eda.tools.calc.tline import (
+    LineGeometry,
+    TLineRangeError,
+    critical_length,
+    edge_coupled_microstrip,
+    edge_coupled_z_diff,
+    edge_coupled_z_even,
+    edge_coupled_z_odd,
+    line_delay,
+    line_geometry,
+    microstrip,
+    microstrip_e_eff,
+    microstrip_z0,
+    spacing_for_zdiff,
+    stripline_impedance,
+    stripline_z0,
+    tpd,
+    width_for_z0,
+    width_for_z0_microstrip,
+    width_for_z0_stripline,
+    width_for_zdiff,
+)
 from ai_eda.tools.calc.si import (
     MIL_FACTOR,
     NGSPICE_EXACT_MANTISSA,
@@ -87,6 +115,8 @@ from ai_eda.tools.calc.si import (
 __all__ = [
     "CALCULATORS",
     "CALC_VERSION",
+    "LineGeometry",
+    "TLineRangeError",
     "MIL_FACTOR",
     "NGSPICE_EXACT_MANTISSA",
     "NGSPICE_EXPONENT_RANGE",
@@ -108,12 +138,19 @@ __all__ = [
     "astable_tran_step",
     "astable_tran_stop",
     "astable_v_be_reverse",
+    "clock_divided",
+    "critical_length",
     "crystal_load_capacitance",
     "current_from_voltage_resistance",
     "derived_values",
     "display_tolerance",
     "divider_r1_for_v_out",
+    "edge_coupled_microstrip",
+    "edge_coupled_z_diff",
+    "edge_coupled_z_even",
+    "edge_coupled_z_odd",
     "find_quantities",
+    "ipc2221_width_for_current",
     "format_part_value",
     "format_quantity",
     "format_spice_number",
@@ -121,6 +158,11 @@ __all__ = [
     "lc_cutoff",
     "led_current",
     "led_series_resistor",
+    "line_delay",
+    "line_geometry",
+    "microstrip",
+    "microstrip_e_eff",
+    "microstrip_z0",
     "ngspice_reads",
     "parallel_resistance",
     "parse_answer",
@@ -142,7 +184,15 @@ __all__ = [
     "rc_tran_stop",
     "recompute_parameters",
     "regulator_dissipation",
+    "spacing_for_zdiff",
     "spice_value",
+    "stripline_impedance",
+    "stripline_z0",
+    "tpd",
     "voltage_divider_output",
     "voltage_divider_ratio",
+    "width_for_z0",
+    "width_for_z0_microstrip",
+    "width_for_z0_stripline",
+    "width_for_zdiff",
 ]

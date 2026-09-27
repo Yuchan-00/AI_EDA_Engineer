@@ -262,7 +262,7 @@ def test_thermal_keys_have_their_unit_families_and_ground_from_a_degc_per_watt_q
     assert expected_unit("theta_ja") == "K/W" and expected_unit("t_j_max") == "degC" and expected_unit("junction_temperature") == "degC"
     assert expected_unit("thermal_resistance") == expected_unit("thermal_resistance_ja") == expected_unit("thermal_resistance_jc") == "K/W"
     assert expected_unit("r_th_ja") == "ohm"  # the r_ prefix rule: use theta_ja for the junction-to-ambient thermal resistance
-    assert KEY_UNITS["theta_ja"] == "K/W" and {"theta_ja", "t_j_max"} <= set(DEFAULT_FACT_KEYS) and FACTS_VERSION == "0.3"
+    assert KEY_UNITS["theta_ja"] == "K/W" and {"theta_ja", "t_j_max"} <= set(DEFAULT_FACT_KEYS) and FACTS_VERSION == "0.4"
     thermal = doc.model_copy(update={"pages": [*doc.pages, "Thermal resistance junction to ambient 62 °C/W\nMaximum junction temperature 150 °C"]})
     g = ground_facts(thermal, [
         fact("theta_ja", 62, "°C/W", 4, "62 °C/W"),

@@ -38,16 +38,29 @@ group ``board`` / ``copper`` / ``silk`` / ``parts``), draws it with one
 Lambert shader (opaque meshes, then the translucent mask), orbits on drag,
 pans on shift-drag, zooms on the wheel (and the arrow / + / − / 0 keys), and
 has the 맞춤 / 위 / 아래 / 등각 buttons and the 보드 / 구리 / 실크 / 부품
-toggles. It draws exactly the file's triangles and judges nothing; its
+toggles (the inner planes of a 4-layer board are translucent copper sheets
+in the ``copper`` group). It draws exactly the file's triangles and judges nothing; its
 caption says what a part box is (the ``F.Fab`` outline x the STEP height,
 not the part's shape). Without WebGL (or when the context is lost) it
 shows the server's isometric SVG of the same scene
 (``/preview/<name>/board3d/<view>.svg``), with the same buttons and
 toggles. KiCad's own STEP / GLB / render files, when a kicad-cli run
 registered them, are listed below as KiCad's real part shapes.
+
+Signal integrity is displayed, never judged here: the 기판 tab's 평면
+toggle shows or hides the hatched inner-plane zones of the board SVG, and
+its 넷 클래스 색 toggle recolours the tracks by the net class the server
+wrote on each (``data-nc``, :func:`ai_eda.report.figures.net_class_styles`:
+the colours are app.css classes built from the same palette,
+:data:`NETCLASS_CSS`) with a legend of the classes, their net counts and the
+promoted nets from the project JSON (``previews.board_classes``, read from
+``ir.si``). The 검증 tab's 검사 묶음 filter shows the signal-integrity rows
+(``si.*`` / ``spice.si.*``) alone - the same rows, copied.
 """
 
 from __future__ import annotations
+
+from ai_eda.report.figures import CLASS_COLOURS, CLASS_VIA_RING, NET_CLASS_DEFAULT, NET_CLASS_OTHER, NEUTRAL_PAD
 
 APP_HTML = r"""<!doctype html>
 <html lang="ko">
@@ -308,9 +321,12 @@ APP_HTML = r"""<!doctype html>
 <span class="check"><input type="checkbox" id="layer-outline" data-layer-class="outline" checked><label for="layer-outline">외곽</label></span>
 <span class="check"><input type="checkbox" id="layer-silk" data-layer-class="silk" checked><label for="layer-silk">실크</label></span>
 <span class="check"><input type="checkbox" id="layer-labels" data-layer-class="labels" checked><label for="layer-labels">라벨</label></span>
+<span class="check"><input type="checkbox" id="layer-planes" data-layer-class="planes" checked><label for="layer-planes">평면</label></span>
+<span class="check"><input type="checkbox" id="board-netclass"><label for="board-netclass">넷 클래스 색</label></span>
 <span id="board-download" class="toolbar-link"></span>
 </fieldset>
 <div id="board-facts"></div>
+<div id="board-classes" class="nc-legend" hidden></div>
 <div id="board-view"></div>
 </section>
 
@@ -352,6 +368,11 @@ APP_HTML = r"""<!doctype html>
 <option value="NOT_VERIFIED">NOT_VERIFIED</option>
 <option value="PASS">PASS</option>
 <option value="other">그 밖의 상태</option>
+</select>
+<label for="val-group">검사 묶음</label>
+<select id="val-group">
+<option value="all">모든 검사</option>
+<option value="si">신호 무결성 (si.* / spice.si.*)</option>
 </select>
 <span id="val-count" class="muted" role="status"></span>
 </div>
@@ -584,7 +605,8 @@ pre.log { font-family: var(--mono); font-size: 12px; line-height: 1.45; backgrou
 .board-view.hide-vias .vias,
 .board-view.hide-outline .outline,
 .board-view.hide-silk .silk,
-.board-view.hide-labels .labels { display: none; }
+.board-view.hide-labels .labels,
+.board-view.hide-planes .planes { display: none; }
 /* 3D: the WebGL canvas fills its stage; the SVG fallback's polygons carry g-<group> like the GLB nodes' extras.group */
 .m3d-stage { height: 68vh; min-height: 420px; border: 1px solid var(--border); border-radius: 6px; background: #f6f5f1; overflow: hidden; margin: 8px 0 14px; }
 .m3d-canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
@@ -1530,6 +1552,14 @@ async function renderBoard() {
   const noLabels = !labels || labels.childElementCount === 0;
   $('layer-labels').disabled = noLabels;
   $('layer-labels').parentElement.title = noLabels ? '참조 지정자는 실크 층에 있습니다 (실크 토글로 보이고 숨김)' : '';
+  // 평면: only a board whose SVG has inner-plane zones; 넷 클래스 색: only a design with net classes (ir.si)
+  const planes = svg.querySelector('g.planes');
+  $('layer-planes').disabled = !planes;
+  $('layer-planes').parentElement.title = planes ? '내층 평면 존 (빗금; KiCad 가 채움)' : '내층 평면이 없는 보드입니다';
+  const classes = state.data.previews.board_classes || [];
+  $('board-netclass').disabled = !classes.length;
+  $('board-netclass').parentElement.title = classes.length ? '' : '이 설계에는 넷 클래스(ir.si)가 없습니다';
+  drawBoardClasses(classes);
   svg.setAttribute('aria-label', svg.querySelector('title') ? svg.querySelector('title').textContent : '기판');
   fitFigure(svg);
   applyLayers();
@@ -1548,6 +1578,19 @@ function applyLayers() {
   for (const input of document.querySelectorAll('#board-layers input[data-layer-class]')) {
     box.classList.toggle('hide-' + input.dataset.layerClass, !input.checked);
   }
+  // 넷 클래스 색: the tracks carry the class the server wrote (data-nc); app.css recolours them (the page computes nothing)
+  const byClass = $('board-netclass').checked && !$('board-netclass').disabled;
+  box.classList.toggle('by-class', byClass);
+  $('board-classes').hidden = !byClass;
+}
+
+// the legend of the 넷 클래스 색 view: ir.si's classes as the server listed them (previews.board_classes), their colour a CSS class
+function drawBoardClasses(rows) {
+  const items = rows.filter((r) => r.nets > 0).map((r) => h('li', {},
+    h('span', {class: 'nc-swatch ' + r.token, 'aria-hidden': 'true'}), code(r.name), ' ' + r.nets + '개 넷' + (r.default ? ' (기본 클래스)' : ''),
+    r.promoted.length ? h('span', {class: 'muted'}, ' - 임계 길이 규칙으로 승격: ' + r.promoted.join(', ')) : null));
+  fill($('board-classes'), h('p', {class: 'hint'}, '넷 클래스 색: 트랙마다 서버가 적은 넷 클래스(ir.si)를 색으로 보입니다. 진한 선 = F.Cu, 옅은 선 = B.Cu, 회색 패드 = SMD, 노랑 = 관통 패드, 회색 테의 흰 원 = 비아 (그림 아래 설명도 이 보기의 것으로 바뀝니다). 판정이 아니라 그림입니다 (판정은 검증 탭의 si.* 행).'),
+    h('ul', {class: 'nc-list'}, items));
 }
 
 // ------------------------------------------------------------------ 3D: the built-in preview (glTF binary) in a hand-written WebGL viewer
@@ -2072,12 +2115,14 @@ function renderValidation() {
 function drawValidation() {
   const v = state.data.report.validation;
   const filter = $('val-filter').value;
+  const group = $('val-group').value;
   const known = ['PASS', 'FAIL', 'NOT_VERIFIED'];
-  const rows = v.latest.filter((r) => filter === 'all' || (filter === 'other' ? !known.includes(r.status) : r.status === filter));
+  const inGroup = (r) => group !== 'si' || r.check_id.startsWith('si.') || r.check_id.startsWith('spice.si.');
+  const rows = v.latest.filter((r) => inGroup(r) && (filter === 'all' || (filter === 'other' ? !known.includes(r.status) : r.status === filter)));
   $('val-count').textContent = rows.length + '개 표시 / 전체 ' + v.latest.length + '개';
   const view = $('val-view');
   if (!v.latest.length) { fill(view, empty('검증 결과 없음: \'실행\'하면 IR_BUILD 이후의 검증 단계들이 결과를 기록합니다.')); return; }
-  if (!rows.length) { fill(view, empty('이 상태의 결과가 없습니다.')); return; }
+  if (!rows.length) { fill(view, empty(group === 'si' ? '이 상태의 신호 무결성 결과가 없습니다 (ir.si 가 없는 설계에는 si.* 검사가 없습니다).' : '이 상태의 결과가 없습니다.')); return; }
   const body = rows.map((r) => h('tr', {},
     td(idCode(r.check_id), 'id'), td([statusBadge(r.status), h('span', {class: 'fresh'}, ko(r.freshness))], 'state'),
     td([r.tool ? idCode(r.tool) : (r.opinion ? '의견 (도구 없음)' : ''), r.tool_version ? h('span', {class: 'muted small'}, ' ' + r.tool_version) : null], 'tool'),
@@ -2263,6 +2308,7 @@ document.addEventListener('DOMContentLoaded', () => {
   for (const view of ['top', 'bottom', 'iso']) $('m3d-' + view).addEventListener('click', () => m3dSetView(view));
   $('m3d-layers').addEventListener('change', m3dApplyLayers);
   $('val-filter').addEventListener('change', drawValidation);
+  $('val-group').addEventListener('change', drawValidation);
   $('project-notices').addEventListener('click', (ev) => {
     const a = ev.target.closest('a[data-local]');
     if (!a) return;
@@ -2276,4 +2322,30 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 """
 
-__all__ = ["APP_CSS", "APP_HTML", "APP_JS"]
+def _netclass_css() -> str:
+    """The 넷 클래스 색 view's rules: one per :func:`~ai_eda.report.figures.net_class_styles` token, the figure's own palette (B.Cu lighter)."""
+    colours = {f"nc-{i}": c for i, c in enumerate(CLASS_COLOURS)} | {"nc-default": NET_CLASS_DEFAULT, "nc-other": NET_CLASS_OTHER}
+    lines = ["/* 넷 클래스 색: the board SVG's tracks carry data-nc; the colours are the report figure's (ai_eda.report.figures.net_class_styles) */"]
+    for token, colour in colours.items():
+        lines.append(f'.board-view.by-class line.track[data-nc="{token}"] {{ stroke: {colour}; }}')
+        lines.append(f".nc-swatch.{token} {{ background: {colour}; }}")
+    lines += [
+        '.board-view.by-class line.track[data-layer="B.Cu"] { stroke-opacity: 0.5; }',
+        ".board-view.by-class line.track:not([data-nc]) { stroke: #c3c2b7; }",
+        f'.board-view.by-class g.pad[data-tht="false"] > * {{ fill: {NEUTRAL_PAD}; }}',
+        f".board-view.by-class g.via > circle:not(.drill) {{ fill: #ffffff; stroke: {CLASS_VIA_RING}; stroke-width: 1px; }}",
+        # the board SVG carries both caption keys: the layer key, and the class key (display="none"); the class view swaps them
+        '.board-view.by-class text.caption[data-view="layer"] { display: none; }',
+        '.board-view.by-class text.caption[data-view="class"] { display: inline; }',
+        ".nc-legend { margin: 4px 0 8px; font-size: 13px; }",
+        ".nc-list { list-style: none; padding: 0; margin: 4px 0; display: flex; flex-wrap: wrap; gap: 4px 16px; }",
+        ".nc-swatch { display: inline-block; width: 18px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+#: the 넷 클래스 색 rules appended to app.css
+NETCLASS_CSS = _netclass_css()
+APP_CSS += NETCLASS_CSS
+
+__all__ = ["APP_CSS", "APP_HTML", "APP_JS", "NETCLASS_CSS"]

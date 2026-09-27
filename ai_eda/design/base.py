@@ -42,13 +42,15 @@ from pydantic import BaseModel
 from ai_eda.ir import CircuitIR, MissingInformation, Provenance, ProvenanceKind, Requirement, Traced
 from ai_eda.tools.kicad.library import KicadLibrary
 
-from ai_eda.design.inputs import DesignInput, canonical_key
+from ai_eda.design.inputs import BOARD_KEY_ALIASES, DesignInput, canonical_key
 
 if TYPE_CHECKING:  # the report package imports this one (stages -> TEMPLATES), so the figure type is a type-only import here
+    from ai_eda.design.board import BoardContext, SIDeclarations
     from ai_eda.report.figures import Figure
 
-#: 0.2: part values are KiCad-style display text to 5 significant digits (``100n``, not the netlist spelling ``1e-7``)
-TEMPLATE_VERSION = "0.2"
+#: 0.2: part values are KiCad-style display text to 5 significant digits (``100n``, not the netlist spelling ``1e-7``);
+#: 0.3: every template also proposes the board stack (``pcb_layers`` 2 | 4) and its signal-integrity net classes (``ir.si``)
+TEMPLATE_VERSION = "0.3"
 #: tool id of the template machinery (``Provenance.tool`` is ``design.template.<template id>`` on structural decisions)
 TOOL_ID = "design.template"
 #: how a confirmed free choice's note starts (the rest names the template, its version and the choice)
@@ -67,6 +69,9 @@ _SI_PREFIXES: dict[int, str] = {-12: "p", -9: "n", -6: "µ", -3: "m", 0: "", 3: 
 DESIGN_CATEGORIES: frozenset[str] = frozenset({"electrical", "thermal", "mechanical", "signal_integrity", "power_integrity", "rf"})
 #: requirement keys every template may ignore: they describe the product, not the circuit
 IGNORED_KEYS: frozenset[str] = frozenset({"application", "jurisdiction"})
+#: canonical board keys every template serves through the board stackup (:mod:`ai_eda.design.stackup`): the layer
+#: count ``pcb_layers`` (read by :func:`~ai_eda.design.inputs.read_layer_count`) is a board decision, not a circuit one
+BOARD_KEYS: frozenset[str] = frozenset(BOARD_KEY_ALIASES)
 
 
 def template_tool(template_id: str) -> str:
@@ -140,6 +145,8 @@ class Plan:
     parts: list[str] = field(default_factory=list)
     nets: list[str] = field(default_factory=list)
     simulation: list[str] = field(default_factory=list)
+    #: one line per board decision: the stack and every signal-integrity class / timing path (:mod:`ai_eda.design.board`)
+    board: list[str] = field(default_factory=list)
 
     @property
     def buildable(self) -> bool:
@@ -167,6 +174,9 @@ class Plan:
         lines.extend(f"  {n}" for n in self.nets)
         lines.append("Simulation:")
         lines.extend(f"  {s}" for s in self.simulation)
+        if self.board:
+            lines.append("Board stack and signal integrity (need-driven: declared interfaces, and nets the routed copper shows to be electrically long):")
+            lines.extend(f"  {b}" for b in self.board)
         return "\n".join(lines)
 
 
@@ -254,6 +264,8 @@ class Template(ABC):
     serves: tuple[str, ...]
     #: canonical keys the template may leave unserved without refusing (beside :data:`IGNORED_KEYS`)
     ignores: tuple[str, ...] = ()
+    #: the nets of a 4-layer board's planes: ``In1.Cu`` (ground) and ``In2.Cu`` (a supply; ``None``: ground again)
+    plane_nets: tuple[str, str | None] = ("GND", None)
 
     def triggered(self, inputs: dict[str, DesignInput]) -> bool:
         present = [k in inputs for k in self.triggers]
@@ -305,6 +317,17 @@ class Template(ABC):
         """Per reference designator: role, reason, substitute criteria and unverified candidates. Default: nothing (the parts report says so per part)."""
         return {}
 
+    def si_declarations(self, ir: CircuitIR, ctx: BoardContext) -> SIDeclarations:
+        """The signal-integrity classes / timing paths this circuit needs beyond the default classes (:mod:`ai_eda.design.board`).
+
+        Default: none - every net is in the ``DEFAULT`` class and only the
+        critical-length rule can promote one. ``ctx.choice`` adds a choice to
+        the confirmation table; ``ctx.computed_param`` a calculator output.
+        """
+        from ai_eda.design.board import SIDeclarations
+
+        return SIDeclarations()
+
 
 def requirement_text(r: Requirement) -> str:
     v = r.value.value if r.value is not None else None
@@ -312,7 +335,11 @@ def requirement_text(r: Requirement) -> str:
 
 
 def unserved_requirements(ir: CircuitIR, template: Template) -> list[Requirement]:
-    """Confirmed design-category requirements the template neither serves nor may ignore (an unconfirmed value is not counted)."""
+    """Confirmed design-category requirements the template neither serves nor may ignore (an unconfirmed value is not counted).
+
+    A board key (:data:`BOARD_KEYS`, the layer count) is served by every
+    template through the stackup, so it never refuses one.
+    """
     out: list[Requirement] = []
     for r in ir.requirements.requirements:
         if r.category not in DESIGN_CATEGORIES or r.key in IGNORED_KEYS:
@@ -320,13 +347,14 @@ def unserved_requirements(ir: CircuitIR, template: Template) -> list[Requirement
         if r.value is not None and r.value.provenance.needs_verification:
             continue
         canon = canonical_key(r.key) or r.key
-        if canon in template.serves or canon in template.ignores:
+        if canon in template.serves or canon in template.ignores or canon in BOARD_KEYS:
             continue
         out.append(r)
     return out
 
 
 __all__ = [
+    "BOARD_KEYS",
     "CHOICE_NOTE_PREFIX",
     "CONFIRM_DESIGN_KEY",
     "DESIGN_CATEGORIES",

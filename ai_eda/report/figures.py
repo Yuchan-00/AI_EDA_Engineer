@@ -90,6 +90,13 @@ __all__ = [
     "SERIES_COLOURS",
     "SILK_COLOUR",
     "SILK_LAYER_ORDER",
+    "NET_CLASS_DEFAULT",
+    "NET_CLASS_OTHER",
+    "NEUTRAL_PAD",
+    "CLASS_COLOURS",
+    "CLASS_KEY",
+    "NetClassStyle",
+    "net_class_styles",
     "STATUS_COLOURS",
     "STATUS_OTHER",
     "SURFACE",
@@ -144,6 +151,23 @@ DRILL_COLOUR = "#ffffff"
 BOARD_FILL = "#f3f1ea"
 #: silkscreen strokes and texts on the board figure: ink on the light board, at their true stroke width / text height
 SILK_COLOUR = INK
+#: the board figure's class view (``colour_by="class"``) and the GUI's net-class toggle: the default class is neutral, every other
+#: class of ``ir.si`` takes the next hue of :data:`CLASS_COLOURS` (a class beyond them: :data:`NET_CLASS_OTHER`)
+NET_CLASS_DEFAULT = "#8a8983"
+NET_CLASS_OTHER = INK_SECONDARY
+#: SMD pads in the class view (the layer colours would read as classes)
+NEUTRAL_PAD = "#b9b7ae"
+#: the class hues: :data:`SERIES_COLOURS` in order without the colours the class view keeps for something else (the through-hole
+#: pads' yellow; the vias and the default class share the neutral gray, so the class view draws a via as a white disc in a gray ring)
+CLASS_COLOURS: tuple[str, ...] = tuple(c for c in SERIES_COLOURS if c not in (THT_COLOUR, VIA_COLOUR, NET_CLASS_DEFAULT, NEUTRAL_PAD))
+#: a via in the class view: a white disc with this ring (never the default class's gray fill)
+CLASS_VIA_RING = INK_SECONDARY
+#: the class view's key (the report figure's caption, and the GUI's class caption over the layer figure)
+CLASS_KEY = ("선 색 = 넷 클래스 (범례, 괄호 안은 넷 수), 진한 선 = F.Cu, 옅은 선 = B.Cu, 회색 패드 = SMD, 노랑 = 관통 패드(흰 원 = 드릴), "
+             "회색 테의 흰 원 = 비아")
+#: the hatch of an inner plane zone on the board figure: thin ink lines at a low opacity, one angle per inner layer (never a fill)
+PLANE_HATCH = INK_SECONDARY
+PLANE_HATCH_ANGLES: tuple[float, ...] = (45.0, -45.0, 0.0, 90.0)
 #: the silk layer groups of the board figure, back first (the front is drawn over it)
 SILK_LAYER_ORDER: tuple[str, ...] = ("B.SilkS", "F.SilkS")
 #: points per series after :func:`downsample`
@@ -1128,12 +1152,86 @@ def _board_silk(ir: CircuitIR, placed: Sequence[tuple[Any, Any, FootprintDef]], 
     return out
 
 
+@dataclass(frozen=True)
+class NetClassStyle:
+    """One ``ir.si`` net class as the board figure / GUI colours it: ``token`` (``nc-default`` / ``nc-<i>`` / ``nc-other``), ``colour``, and its routed nets.
+
+    ``nets`` are the nets the class routes (declared, promoted, and for the
+    default class every net no class lists), in IR order; ``promoted`` the
+    nets the critical-length rule moved into it. Read from ``ir.si`` only.
+    """
+
+    name: str
+    token: str
+    colour: str
+    default: bool
+    nets: tuple[str, ...]
+    promoted: tuple[str, ...]
+
+
+def net_class_styles(ir: CircuitIR) -> list[NetClassStyle]:
+    """The colour of every ``ir.si`` net class in ``ir.si`` order (:class:`NetClassStyle`); ``[]`` for a design without ``ir.si``."""
+    si = ir.si
+    if si is None:
+        return []
+    members: dict[str, list[str]] = {c.name: [] for c in si.net_classes}
+    for n in ir.nets:
+        c = si.class_of(n.name)
+        if c is not None:
+            members[c.name].append(n.name)
+    out: list[NetClassStyle] = []
+    k = 0
+    for c in si.net_classes:
+        if c.default:
+            token, colour = "nc-default", NET_CLASS_DEFAULT
+        elif k < len(CLASS_COLOURS):
+            token, colour = f"nc-{k}", CLASS_COLOURS[k]
+            k += 1
+        else:
+            token, colour = "nc-other", NET_CLASS_OTHER
+        out.append(NetClassStyle(c.name, token, colour, c.default, tuple(members[c.name]), tuple(p.net for p in c.promoted)))
+    return out
+
+
+def _plane_hatches(ir: CircuitIR, fig_id: str, X: Any, Y: Any) -> tuple[list[str], list[str]]:
+    """``(markup, caption parts)`` of the inner-layer zones (the stackup's planes) as hatched outlines, never a fill that hides the tracks."""
+    pcb = ir.pcb
+    assert pcb is not None
+    inner = [z for z in pcb.zones if re.match(r"^In[1-9][0-9]*\.Cu$", z.layer)]
+    if not inner:
+        return [], []
+    layers = sorted({z.layer for z in inner}, key=lambda name: int(name[2:-3]))
+    base = _ID_SAFE_RE.sub("-", fig_id)
+    out = ['<g class="planes">', "<defs>"]
+    for i, layer in enumerate(layers):
+        angle = PLANE_HATCH_ANGLES[i % len(PLANE_HATCH_ANGLES)]
+        out.append(
+            f'<pattern id="hatch-{base}-{layer_class(layer)}" patternUnits="userSpaceOnUse" width="9" height="9" patternTransform="rotate({_f(angle)})">'
+            f'<line x1="0" y1="0" x2="0" y2="9" stroke="{PLANE_HATCH}" stroke-width="1" stroke-opacity="0.35"/></pattern>'
+        )
+    out.append("</defs>")
+    parts: list[str] = []
+    for z in inner:
+        points = " ".join(f"{_f(X(x))},{_f(Y(y))}" for x, y in z.polygon)
+        out.append(
+            f'<polygon class="plane" data-net="{esc(z.net)}" data-layer="{esc(z.layer)}" points="{points}" fill="url(#hatch-{base}-{layer_class(z.layer)})" '
+            f'stroke="{PLANE_HATCH}" stroke-width="1" stroke-dasharray="6 4" stroke-opacity="0.6"/>'
+        )
+        angle = PLANE_HATCH_ANGLES[layers.index(z.layer) % len(PLANE_HATCH_ANGLES)]
+        parts.append(f"{z.layer} {z.net} ({_g(angle)}° 빗금)")
+    out.append("</g>")
+    return out, parts
+
+
 def layer_class(layer: str) -> str:
     """The class of a copper layer's track group in a board figure: ``F.Cu`` -> ``layer-F_Cu`` (every character outside ``[A-Za-z0-9_-]`` becomes ``_``)."""
     return "layer-" + _ID_SAFE_RE.sub("_", layer)
 
 
-def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, scale_px_per_mm: float = 18.0, max_width: int = COLUMN_PX, fig_id: str | None = None) -> Figure:
+def board_figure(
+    ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, scale_px_per_mm: float = 18.0, max_width: int = COLUMN_PX, fig_id: str | None = None,
+    colour_by: str = "layer",
+) -> Figure:
     """The placed board of ``ir``: outline, every pad from the KiCad library, tracks and vias (``copper=True``), reference / value labels
     (inside a part whose extent holds them clear of its pads, else above / below it, beside it when crowded: :func:`_board_labels`)
     and a caption line.
@@ -1159,6 +1257,17 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     line). ``copper=False`` draws the placement only (id default
     ``placement``, else ``board``).
 
+    Signal integrity (a design with ``ir.si``): every track carries
+    ``data-class`` (the net class that routes it) and ``data-nc`` (its
+    :func:`net_class_styles` token), so a viewer can colour the tracks by
+    class; ``colour_by="class"`` draws that view itself - each track in its
+    class's colour (F.Cu solid, B.Cu lighter), SMD pads neutral, a legend of
+    the classes (with their net counts) above the board. The zones on inner
+    copper layers (the stackup's planes) are drawn under the tracks as
+    hatched, dashed outlines in ``<g class="planes">`` (one hatch angle per
+    layer, never a fill that would hide the tracks), and the caption names
+    them; KiCad computes their fill.
+
     The silkscreen (:func:`_board_silk`) is drawn over the copper in
     :data:`SILK_COLOUR` inside ``<g class="silk">``, one group per silk layer
     (:func:`layer_class`: ``layer-B_SilkS`` then ``layer-F_SilkS``, always
@@ -1174,6 +1283,13 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     pcb = ir.pcb
     if pcb is None or pcb.outline is None:
         raise ValueError("ir.pcb.outline is None: a board figure needs the outline the PCB compiler needs")
+    if colour_by not in ("layer", "class"):
+        raise ValueError(f"colour_by must be 'layer' or 'class', got {colour_by!r}")
+    by_class = colour_by == "class" and copper
+    styles = net_class_styles(ir)
+    if colour_by == "class" and not styles:
+        raise ValueError("colour_by='class' needs ir.si net classes")
+    style_of = {net: st for st in styles for net in st.nets}
     outline = pcb.outline
     if not (outline.width_mm > 0 and outline.height_mm > 0):
         raise ValueError(f"ir.pcb.outline must have positive size (got {outline.width_mm} x {outline.height_mm})")
@@ -1182,11 +1298,18 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
         raise ValueError("scale_px_per_mm / max_width leave no room for the board")
     width = int(round(outline.width_mm * scale + 2 * _BOARD_MARGIN))
 
+    legend: list[str] = []
+    top_pad = float(_BOARD_MARGIN)
+    if by_class:
+        entries = [("box", st.colour, f"{st.name} ({len(st.nets)})") for st in styles if st.nets]
+        legend, next_y = _legend(entries, _BOARD_MARGIN, 22, width - _BOARD_MARGIN)
+        top_pad = next_y + 6
+
     def X(x_mm: float) -> float:
         return _BOARD_MARGIN + (x_mm - outline.origin_x_mm) * scale
 
     def Y(y_mm: float) -> float:
-        return _BOARD_MARGIN + (y_mm - outline.origin_y_mm) * scale
+        return top_pad + (y_mm - outline.origin_y_mm) * scale
 
     placed: list[tuple[Any, Any, FootprintDef]] = []
     for comp in ir.components:
@@ -1201,7 +1324,7 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
         placed.append((comp, placement, library.load_footprint(comp.footprint)))
 
     kind = "board" if copper else "placement"
-    what = "보드 그림 (동박 포함)" if copper else "배치도 (동박 제외)"
+    what = ("보드 그림 (넷 클래스 색)" if by_class else "보드 그림 (동박 포함)") if copper else "배치도 (동박 제외)"
     title = f"{ir.project.id}: {what}"
     silk = _board_silk(ir, placed, X, Y, scale)
     tracks = list(pcb.tracks) if copper else []
@@ -1211,7 +1334,11 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     # the caption line is wrapped to the figure's width before the height is known: every line must fit inside the SVG
     length_mm = sum(math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1]) for t in tracks)
     size = f"{_g(outline.width_mm)} × {_g(outline.height_mm)} mm"
-    if copper:
+    planes, plane_parts = _plane_hatches(ir, fig_id or kind, X, Y) if copper else ([], [])
+    if by_class:
+        stats = f"부품 {len(placed)}개, 트랙 {len(tracks)}개 (동박 {_g(length_mm, 4)} mm), 비아 {len(vias)}개"
+        key = CLASS_KEY
+    elif copper:
         stats = f"부품 {len(placed)}개, 트랙 {len(tracks)}개 (동박 {_g(length_mm, 4)} mm), 비아 {len(vias)}개"
         key = "빨강 = F.Cu, 파랑 = B.Cu, 노랑 = 관통 패드(흰 원 = 드릴), 회색 = 비아"
         if other_layers:
@@ -1230,14 +1357,24 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
         key += ", 검정 = 실크스크린 (B.SilkS 문자는 거울상)"
     else:
         key += ", 검정 선 = 라이브러리 실크 (설계된 실크 문자 없음: 참조·값 라벨은 그림용)"
+    if plane_parts:
+        key += f", 빗금 + 점선 = 내층 평면 영역 {', '.join(plane_parts)} (KiCad 가 채움; 트랙을 가리지 않도록 빗금으로만 그림)"
     caption_lines = _wrap_caption(f"{ir.project.id}: {size}, {stats}; {key}", width - 2 * _BOARD_MARGIN, _SMALL_PX)
-    caption_h = _BOARD_CAPTION_PAD + _BOARD_CAPTION_LINE_H * len(caption_lines)
-    height = int(round(outline.height_mm * scale + 2 * _BOARD_MARGIN + caption_h))
+    class_lines: list[str] = []
+    if copper and not by_class and styles:
+        # the GUI recolours this layer figure by class (app.css): the layer key would then be false, so the class key rides along,
+        # hidden (display="none") until the viewer's class view shows it instead of the layer key
+        tail = key[key.index(", 검정"):] if ", 검정" in key else ""
+        class_lines = _wrap_caption(f"{ir.project.id}: {size}, {stats}; {CLASS_KEY}{tail}", width - 2 * _BOARD_MARGIN, _SMALL_PX)
+    caption_h = _BOARD_CAPTION_PAD + _BOARD_CAPTION_LINE_H * max(len(caption_lines), len(class_lines))
+    height = int(round(outline.height_mm * scale + top_pad + _BOARD_MARGIN + caption_h))
     out = _svg_open(width, height, title)
+    out += legend
     out.append(
         f'<rect class="outline" x="{_f(X(outline.origin_x_mm))}" y="{_f(Y(outline.origin_y_mm))}" width="{_f(outline.width_mm * scale)}" '
         f'height="{_f(outline.height_mm * scale)}" fill="{BOARD_FILL}" stroke="{INK_SECONDARY}" stroke-width="1.5"/>'
     )
+    out += planes
     out.append('<g class="tracks">')
     for layer in layer_order:
         if copper:
@@ -1245,9 +1382,16 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
         for i, t in enumerate(tracks):
             if t.layer != layer:
                 continue
+            st = style_of.get(t.net)
+            cls_attr = f' data-class="{esc(st.name)}" data-nc="{st.token}"' if st is not None else ""
+            if by_class:
+                stroke = st.colour if st is not None else NET_CLASS_OTHER
+                opacity = "" if t.layer == "F.Cu" else ' stroke-opacity="0.5"'
+            else:
+                stroke, opacity = COPPER_COLOURS.get(t.layer, OTHER_COPPER), ""
             out.append(
-                f'<line class="track" data-net="{esc(t.net)}" data-layer="{esc(t.layer)}" x1="{_f(X(t.start[0]))}" y1="{_f(Y(t.start[1]))}" '
-                f'x2="{_f(X(t.end[0]))}" y2="{_f(Y(t.end[1]))}" stroke="{COPPER_COLOURS.get(t.layer, OTHER_COPPER)}" '
+                f'<line class="track" data-net="{esc(t.net)}" data-layer="{esc(t.layer)}"{cls_attr} x1="{_f(X(t.start[0]))}" y1="{_f(Y(t.start[1]))}" '
+                f'x2="{_f(X(t.end[0]))}" y2="{_f(Y(t.end[1]))}" stroke="{stroke}"{opacity} '
                 f'stroke-width="{_f(t.width_mm * scale)}" stroke-linecap="round"/>'
             )
         if copper:
@@ -1271,6 +1415,8 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
                 own_copper.append(own_pads[-1])
             layers = pad_layers(placement, pad)
             fill, tht = _pad_fill(pad, layers)
+            if by_class and not tht:
+                fill = NEUTRAL_PAD
             order = 2 if tht else (1 if "F.Cu" in layers else 0)
             parts = [f'<g class="pad" data-ref="{esc(comp.ref)}" data-pad="{esc(pad.number)}" data-tht="{"true" if tht else "false"}">']
             parts.append(_pad_shape(pad, X(cx), Y(cy), angle, scale, fill))
@@ -1286,9 +1432,10 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     out += [markup for _, markup in sorted(pad_items, key=lambda item: item[0])]
     out.append("</g>")
     out.append('<g class="vias">')
+    via_paint = f'fill="{DRILL_COLOUR}" stroke="{CLASS_VIA_RING}" stroke-width="1"' if by_class else f'fill="{VIA_COLOUR}"'
     for v in vias:
         out.append(
-            f'<g class="via" data-net="{esc(v.net)}"><circle cx="{_f(X(v.x_mm))}" cy="{_f(Y(v.y_mm))}" r="{_f(v.diameter_mm / 2 * scale)}" fill="{VIA_COLOUR}"/>'
+            f'<g class="via" data-net="{esc(v.net)}"><circle cx="{_f(X(v.x_mm))}" cy="{_f(Y(v.y_mm))}" r="{_f(v.diameter_mm / 2 * scale)}" {via_paint}/>'
             f'<circle class="drill" cx="{_f(X(v.x_mm))}" cy="{_f(Y(v.y_mm))}" r="{_f(v.drill_mm / 2 * scale)}" fill="{DRILL_COLOUR}"/></g>'
         )
     out.append("</g>")
@@ -1302,9 +1449,14 @@ def board_figure(ir: CircuitIR, library: KicadLibrary, *, copper: bool = True, s
     if not silk.designed:
         out += _board_labels(label_parts, width)
     out.append("</g>")
+    view = ' data-view="class"' if by_class else (' data-view="layer"' if class_lines else "")
     for i, line in enumerate(caption_lines):
         y = height - 10 - _BOARD_CAPTION_LINE_H * (len(caption_lines) - 1 - i)
-        out.append(f'<text class="caption" x="{_BOARD_MARGIN}" y="{_f(y)}" font-size="{_SMALL_PX}" fill="{INK_SECONDARY}">{esc(line)}</text>')
+        out.append(f'<text class="caption"{view} x="{_BOARD_MARGIN}" y="{_f(y)}" font-size="{_SMALL_PX}" fill="{INK_SECONDARY}">{esc(line)}</text>')
+    for i, line in enumerate(class_lines):
+        y = height - 10 - _BOARD_CAPTION_LINE_H * (len(class_lines) - 1 - i)
+        out.append(f'<text class="caption" data-view="class" display="none" x="{_BOARD_MARGIN}" y="{_f(y)}" font-size="{_SMALL_PX}" '
+                   f'fill="{INK_SECONDARY}">{esc(line)}</text>')
     out.append("</svg>")
     caption = (
         f"{what}: 외곽 {size}, {stats}. 패드 형상과 실크 선은 KiCad 라이브러리에서 읽은 것이고 위치는 IR 의 배치 그대로입니다"

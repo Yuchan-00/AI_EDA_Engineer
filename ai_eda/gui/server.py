@@ -84,6 +84,7 @@ from ai_eda.gui.preview import (
     artifact_rows,
     artifact_state,
     board_available,
+    board_classes,
     board_svg,
     bom_table,
     confined_file,
@@ -440,6 +441,8 @@ class GuiApp:
                     "board": board_available(ir),
                     "board_file": artifact_download(ir, workdir, ArtifactKind.PCB),
                     "board_state": artifact_state(rows, ArtifactKind.PCB),
+                    # the net classes of ir.si for the 넷 클래스 색 legend (names, colour tokens, net counts, promoted nets; no status)
+                    "board_classes": board_classes(ir),
                     # the 3D tab: drawn from the current IR like the board (same input); the compiled preview GLB's own facts beside it
                     "model3d": board_available(ir),
                     "model3d_file": artifact_download(ir, workdir, ArtifactKind.MODEL_3D),

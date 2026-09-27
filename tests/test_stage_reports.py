@@ -169,7 +169,7 @@ def test_astable_theory_report_states_the_formulas_with_the_design_numbers(astab
     # the model card comes from the IR's SPICE binding, the tran window from the calculator parameters
     assert "`.model QNPN NPN (TR=200n)`" in text and "step  = 1/(200·f) = 5 µs" in text and "stop  = 20/f      = 20 ms" in text
     # the parameter table: key, value, origin, calculator id or the confirmed-choice label, the formula note
-    assert "| `c` | 64.817 nF | 계산기 출력 | `calc.astable.c_for_frequency` v0.7 ← f_osc, r_b, v_in, v_be | C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE))) |" in text
+    assert "| `c` | 64.817 nF | 계산기 출력 | `calc.astable.c_for_frequency` v0.8 ← f_osc, r_b, v_in, v_be | C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE))) |" in text
     assert f"| `r_b` | 10 kΩ | 사용자 확인 선택값 | template astable v{TEMPLATE_VERSION} |" in text
     assert "| `v_in` | 5 V | 사용자 요구사항 | req.input_voltage |" in text
     # constraints, simulation setup, the judging rule and the frequency measurement rule (Reduce.FREQUENCY is used)
@@ -188,7 +188,7 @@ def test_divider_theory_report(divider, tmp_path: Path):
     assert "= 10 kΩ·(12 V − 5 V)/5 V = 14 kΩ" in text and "R_th = R1‖R2" in text and "5.8333 kΩ" in text
     assert "|측정값 − 5 V| ≤ 1 % × 5 V = 50 mV" in text
     assert "주파수 측정식" not in text  # no Reduce.FREQUENCY expectation in a divider
-    assert "| `r1` | 14 kΩ | 계산기 출력 | `calc.divider.r1_for_v_out` v0.7 ← v_in, v_out_target, r2 | R1 = R2 * (V_in - V_out) / V_out |" in text
+    assert "| `r1` | 14 kΩ | 계산기 출력 | `calc.divider.r1_for_v_out` v0.8 ← v_in, v_out_target, r2 | R1 = R2 * (V_in - V_out) / V_out |" in text
     _assert_clean(text, tmp_path)
 
 
@@ -274,7 +274,7 @@ def test_divider_parts_report(divider, tmp_path: Path):
     assert "- 역할: R1: 상단 분압 저항 (VIN–VOUT), 출력 비율을 정함" in text
     assert f"- 저항값 14 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in text
     assert "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 3.5 mW = 7 mW" in text
-    assert "- 전기 특성: resistance = 14 kΩ [계산기 출력 (calc.divider.r1_for_v_out v0.7)]" in text
+    assert "- 전기 특성: resistance = 14 kΩ [계산기 출력 (calc.divider.r1_for_v_out v0.8)]" in text
     assert "- req.output_voltage (output_voltage: 5 V)" in text
     _assert_clean(text, tmp_path)
 
@@ -299,7 +299,7 @@ def test_non_template_design_gets_honest_fallbacks(tmp_path: Path):
     assert template_of(ir) is None and template_for(ir) is None
     theory, parts = theory_report(ir, lib), parts_report(ir, lib)
     assert f"- 설계 출처: {NO_TEMPLATE}" in theory and f"{NO_TEMPLATE}: 이 설계는 템플릿이 만들지 않았으므로" in theory
-    assert "| `v_out` | 6 V | 계산기 출력 | `calc.divider.v_out` v0.7 ← v_in, r1, r2 | V_out = V_in * R2 / (R1 + R2) |" in theory
+    assert "| `v_out` | 6 V | 계산기 출력 | `calc.divider.v_out` v0.8 ← v_in, r1, r2 | V_out = V_in * R2 / (R1 + R2) |" in theory
     assert "제약 조건 기록 없음." in theory and "- `dc_vin`: dc (source = VIN, start = 0 V, stop = 12 V, step = 1 V)" in theory
     assert f"{NO_TEMPLATE}: 템플릿의 이론 곡선이 없습니다." in theory and "![fig]" not in theory and NO_WAVEFORM in theory
     assert parts.count(f"{NO_TEMPLATE_INFO}: 역할·선정 이유·대체 기준은 템플릿이 만든 설계에만 있습니다.") == 3
@@ -828,7 +828,7 @@ def test_led_theory_and_parts_reports(tmp_path: Path):
     assert "R = (V_in − V_f)/I_f" in text and "= (5 V − 2 V)/10 mA = 300 Ω   (`calc.led.R`)" in text and "= 3 V/300 Ω = 10 mA   (`calc.led.I`)" in text
     assert "| 저항 소비전력 | P(R) = (V_in − V_f)·I = (V_in − V_f)²/R | 30 mW |" in text and "| LED 소비전력 | P(LED) = V_f·I | 20 mW |" in text
     assert "V_f 가 0.1 V 커지면 전류는 약 3.33 % 줄어듭니다" in text and "|측정값 − 10 mA| ≤ 1 % × 10 mA = 100 µA" in text
-    assert "| `r_led` | 300 Ω | 계산기 출력 | `calc.led.R` v0.7 ← v_in, v_f, i_f | R = (V_supply - V_f) / I_f |" in text
+    assert "| `r_led` | 300 Ω | 계산기 출력 | `calc.led.R` v0.8 ← v_in, v_f, i_f | R = (V_supply - V_f) / I_f |" in text
     parts = parts_report(ir, lib)
     notes = template_for(ir).part_notes(ir)
     assert set(notes) == {c.ref for c in ir.components} == {"R1", "D1", "J1"}
@@ -1007,7 +1007,10 @@ def test_parts_report_says_it_has_no_chart(astable):
 def test_circuit_report_figures_placement_board_and_copper_bars(astable_release, tmp_path: Path):
     ir, lib, state = astable_release
     doc = build_stage_document(Stage.PCB, ir, lib, state)
-    assert _figure_ids(doc.markdown) == ["placement", "board", "copper_bars", "iso3d"] and doc.html.count("<figure>") == 4
+    # the template declares SI classes (ir.si): the class-coloured board and the delay bars join; a 2-layer board has no Z0 curve (no plane)
+    # and no step response (nothing long over a plane), each said in one sentence
+    assert _figure_ids(doc.markdown) == ["placement", "board", "copper_bars", "si_board", "si_delay", "iso3d"] and doc.html.count("<figure>") == 6
+    assert "기준 평면이 없어 임피던스가 정의되지 않으므로 Z0–폭 곡선이 없습니다" in doc.markdown and "SPICE 계단 응답 그림이 없습니다" in doc.markdown
     placement, board, bars, iso = (doc.figures.figures[k].svg for k in ("placement", "board", "copper_bars", "iso3d"))
     # the 3D preview: one flat outline or body per component (no STEP here), its caption carries the body rule
     assert doc.figures.scene is not None and len(doc.figures.scene.bodies) == len(ir.components) and "k-slab" in iso
@@ -1021,7 +1024,8 @@ def test_circuit_report_figures_placement_board_and_copper_bars(astable_release,
     _assert_clean(doc.html, tmp_path)
     # without a library the board figures are one sentence each; the copper bars need no library
     md = circuit_report(ir, None, state)
-    assert md.count(NO_LIBRARY_FIGURE) == 2 and "fig:placement" not in md and "fig:board" not in md and "![fig](fig:copper_bars)" in md
+    assert md.count(NO_LIBRARY_FIGURE) == 3 and "fig:placement" not in md and "fig:board" not in md and "![fig](fig:copper_bars)" in md
+    assert "fig:si_board" not in md and "![fig](fig:si_delay)" in md
     assert "fig:iso3d" not in md and "3D 미리보기 그림이 없습니다: KiCad 라이브러리를 열 수 없습니다." in md
 
 
@@ -1127,7 +1131,7 @@ def test_write_stage_report_without_a_browser_or_with_no_pdf_leaves_no_pdf(astab
     stale.write_bytes(b"%PDF-1.4 stale")
     result = write_stage_report(Stage.PCB, ir, lib, state, tmp_path / "out")  # conftest: no browser is discovered
     assert result.pdf is None and result.pdf_reason == NO_BROWSER_REASON and not stale.exists() and result.summary() == f"(+ .html; pdf not produced: {NO_BROWSER_REASON})"
-    assert result.paths == [result.markdown, result.html] and result.figure_ids == ("placement", "board", "copper_bars", "iso3d")
+    assert result.paths == [result.markdown, result.html] and result.figure_ids == ("placement", "board", "copper_bars", "si_board", "si_delay", "iso3d")
     stale.write_bytes(b"%PDF-1.4 stale")
     result = write_stage_report(Stage.PCB, ir, lib, state, tmp_path / "out", pdf=False)
     assert result.pdf is None and result.pdf_reason == PDF_NOT_REQUESTED and not stale.exists()

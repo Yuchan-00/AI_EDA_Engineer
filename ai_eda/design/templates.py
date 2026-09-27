@@ -415,6 +415,7 @@ def _header_note(role: str, pins: str, req_text: str) -> PartNote:
 class DividerTemplate(Template):
     id = "divider"
     title = "unloaded resistive voltage divider"
+    plane_nets = ("GND", "VIN")
     triggers = ("input_voltage", "output_voltage")
     needs = ("input_voltage", "output_voltage")
     serves = ("input_voltage", "output_voltage", "output_current")
@@ -608,6 +609,7 @@ class LedTemplate(Template):
     title = "LED indicator with series resistor"
     triggers = ("led_forward_voltage", "led_forward_current")
     all_triggers = False
+    plane_nets = ("GND", "VCC")
     needs = ("input_voltage", "led_forward_voltage", "led_forward_current")
     serves = ("input_voltage", "led_forward_voltage", "led_forward_current")
 
@@ -1007,6 +1009,7 @@ class AstableTemplate(Template):
 
     id = "astable"
     title = "BJT astable multivibrator"
+    plane_nets = ("GND", "VCC")
     triggers = ("oscillation_frequency",)
     needs = ("oscillation_frequency", "input_voltage")
     serves = ("oscillation_frequency", "input_voltage")
@@ -1513,7 +1516,15 @@ def design_from_requirements(
         if refusals:
             plan = Plan(template=template.id, title=template.title, questions=refusals)
             return _refused(plan, "; ".join(q.rationale for q in refusals))
-    return template.build(ir, inputs, unusable, library, confirmed=confirmed)
+    plan = template.build(ir, inputs, unusable, library, confirmed=confirmed)
+    if plan.buildable:
+        from ai_eda.design.board import add_board  # the board module imports the shared helpers of this one
+
+        why = add_board(template, ir, plan, confirmed=confirmed)
+        if why is not None:
+            plan.changes = []
+            return _refused(plan, why)
+    return plan
 
 
 __all__ = [

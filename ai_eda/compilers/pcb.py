@@ -295,6 +295,9 @@ class PCBCompiler(Compiler):
             raise NothingToCompileError("ir.pcb is None: nothing to lay out (the PCB stage needs an outline and placements)")
         if not ir.components:
             raise NothingToCompileError("IR has no components: nothing to place")
+        if ir.pcb.outline is None and not ir.pcb.placements and not ir.pcb.tracks and not ir.pcb.vias and not ir.pcb.zones:
+            # a template's board decisions (layers, stackup) before the PLACEMENT stage placed anything: nothing to lay out yet
+            raise NothingToCompileError("ir.pcb has no outline, placements or copper yet: nothing to lay out (the PCB stage needs an outline and placements)")
         if not ir.project.id or _BAD_STEM_RE.search(ir.project.id):
             raise CompileError(f"project id {ir.project.id!r} is not usable as a KiCad file stem (it names the board and schematic files)")
         library = self._library(ctx)

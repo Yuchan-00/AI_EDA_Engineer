@@ -195,6 +195,8 @@ class CircuitDesignAgent(Agent):
 
 def _unserved(ir: CircuitIR) -> list[str]:
     served = {rid for c in ir.components for rid in c.serves_requirements} | {rid for n in ir.nets for rid in n.serves_requirements}
+    if ir.pcb is not None and ir.pcb.stackup is not None:  # a stated layer count is served by the stack built from it
+        served |= set(ir.pcb.stackup.served_requirements())
     return [
         r.id for r in ir.requirements.requirements
         if r.category in DESIGN_CATEGORIES and r.key not in IGNORED_KEYS and r.id not in served

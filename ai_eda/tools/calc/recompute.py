@@ -32,9 +32,13 @@ reported under their path (``simulation.expectations[v_out].nominal``).
 After a JSON round trip these are independent copies of the parameters they
 were built from, so a recomputed parameter says nothing about them.
 
-Inputs are looked up in ``ir.parameters`` first and, like the reviewer's
-``calculations_vs_design`` check, in ``ir.requirements`` (a requirement's
-traced ``value``) as a fallback.
+The walk also covers the traced numbers of ``ir.si`` (their ids,
+``si.net_classes[POWER].min_width_mm``, are the paths). Inputs are looked up
+in ``ir.parameters`` first, then - for an id under :data:`SI_PREFIX` - in
+``ir.si``, for an id under :data:`STACKUP_PREFIX` - in the board's stackup (a transmission-line
+calculator records ``pcb.stackup.dielectrics[0].thickness_mm`` and the like),
+and, like the reviewer's ``calculations_vs_design`` check, in
+``ir.requirements`` (a requirement's traced ``value``) as a fallback.
 """
 
 from __future__ import annotations
@@ -53,9 +57,11 @@ from ai_eda.tools.calc.basic import (
     astable_tran_step,
     astable_tran_stop,
     astable_v_be_reverse,
+    clock_divided,
     crystal_load_capacitance,
     current_from_voltage_resistance,
     divider_r1_for_v_out,
+    ipc2221_width_for_current,
     junction_temperature,
     lc_cutoff,
     led_current,
@@ -76,8 +82,31 @@ from ai_eda.tools.calc.basic import (
     voltage_divider_output,
     voltage_divider_ratio,
 )
+from ai_eda.tools.calc.tline import (
+    critical_length,
+    edge_coupled_e_eff_even,
+    edge_coupled_e_eff_odd,
+    edge_coupled_z_diff,
+    edge_coupled_z_even,
+    edge_coupled_z_odd,
+    line_delay,
+    microstrip_e_eff,
+    microstrip_z0,
+    spacing_for_zdiff,
+    stripline_z0,
+    tpd,
+    width_for_z0_microstrip,
+    width_for_z0_stripline,
+    width_for_zdiff,
+)
 
 CHECK_ID = "calc.recompute"
+#: ids under this prefix name a traced number of the design's SI constraints (``si.net_classes[POWER].min_width_mm``), resolved
+#: by :meth:`ai_eda.ir.SIConstraints.lookup`; the derived ones among them are recomputed like the parameters
+SI_PREFIX = "si"
+#: ids under this prefix name a number of the board's stackup (``pcb.stackup.dielectrics[0].er``), resolved by
+#: :meth:`ai_eda.ir.Stackup.lookup`: a transmission-line value records the stack's numbers it was computed from
+STACKUP_PREFIX = "pcb.stackup"
 TOOL_ID = "calc"
 #: relative tolerance for "the same number" (floating point round-off between two evaluations)
 REL_TOL = 1e-9
@@ -114,6 +143,23 @@ CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     "calc.regulator.p_dissipation": (regulator_dissipation, ROLES["calc.regulator.p_dissipation"]),
     "calc.crystal.load_capacitance": (crystal_load_capacitance, ROLES["calc.crystal.load_capacitance"]),
     "calc.lc.cutoff": (lc_cutoff, ROLES["calc.lc.cutoff"]),
+    "calc.tline.microstrip.z0": (microstrip_z0, ROLES["calc.tline.microstrip.z0"]),
+    "calc.tline.microstrip.e_eff": (microstrip_e_eff, ROLES["calc.tline.microstrip.e_eff"]),
+    "calc.tline.stripline.z0": (stripline_z0, ROLES["calc.tline.stripline.z0"]),
+    "calc.tline.edge_coupled_microstrip.z_even": (edge_coupled_z_even, ROLES["calc.tline.edge_coupled_microstrip.z_even"]),
+    "calc.tline.edge_coupled_microstrip.z_odd": (edge_coupled_z_odd, ROLES["calc.tline.edge_coupled_microstrip.z_odd"]),
+    "calc.tline.edge_coupled_microstrip.z_diff": (edge_coupled_z_diff, ROLES["calc.tline.edge_coupled_microstrip.z_diff"]),
+    "calc.tline.edge_coupled_microstrip.e_eff_even": (edge_coupled_e_eff_even, ROLES["calc.tline.edge_coupled_microstrip.e_eff_even"]),
+    "calc.tline.edge_coupled_microstrip.e_eff_odd": (edge_coupled_e_eff_odd, ROLES["calc.tline.edge_coupled_microstrip.e_eff_odd"]),
+    "calc.tline.width_for_z0.microstrip": (width_for_z0_microstrip, ROLES["calc.tline.width_for_z0.microstrip"]),
+    "calc.tline.width_for_z0.stripline": (width_for_z0_stripline, ROLES["calc.tline.width_for_z0.stripline"]),
+    "calc.tline.edge_coupled_microstrip.s_for_zdiff": (spacing_for_zdiff, ROLES["calc.tline.edge_coupled_microstrip.s_for_zdiff"]),
+    "calc.tline.edge_coupled_microstrip.w_for_zdiff": (width_for_zdiff, ROLES["calc.tline.edge_coupled_microstrip.w_for_zdiff"]),
+    "calc.tline.tpd": (tpd, ROLES["calc.tline.tpd"]),
+    "calc.tline.delay": (line_delay, ROLES["calc.tline.delay"]),
+    "calc.tline.critical_length": (critical_length, ROLES["calc.tline.critical_length"]),
+    "calc.ipc2221.width_for_current": (ipc2221_width_for_current, ROLES["calc.ipc2221.width_for_current"]),
+    "calc.clock.divided": (clock_divided, ROLES["calc.clock.divided"]),
 }
 
 #: lower-cased unit spelling -> the key a role's expected unit lower-cases to. A thermal resistance is written
@@ -135,6 +181,10 @@ def _unit_key(unit: str | None) -> str | None:
 def _input(ir: CircuitIR, key: str) -> Traced | None:
     if key in ir.parameters:
         return ir.parameters[key]
+    if key.startswith(STACKUP_PREFIX) and ir.pcb is not None and ir.pcb.stackup is not None:
+        return ir.pcb.stackup.lookup(key, STACKUP_PREFIX)
+    if key.startswith(SI_PREFIX + ".") and ir.si is not None:
+        return ir.si.lookup(key, SI_PREFIX)
     req = ir.requirements.get(key)
     return req.value if req is not None else None
 
@@ -157,6 +207,10 @@ def derived_values(ir: CircuitIR) -> Iterator[tuple[str, Traced]]:
     for key, t in ir.parameters.items():
         if t.provenance.kind == ProvenanceKind.DERIVED:
             yield key, t
+    if ir.si is not None:
+        for key, t in ir.si.traced_items(SI_PREFIX):
+            if t.provenance.kind == ProvenanceKind.DERIVED:
+                yield key, t
     for c in ir.components:
         for k, t in c.electrical.items():
             if t.provenance.kind == ProvenanceKind.DERIVED:
@@ -229,7 +283,7 @@ def recompute_parameters(ir: CircuitIR) -> ValidationResult:
         inputs = {role: _input(ir, k) for role, k in prov.inputs.items()}
         missing = [k for role, k in prov.inputs.items() if inputs[role] is None]
         if missing:
-            refuse(f"input(s) {missing} not found in ir.parameters / ir.requirements")
+            refuse(f"input(s) {missing} not found in ir.parameters / ir.si / the stackup / ir.requirements")
             continue
         bad_units = [
             f"{role}={prov.inputs[role]!r} carries unit {inputs[role].unit!r}, {prov.tool} expects {expected!r}"
@@ -271,7 +325,11 @@ def recompute_parameters(ir: CircuitIR) -> ValidationResult:
     return ValidationResult(check_id=CHECK_ID, status=ValidationStatus.PASS, message=f"{recomputed} value(s) recomputed", tool=TOOL_ID, tool_version=CALC_VERSION, details=details)
 
 
-__all__ = ["CALCULATORS", "CHECK_ID", "REL_TOL", "TOOL_ID", "derived_values", "recompute_parameters", "unit_key"]
+__all__ = ["CALCULATORS", "CHECK_ID", "REL_TOL", "SI_PREFIX", "STACKUP_PREFIX", "TOOL_ID", "derived_values", "recompute_parameters", "resolve_input", "unit_key"]
 
 #: public name of :func:`_unit_key` for the validators that compare a rating's unit with a role's (``K/W`` == ``degC/W``)
 unit_key = _unit_key
+
+#: public name of :func:`_input`: the traced value an id names in ``ir.parameters``, ``ir.si``, the stackup or ``ir.requirements`` (``None``
+#: when none) - the reviewer checks a derived value's inputs exist with the same resolution the recompute uses
+resolve_input = _input

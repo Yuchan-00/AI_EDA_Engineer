@@ -156,7 +156,7 @@ def test_table_lists_every_input_choice_computed_value_part_net_and_simulation_l
 def test_confirm_applies_the_board_with_every_mcu_pin_in_exactly_one_net(tmp_path: Path):
     ir, lib, state, _ = _built(tmp_path)
     out = state.outcome(Stage.ARCHITECTURE)
-    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"129 proposal(s) applied, nothing verified; template atmega128_devboard v{TEMPLATE_VERSION} confirmed by the user: 129 proposal(s)")
+    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"135 proposal(s) applied, nothing verified; template atmega128_devboard v{TEMPLATE_VERSION} confirmed by the user: 135 proposal(s)")
     assert [c.ref for c in ir.components] == REFS
     assert [n.name for n in ir.nets] == ["VIN_RAW", "VIN", "+5V", "GND", "LED_A", "AVCC", "AREF", "RESET", "PEN", "XTAL1", "XTAL2", *PORT_NETS]
     # every pin of every part is in exactly one net; U1's 64 pins, found by name, land where the ATmega128 pinout says
@@ -184,13 +184,17 @@ def test_confirm_applies_the_board_with_every_mcu_pin_in_exactly_one_net(tmp_pat
     p = ir.parameters
     assert list(p) == ["v_in", "f_clk", "v_out_reg", "i_load_budget", "p_reg_max", "c_in", "c_out", "c_dec", "l_avcc", "c_xtal", "c_stray", "r_reset", "c_reset", "c8_ic",
                        "r_pen", "v_f_led", "i_led", "tol_rel", "v_avcc_tol_abs", "p_reg", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop",
-                       "c_load", "f_avcc"]
+                       "c_load", "f_avcc", "power_temp_rise", "w_power_min", "isp_sck_divider", "f_sck"]  # the last four: the board's SI declarations
     for key, rid, value in (("v_in", "req.input_voltage", 9.0), ("f_clk", "req.clock_frequency", 16e6)):
         assert p[key].value == value and p[key].provenance.kind is ProvenanceKind.USER_REQUIREMENT and p[key].provenance.derived_from == [rid]
     for key in list(p)[2:19]:
         assert p[key].provenance.kind is ProvenanceKind.USER_REQUIREMENT and p[key].provenance.tool is None, key
         assert p[key].provenance.note.startswith(f"{CHOICE_NOTE_PREFIX}; template atmega128_devboard v{TEMPLATE_VERSION}: {key} = "), key
-    tools = {k: (p[k].provenance.tool, p[k].provenance.tool_version) for k in list(p)[19:]}
+    tools = {k: (p[k].provenance.tool, p[k].provenance.tool_version) for k in list(p)[19:28]}
+    assert {k: (p[k].provenance.tool, p[k].provenance.kind) for k in list(p)[28:]} == {  # the board's SI declarations: two choices, two calculator outputs
+        "power_temp_rise": (None, ProvenanceKind.USER_REQUIREMENT), "w_power_min": ("calc.ipc2221.width_for_current", ProvenanceKind.DERIVED),
+        "isp_sck_divider": (None, ProvenanceKind.USER_REQUIREMENT), "f_sck": ("calc.clock.divided", ProvenanceKind.DERIVED),
+    }
     assert tools == {
         "p_reg": ("calc.regulator.p_dissipation", CALC_VERSION), "r_led": ("calc.led.R", CALC_VERSION), "i_led_design": ("calc.led.I", CALC_VERSION),
         "tau_reset": ("calc.rc.tau", CALC_VERSION), "v_reset_tau": ("calc.rc.step_response", CALC_VERSION), "tran_step": ("calc.rc.tran_step", CALC_VERSION),
@@ -255,9 +259,10 @@ def test_the_simulation_excludes_what_has_no_model_and_judges_three_analog_facts
 def test_recompute_inputs_check_validators_and_compiled_views_of_the_confirmed_board(tmp_path: Path):
     ir, lib, _, _ = _built(tmp_path)
     rec = recompute_parameters(ir)
-    assert rec.status is S.PASS and rec.message == "16 value(s) recomputed"
+    assert rec.status is S.PASS and rec.message == "20 value(s) recomputed"  # + w_power_min, f_sck and their copies in ir.si
     assert {k for k in rec.details["parameters"] if not k.startswith(("components", "simulation"))} == {
-        "p_reg", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop", "c_load", "f_avcc"}
+        "p_reg", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop", "c_load", "f_avcc",
+        "w_power_min", "f_sck", "si.net_classes[POWER].min_width_mm", "si.timing_paths[ISP].f_clk_hz"}
     assert {k for k in rec.details["parameters"] if k.startswith("simulation")} == {
         "simulation.analyses[tran].params[step]", "simulation.analyses[tran].params[stop]", "simulation.expectations[i_led].nominal",
         "simulation.expectations[v_reset_tau].nominal", "simulation.expectations[v_reset_tau].at"}

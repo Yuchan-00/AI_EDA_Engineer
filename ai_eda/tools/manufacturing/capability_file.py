@@ -44,6 +44,25 @@ the fab):
   non-finite file value is rejected with the reason, and a capability file
   that does not parse (including one nested past the JSON parser's depth)
   is a :class:`CapabilityFileError`, never a traceback.
+* The optional ``stackup`` block states the physical layer stack (copper
+  thickness per layer, each dielectric's kind, thickness, Dk and optionally
+  its frequency and loss tangent, the solder mask) with a quote per number,
+  grounded by the same rules (:func:`_ground_number`): a length or a
+  frequency is one whole quantity of the page converted exactly from the
+  page's token (copper and mask in um, dielectrics in mm, frequencies in
+  Hz); a Dk / loss tangent carries no unit and its quote holds exactly one
+  bare number equal to the file's. The grounded stack
+  (``GroundedCapability.stackup``, an :class:`~ai_eda.ir.Stackup` with
+  ``authoritative`` numbers, ids ``pcb.stackup...``) is built only when
+  every number grounded - a partial stack is no stack - and it has no plane
+  layer: which net a plane carries is the design's decision
+  (:func:`ai_eda.design.stackup.with_planes`). :func:`relocate_stackup`
+  re-verifies its numbers like :func:`relocate_limits` does the limits.
+  **Not wired yet**: no agent writes the grounded stack into
+  ``ir.pcb.stackup`` (the FAB_CAPABILITY stage merges the limits only, and it
+  runs after PLACEMENT, whose routed widths come from the stack in the IR),
+  so ``mfg.capability_source`` reports the stack as "grounded, not recorded
+  in the IR" and never counts it toward its PASS.
 """
 
 from __future__ import annotations
@@ -55,19 +74,34 @@ import math
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ai_eda.errors import AiEdaError
-from ai_eda.ir import Evidence, ManufacturingConstraints, ProvenanceKind, SourceRef, Traced, ValidationResult, ValidationStatus, authoritative
+from ai_eda.ir import (
+    Evidence,
+    ManufacturingConstraints,
+    Provenance,
+    ProvenanceKind,
+    SourceRef,
+    Stackup,
+    StackupCopper,
+    StackupDielectric,
+    SolderMask,
+    Traced,
+    ValidationResult,
+    ValidationStatus,
+    authoritative,
+)
+from ai_eda.ir.pcb import DielectricKind
 from ai_eda.llm.extraction import _mismatch, _model_quantity, _request_quantity, find_directive
 from ai_eda.parts.datasheet_facts import searchable_document
-from ai_eda.tools.calc.quantity import PREFIX_EXPONENTS, Quantity, format_quantity
+from ai_eda.tools.calc.quantity import PREFIX_EXPONENTS, Quantity, find_quantities, format_quantity
 from ai_eda.tools.sources import ArchivedDocument, DocumentArchive, QuoteHit
 
-#: bumped when the grounding rules or the file schema change
-CAPABILITY_FILE_VERSION = "0.1"
+#: bumped when the grounding rules or the file schema change (0.2: the optional ``stackup`` block)
+CAPABILITY_FILE_VERSION = "0.2"
 GROUNDING_TOOL = "mfg.capability_grounding"
 SOURCE_CHECK_ID = "mfg.capability_source"
 
@@ -83,11 +117,21 @@ OZ_KEY = "copper_weight_oz"
 QUOTE_NOTE_PREFIX = "quote: "
 #: a Python string literal as ``repr`` writes it (the quote in a provenance note)
 _STRING_LITERAL_RE = re.compile("'(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\"")
-_LENGTH_TOKEN_RE = re.compile(
-    r"^\s*(?P<num>[+\-−]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?|\.\d+)\s*"
-    r"(?P<prefix>[" + "".join(re.escape(p) for p in PREFIX_EXPONENTS) + r"]?)\s*"
-    r"(?P<unit>m|meter|meters|metre|metres|미터)\s*$"
-)
+
+
+def _token_re(unit_words: str) -> re.Pattern[str]:
+    """One quantity token (number, optional SI prefix, one of ``unit_words``) and nothing else."""
+    return re.compile(
+        r"^\s*(?P<num>[+\-−]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?|\.\d+)\s*"
+        r"(?P<prefix>[" + "".join(re.escape(p) for p in PREFIX_EXPONENTS) + r"]?)\s*"
+        r"(?P<unit>" + unit_words + r")\s*$"
+    )
+
+
+_LENGTH_TOKEN_RE = _token_re("m|meter|meters|metre|metres|미터")
+_FREQUENCY_TOKEN_RE = _token_re("Hz|hz")
+#: a bare number in a quote: not glued to a letter, a dash or a dot on either side (``FR-4``, ``7628`` in ``JLC7628`` are not)
+_BARE_NUMBER_RE = re.compile(r"(?<![\w.\-])\d+(?:\.\d+)?(?![\w.])")
 _OZ_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*oz(?![A-Za-z0-9])")
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 _PAGE_SECTION_RE = re.compile(r"^page (\d+)$")
@@ -131,25 +175,94 @@ class CapabilitySource(_Strict):
         return self
 
 
+#: a number of a stackup block: finite, never text (``"4.5"`` is not read)
+_FileNumber = Annotated[float, Field(strict=True, allow_inf_nan=False)]
+
+
+class QuotedNumber(_Strict):
+    """One stackup number the user claims the vendor page states, with the page and the verbatim quote."""
+
+    value: _FileNumber = Field(description="the number as written in the quote")
+    unit: str | None = Field(default=None, description="lengths: the length unit as written (um, mm, ...); er_frequency: Hz / MHz / GHz; er and loss_tangent: null")
+    page: int = Field(description="1-based page of the archived document the quote stands on (1 for an HTML page)")
+    quote: str = Field(description="verbatim phrase from that page containing exactly this value (and its unit)")
+
+
+class CapabilityCopper(_Strict):
+    layer: str = Field(description="F.Cu, In1.Cu .. In<n>.Cu, B.Cu - top to bottom")
+    thickness: QuotedNumber = Field(description="finished copper thickness, a length (stored in um)")
+
+
+class CapabilityDielectric(_Strict):
+    kind: Literal["core", "prepreg"]
+    thickness: QuotedNumber = Field(description="a length (stored in mm)")
+    er: QuotedNumber = Field(description="relative permittivity (Dk), no unit")
+    er_frequency: QuotedNumber | None = Field(default=None, description="the frequency the page states the Dk at (stored in Hz)")
+    loss_tangent: QuotedNumber | None = Field(default=None, description="dissipation factor (Df), no unit")
+
+
+class CapabilitySolderMask(_Strict):
+    thickness: QuotedNumber = Field(description="a length (stored in um)")
+    er: QuotedNumber = Field(description="relative permittivity, no unit")
+
+
+class CapabilityStackup(_Strict):
+    """The optional ``stackup`` block: the physical layer stack the fab page states (never the plane nets - those are the design's)."""
+
+    copper: list[CapabilityCopper]
+    dielectrics: list[CapabilityDielectric]
+    solder_mask: CapabilitySolderMask | None = None
+
+    @model_validator(mode="after")
+    def _shape(self) -> CapabilityStackup:
+        names = [c.layer for c in self.copper]
+        expected = ["F.Cu", *[f"In{i}.Cu" for i in range(1, len(names) - 1)], "B.Cu"] if len(names) >= 2 else ["F.Cu", "B.Cu"]
+        if names != expected:
+            raise ValueError(f"copper layers must be {expected} top to bottom, got {names}")
+        if len(self.dielectrics) != len(self.copper) - 1:
+            raise ValueError(f"{len(self.copper)} copper layers need {len(self.copper) - 1} dielectric(s), got {len(self.dielectrics)}")
+        return self
+
+    def numbers(self, prefix: str = "pcb.stackup") -> list[tuple[str, QuotedNumber]]:
+        """``(IR id, quoted number)`` of every number in the block, in stack order (the ids :meth:`ai_eda.ir.Stackup.traced_items` uses)."""
+        out: list[tuple[str, QuotedNumber]] = [(f"{prefix}.copper[{c.layer}].thickness_um", c.thickness) for c in self.copper]
+        for i, d in enumerate(self.dielectrics):
+            out.append((f"{prefix}.dielectrics[{i}].thickness_mm", d.thickness))
+            out.append((f"{prefix}.dielectrics[{i}].er", d.er))
+            if d.er_frequency is not None:
+                out.append((f"{prefix}.dielectrics[{i}].er_frequency_hz", d.er_frequency))
+            if d.loss_tangent is not None:
+                out.append((f"{prefix}.dielectrics[{i}].loss_tangent", d.loss_tangent))
+        if self.solder_mask is not None:
+            out.append((f"{prefix}.solder_mask.thickness_um", self.solder_mask.thickness))
+            out.append((f"{prefix}.solder_mask.er", self.solder_mask.er))
+        return out
+
+
 class FabCapabilityFile(_Strict):
     fab: str
     source: CapabilitySource
-    limits: list[CapabilityLimit]
+    limits: list[CapabilityLimit] = Field(default_factory=list)
+    stackup: CapabilityStackup | None = None
     #: where the file was read from and what it hashed to (bookkeeping, not part of the schema the user writes)
     path: Path
     sha256: str
 
     def describe(self) -> dict[str, Any]:
-        return {"fab": self.fab, "path": str(self.path), "sha256": self.sha256, "source": self.source.model_dump(mode="json"), "limits": [lim.key for lim in self.limits]}
+        return {"fab": self.fab, "path": str(self.path), "sha256": self.sha256, "source": self.source.model_dump(mode="json"),
+                "limits": [lim.key for lim in self.limits], "stackup": self.stackup is not None}
 
 
 def load_capability_file(path: Path | str) -> FabCapabilityFile:
     """The user's JSON capability file; :class:`CapabilityFileError` names the entry that does not validate.
 
     Layout: ``{"fab": "...", "source": {"url": ...} | {"file": ..., "retrieved_at": ...},
-    "limits": [{"key", "value", "unit", "page", "quote"}, ...]}``. Keys the
-    schema does not declare are refused (a misspelled key would otherwise be
-    a silently dropped limit).
+    "limits": [{"key", "value", "unit", "page", "quote"}, ...],
+    "stackup": {"copper": [{"layer", "thickness": {value, unit, page, quote}}, ...],
+    "dielectrics": [{"kind", "thickness", "er", "er_frequency"?, "loss_tangent"?}, ...],
+    "solder_mask"?: {"thickness", "er"}}}`` (``stackup`` optional; at least one
+    limit or a stackup). Keys the schema does not declare are refused (a
+    misspelled key would otherwise be a silently dropped limit).
     """
     p = Path(path)
     try:
@@ -171,8 +284,8 @@ def load_capability_file(path: Path | str) -> FabCapabilityFile:
         raise CapabilityFileError(f"capability file {p}: {where}: {first.get('msg', e)}") from e
     if not loaded.fab.strip():
         raise CapabilityFileError(f"capability file {p}: fab: must name the fab")
-    if not loaded.limits:
-        raise CapabilityFileError(f"capability file {p}: limits: at least one limit is needed")
+    if not loaded.limits and loaded.stackup is None:
+        raise CapabilityFileError(f"capability file {p}: limits: at least one limit (or a stackup block) is needed")
     for i, lim in enumerate(loaded.limits):
         # the value's shape follows the key; an unknown key is left to grounding, which rejects it with the reason
         if lim.key in MM_KEYS or lim.key == OZ_KEY:
@@ -186,6 +299,19 @@ def load_capability_file(path: Path | str) -> FabCapabilityFile:
 # --------------------------------------------------------------------------- tokens
 
 
+def _scaled_from_token(original: str, pattern: re.Pattern[str], exponent: int, what: str) -> float:
+    """The token's number times ``10**(prefix + exponent)``, in ``Decimal`` on the document's own digits."""
+    m = pattern.match(original)
+    if m is None:
+        raise ValueError(f"not a {what} token: {original!r}")
+    num = m.group("num").replace(",", "").replace("−", "-")
+    try:
+        value = Decimal(num).scaleb(PREFIX_EXPONENTS.get(m.group("prefix") or "", 0) + exponent)
+    except InvalidOperation as e:
+        raise ValueError(f"not a number: {num!r}") from e
+    return float(value)
+
+
 def mm_from_token(original: str) -> float:
     """The exact millimetre value of a length token as the document writes it (``0.09 mm`` -> 0.09, ``90um`` -> 0.09).
 
@@ -193,16 +319,17 @@ def mm_from_token(original: str) -> float:
     ``value * 1000`` of the quantity parser would give ``0.09000000000000001``.
     ``ValueError`` when the token is not one length.
     """
-    m = _LENGTH_TOKEN_RE.match(original)
-    if m is None:
-        raise ValueError(f"not a length token: {original!r}")
-    num = m.group("num").replace(",", "").replace("−", "-")
-    exponent = PREFIX_EXPONENTS.get(m.group("prefix") or "", 0) + 3  # metres -> millimetres
-    try:
-        value = Decimal(num).scaleb(exponent)
-    except InvalidOperation as e:
-        raise ValueError(f"not a number: {num!r}") from e
-    return float(value)
+    return _scaled_from_token(original, _LENGTH_TOKEN_RE, 3, "length")
+
+
+def um_from_token(original: str) -> float:
+    """The exact micrometre value of a length token (``35um`` -> 35.0, ``0.035 mm`` -> 35.0); ``ValueError`` when it is not one length."""
+    return _scaled_from_token(original, _LENGTH_TOKEN_RE, 6, "length")
+
+
+def hz_from_token(original: str) -> float:
+    """The exact hertz value of a frequency token (``1 MHz`` -> 1e6, ``1.2GHz`` -> 1.2e9); ``ValueError`` when it is not one frequency."""
+    return _scaled_from_token(original, _FREQUENCY_TOKEN_RE, 0, "frequency")
 
 
 def quote_from_note(note: str | None) -> str | None:
@@ -242,6 +369,12 @@ class GroundedCapability(BaseModel):
     rejected: list[tuple[str, str]] = Field(default_factory=list)
     proposer: str = "user file"
     extraction: str = ""
+    #: the physical stack of the file's ``stackup`` block, every number grounded (no plane nets: the design adds them);
+    #: ``None`` when the file has no block or any of its numbers was rejected - a partial stack is no stack
+    stackup: Stackup | None = None
+    #: numbers in the file's stackup block, and how many of them grounded
+    stackup_numbers: int = 0
+    stackup_grounded: int = 0
 
     def constraints(self) -> ManufacturingConstraints:
         return ManufacturingConstraints(fab=self.fab, **self.accepted)
@@ -292,7 +425,81 @@ def ground_capability(doc: ArchivedDocument, file: FabCapabilityFile, *, propose
         seen.add(key)
         out.accepted[key] = authoritative(value, source, unit=unit, note=note)
         out.rows.append({"key": key, "value": value, "unit": unit, "page": hit.page, "quote": hit.matched, "parsed": parsed_text, "context": hit.context})
+    if file.stackup is not None:
+        _ground_stackup(out, file, doc, sdoc, tail)
     return out
+
+
+def _stackup_kind(key: str) -> str:
+    """The grounding step a stackup number takes, by the IR field it fills: ``um`` / ``mm`` (lengths), ``Hz``, ``ratio`` (er, loss tangent)."""
+    if key.endswith("thickness_um"):
+        return "um"
+    if key.endswith("thickness_mm"):
+        return "mm"
+    if key.endswith("er_frequency_hz"):
+        return "Hz"
+    return "ratio"
+
+
+def _ground_stackup(out: GroundedCapability, file: FabCapabilityFile, doc: ArchivedDocument, sdoc: ArchivedDocument, tail: str) -> None:
+    """Ground every number of the file's stackup block; build the IR stack only when all of them ground (module docstring)."""
+    block = file.stackup
+    assert block is not None
+    numbers = block.numbers()
+    out.stackup_numbers = len(numbers)
+    traced: dict[str, Traced] = {}
+    for key, q in numbers:
+        kind = _stackup_kind(key)
+        phrase = find_directive(key, q.quote, str(q.value), q.unit)
+        if phrase is not None:
+            out.rejected.append((key, f"directive phrase {phrase!r} in the number; document text is data, not instructions"))
+            continue
+        if not q.quote.strip():
+            out.rejected.append((key, "empty quote"))
+            continue
+        if q.page < 1 or q.page > doc.page_count:
+            out.rejected.append((key, f"page {q.page} does not exist (the archived document has {doc.page_count} page(s))"))
+            continue
+        hits = sdoc.find_quote(q.quote, q.page)
+        if not hits:
+            elsewhere = [h.page for h in sdoc.find_quote(q.quote)]
+            where = f" (found on page(s) {elsewhere} instead)" if elsewhere else ""
+            out.rejected.append((key, f"quote not found verbatim on page {q.page}: {q.quote!r}{where}"))
+            continue
+        hit = hits[0]
+        grounded, reason = _ground_number(kind, q.value, q.unit, sdoc, hit)
+        if grounded is None:
+            out.rejected.append((key, str(reason)))
+            continue
+        value, unit, parsed_text = grounded
+        source = doc.source_ref(title=file.source.title, section=hit.section, authority=file.source.authority)
+        note = f"{QUOTE_NOTE_PREFIX}{hit.matched!r}; parsed: {parsed_text}; page {hit.page}{tail}"
+        traced[key] = authoritative(value, source, unit=unit, note=note)
+        out.rows.append({"key": key, "value": value, "unit": unit, "page": hit.page, "quote": hit.matched, "parsed": parsed_text, "context": hit.context})
+    out.stackup_grounded = len(traced)
+    if len(traced) != len(numbers):
+        out.rejected.append(("stackup", f"not recorded: {len(numbers) - len(traced)} of {len(numbers)} stackup number(s) did not ground (a partial stack is no stack)"))
+        return
+    prefix = "pcb.stackup"
+    try:
+        out.stackup = Stackup(
+            copper=[StackupCopper(name=c.layer, thickness_um=traced[f"{prefix}.copper[{c.layer}].thickness_um"]) for c in block.copper],
+            dielectrics=[
+                StackupDielectric(
+                    kind=DielectricKind(d.kind), thickness_mm=traced[f"{prefix}.dielectrics[{i}].thickness_mm"], er=traced[f"{prefix}.dielectrics[{i}].er"],
+                    er_frequency_hz=traced.get(f"{prefix}.dielectrics[{i}].er_frequency_hz"), loss_tangent=traced.get(f"{prefix}.dielectrics[{i}].loss_tangent"),
+                )
+                for i, d in enumerate(block.dielectrics)
+            ],
+            solder_mask=SolderMask(thickness_um=traced[f"{prefix}.solder_mask.thickness_um"], er=traced[f"{prefix}.solder_mask.er"]) if block.solder_mask is not None else None,
+            provenance=Provenance(
+                kind=ProvenanceKind.AUTHORITATIVE, source=doc.source_ref(title=file.source.title, authority=file.source.authority),
+                note=f"layer stack of {file.fab} grounded verbatim on the archived page ({len(traced)} numbers); no plane layer: the planes are the design's decision{tail}",
+            ),
+        )
+    except ValueError as e:
+        out.stackup_grounded = 0
+        out.rejected.append(("stackup", f"not recorded: the grounded numbers do not form a stack: {e}"))
 
 
 def _ground_hit(key: str, lim: CapabilityLimit, sdoc: ArchivedDocument, hit: QuoteHit) -> tuple[tuple[Any, str | None, str] | None, str | None]:
@@ -307,6 +514,90 @@ def _ground_hit(key: str, lim: CapabilityLimit, sdoc: ArchivedDocument, hit: Quo
     if key == LAYER_KEY:
         return _ground_layers(lim, hit.matched)
     return _ground_oz(lim, hit.matched)
+
+
+def _cuts_number(page_text: str, start: int, end: int) -> bool:
+    """Whether the quote ``page_text[start:end]`` starts or stops inside a longer number of the page (``4`` quoted out of ``4.5``)."""
+    before = page_text[start - 1] if start > 0 else ""
+    after = page_text[end:end + 2]
+    starts_digit = start < len(page_text) and page_text[start].isdigit()
+    ends_digit = end > 0 and page_text[end - 1].isdigit()
+    if starts_digit and (before.isdigit() or before == "."):
+        return True
+    return ends_digit and bool(after) and (after[0].isdigit() or (after[0] in ".," and len(after) > 1 and after[1].isdigit()))
+
+
+def _page_number(kind: str, sdoc: ArchivedDocument, hit: QuoteHit) -> tuple[tuple[float, str | None, str, Quantity | None] | None, str | None]:
+    """What the page states at a located quote for a stackup number of ``kind``: ``((number, stored unit, text, parsed), None)`` or ``(None, reason)``.
+
+    ``"um"`` / ``"mm"``: one whole length (not part of a larger quantity or a
+    range), converted exactly from the page's own token; ``"Hz"``: one whole
+    frequency, likewise; ``"ratio"`` (er, loss tangent): exactly one bare
+    number in the quote (not glued to a letter, dash or dot, outside every
+    quantity with a unit) that does not cut a longer number of the page.
+    """
+    page_text = sdoc.pages[hit.page - 1]
+    span = (hit.offset, hit.offset + len(hit.matched))
+    if kind in ("um", "mm", "Hz"):
+        dimension = "Hz" if kind == "Hz" else "m"
+        word = "frequency" if kind == "Hz" else "length"
+        parsed, reason = _request_quantity(page_text, span)
+        if parsed is None:
+            return None, str(reason).replace("in the request", "on the page")
+        if not isinstance(parsed, Quantity) or parsed.plus_minus or parsed.unit != dimension or not math.isfinite(parsed.value):
+            return None, f"the quote does not state one {word} ({format_quantity(parsed)})"
+        try:
+            number = {"um": um_from_token, "mm": mm_from_token, "Hz": hz_from_token}[kind](parsed.original)
+        except ValueError as e:
+            return None, str(e)
+        if not math.isfinite(number):
+            return None, f"the page states a non-finite {word} ({parsed.original!r})"
+        return (number, kind, f"{number:g} {kind}", parsed), None
+    quoted = hit.matched
+    masked = list(quoted)
+    for (a, b), _q in find_quantities(quoted):
+        masked[a:b] = [" "] * (b - a)
+    tokens = _BARE_NUMBER_RE.findall("".join(masked))
+    if len(tokens) != 1:
+        return None, f"the quote must hold exactly one bare number; found {tokens or 'none'} in {quoted!r}"
+    if _cuts_number(page_text, *span):
+        return None, f"the quote {quoted!r} starts or stops inside a longer number on the page"
+    number = float(Decimal(tokens[0]))
+    return (number, None, f"{number:g}", None), None
+
+
+def _ground_number(kind: str, value: Any, unit: str | None, sdoc: ArchivedDocument, hit: QuoteHit) -> tuple[tuple[Any, str | None, str] | None, str | None]:
+    """The grounding step of one stackup number: the file's ``value`` / ``unit`` must be what the page states at the quote (:func:`_page_number`).
+
+    Lengths and frequencies need the unit as written (a unit the quantity
+    parser knows, of the right dimension) and must agree with the page's
+    token; a ratio carries no unit and must equal the page's one bare number
+    exactly. ``((value, unit, parsed text), None)`` stores the page's number
+    in um / mm / Hz; ``(None, reason)`` otherwise.
+    """
+    if not _is_number(value) or not math.isfinite(value):
+        return None, f"expected a finite number, got {value!r}"
+    model_q = None
+    if kind in ("um", "mm", "Hz"):
+        dimension, word = ("Hz", "frequency") if kind == "Hz" else ("m", "length")
+        if not unit or not unit.strip():
+            return None, "needs the unit as written in the quote"
+        model_q = _model_quantity(float(value), unit, None)
+        if model_q is None or model_q.unit != dimension:
+            return None, f"unit {unit!r} is not a {word} unit the parser knows"
+    elif unit:
+        return None, f"a ratio (er, loss tangent) has no unit; got {unit!r}"
+    page, reason = _page_number(kind, sdoc, hit)
+    if page is None:
+        return None, reason
+    number, stored_unit, text, parsed = page
+    if model_q is not None:
+        why = _mismatch(model_q, parsed)
+        if why is not None:
+            return None, why.replace("model", "file")
+    elif number != float(value):
+        return None, f"number mismatch: file {value!r} vs quote {text}"
+    return (number, stored_unit, text), None
 
 
 def _ground_mm(key: str, lim: CapabilityLimit, page_text: str, span: tuple[int, int]) -> tuple[tuple[Any, str | None, str] | None, str | None]:
@@ -383,21 +674,31 @@ def capability_source_result(
 ) -> ValidationResult:
     """``mfg.capability_source``: PASS when the page was obtained and every limit of the file grounded; NOT_VERIFIED otherwise, never FAIL.
 
-    A wrong quote is the user's file, not the design. ``status`` overrides the
+    A wrong quote is the user's file, not the design. A ``stackup`` block is
+    grounded and reported, but it is not recorded in the IR (module
+    docstring: not wired yet), so it never counts toward the PASS: a file
+    with no limit is NOT_VERIFIED whatever its stack, and a stack that did
+    not ground still makes the result NOT_VERIFIED. ``status`` overrides the
     rule (the agent passes NOT_VERIFIED when there is no board to record the
     limits in); ``reason`` is appended to the message (or is the message when
     no document was obtained).
     """
     details: dict[str, Any] = {"fab": file.fab, "file": str(file.path), "file_sha256": file.sha256, "source": file.source.model_dump(mode="json"),
-                               "limits_in_file": [lim.key for lim in file.limits]}
+                               "limits_in_file": [lim.key for lim in file.limits], "stackup_in_file": file.stackup is not None}
     if doc is None or grounded is None:
         details["reason"] = reason
         return ValidationResult(check_id=SOURCE_CHECK_ID, status=status or ValidationStatus.NOT_VERIFIED, message=reason or "vendor page not obtained",
                                 tool=GROUNDING_TOOL, tool_version=CAPABILITY_FILE_VERSION, details=details)
     n_ok, n_bad = len(grounded.accepted), len(grounded.rejected)
+    stack_ok = file.stackup is None or (grounded.stackup is not None and grounded.stackup_grounded == grounded.stackup_numbers)
     if status is None:
-        status = ValidationStatus.PASS if n_ok and not n_bad and n_ok == len(file.limits) else ValidationStatus.NOT_VERIFIED
+        everything = n_ok == len(file.limits) and stack_ok and n_ok > 0
+        status = ValidationStatus.PASS if everything and not n_bad else ValidationStatus.NOT_VERIFIED
     message = f"{n_ok} limit(s) grounded verbatim on the archived vendor page, {n_bad} rejected (proposed by {grounded.proposer})"
+    if file.stackup is not None:
+        message += (f"; stackup: {grounded.stackup_grounded} of {grounded.stackup_numbers} number(s) grounded"
+                    + (", a complete stack" if grounded.stackup is not None else ", no stack (a partial stack is no stack)")
+                    + ", not recorded in the IR (the fab stack does not replace ir.pcb.stackup in this version; the design's stack stays as it is)")
     if grounded.rejected:
         message += ": " + "; ".join(f"{k}: {why}" for k, why in grounded.rejected[:3]) + (" ..." if n_bad > 3 else "")
     if reason:
@@ -406,6 +707,8 @@ def capability_source_result(
         "document": doc.sha256, "url": doc.final_url or doc.url, "proposer": grounded.proposer,
         "accepted": list(grounded.rows), "rejected": [{"key": k, "reason": why} for k, why in grounded.rejected],
         "extraction": grounded.extraction, "text_matches_meta": doc.text_matches_meta, "reason": reason,
+        "stackup": None if file.stackup is None else {"numbers": grounded.stackup_numbers, "grounded": grounded.stackup_grounded,
+                                                       "complete": grounded.stackup is not None, "recorded": False},
     })
     return ValidationResult(
         check_id=SOURCE_CHECK_ID, status=status, message=message, tool=GROUNDING_TOOL, tool_version=CAPABILITY_FILE_VERSION,
@@ -439,39 +742,72 @@ def relocate_limits(constraints: ManufacturingConstraints, archive: DocumentArch
     ``value_mismatch`` (both numbers in the reason) when the quote is there
     but does not state the stored value - an edited ``ir.json``.
     """
-    from ai_eda.parts.identity import locate_source
-
     out: list[LimitSourceCheck] = []
     cache: dict[str, tuple[str, str, ArchivedDocument | None]] = {}
     for key in sorted(CAPABILITY_KEYS):
         traced = getattr(constraints, key)
         if traced is None or traced.provenance.kind is not ProvenanceKind.AUTHORITATIVE:
             continue
-        ref: SourceRef | None = traced.provenance.source
-        quote = quote_from_note(traced.provenance.note)
-        page = page_from_section(ref.section if ref is not None else None)
-        cache_key = f"{ref.content_hash}|{ref.document_path}|{ref.retrieved_at}" if ref is not None else ""
-        if cache_key not in cache:
-            cache[cache_key] = locate_source(ref, archive)
-        status, reason, doc = cache[cache_key]
-        if status != "ok" or doc is None:
-            out.append(LimitSourceCheck(key=key, status=status, reason=reason, document=ref.content_hash if ref else None, page=page, quote=quote))
-            continue
-        if quote is None or page is None:
-            out.append(LimitSourceCheck(key=key, status="quote_missing", reason="the limit's note records no quote / page to re-locate", document=doc.sha256, page=page, quote=quote))
-            continue
-        sdoc = searchable_document(doc)
-        hits = sdoc.find_quote(quote, page)
-        if not hits:
-            out.append(LimitSourceCheck(key=key, status="quote_missing", reason=f"quote {quote!r} not found on page {page} of the archived page {doc.sha256[:19]}… at review time",
-                                        document=doc.sha256, page=page, quote=quote))
-            continue
-        mismatch = _stored_value_mismatch(key, traced, sdoc, hits[0])
-        if mismatch is not None:
-            out.append(LimitSourceCheck(key=key, status="value_mismatch", reason=mismatch, document=doc.sha256, page=page, quote=quote))
-            continue
-        out.append(LimitSourceCheck(key=key, status="ok", reason=f"{reason}; quote re-read as {_stored_text(traced)}", document=doc.sha256, page=page, quote=quote))
+        out.append(_relocate_one(key, traced, archive, cache, _stored_value_mismatch))
     return out
+
+
+def relocate_stackup(stackup: Stackup | None, archive: DocumentArchive | None) -> list[LimitSourceCheck]:
+    """:func:`relocate_limits` for the ``authoritative`` numbers of a stack grounded from a capability file.
+
+    Each number (keyed by its IR id, ``pcb.stackup.dielectrics[0].er``) is
+    re-located on its recorded page and re-grounded by the same step
+    (:func:`_ground_number`); an edited number is ``value_mismatch``. A
+    template's choice or a user's number is not a page claim and is skipped;
+    so is a plane net (the design's decision, never the page's).
+    """
+    if stackup is None:
+        return []
+    out: list[LimitSourceCheck] = []
+    cache: dict[str, tuple[str, str, ArchivedDocument | None]] = {}
+    for key, traced in stackup.traced_items():
+        if key.endswith(".plane_net") or traced.provenance.kind is not ProvenanceKind.AUTHORITATIVE:
+            continue
+        out.append(_relocate_one(key, traced, archive, cache, _stored_stackup_mismatch))
+    return out
+
+
+def _relocate_one(key: str, traced: Traced, archive: DocumentArchive | None, cache: dict, mismatch_of) -> LimitSourceCheck:
+    """Re-verify one authoritative number: its page re-hashed, its quote re-located and ``mismatch_of(key, traced, sdoc, hit)`` re-read."""
+    from ai_eda.parts.identity import locate_source
+
+    ref: SourceRef | None = traced.provenance.source
+    quote = quote_from_note(traced.provenance.note)
+    page = page_from_section(ref.section if ref is not None else None)
+    cache_key = f"{ref.content_hash}|{ref.document_path}|{ref.retrieved_at}" if ref is not None else ""
+    if cache_key not in cache:
+        cache[cache_key] = locate_source(ref, archive)
+    status, reason, doc = cache[cache_key]
+    if status != "ok" or doc is None:
+        return LimitSourceCheck(key=key, status=status, reason=reason, document=ref.content_hash if ref else None, page=page, quote=quote)
+    if quote is None or page is None:
+        return LimitSourceCheck(key=key, status="quote_missing", reason="the limit's note records no quote / page to re-locate", document=doc.sha256, page=page, quote=quote)
+    sdoc = searchable_document(doc)
+    hits = sdoc.find_quote(quote, page)
+    if not hits:
+        return LimitSourceCheck(key=key, status="quote_missing", reason=f"quote {quote!r} not found on page {page} of the archived page {doc.sha256[:19]}… at review time",
+                                document=doc.sha256, page=page, quote=quote)
+    mismatch = mismatch_of(key, traced, sdoc, hits[0])
+    if mismatch is not None:
+        return LimitSourceCheck(key=key, status="value_mismatch", reason=mismatch, document=doc.sha256, page=page, quote=quote)
+    return LimitSourceCheck(key=key, status="ok", reason=f"{reason}; quote re-read as {_stored_text(traced)}", document=doc.sha256, page=page, quote=quote)
+
+
+def _stored_stackup_mismatch(key: str, traced: Traced, sdoc: ArchivedDocument, hit: QuoteHit) -> str | None:
+    """Why the stored stackup number is not what its re-located quote states (the page read by the grounding step), else ``None``."""
+    stored = _stored_text(traced)
+    page, reason = _page_number(_stackup_kind(key), sdoc, hit)
+    if page is None:
+        return f"stored value {stored} does not re-ground on the quote {hit.matched!r}: {reason}"
+    number, unit, text, _ = page
+    if number != traced.value or (unit or None) != (traced.unit or None):
+        return f"stored value {stored} but the quote {hit.matched!r} re-reads as {text}"
+    return None
 
 
 def _stored_text(traced: Traced) -> str:
@@ -534,4 +870,9 @@ __all__ = [
     "page_from_section",
     "quote_from_note",
     "relocate_limits",
+    "relocate_stackup",
+    "hz_from_token",
+    "um_from_token",
+    "CapabilityStackup",
+    "QuotedNumber",
 ]
