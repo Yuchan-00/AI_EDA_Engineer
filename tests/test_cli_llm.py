@@ -254,7 +254,9 @@ def test_run_on_the_subscription_route_needs_no_budget_and_shows_its_usage(proje
     assert "--no-session-persistence" not in argv and "--bare" not in argv and "--max-budget-usd" not in argv and "--fallback-model" not in argv
     assert json.loads(argv[argv.index("--json-schema") + 1])["type"] == "object"
     assert call["cwd_entries"] == [] and not Path(call["cwd"]).exists() and Path(call["cwd"]) != project.parent
-    assert REQUEST in argv[argv.index("-p") + 1]
+    # the request travels in the prompt on stdin (UTF-8 bytes), never on the command line
+    assert call["prompt_source"] == "stdin" and REQUEST in call["prompt"] and REQUEST.encode("utf-8") in fake.stdin_bytes(call)
+    assert not any(REQUEST in a for a in argv) and argv[argv.index("-p") + 1] == "--output-format"
     # the reply entered the IR the same way a scripted one does: grounded, llm_generated, the served model as the tool
     ir = CircuitIR.load(project)
     req = ir.requirements.get("input_voltage")

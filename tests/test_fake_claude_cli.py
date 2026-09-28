@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import json
 import os
@@ -27,6 +29,8 @@ from tests.fake_claude_cli import (
     garbage,
     is_fake_claude_cli,
     missing_keys,
+    reply,
+    reply_bytes,
     slow,
     success,
     success_structured,
@@ -46,6 +50,13 @@ def _run(fake: FakeClaudeCli, *args: str, cwd: Path | None = None, stdin: str | 
         [str(fake.exe), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         cwd=str(cwd) if cwd else None, input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL,
     )
+
+
+def _run_bytes(
+    fake: FakeClaudeCli, *args: str, stdin: bytes, timeout: float = 10.0, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Binary mode both ways, like the client's model call; ``env`` replaces the inherited environment when given."""
+    return subprocess.run([str(fake.exe), *args], input=stdin, capture_output=True, timeout=timeout, env=env)
 
 
 def test_install_puts_an_executable_claude_on_path(fake: FakeClaudeCli):
@@ -164,6 +175,9 @@ def test_every_invocation_is_recorded_with_cwd_entries_env_presence_and_stdin(fa
     first, second = fake.prompt_calls()
     assert first["argv"] == ["-p", "with stdin", "--model", "m"] and first["cwd"] == str(cwd) and first["cwd_entries"] == ["note.txt"]
     assert first["stdin"] == "piped text" and second["stdin"] == ""
+    # a positional prompt still works (the real CLI accepts one); stdin is then only recorded
+    assert (first["prompt"], first["prompt_source"], second["prompt"], second["prompt_source"]) == ("with stdin", "argv", "no stdin", "argv")
+    assert isinstance(first["pid"], int) and first["pid"] != os.getpid()
     assert first["env"] == {"CLAUDECODE": "CLAUDECODE" in os.environ, "ANTHROPIC_API_KEY": False, MARKER_ENV: True}
     assert second["env"][MARKER_ENV] is False
 
@@ -200,3 +214,56 @@ def test_discovery_in_tests_finds_only_the_fake(tmp_path: Path, monkeypatch: pyt
     fake = FakeClaudeCli(tmp_path / "bin")
     fake.install(monkeypatch)
     assert claude_cli.find_claude_cli() == str(fake.exe)  # the double is found
+
+
+def test_a_p_call_without_a_positional_prompt_reads_the_prompt_from_stdin_as_exact_bytes(fake: FakeClaudeCli):
+    """Like the real CLI (2026-09-28): ``-p`` with no prompt argument takes the prompt from stdin; the log keeps the
+    exact bytes (base64, length, sha256) beside the text decoded with replacement."""
+    data = "첫 줄 Ω ± µ\r\n둘째 줄\n".encode("utf-8") + b"\xff tail\x00\n"
+    fake.queue(success("a"), success("b"))
+    proc = _run_bytes(fake, "-p", "--output-format", "json", "--model", "m", "--tools", "", "--system-prompt", "sys", stdin=data)
+    assert proc.returncode == 0 and json.loads(proc.stdout.decode("utf-8"))["result"] == "a"
+    big = ("동" * 100_000).encode("utf-8")  # 300,000 bytes: several pipe buffers, read until EOF
+    _run_bytes(fake, "-p", "--tools", "", stdin=big)
+    first, second = fake.prompt_calls()
+    assert FakeClaudeCli.stdin_bytes(first) == data and base64.b64decode(first["stdin_b64"]) == data
+    assert first["stdin_len"] == len(data) and first["stdin_sha256"] == hashlib.sha256(data).hexdigest()
+    assert first["prompt_source"] == "stdin" and first["prompt"] == data.decode("utf-8", "replace") == first["stdin"]
+    assert first["argv"] == ["-p", "--output-format", "json", "--model", "m", "--tools", "", "--system-prompt", "sys"]  # no value read as a prompt
+    assert FakeClaudeCli.stdin_bytes(second) == big and second["prompt_source"] == "stdin"
+
+
+def test_probes_record_stdin_but_no_prompt(fake: FakeClaudeCli):
+    _run(fake, "--version")
+    _run(fake, "auth", "status")
+    assert [(c["prompt"], c["prompt_source"], c["stdin_len"]) for c in fake.calls()] == [(None, None, 0), (None, None, 0)]
+
+
+def test_reply_bytes_writes_exact_bytes_and_ignore_stdin_exits_without_reading(fake: FakeClaudeCli):
+    fake.queue(reply_bytes(b"\xff\xfe out \xe9", stderr=b"err \x80\n", exit_code=4), reply(envelope("early"), ignore_stdin=True))
+    proc = _run_bytes(fake, "-p", stdin=b"prompt")
+    assert (proc.returncode, proc.stdout, proc.stderr) == (4, b"\xff\xfe out \xe9", b"err \x80\n")
+    proc = _run_bytes(fake, "-p", stdin=b"x" * 2_000_000)  # the writer sees a broken pipe, which subprocess ignores
+    assert proc.returncode == 0 and json.loads(proc.stdout)["result"] == "early"
+    first, second = fake.prompt_calls()
+    assert first["stdin_len"] == 6 and (second["stdin_len"], second["prompt_source"]) == (0, None)
+
+
+@pytest.mark.parametrize("encoding", [None, "cp949", "latin-1"])
+def test_text_output_is_written_as_utf8_whatever_the_locale(fake: FakeClaudeCli, encoding: str | None):
+    """The fake's stdio encoding is forced to cp949 (the Windows PC's code page) and latin-1 through
+    ``PYTHONIOENCODING`` (UTF-8 mode off): a fake that printed through its text streams would then write cp949 /
+    fail to encode, so the UTF-8 bytes asserted here prove the output does not depend on the locale. ``None`` keeps
+    the inherited environment (this suite's own UTF-8 mode)."""
+    env = None if encoding is None else {**os.environ, "PYTHONIOENCODING": encoding, "PYTHONUTF8": "0"}
+    fake.queue(success("저항 10 kΩ ± 1 %"), reply("plain", stderr="경고 µ\n", exit_code=0))
+    proc = _run_bytes(fake, "-p", stdin=b"q", env=env)
+    assert json.loads(proc.stdout.decode("utf-8"))["result"] == "저항 10 kΩ ± 1 %"
+    proc = _run_bytes(fake, "-p", stdin=b"q", env=env)
+    assert proc.stdout == b"plain" and proc.stderr == "경고 µ\n".encode("utf-8")
+    fake.set_version("9.9.9 (클로드 코드, fake Ω)")  # the probes' answers too
+    fake.set_auth({"loggedIn": True, "authMethod": "메서드"})
+    proc = _run_bytes(fake, "--version", stdin=b"", env=env)
+    assert proc.returncode == 0 and proc.stdout == "9.9.9 (클로드 코드, fake Ω)\n".encode("utf-8")
+    proc = _run_bytes(fake, "auth", "status", stdin=b"", env=env)
+    assert proc.returncode == 0 and json.loads(proc.stdout.decode("utf-8"))["authMethod"] == "메서드"

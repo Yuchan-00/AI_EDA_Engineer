@@ -9,27 +9,42 @@ ships (``pip._vendor.distlib``'s ``t64.exe`` & co., the same stub pip puts in
 front of every console script in ``Scripts``) followed by a shebang naming the running
 interpreter and a zip whose ``__main__.py`` is the script - never a ``.cmd``
 shim, which the client refuses because ``cmd.exe`` would re-parse the
-prompt. Without that launcher the fake cannot be built on Windows and the
+arguments. Without that launcher the fake cannot be built on Windows and the
 test is skipped; the Windows path is written but not exercised here (Linux).
-Every invocation is appended to a JSON-lines log (``argv``, ``cwd``, the
-cwd's entries, ``stdin``, whether ``CLAUDECODE`` / ``ANTHROPIC_API_KEY`` /
-:data:`MARKER_ENV` were in the environment) and answered:
+
+Like the real CLI (measured 2026-09-28), a ``-p`` call without a positional
+prompt reads its prompt from stdin as UTF-8 *bytes*, until EOF (or
+:data:`STDIN_IDLE` seconds of silence - the real CLI gave up after 3 s; the
+fake waits longer so a slow machine never cuts a prompt); a positional
+prompt still works (the real CLI accepts one), and then stdin is only
+recorded. Every invocation is appended to a JSON-lines log - ``argv``,
+``cwd``, the cwd's entries, the exact stdin bytes (``stdin_b64``,
+``stdin_len``, ``stdin_sha256``, and ``stdin`` decoded as UTF-8 with
+replacement), ``prompt`` / ``prompt_source`` (``"argv"`` / ``"stdin"``;
+``None`` for the probes), the fake's ``pid``, whether ``CLAUDECODE`` / ``ANTHROPIC_API_KEY`` /
+:data:`MARKER_ENV` were in the environment - and answered:
 
 * ``--version`` and ``auth status`` from the config file (:meth:`set_version`,
   :meth:`set_auth`), never from the queue;
 * every other call (a ``-p`` call) from a queue of scripted replies, in
   order - each reply is ``{"stdout": <str | JSON object>, "stderr": str,
-  "exit": int, "sleep": float}``; the helpers below build the envelopes the
-  real CLI prints (measured shape, see ``ai_eda/llm/claude_cli.py``). An
-  empty queue answers an ``is_error`` envelope with subtype
-  ``fake_queue_empty`` and exit 1, so a test that under-scripts fails loudly.
+  "exit": int, "sleep": float}`` (``stdout_b64`` / ``stderr_b64`` write raw
+  bytes instead, :func:`reply_bytes`; ``ignore_stdin`` exits without reading
+  stdin); the helpers below build the envelopes the real CLI prints
+  (measured shape, see ``ai_eda/llm/claude_cli.py``). Every text the fake
+  prints (the probes' answers too) is written as UTF-8 bytes whatever its
+  stdio encoding (``PYTHONIOENCODING``, the locale, cp949 on the Windows
+  PC). An empty queue answers
+  an ``is_error`` envelope with subtype ``fake_queue_empty`` and exit 1, so a
+  test that under-scripts fails loudly.
 
 The double only proves what the *client* does with the CLI's contract; it
-proves nothing about the real CLI (the two measurement calls did that).
+proves nothing about the real CLI (the measurement calls did that).
 """
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import io
 import json
@@ -64,30 +79,67 @@ DEFAULT_AUTH: dict[str, Any] = {
 }
 #: the served-model id the fake reports by default (the measured key shape: exactly as requested)
 DEFAULT_MODEL = "claude-sonnet-5"
-#: the auxiliary entry the real CLI added to ``modelUsage`` in both measurement calls (its own request, not the reply)
+#: the auxiliary entry the real CLI added to ``modelUsage`` in both 2026-09-26 measurement calls (its own request, not the
+#: reply; the 2026-09-28 stdin call again had an auxiliary entry, its id not recorded here)
 HELPER_MODEL = "claude-haiku-4-5-20251001"
+#: flags the fake knows take a value (the argument after one is never read as the positional prompt)
+FAKE_VALUE_FLAGS: tuple[str, ...] = (
+    "--output-format", "--input-format", "--model", "--tools", "--resume", "-r", "--session-id", "--setting-sources",
+    "--system-prompt", "--append-system-prompt", "--json-schema", "--max-budget-usd", "--fallback-model",
+    "--permission-mode", "--settings",
+)
+#: seconds of stdin silence after which a stdin prompt read ends without EOF (the real CLI measured 3 s)
+STDIN_IDLE = 10.0
 
 _SCRIPT = r'''#!{python}
 # fake `claude` written by tests/fake_claude_cli.py - standard library only
-import json, os, sys, time
+import base64, hashlib, json, os, sys, time
 LOG = {log!r}
 QUEUE = {queue!r}
 CONFIG = {config!r}
 ENV_KEYS = {env_keys!r}
+VALUE_FLAGS = {value_flags!r}
+STDIN_IDLE = {stdin_idle!r}
 
 
-def _stdin_text():
+def _positional(argv):
+    # the first positional argument (a prompt given on the command line), flags' values skipped; None when there is none
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in VALUE_FLAGS:
+            i += 2
+        elif a == "--":
+            return argv[i + 1] if i + 1 < len(argv) else None
+        elif a.startswith("-") and a != "-":
+            i += 1
+        else:
+            return a
+    return None
+
+
+def _stdin_bytes(wait):
+    # wait=True (the prompt comes on stdin): every byte until EOF, or STDIN_IDLE seconds of silence;
+    # wait=False: only what is already there (recorded, not used as the prompt)
     try:
         if sys.stdin is None or sys.stdin.isatty():
-            return ""
-        if os.name == "posix":
-            import select
-            ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+            return b""
+        if os.name != "posix":
+            return sys.stdin.buffer.read()
+        import select
+        fd = sys.stdin.fileno()
+        chunks = []
+        while True:
+            ready, _, _ = select.select([fd], [], [], STDIN_IDLE if wait else 0.2)
             if not ready:
-                return ""
-        return sys.stdin.read()
+                break
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
     except (OSError, ValueError):
-        return ""
+        return b""
 
 
 def _config():
@@ -111,24 +163,40 @@ def _pop_reply():
     return json.loads(lines[0])
 
 
-argv = sys.argv[1:]
-record = {{
-    "argv": argv,
-    "cwd": os.getcwd(),
-    "cwd_entries": sorted(os.listdir(os.getcwd())),
-    "stdin": _stdin_text(),
-    "env": {{k: (k in os.environ) for k in ENV_KEYS}},
-}}
-with open(LOG, "a", encoding="utf-8") as fh:
-    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+def _record(argv, raw, prompt, source):
+    record = {{
+        "argv": argv,
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "cwd_entries": sorted(os.listdir(os.getcwd())),
+        "stdin": raw.decode("utf-8", "replace"),
+        "stdin_b64": base64.b64encode(raw).decode("ascii"),
+        "stdin_len": len(raw),
+        "stdin_sha256": hashlib.sha256(raw).hexdigest(),
+        "prompt": prompt,
+        "prompt_source": source,
+        "env": {{k: (k in os.environ) for k in ENV_KEYS}},
+    }}
+    with open(LOG, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+
+def _out(stream, text, b64):
+    data = base64.b64decode(b64) if b64 is not None else text.encode("utf-8")
+    if data:
+        stream.buffer.write(data)
+        stream.flush()
+
+
+argv = sys.argv[1:]
 cfg = _config()
-if "--version" in argv:
-    sys.stdout.write(str(cfg.get("version", "")) + "\n")
-    sys.exit(int(cfg.get("version_exit", 0)))
-if argv[:2] == ["auth", "status"]:
+if "--version" in argv or argv[:2] == ["auth", "status"]:
+    _record(argv, _stdin_bytes(False), None, None)
+    if "--version" in argv:
+        _out(sys.stdout, str(cfg.get("version", "")) + "\n", None)
+        sys.exit(int(cfg.get("version_exit", 0)))
     auth = cfg.get("auth")
-    sys.stdout.write(auth if isinstance(auth, str) else json.dumps(auth, indent=2) + "\n")
+    _out(sys.stdout, auth if isinstance(auth, str) else json.dumps(auth, indent=2) + "\n", None)
     sys.exit(int(cfg.get("auth_exit", 0)))
 
 reply = _pop_reply()
@@ -137,16 +205,23 @@ if reply is None:
         "stdout": {{"type": "result", "subtype": "fake_queue_empty", "is_error": True, "result": "fake claude: no scripted reply left"}},
         "exit": 1,
     }}
+positional = _positional(argv)
+if positional is not None:
+    raw = _stdin_bytes(False)
+    _record(argv, raw, positional, "argv")
+elif reply.get("ignore_stdin"):
+    _record(argv, b"", None, None)
+else:
+    raw = _stdin_bytes(True)
+    _record(argv, raw, raw.decode("utf-8", "replace"), "stdin")
 if reply.get("sleep"):
     time.sleep(float(reply["sleep"]))
-if reply.get("stderr"):
-    sys.stderr.write(str(reply["stderr"]))
-    sys.stderr.flush()
+err = reply.get("stderr", "")
+_out(sys.stderr, str(err), reply.get("stderr_b64"))
 out = reply.get("stdout", "")
 if not isinstance(out, str):
     out = json.dumps(out, ensure_ascii=False)
-sys.stdout.write(out)
-sys.stdout.flush()
+_out(sys.stdout, out, reply.get("stdout_b64"))
 sys.exit(int(reply.get("exit", 0)))
 '''
 
@@ -274,14 +349,23 @@ def envelope(
     return env
 
 
-def reply(stdout: str | dict[str, Any], *, exit_code: int = 0, stderr: str = "", sleep: float = 0.0) -> dict[str, Any]:
-    """One queue item."""
+def reply(
+    stdout: str | dict[str, Any], *, exit_code: int = 0, stderr: str = "", sleep: float = 0.0, ignore_stdin: bool = False,
+) -> dict[str, Any]:
+    """One queue item. ``ignore_stdin``: the fake exits without reading stdin (a child that never reads its prompt)."""
     item: dict[str, Any] = {"stdout": stdout, "exit": exit_code}
     if stderr:
         item["stderr"] = stderr
     if sleep:
         item["sleep"] = sleep
+    if ignore_stdin:
+        item["ignore_stdin"] = True
     return item
+
+
+def reply_bytes(stdout: bytes, *, stderr: bytes = b"", exit_code: int = 0) -> dict[str, Any]:
+    """A queue item that writes these exact bytes on stdout / stderr (for output that is not valid UTF-8)."""
+    return {"stdout_b64": base64.b64encode(stdout).decode("ascii"), "stderr_b64": base64.b64encode(stderr).decode("ascii"), "exit": exit_code}
 
 
 def success(result: str = "OK", **kw: Any) -> dict[str, Any]:
@@ -333,7 +417,10 @@ class FakeClaudeCli:
         self.config_path = self.root / "config.json"
         #: what discovery returned once :meth:`install` put the fake on PATH (``None`` before)
         self.found: str | None = None
-        text = _SCRIPT.format(python=sys.executable, log=str(self.log_path), queue=str(self.queue_path), config=str(self.config_path), env_keys=RECORDED_ENV_KEYS)
+        text = _SCRIPT.format(
+            python=sys.executable, log=str(self.log_path), queue=str(self.queue_path), config=str(self.config_path),
+            env_keys=RECORDED_ENV_KEYS, value_flags=FAKE_VALUE_FLAGS, stdin_idle=STDIN_IDLE,
+        )
         self.script.write_text(text, encoding="utf-8", newline="\n")
         self.script.chmod(self.script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         if os.name == "nt":
@@ -409,9 +496,15 @@ class FakeClaudeCli:
     # ------------------------------------------------------------ evidence
 
     def calls(self) -> list[dict[str, Any]]:
-        """Every recorded invocation, oldest first (``argv``, ``cwd``, ``cwd_entries``, ``stdin``, ``env``)."""
+        """Every recorded invocation, oldest first (``argv``, ``pid``, ``cwd``, ``cwd_entries``, ``stdin`` + ``stdin_b64`` /
+        ``stdin_len`` / ``stdin_sha256``, ``prompt``, ``prompt_source``, ``env``)."""
         text = self.log_path.read_text(encoding="utf-8")
         return [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+
+    @staticmethod
+    def stdin_bytes(call: dict[str, Any]) -> bytes:
+        """The exact bytes the fake read on stdin in ``call`` (decoded from its ``stdin_b64``)."""
+        return base64.b64decode(call["stdin_b64"])
 
     def prompt_calls(self) -> list[dict[str, Any]]:
         """The recorded ``-p`` invocations only (no ``--version`` / ``auth status``)."""
@@ -426,6 +519,8 @@ __all__ = [
     "HELPER_MODEL",
     "MARKER_ENV",
     "RECORDED_ENV_KEYS",
+    "STDIN_IDLE",
+    "FAKE_VALUE_FLAGS",
     "FakeClaudeCli",
     "envelope",
     "error",
@@ -433,6 +528,7 @@ __all__ = [
     "is_fake_claude_cli",
     "missing_keys",
     "reply",
+    "reply_bytes",
     "slow",
     "success",
     "success_structured",

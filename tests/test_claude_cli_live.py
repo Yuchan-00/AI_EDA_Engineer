@@ -3,7 +3,7 @@
 Skipped unless ``AI_EDA_CLAUDE_LIVE=1`` *and* a ``claude`` binary is found
 (``AI_EDA_CLAUDE_CLI`` or PATH). It uses the user's subscription quota (a few
 hundred tokens), so it is never on by default and CI never sets the variable;
-the two measurement calls recorded in ``ai_eda/llm/claude_cli.py`` are the
+the measurement calls recorded in ``ai_eda/llm/claude_cli.py`` are the
 facts the client is built on, this test only re-checks that the contract
 still holds on the installed version. Nothing here is a test of what the
 model says: the reply is a proposal like every other model output.

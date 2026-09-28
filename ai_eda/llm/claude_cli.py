@@ -8,7 +8,7 @@ maps one result envelope to one :class:`~ai_eda.llm.client.LLMResponse`.
 Invariants enforced here:
 
 * **Only measured envelope keys are parsed.** Every key this module reads
-  was observed in the two measurement calls below; a key that was seen
+  was observed in the measurement calls below; a key that was seen
   only as ``null`` or not at all is read defensively (missing → ``None``)
   and marked "unmeasured" in this docstring. Nothing about the reply is
   trusted: it is a proposal like every other model output.
@@ -36,31 +36,59 @@ Invariants enforced here:
   status such an error is neither retried nor fallen back from. The CLI's own
   ``--fallback-model`` is the user's opt-in (constructor ``fallback_model``),
   off by default.
-* **The prompt travels on the command line, so the command line is checked
-  before anything runs.** The pinned command carries the prompt as the
-  ``-p`` argument and the system prompt / JSON schema as flag values (stdin
-  as a prompt channel is unmeasured and is not used). Every such argument is
-  made passable first (:func:`sanitise_arg`: a NUL byte becomes a space - the
-  rule of ``clean_control_chars`` - and a lone surrogate U+FFFD; the
-  response then records ``raw["argv_sanitised"] = True``), and a command
-  line the OS would refuse is an ``LLMError(kind="transport",
-  code="prompt_too_long", sent=False)`` naming the limit
-  (:func:`argv_limit_problem`: on Windows CreateProcess takes at most
-  32,767 characters for the whole command line; on Linux one argument may
-  not exceed 32 pages, 131,072 bytes with 4 KiB pages; on every POSIX system
-  the arguments plus the environment may not exceed ``ARG_MAX``) instead of
-  an opaque ``OSError`` from the OS. A long datasheet-facts prompt
-  (``FACT_PROMPT_MAX_CHARS`` characters) is therefore refused on Windows and,
-  for dense multi-byte text, on Linux; the OpenRouter route has no such
-  limit.
+* **The prompt travels on stdin; only the flags stay on the command line,
+  and that command line is still checked before anything runs.** A model
+  call runs ``claude -p`` with no prompt argument and writes the rendered
+  prompt (on the schema-feedback turn: the feedback text only) to the
+  child's stdin, which is closed after writing (measured 2026-09-28, below).
+  It is written as UTF-8 *bytes* to a binary pipe (never ``text=True``), so
+  neither Windows' text-mode newline translation (LF → CRLF) nor the locale
+  code page (cp949 on the PC this was built on) can alter it - a design
+  reason, not a Windows measurement; stdout / stderr come back as bytes and
+  are decoded here as UTF-8 with ``errors="replace"``. The prompt is made
+  encodable first (:func:`encode_prompt`: a lone surrogate - UTF-8 cannot
+  carry it - becomes U+FFFD and a NUL byte a space, the rule of
+  ``clean_control_chars``; a NUL on the CLI's stdin is unmeasured); the
+  response then records ``raw["prompt_sanitised"] = True``. What stays on
+  the command line - the model, the system prompt (``--system-prompt``),
+  the JSON schema (``--json-schema``) and the other pinned flags - is made
+  passable the same way (:func:`sanitise_arg`; ``raw["argv_sanitised"] =
+  True`` when an *argument* changed), and a command line the OS would
+  refuse is an ``LLMError(kind="transport", code="prompt_too_long",
+  sent=False)`` naming the limit (:func:`argv_limit_problem`: on Windows
+  CreateProcess takes at most 32,767 characters for the whole command line
+  - the message names the longest argument; on Linux one argument may not
+  exceed 32 pages, 131,072 bytes with 4 KiB pages - the message names that
+  argument, a pinned flag's value by its flag; on every POSIX system the
+  arguments plus the environment may not exceed ``ARG_MAX`` - that message
+  gives only their total) instead of an opaque ``OSError`` from the OS. The
+  code keeps its name, but since the prompt left the command line only a
+  very long system prompt or schema (or, on POSIX, an environment that
+  nearly fills ``ARG_MAX``) can reach a limit: a ``FACT_PROMPT_MAX_CHARS``
+  datasheet-facts prompt is no longer refused on any platform (stdin on
+  Windows is unmeasured). The prompt is written by a daemon thread of this
+  client while ``communicate`` - handed no stdin - reads stdout / stderr
+  (no pipe deadlock), so the call's ``timeout`` bounds the write on every
+  platform and interpreter: ``subprocess.run(input=...)`` would not, because
+  CPython 3.12's Windows ``communicate`` writes ``input`` in the calling
+  thread before its first timeout check, and a child that stalls before
+  reading a prompt larger than the pipe buffer would block the call with no
+  bound. On expiry (or any other exception, a ``KeyboardInterrupt``
+  included) the child is killed and reaped. A child that exits without
+  reading its stdin is no error of its own (the writer ignores the broken
+  pipe, as ``communicate`` does; the exit code and the envelope decide).
+  These three properties are checked against the fake ``claude`` on Linux
+  only - the timeout also under an emulation of 3.12's Windows
+  ``communicate`` ordering -, not measured with the real CLI.
 * **A batch file is never run.** On Windows ``subprocess`` launches a
   ``.cmd`` / ``.bat`` (the npm ``claude.cmd`` shim) through ``cmd.exe``,
-  which re-parses the prompt on its command line (quotes, ``%VAR%``, ``&``,
-  ``|``, newlines) - so discovery prefers ``claude.exe`` on PATH and a
-  resolved batch file is refused with ``ToolUnavailableError`` naming the
-  remedy (point ``AI_EDA_CLAUDE_CLI`` / ``--llm-claude-cli`` at the native
-  ``claude.exe``). The path is made absolute at construction, because a
-  model call runs with ``cwd`` = the empty temporary directory.
+  which re-parses the arguments on its command line (the system prompt and
+  the JSON schema: quotes, ``%VAR%``, ``&``, ``|``, newlines) - so discovery
+  prefers ``claude.exe`` on PATH and a resolved batch file is refused with
+  ``ToolUnavailableError`` naming the remedy (point ``AI_EDA_CLAUDE_CLI`` /
+  ``--llm-claude-cli`` at the native ``claude.exe``). The path is made
+  absolute at construction, because a model call runs with ``cwd`` = the
+  empty temporary directory.
 
 Measured on Claude Code 2.1.283, 2026-09-26 (``claude --version`` →
 ``2.1.283 (Claude Code)``, exit 0; ``claude auth status`` → a JSON object with
@@ -77,7 +105,9 @@ pinned command). Both exited 0 and left the cwd empty. The plain call's stderr
 held one line, ``Warning: no stdin data received in 3s, proceeding without it.
 If piping from a slow command, redirect stdin explicitly: < /dev/null to skip,
 or wait longer.`` (stdin was inherited and open; the CLI waited 3 s) - hence
-``stdin=subprocess.DEVNULL`` below; the schema call's stderr was empty. Both
+``stdin=subprocess.DEVNULL`` for the ``--version`` / ``auth status`` probes
+below (a model call now writes its prompt to stdin and closes it, so it
+never waits: 2026-09-28); the schema call's stderr was empty. Both
 printed exactly one JSON object on stdout with these keys, verbatim and in
 this order: ``duration_api_ms``, ``stop_reason``, ``session_id``,
 ``total_cost_usd``, ``usage``, ``modelUsage``, ``permission_denials``,
@@ -116,11 +146,44 @@ environment carried ``CLAUDECODE=1`` and ``CLAUDE_CODE_SESSION_ID``) the
 ``session_id`` equalled the inherited session id rather than a fresh one -
 which variable causes that is not measured, and a feedback turn's
 ``--resume`` from inside such a nested session is therefore unmeasured.
-Unmeasured (parsed defensively): an ``is_error: true`` envelope, an integer
-``api_error_status``, any ``subtype`` other than ``success``, a
-``stop_reason`` of ``max_tokens``, ``--resume``, a non-zero exit code, the
-CLI on Windows (native ``claude.exe`` or otherwise) and a prompt passed on
-stdin.
+
+Measured on Claude Code 2.1.283, 2026-09-28 (Linux), the prompt on stdin: the
+2026-09-26 schema call's flags exactly (the same ``--model`` as the
+2026-09-26 calls; a ``--json-schema`` with the string properties ``first`` /
+``middle`` / ``last`` and the integer ``last_row``) with NO prompt argument
+after ``-p``; the prompt was written to stdin as UTF-8 and stdin was closed
+after writing (``subprocess.run(input=...)``), cwd = a fresh empty temporary
+directory. The prompt: 45,134 characters = 58,721 UTF-8 bytes = 45,134 UTF-16
+units (longer than Windows' 32,767-character command line), 647 numbered rows
+mixing ASCII with Korean text and the non-ASCII symbols Ω, ±, µ, with the
+markers ``CODE_FIRST`` / ``CODE_MIDDLE`` / ``CODE_LAST`` at its start, middle
+and end. Result: exit 0, stderr empty (no "no stdin data received in 3s"
+warning), the cwd left empty, 4.89 s; one JSON envelope with exactly the same
+29 keys in the same order as the 2026-09-26 schema call; ``type: "result"``,
+``subtype: "success"``, ``is_error: false``, ``api_error_status: null``,
+``stop_reason: "tool_use"``, ``num_turns: 2``, ``terminal_reason:
+"completed"``; ``structured_output`` held all three markers and ``last_row:
+647`` exactly (the whole stdin reached the model, nothing was cut).
+``usage``: ``input_tokens: 2, cache_creation_input_tokens: 37959,
+cache_read_input_tokens: 0, output_tokens: 136``. ``modelUsage`` again held
+two entries: the requested model (``inputTokens`` 2,
+``cacheCreationInputTokens`` 37959, ``outputTokens`` 136, ``costUSD``
+0.1532) and the CLI's auxiliary model entry, which this time read 37,188
+input tokens (``outputTokens`` 22, ``costUSD`` 0.037298) - the CLI's
+auxiliary request processed the whole prompt too (with the tiny 2026-09-26
+prompts it read about 900); ``total_cost_usd`` 0.190498 was the sum of both
+entries.
+
+Unmeasured (parsed or handled defensively): an ``is_error: true`` envelope,
+an integer ``api_error_status``, any ``subtype`` other than ``success``, a
+``stop_reason`` of ``max_tokens``, ``--resume`` (and so the feedback text on
+stdin of a ``--resume`` turn), a non-zero exit code, the CLI on Windows
+(native ``claude.exe`` or otherwise, including whether it reads UTF-8
+stdin), a NUL byte or a lone surrogate on stdin (both are replaced before
+writing), whether the auxiliary request always re-reads the whole prompt,
+and a real CLI that stalls, exits without reading stdin or is killed on the
+timeout (whether killing it also ends any process it started is unknown:
+the reap then waits at most :data:`REAP_TIMEOUT` per step).
 """
 
 from __future__ import annotations
@@ -134,10 +197,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import IO, Any, Iterator
 
 from pydantic import BaseModel
 
@@ -150,7 +214,7 @@ ENV_CLI = "AI_EDA_CLAUDE_CLI"
 CLI_NAME = "claude"
 #: the native Windows executable, preferred over whatever PATHEXT resolves ``claude`` to (the npm shim is ``claude.cmd``)
 WINDOWS_CLI_NAME = "claude.exe"
-#: suffixes Windows runs through ``cmd.exe`` whatever ``shell=`` says: never executed with a prompt on the command line
+#: suffixes Windows runs through ``cmd.exe`` whatever ``shell=`` says (it would re-parse the arguments): never executed
 BATCH_SUFFIXES: tuple[str, ...] = (".cmd", ".bat")
 #: how a subscription-billed call is accounted: a known zero charge, the estimate shown beside it
 COST_SOURCE = "subscription"
@@ -159,14 +223,26 @@ BILLING = "subscription"
 ERROR_TEXT_LIMIT = 2000
 #: seconds allowed for ``--version`` / ``auth status``
 PROBE_TIMEOUT = 30.0
+#: seconds allowed, once the child is gone (or killed on the timeout), to collect its pipes and to let the stdin writer
+#: thread finish; only a process the child started that still holds a pipe can use them up (the child is reaped anyway)
+REAP_TIMEOUT = 5.0
+#: the name of the thread that writes a model call's prompt to the child's stdin
+STDIN_WRITER_NAME = "claude-cli-stdin"
 #: CreateProcess's limit for the whole command line, in UTF-16 code units including the terminating NUL
 WINDOWS_COMMAND_LINE_LIMIT = 32767
 #: Linux's MAX_ARG_STRLEN in pages: one argument (its bytes and its NUL) may not exceed 32 pages
 LINUX_ARG_PAGES = 32
 #: the page size assumed when ``sysconf`` cannot say
 DEFAULT_PAGE_SIZE = 4096
-#: the ``LLMError.code`` of a command line the OS would refuse (nothing was sent)
+#: the ``LLMError.code`` of a command line the OS would refuse (nothing was sent). The name predates the prompt's
+#: move to stdin and is kept: only the arguments (a system prompt, a JSON schema, the flags) can reach a limit now -
+#: with the environment, on POSIX, for ``ARG_MAX``
 PROMPT_TOO_LONG = "prompt_too_long"
+#: the pinned flags that take a value: the argument after one is that flag's value (names it in a limit message)
+VALUE_FLAGS: tuple[str, ...] = (
+    "--output-format", "--model", "--tools", "--resume", "--setting-sources", "--system-prompt", "--json-schema",
+    "--max-budget-usd", "--fallback-model",
+)
 #: Windows' ERROR_FILENAME_EXCED_RANGE, what CreateProcess raises for an overlong command line
 _WINERROR_TOO_LONG = 206
 
@@ -199,14 +275,16 @@ def refuse_batch_file(path: str, *, windows: bool | None = None) -> str:
     ``subprocess`` on Windows launches a ``.cmd`` / ``.bat`` through the
     command interpreter regardless of ``shell=False``, and ``cmd.exe``
     re-parses the arguments (quotes, ``%VAR%``, ``&``, ``|``, newlines)
-    without any escaping - the prompt, which carries the user's request and
-    archived datasheet text, would be mangled or executed. ``windows``
-    defaults to the running platform (tests pass it explicitly).
+    without any escaping - the system prompt and the JSON schema on the
+    command line would be mangled or executed (the prompt itself goes on
+    stdin, but what a batch file does with it is not this module's contract
+    either). ``windows`` defaults to the running platform (tests pass it
+    explicitly).
     """
     if (_is_windows() if windows is None else windows) and Path(path).suffix.lower() in BATCH_SUFFIXES:
         raise ToolUnavailableError(
             f"the Claude Code CLI resolved to the batch file {path}: Windows runs a .cmd/.bat through cmd.exe, which "
-            "re-parses the prompt on the command line (quotes, %VAR%, &, |, newlines) - refused. Set "
+            "re-parses the arguments on the command line (the system prompt, the JSON schema: quotes, %VAR%, &, |, newlines) - refused. Set "
             f"{ENV_CLI} or --llm-claude-cli to the native {WINDOWS_CLI_NAME} (the native installer's, or the one in "
             "the npm package's bin directory)"
         )
@@ -233,6 +311,13 @@ def find_claude_cli() -> str | None:
 _SURROGATE_RE = re.compile("[\ud800-\udfff]")
 
 
+def _passable(text: str) -> str:
+    """NUL → space (the rule of ``clean_control_chars``), every lone surrogate → U+FFFD."""
+    if "\x00" in text:
+        text = text.replace("\x00", " ")
+    return _SURROGATE_RE.sub("\ufffd", text)
+
+
 def sanitise_arg(text: str) -> str:
     """``text`` as an argument the OS can pass: a NUL byte becomes a space (the rule of ``clean_control_chars``), a lone surrogate U+FFFD.
 
@@ -240,9 +325,67 @@ def sanitise_arg(text: str) -> str:
     has no UTF-8 encoding; both would otherwise escape as ``ValueError``
     before any child exists.
     """
-    if "\x00" in text:
-        text = text.replace("\x00", " ")
-    return _SURROGATE_RE.sub("\ufffd", text)
+    return _passable(text)
+
+
+def encode_prompt(prompt: str) -> tuple[bytes, bool]:
+    """``(stdin bytes, sanitised)``: ``prompt`` as the UTF-8 bytes written to the CLI's stdin, and whether it had to change.
+
+    A lone surrogate becomes U+FFFD (UTF-8 cannot carry it, so the encode
+    would raise before any child exists) and a NUL byte a space (the rule of
+    ``clean_control_chars``; how the CLI reads a NUL on stdin is
+    unmeasured). Nothing else is touched: no BOM is added and line endings
+    stay exactly as rendered (the bytes are written in binary mode, so
+    Windows' text-mode LF → CRLF translation never applies).
+    """
+    clean = _passable(prompt)
+    return clean.encode("utf-8"), clean != prompt
+
+
+def _broken_pipe(e: OSError) -> bool:
+    """Whether ``e`` only says the reader of a pipe is gone: ``BrokenPipeError`` (EPIPE) on POSIX, EINVAL on Windows
+    (a child that exited or closed its stdin) - the two cases ``Popen.communicate`` ignores on a stdin write."""
+    return isinstance(e, BrokenPipeError) or e.errno == errno.EINVAL
+
+
+def _feed_stdin(pipe: IO[bytes], data: bytes, failures: list[OSError]) -> None:
+    """Write ``data`` to ``pipe`` (a child's stdin) and close it - run on its own thread, never the caller's.
+
+    A broken pipe (:func:`_broken_pipe`: the child exited or closed its stdin
+    before reading everything) is no error of its own, as in
+    ``Popen.communicate``: the exit code and the envelope decide. Any other
+    ``OSError`` of the write or the close is appended to ``failures`` for the
+    caller to report; the pipe is closed whatever happened, so the child
+    always sees EOF.
+    """
+    try:
+        if data:
+            pipe.write(data)
+    except OSError as e:
+        if not _broken_pipe(e):
+            failures.append(e)
+    finally:
+        try:
+            pipe.close()
+        except OSError as e:
+            if not _broken_pipe(e):
+                failures.append(e)
+
+
+def _reap(proc: subprocess.Popen[bytes]) -> None:
+    """After ``proc.kill()``: collect the rest of its pipes and wait for it, each within :data:`REAP_TIMEOUT`.
+
+    The killed child itself exits at once; only a process it started that
+    still holds stdout / stderr can keep the pipes open, and then the child
+    is waited for alone (the pipes' readers end when that process does).
+    """
+    try:
+        proc.communicate(timeout=REAP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.wait(timeout=REAP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            log.info("claude-cli: the killed child %s did not exit within %gs", proc.pid, REAP_TIMEOUT)
 
 
 def _platform_kind() -> str:
@@ -259,6 +402,20 @@ def _sysconf(name: str) -> int | None:
     return value if isinstance(value, int) and value > 0 else None
 
 
+def _argument_name(argv: list[str], i: int) -> str:
+    """``argv[i]`` named for a limit message: ``the --system-prompt value (argument 12)`` when a :data:`VALUE_FLAGS` flag
+    takes it (flags and their values walked in order, so a value that looks like a flag is still a value), else ``argument i``."""
+    j = 1
+    while j < len(argv):
+        if argv[j] in VALUE_FLAGS and j + 1 < len(argv):
+            if j + 1 == i:
+                return f"the {argv[j]} value (argument {i})"
+            j += 2
+        else:
+            j += 1
+    return f"argument {i}"
+
+
 def argv_limit_problem(
     argv: list[str],
     env: dict[str, str] | None = None,
@@ -271,28 +428,33 @@ def argv_limit_problem(
 
     ``windows``: the command line ``subprocess`` builds
     (``subprocess.list2cmdline``) plus its NUL may not exceed
-    :data:`WINDOWS_COMMAND_LINE_LIMIT` UTF-16 code units. ``linux``: one
-    argument's UTF-8 bytes plus its NUL may not exceed :data:`LINUX_ARG_PAGES`
-    pages (MAX_ARG_STRLEN; measured here: 131,071 bytes start, 131,072 do
-    not). Every POSIX system (``linux`` and ``posix``): the arguments, the
-    environment and their pointers may not exceed ``ARG_MAX``. ``platform``,
-    ``page_size`` and ``arg_max`` default to the running system's (tests pass
-    them).
+    :data:`WINDOWS_COMMAND_LINE_LIMIT` UTF-16 code units; the message names
+    the longest argument. ``linux``: one argument's UTF-8 bytes plus its NUL
+    may not exceed :data:`LINUX_ARG_PAGES` pages (MAX_ARG_STRLEN; measured
+    here: 131,071 bytes start, 131,072 do not); the message names that
+    argument (a pinned flag's value by its flag). Every POSIX system
+    (``linux`` and ``posix``): the arguments, the environment and their
+    pointers may not exceed ``ARG_MAX``. ``platform``, ``page_size`` and
+    ``arg_max`` default to the running system's (tests pass them). The
+    prompt is not an argument (it goes on stdin), so none of these limits
+    applies to it.
     """
     kind = platform or _platform_kind()
     if kind == "windows":
         line = subprocess.list2cmdline(argv)
         units = len(line.encode("utf-16-le", "surrogatepass")) // 2 + 1
         if units > WINDOWS_COMMAND_LINE_LIMIT:
-            return f"the command line would be {units - 1} characters; Windows (CreateProcess) takes at most {WINDOWS_COMMAND_LINE_LIMIT - 1}"
+            widths = [len(a.encode("utf-16-le", "surrogatepass")) // 2 for a in argv]
+            longest = max(range(1, len(argv)), key=lambda k: widths[k], default=None)
+            which = "" if longest is None else f", the longest argument being {_argument_name(argv, longest)} with {widths[longest]} characters"
+            return f"the command line would be {units - 1} characters{which}; Windows (CreateProcess) takes at most {WINDOWS_COMMAND_LINE_LIMIT - 1}"
         return None
     sizes = [len(a.encode("utf-8", "surrogatepass")) + 1 for a in argv]
     if kind == "linux":
         limit = LINUX_ARG_PAGES * (page_size or _sysconf("SC_PAGE_SIZE") or DEFAULT_PAGE_SIZE)
         for i, size in enumerate(sizes):
             if size > limit:
-                what = "the prompt" if i == 2 and argv[1:2] == ["-p"] else f"argument {i}"
-                return f"{what} would be {size - 1} bytes; Linux takes at most {limit - 1} bytes in one argument (MAX_ARG_STRLEN)"
+                return f"{_argument_name(argv, i)} would be {size - 1} bytes; Linux takes at most {limit - 1} bytes in one argument (MAX_ARG_STRLEN)"
     total_max = arg_max or _sysconf("SC_ARG_MAX")
     if total_max:
         environ = os.environ if env is None else env
@@ -316,6 +478,22 @@ class LoginState(BaseModel):
     auth_method: str | None = None
     api_provider: str | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class _Command:
+    """One model call as it is started: ``argv`` (no prompt in it) and ``stdin`` (the prompt's UTF-8 bytes).
+
+    ``argv_sanitised``: :func:`sanitise_arg` changed an argument (the model,
+    the system prompt, the schema ...); ``prompt_sanitised``:
+    :func:`encode_prompt` changed the prompt. Each becomes its own ``raw``
+    flag on the response.
+    """
+
+    argv: list[str]
+    stdin: bytes
+    argv_sanitised: bool
+    prompt_sanitised: bool
 
 
 @dataclass
@@ -461,8 +639,9 @@ class ClaudeCodeClient(LLMClient):
     ``cli`` names the binary (else :func:`find_claude_cli`; absent →
     :class:`~ai_eda.errors.ToolUnavailableError`); it is kept as an absolute
     path (:func:`absolute_cli_path`) and a Windows batch file is refused
-    (:func:`refuse_batch_file`). ``timeout`` bounds one call (the child is
-    killed on expiry). ``max_budget_usd`` is passed as the CLI's own
+    (:func:`refuse_batch_file`). ``timeout`` bounds one call, the write of
+    the prompt to stdin included (the child is killed and reaped on expiry).
+    ``max_budget_usd`` is passed as the CLI's own
     ``--max-budget-usd`` (a second safety net when the user gave a USD budget;
     the service's check comes first). ``fallback_model`` is passed as
     ``--fallback-model`` - the user's explicit opt-in to the CLI's own
@@ -583,16 +762,20 @@ class ClaudeCodeClient(LLMClient):
     def build_argv(
         self,
         model: str,
-        prompt: str,
-        system: str | None,
         *,
+        system: str | None = None,
         response_schema: dict[str, Any] | None = None,
         resume: str | None = None,
     ) -> list[str]:
-        """The pinned command line. ``--no-session-persistence`` is left out when the reply may need a feedback turn
-        (a structured call) or when resuming one; ``--resume`` and ``--no-session-persistence`` exclude each other.
-        Every argument after the executable is passed through :func:`sanitise_arg`."""
-        return self._command(model, prompt, system, response_schema=response_schema, resume=resume)[0]
+        """The pinned command line - without the prompt, which goes on stdin (:func:`encode_prompt`).
+
+        ``-p`` takes no argument. ``--no-session-persistence`` is left out
+        when the reply may need a feedback turn (a structured call) or when
+        resuming one; ``--resume`` and ``--no-session-persistence`` exclude
+        each other. Every argument after the executable is passed through
+        :func:`sanitise_arg`.
+        """
+        return self._command(model, "", system, response_schema=response_schema, resume=resume).argv
 
     def _command(
         self,
@@ -602,9 +785,10 @@ class ClaudeCodeClient(LLMClient):
         *,
         response_schema: dict[str, Any] | None = None,
         resume: str | None = None,
-    ) -> tuple[list[str], bool]:
-        """``(argv, sanitised)``: :meth:`build_argv`'s command and whether :func:`sanitise_arg` changed any argument."""
-        argv = ["-p", prompt, "--output-format", "json", "--model", model, "--tools", ""]
+    ) -> _Command:
+        """:meth:`build_argv`'s command plus ``prompt`` as the stdin bytes, and which of the two had to be sanitised."""
+        stdin, prompt_sanitised = encode_prompt(prompt)
+        argv = ["-p", "--output-format", "json", "--model", model, "--tools", ""]
         if resume is not None:
             argv += ["--resume", resume]
         elif response_schema is None:
@@ -619,7 +803,7 @@ class ClaudeCodeClient(LLMClient):
         if self.fallback_model:
             argv += ["--fallback-model", self.fallback_model]
         clean = [sanitise_arg(a) for a in argv]
-        return [self.cli, *clean], clean != argv
+        return _Command(argv=[self.cli, *clean], stdin=stdin, argv_sanitised=clean != argv, prompt_sanitised=prompt_sanitised)
 
     # ------------------------------------------------------- envelope parse
 
@@ -657,7 +841,7 @@ class ClaudeCodeClient(LLMClient):
 
     def _parse_response(
         self, model: str, envelope: dict[str, Any], *, want_structured: bool, temperature_ignored: bool, max_tokens_ignored: bool,
-        argv_sanitised: bool = False,
+        argv_sanitised: bool = False, prompt_sanitised: bool = False,
     ) -> LLMResponse:
         problems: list[str] = []
         result = envelope.get("result")
@@ -688,6 +872,8 @@ class ClaudeCodeClient(LLMClient):
             raw["max_tokens_ignored"] = True
         if argv_sanitised:
             raw["argv_sanitised"] = True
+        if prompt_sanitised:
+            raw["prompt_sanitised"] = True
         return LLMResponse(
             model=model,
             content=content,
@@ -725,7 +911,12 @@ class ClaudeCodeClient(LLMClient):
         feedback turn, at the next unrelated call, or by :meth:`close`. Every
         other call runs in a fresh empty cwd removed right after it.
 
-        A command line the OS would refuse (:func:`argv_limit_problem`) is an
+        The prompt (on the feedback turn: the feedback text only) is written
+        to the CLI's stdin as UTF-8 bytes (:func:`encode_prompt`; a changed
+        prompt is recorded as ``raw["prompt_sanitised"] = True``, a changed
+        argument as ``raw["argv_sanitised"] = True``). A command line the OS
+        would refuse (:func:`argv_limit_problem` - the system prompt, the
+        schema and the flags; the prompt is not on it) is an
         ``LLMError(kind="transport", code="prompt_too_long", sent=False)``
         raised before any directory or process exists.
         """
@@ -735,14 +926,15 @@ class ClaudeCodeClient(LLMClient):
         want_structured = response_schema is not None
         held = self._feedback_turn(model, messages, response_schema)
         if held is not None:
-            argv, sanitised = self._command(model, messages[-1].content or "", system, response_schema=response_schema, resume=held.session_id)
+            cmd = self._command(model, messages[-1].content or "", system, response_schema=response_schema, resume=held.session_id)
         else:
-            argv, sanitised = self._command(model, prompt, system, response_schema=response_schema)
-        problem = argv_limit_problem(argv)
+            cmd = self._command(model, prompt, system, response_schema=response_schema)
+        problem = argv_limit_problem(cmd.argv)
         if problem is not None:
             log.info("claude-cli complete model=%s refused before starting: %s", model, problem)
             raise LLMError(
-                f"{problem}; nothing was sent (the Claude Code CLI takes the prompt on its command line)",
+                f"{problem}; nothing was sent (the prompt would go on stdin, but the system prompt, the JSON schema and the "
+                "flags stay on the Claude Code CLI's command line)",
                 kind="transport", code=PROMPT_TOO_LONG, model=model, sent=False,
             )
         if held is not None:
@@ -754,10 +946,10 @@ class ClaudeCodeClient(LLMClient):
         keep_cwd = False
         t0 = time.monotonic()
         try:
-            envelope, returncode = self._run(model, argv, cwd)
+            envelope, returncode = self._run(model, cmd.argv, cmd.stdin, cwd)
             resp = self._parse_response(
                 model, envelope, want_structured=want_structured, temperature_ignored=True, max_tokens_ignored=max_tokens is not None,
-                argv_sanitised=sanitised,
+                argv_sanitised=cmd.argv_sanitised, prompt_sanitised=cmd.prompt_sanitised,
             )
             if want_structured and held is None and resp.id:
                 self._resumable = _Resumable(session_id=resp.id, model=model, messages=list(messages), content=resp.content or "", cwd=cwd)
@@ -772,18 +964,67 @@ class ClaudeCodeClient(LLMClient):
         )
         return resp
 
-    def _run(self, model: str, argv: list[str], cwd: str) -> tuple[dict[str, Any], int]:
-        """Run the CLI; return ``(envelope, exit code)`` or raise the typed error (see the module docstring)."""
+    def _exchange(self, proc: subprocess.Popen[bytes], stdin: bytes) -> tuple[int, bytes, bytes, OSError | None]:
+        """Feed ``stdin`` to the started ``proc`` and collect it: ``(exit code, stdout, stderr, write error)``.
+
+        The prompt is written by a daemon thread of this client
+        (:func:`_feed_stdin`), never by ``communicate``: ``proc.stdin`` is
+        detached first, so ``communicate`` only reads stdout / stderr, and
+        its ``timeout`` bounds the whole exchange on every platform and
+        interpreter - CPython 3.12's Windows ``communicate`` writes ``input=``
+        in the calling thread before its first timeout check, so a child that
+        never read a prompt larger than the pipe buffer would block
+        ``subprocess.run(input=...)`` with no bound. Writing and reading run
+        together (no pipe deadlock). On the timeout (``TimeoutExpired``
+        propagates) and on any other exception - a ``KeyboardInterrupt``
+        reaches this thread, which never sits in a blocking write - the child
+        is killed and reaped (:func:`_reap`); the writer then sees the broken
+        pipe and ends, and is joined within :data:`REAP_TIMEOUT` (a daemon: a
+        process the child started that still holds stdin cannot pin the call).
+        """
+        pipe = proc.stdin
+        assert pipe is not None, "the child is started with stdin=PIPE"
+        proc.stdin = None  # communicate() must never write (3.12 on Windows: unbounded) nor close it
+        failures: list[OSError] = []
+        writer = threading.Thread(target=_feed_stdin, args=(pipe, stdin, failures), name=STDIN_WRITER_NAME, daemon=True)
+        try:
+            writer.start()
+            out, err = proc.communicate(timeout=self.timeout)
+        except BaseException:
+            if proc.poll() is None:
+                proc.kill()
+                _reap(proc)
+            if writer.ident is None:
+                _feed_stdin(pipe, b"", failures)  # the writer never started: close stdin here so nothing waits on it
+            raise
+        finally:
+            if writer.ident is not None:
+                writer.join(REAP_TIMEOUT)
+                if writer.is_alive():
+                    log.info("claude-cli: stdin still held open by a process the child started; the writer is left to end with it")
+        return proc.returncode, out or b"", err or b"", failures[0] if failures else None
+
+    def _run(self, model: str, argv: list[str], stdin: bytes, cwd: str) -> tuple[dict[str, Any], int]:
+        """Run the CLI with ``stdin`` written to its stdin; return ``(envelope, exit code)`` or raise the typed error.
+
+        Bytes in, bytes out (no text mode): the child is started with three
+        pipes, :meth:`_exchange` writes ``stdin`` on its own thread while the
+        output is read, closes stdin after the last byte, ignores a broken
+        pipe from a child that exits without reading it, and on the timeout
+        kills and reaps the child - the timeout bounds the write too, whatever
+        the platform. stdout / stderr are decoded here as UTF-8 with
+        ``errors="replace"`` (never an exception). A write that failed other
+        than by a broken pipe is named in the error only when the exit code
+        and the envelope do not already decide the call. See the module
+        docstring for the error mapping.
+        """
         t0 = time.monotonic()
         try:
-            proc = subprocess.run(
-                argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.timeout,
-                cwd=cwd, env=dict(os.environ), stdin=subprocess.DEVNULL,
+            child = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=dict(os.environ),
             )
-        except subprocess.TimeoutExpired:
-            log.info("claude-cli complete model=%s timeout after %gs", model, self.timeout)
-            raise LLMError(f"timeout after {self.timeout:g}s", kind="transport", model=model, sent=True) from None
         except OSError as e:
+            # the child could not start (missing binary, E2BIG, winerror 206); a broken stdin pipe never lands here
             log.info("claude-cli complete model=%s could not start: %s", model, e.__class__.__name__)
             too_long = e.errno == errno.E2BIG or getattr(e, "winerror", None) == _WINERROR_TOO_LONG
             raise LLMError(
@@ -794,6 +1035,15 @@ class ClaudeCodeClient(LLMClient):
             # argv the OS cannot encode (a NUL, a lone surrogate) that sanitise_arg did not catch: nothing started
             log.info("claude-cli complete model=%s could not start: %s", model, e.__class__.__name__)
             raise LLMError(f"{e.__class__.__name__}: {e}", kind="transport", model=model, sent=False) from None
+        try:
+            returncode, out_bytes, err_bytes, write_error = self._exchange(child, stdin)
+        except subprocess.TimeoutExpired:
+            log.info("claude-cli complete model=%s timeout after %gs", model, self.timeout)
+            raise LLMError(f"timeout after {self.timeout:g}s", kind="transport", model=model, sent=True) from None
+        proc = subprocess.CompletedProcess(argv, returncode, out_bytes.decode("utf-8", "replace"), err_bytes.decode("utf-8", "replace"))
+        write_note = "" if write_error is None else f"; writing the prompt to stdin failed ({write_error.__class__.__name__}: {write_error})"
+        if write_error is not None:
+            log.info("claude-cli complete model=%s stdin write failed: %s", model, write_error.__class__.__name__)
         elapsed = time.monotonic() - t0
         envelope: dict[str, Any] | None = None
         try:
@@ -806,12 +1056,12 @@ class ClaudeCodeClient(LLMClient):
             if proc.returncode != 0:
                 log.info("claude-cli complete model=%s exit=%d (no envelope) elapsed=%.2fs", model, proc.returncode, elapsed)
                 raise LLMError(
-                    _excerpt(_first_lines(proc.stderr) or _first_lines(proc.stdout) or f"exit {proc.returncode} with empty output"),
+                    _excerpt(_first_lines(proc.stderr) or _first_lines(proc.stdout) or f"exit {proc.returncode} with empty output") + write_note,
                     kind="http", status=None, code=f"exit {proc.returncode}", model=model, sent=None,
                 )
             log.info("claude-cli complete model=%s exit=0 (unparseable stdout) elapsed=%.2fs", model, elapsed)
             raise LLMError(
-                "stdout is not a JSON envelope: " + _excerpt(_first_lines(proc.stdout) or "(empty)", 500),
+                "stdout is not a JSON envelope: " + _excerpt(_first_lines(proc.stdout) or "(empty)", 500) + write_note,
                 kind="response", status=None, code="unparseable", model=model, sent=True,
             )
         err = self._error_from_envelope(model, envelope, proc.returncode)
@@ -847,12 +1097,14 @@ __all__ = [
     "COST_SOURCE",
     "ENV_CLI",
     "PROMPT_TOO_LONG",
+    "VALUE_FLAGS",
     "WINDOWS_CLI_NAME",
     "WINDOWS_COMMAND_LINE_LIMIT",
     "ClaudeCodeClient",
     "LoginState",
     "absolute_cli_path",
     "argv_limit_problem",
+    "encode_prompt",
     "find_claude_cli",
     "finish_reason_of",
     "parse_usage",

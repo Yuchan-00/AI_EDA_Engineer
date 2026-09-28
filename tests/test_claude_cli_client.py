@@ -1,16 +1,21 @@
 """ClaudeCodeClient against the fake ``claude`` on PATH (tests/fake_claude_cli.py). No login, no key, no network.
 
-The real CLI is used by nothing here; the two measurement calls that pinned
-the envelope shape are recorded in ``ai_eda/llm/claude_cli.py``.
+The real CLI is used by nothing here; the measurement calls that pinned the
+envelope shape (2026-09-26) and the prompt on stdin (2026-09-28) are recorded
+in ``ai_eda/llm/claude_cli.py``.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -25,6 +30,7 @@ from ai_eda.llm.claude_cli import (
     ClaudeCodeClient,
     LoginState,
     argv_limit_problem,
+    encode_prompt,
     find_claude_cli,
     finish_reason_of,
     parse_usage,
@@ -45,6 +51,7 @@ from tests.fake_claude_cli import (
     garbage,
     missing_keys,
     reply,
+    reply_bytes,
     slow,
     success,
     success_structured,
@@ -120,11 +127,13 @@ def test_plain_call_argv_is_the_pinned_command(fake: FakeClaudeCli, client: Clau
     client.complete(MODEL, _msgs("Reply with the single word OK."))
     (call,) = fake.prompt_calls()
     assert call["argv"] == [
-        "-p", "Reply with the single word OK.", "--output-format", "json", "--model", MODEL, "--tools", "",
+        "-p", "--output-format", "json", "--model", MODEL, "--tools", "",
         "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config", "--system-prompt", "You answer tersely.",
     ]
+    assert call["argv"] == client.build_argv(MODEL, system="You answer tersely.")[1:]  # build_argv takes no prompt
     assert "--bare" not in call["argv"]
-    assert call["stdin"] == ""  # nothing piped; that stdin is /dev/null is pinned by test_every_subprocess_gets_stdin_devnull
+    # the prompt came on stdin, nothing else did (the bytes / kwargs are pinned by the stdin tests below)
+    assert call["prompt_source"] == "stdin" and fake.stdin_bytes(call) == b"Reply with the single word OK."
 
 
 def test_schema_call_argv_has_json_schema_and_keeps_session_persistence(fake: FakeClaudeCli, client: ClaudeCodeClient):
@@ -132,9 +141,11 @@ def test_schema_call_argv_has_json_schema_and_keeps_session_persistence(fake: Fa
     resp = client.complete(MODEL, _msgs('Return {"word": "OK"}.'), response_schema=SCHEMA)
     (call,) = fake.prompt_calls()
     assert call["argv"] == [
-        "-p", 'Return {"word": "OK"}.', "--output-format", "json", "--model", MODEL, "--tools", "",
+        "-p", "--output-format", "json", "--model", MODEL, "--tools", "",
         "--setting-sources", "", "--strict-mcp-config", "--system-prompt", "You answer tersely.", "--json-schema", SCHEMA_TEXT,
     ]
+    assert call["argv"] == client.build_argv(MODEL, system="You answer tersely.", response_schema=SCHEMA)[1:]
+    assert fake.stdin_bytes(call) == b'Return {"word": "OK"}.'
     assert "--no-session-persistence" not in call["argv"] and "--bare" not in call["argv"]
     assert json.loads(call["argv"][call["argv"].index("--json-schema") + 1]) == SCHEMA
     assert resp.structured == {"word": "OK"} and resp.content == '{"word":"OK"}'
@@ -147,15 +158,19 @@ def test_feedback_turn_resumes_the_session_with_only_the_feedback_text(fake: Fak
     assert first.id == "00000000-0000-4000-8000-00000000abcd"
     first_call = fake.prompt_calls()[0]
     assert os.path.isdir(first_call["cwd"])  # kept for the feedback turn
+    assert fake.stdin_bytes(first_call) == b"Return the word."
     feedback = [*msgs, LLMMessage(role="assistant", content=first.content or ""), LLMMessage(role="user", content="That was not a string. Fix it.")]
     second = client.complete(MODEL, feedback, response_schema=SCHEMA)
     assert second.structured == {"word": "OK"}
     _, call = fake.prompt_calls()
     assert call["argv"] == [
-        "-p", "That was not a string. Fix it.", "--output-format", "json", "--model", MODEL, "--tools", "",
+        "-p", "--output-format", "json", "--model", MODEL, "--tools", "",
         "--resume", "00000000-0000-4000-8000-00000000abcd", "--setting-sources", "", "--strict-mcp-config",
         "--system-prompt", "You answer tersely.", "--json-schema", SCHEMA_TEXT,
     ]
+    # the resumed session already holds the conversation: stdin carries the feedback text and nothing else
+    assert call["prompt_source"] == "stdin" and fake.stdin_bytes(call) == b"That was not a string. Fix it."
+    assert not any("Fix it" in a or "Return the word" in a for a in call["argv"])
     assert "--no-session-persistence" not in call["argv"] and "--bare" not in call["argv"]
     assert call["cwd"] == first_call["cwd"] and call["cwd_entries"] == []
     assert not os.path.exists(call["cwd"])  # removed after the feedback turn
@@ -182,7 +197,7 @@ def test_a_turn_that_is_not_the_feedback_turn_starts_a_fresh_session(fake: FakeC
     client.complete(model, follow, response_schema=schema2)
     _, call = fake.prompt_calls()
     assert "--resume" not in call["argv"]
-    assert call["argv"][1].startswith("[user]\nReturn the word.\n\n[assistant]\n")  # the whole conversation, rendered
+    assert call["prompt_source"] == "stdin" and call["prompt"].startswith("[user]\nReturn the word.\n\n[assistant]\n")  # the whole conversation, rendered
     assert call["cwd"] != first_cwd and not os.path.exists(first_cwd)  # the kept cwd was dropped
     if schema2 is None:
         assert "--no-session-persistence" in call["argv"]
@@ -228,8 +243,8 @@ def test_budget_and_fallback_flags_are_appended_only_when_configured(fake: FakeC
 def test_no_system_message_means_no_system_prompt_flag(fake: FakeClaudeCli, client: ClaudeCodeClient):
     fake.queue(success("OK"))
     client.complete(MODEL, _msgs("hi", system=None))
-    argv = fake.prompt_calls()[0]["argv"]
-    assert "--system-prompt" not in argv and argv[:2] == ["-p", "hi"]
+    (call,) = fake.prompt_calls()
+    assert "--system-prompt" not in call["argv"] and call["argv"][:2] == ["-p", "--output-format"] and fake.stdin_bytes(call) == b"hi"
 
 
 def test_several_system_messages_are_joined_and_the_conversation_is_rendered_in_blocks():
@@ -531,27 +546,280 @@ def test_probes_never_call_the_model(fake: FakeClaudeCli, client: ClaudeCodeClie
     assert fake.prompt_calls() == [] and fake.remaining == 0
 
 
-def test_every_subprocess_gets_stdin_devnull(fake: FakeClaudeCli, client: ClaudeCodeClient, monkeypatch: pytest.MonkeyPatch):
-    """The ``-p`` call and both probes run with ``stdin=DEVNULL`` (an open stdin makes the CLI wait 3 s - measured).
+def _writer_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == claude_cli.STDIN_WRITER_NAME and t.is_alive()]
 
-    Asserted on the ``subprocess.run`` call itself: the fake's recorded stdin
-    cannot tell /dev/null from an idle inherited stdin (pytest's own capture
-    already puts /dev/null on fd 0).
+
+def test_the_model_call_writes_bytes_to_stdin_and_the_probes_get_devnull(fake: FakeClaudeCli, client: ClaudeCodeClient, monkeypatch: pytest.MonkeyPatch):
+    """The ``-p`` call is a ``Popen`` with three binary pipes whose stdin gets the prompt's UTF-8 bytes and is closed;
+    both probes are ``subprocess.run`` with ``stdin=DEVNULL`` (an open, unwritten stdin makes the CLI wait 3 s -
+    measured).
+
+    Asserted on the calls themselves: text mode (``text=`` / ``encoding=`` /
+    ``errors=`` / ``universal_newlines=``) would let Windows translate LF to
+    CRLF and the locale code page re-encode the prompt, ``input=`` would hand
+    the write to ``communicate`` (unbounded by the timeout on CPython 3.12's
+    Windows), and the fake's recorded stdin cannot tell /dev/null from an
+    idle inherited stdin.
     """
-    seen: list[tuple[list[str], object]] = []
-    real = subprocess.run
+    ran: list[tuple[list[str], dict]] = []
+    started: list[tuple[list[str], dict, object]] = []
+    real_run, real_popen = subprocess.run, subprocess.Popen
 
-    def spy(*args, **kwargs):
-        seen.append((list(args[0]), kwargs.get("stdin", "<not given>")))
-        return real(*args, **kwargs)
+    def run_spy(*args, **kwargs):
+        ran.append((list(args[0]), dict(kwargs)))
+        return real_run(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", spy)
+    def popen_spy(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        started.append((list(args[0]), dict(kwargs), proc.stdin))  # the pipe before the client detaches it
+        return proc
+
+    monkeypatch.setattr(subprocess, "run", run_spy)
+    monkeypatch.setattr(subprocess, "Popen", popen_spy)
     fake.queue(success("OK"))
-    client.complete(MODEL, _msgs())
+    client.complete(MODEL, _msgs("한글 prompt\nline two"))
     client.version()
     client.login_state()
-    assert [argv[1] for argv, _ in seen] == ["-p", "--version", "auth"]
-    assert all(stdin is subprocess.DEVNULL for _, stdin in seen)
+    assert [argv[1] for argv, _ in ran] == ["--version", "auth"]  # the model call does not go through run(input=...)
+    assert [argv[1] for argv, _, _ in started] == ["-p", "--version", "auth"]  # run() starts the probes through Popen
+    _, model_call, pipe = started[0]
+    assert model_call["stdin"] is subprocess.PIPE and model_call["stdout"] is subprocess.PIPE and model_call["stderr"] is subprocess.PIPE
+    assert not {"text", "encoding", "errors", "universal_newlines", "input"} & set(model_call)
+    assert pipe is not None and pipe.closed  # written and closed (the child saw EOF)
+    (call,) = fake.prompt_calls()
+    assert fake.stdin_bytes(call) == "한글 prompt\nline two".encode("utf-8")
+    assert _writer_threads() == []  # the writer thread ended with the call
+    for _, kwargs in ran:
+        assert kwargs["stdin"] is subprocess.DEVNULL and "input" not in kwargs
+
+
+def test_the_prompt_is_not_on_the_command_line_and_arrives_on_stdin_byte_exact(fake: FakeClaudeCli, client: ClaudeCodeClient):
+    """UTF-8, every line ending exactly as rendered (LF stays LF, a CR the text carried stays), no BOM - and a prompt
+    that starts like a flag is never read as one, because it is no argument at all."""
+    prompt = '--tools Bash\n저항 R1 = 10 kΩ ± 1 %, C1 = 100 µF\n"quoted" %PATH% & | ^ <>\nwindows line\r\nlast line\n'
+    fake.queue(success("OK"))
+    assert client.complete(MODEL, _msgs(prompt)).content == "OK"
+    (call,) = fake.prompt_calls()
+    data = fake.stdin_bytes(call)
+    assert data == prompt.encode("utf-8") and call["stdin_len"] == len(prompt.encode("utf-8"))
+    assert not data.startswith(b"\xef\xbb\xbf") and data.count(b"\r\n") == 1 and data.count(b"\n") == 5
+    assert call["prompt_source"] == "stdin" and call["prompt"] == prompt
+    assert not any("저항" in a or "--tools Bash" in a or "last line" in a for a in call["argv"])
+    assert call["argv"].count("--tools") == 1 and call["argv"][call["argv"].index("--tools") + 1] == ""
+    assert encode_prompt(prompt) == (prompt.encode("utf-8"), False)
+
+
+def test_a_child_that_exits_without_reading_its_stdin_is_not_an_error(fake: FakeClaudeCli, client: ClaudeCodeClient):
+    """A prompt far larger than a pipe buffer, and a child that answers without reading it: the writer thread swallows
+    the broken pipe (as ``communicate`` would), and the envelope decides."""
+    fake.queue(reply(envelope("answered early"), ignore_stdin=True))
+    resp = client.complete(MODEL, _msgs("x" * 2_000_000))
+    assert resp.content == "answered early" and resp.raw_error is None
+    (call,) = fake.prompt_calls()
+    assert call["stdin_len"] == 0 and call["prompt_source"] is None
+    assert _writer_threads() == []
+
+
+def test_a_timeout_while_the_child_does_not_read_stdin_kills_it_and_never_hangs(fake: FakeClaudeCli):
+    """The write of a prompt the child never reads cannot block past the timeout; the child is killed and reaped.
+
+    The error is asserted on every platform (the write runs on the client's
+    own thread). The time bound and the reaping are asserted off Windows
+    only: there the fake is pip's launcher plus the Python child it starts,
+    and whether killing the launcher also ends that child - which may hold
+    the pipes until its sleep ends - is not measured here.
+    """
+    c = ClaudeCodeClient(timeout=0.5)
+    fake.queue(reply(envelope("late"), sleep=5, ignore_stdin=True))
+    t0 = time.monotonic()
+    with pytest.raises(LLMError) as ei:
+        c.complete(MODEL, _msgs("y" * 2_000_000))
+    assert ei.value.kind == "transport" and ei.value.sent is True and "timeout after 0.5s" in ei.value.message
+    (call,) = fake.prompt_calls()
+    assert not os.path.exists(call["cwd"])
+    if os.name != "nt":
+        assert time.monotonic() - t0 < 3.0
+        with pytest.raises(ProcessLookupError):
+            os.kill(call["pid"], 0)  # killed and reaped, not left running
+        assert _writer_threads() == []  # the kill broke the pipe: the writer ended
+
+
+def _cpython312_windows_communicate(self, input, endtime, orig_timeout):
+    """CPython 3.12's Windows ``Popen._communicate`` in its own order (Lib/subprocess.py, 3.12.3): the reader threads,
+    then ``self._stdin_write(input)`` *blocking in the calling thread*, and only then the joins bounded by the
+    timeout. (A later CPython writes from a thread joined with the timeout.) Patched onto the POSIX ``Popen``, it lets
+    Linux run the ordering the Windows PC's 3.12 venv runs."""
+
+    def reader(fh, buffer):
+        buffer.append(fh.read())
+        fh.close()
+
+    if self.stdout and not hasattr(self, "_stdout_buff"):
+        self._stdout_buff = []
+        self.stdout_thread = threading.Thread(target=reader, args=(self.stdout, self._stdout_buff), daemon=True)
+        self.stdout_thread.start()
+    if self.stderr and not hasattr(self, "_stderr_buff"):
+        self._stderr_buff = []
+        self.stderr_thread = threading.Thread(target=reader, args=(self.stderr, self._stderr_buff), daemon=True)
+        self.stderr_thread.start()
+    if self.stdin:
+        self._stdin_write(input)
+    if self.stdout is not None:
+        self.stdout_thread.join(self._remaining_time(endtime))
+        if self.stdout_thread.is_alive():
+            raise subprocess.TimeoutExpired(self.args, orig_timeout)
+    if self.stderr is not None:
+        self.stderr_thread.join(self._remaining_time(endtime))
+        if self.stderr_thread.is_alive():
+            raise subprocess.TimeoutExpired(self.args, orig_timeout)
+    stdout = stderr = None
+    if self.stdout:
+        stdout = self._stdout_buff
+        self.stdout.close()
+    if self.stderr:
+        stderr = self._stderr_buff
+        self.stderr.close()
+    return (stdout[0] if stdout else None, stderr[0] if stderr else None)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="patches CPython 3.12's Windows communicate onto the POSIX Popen")
+def test_the_emulated_cpython312_windows_communicate_does_not_bound_a_stdin_write(monkeypatch: pytest.MonkeyPatch):
+    """The emulation is faithful where it matters: ``subprocess.run(input=...)`` against a child that never reads a
+    2 MB input blocks until that child exits, far past the timeout - what the client must not rely on."""
+    monkeypatch.setattr(subprocess.Popen, "_communicate", _cpython312_windows_communicate)
+    t0 = time.monotonic()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        subprocess.run([sys.executable, "-c", "import time; time.sleep(1.5)"], input=b"y" * 2_000_000, capture_output=True, timeout=0.3)
+    assert time.monotonic() - t0 >= 1.2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="patches CPython 3.12's Windows communicate onto the POSIX Popen")
+def test_the_timeout_bounds_the_stdin_write_under_cpython312s_windows_communicate(fake: FakeClaudeCli, monkeypatch: pytest.MonkeyPatch):
+    """With 3.12's Windows ordering, a 0.5 s timeout still holds against a child that sleeps without reading a 2 MB
+    prompt: the client writes on its own thread and ``communicate`` never touches stdin."""
+    monkeypatch.setattr(subprocess.Popen, "_communicate", _cpython312_windows_communicate)
+    c = ClaudeCodeClient(timeout=0.5)
+    fake.queue(reply(envelope("late"), sleep=5, ignore_stdin=True))
+    t0 = time.monotonic()
+    with pytest.raises(LLMError) as ei:
+        c.complete(MODEL, _msgs("y" * 2_000_000))
+    assert time.monotonic() - t0 < 3.0
+    assert ei.value.kind == "transport" and ei.value.sent is True and "timeout after 0.5s" in ei.value.message
+    (call,) = fake.prompt_calls()
+    with pytest.raises(ProcessLookupError):
+        os.kill(call["pid"], 0)
+    assert _writer_threads() == [] and not os.path.exists(call["cwd"])
+    # and a prompt the child does read still arrives whole under the same ordering
+    fake.queue(success("OK"))
+    assert ClaudeCodeClient(timeout=10.0).complete(MODEL, _msgs("z" * 300_000)).content == "OK"
+    assert fake.stdin_bytes(fake.prompt_calls()[-1]) == b"z" * 300_000
+
+
+def test_an_interrupt_during_the_call_kills_and_reaps_the_child(fake: FakeClaudeCli, client: ClaudeCodeClient, monkeypatch: pytest.MonkeyPatch):
+    """A ``KeyboardInterrupt`` reaches the calling thread (it never sits in a blocking write) and leaves no child."""
+    real = subprocess.Popen.communicate
+    seen: list[float | None] = []
+
+    def interrupted(self, input=None, timeout=None):
+        seen.append(timeout)
+        if len(seen) == 1:
+            deadline = time.monotonic() + 5.0
+            while not fake.prompt_calls() and time.monotonic() < deadline:  # the fake has read its prompt
+                time.sleep(0.02)
+            raise KeyboardInterrupt
+        return real(self, input, timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
+    fake.queue(reply(envelope("never"), sleep=5))
+    t0 = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        client.complete(MODEL, _msgs("read me"))
+    assert time.monotonic() - t0 < 4.0 and seen[0] == client.timeout and len(seen) == 2  # interrupted, then reaped
+    (call,) = fake.prompt_calls()
+    assert fake.stdin_bytes(call) == b"read me" and not os.path.exists(call["cwd"])
+    with pytest.raises(ProcessLookupError):
+        os.kill(call["pid"], 0)
+    assert _writer_threads() == []
+
+
+class _Pipe:
+    """A stand-in for a child's stdin: ``write`` / ``close`` raise what they are given."""
+
+    def __init__(self, write_error: BaseException | None = None, close_error: BaseException | None = None) -> None:
+        self.write_error, self.close_error = write_error, close_error
+        self.data = b""
+        self.closed = False
+
+    def write(self, data: bytes) -> int:
+        if self.write_error is not None:
+            raise self.write_error
+        self.data += data
+        return len(data)
+
+    def close(self) -> None:
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def test_feed_stdin_ignores_only_a_broken_pipe_and_always_closes():
+    feed = claude_cli._feed_stdin
+    for broken in (BrokenPipeError(errno.EPIPE, "gone"), OSError(errno.EINVAL, "Windows: the reader is gone")):
+        failures: list[OSError] = []
+        pipe = _Pipe(write_error=broken, close_error=broken)
+        feed(pipe, b"x", failures)
+        assert pipe.closed and failures == []
+    failures = []
+    pipe = _Pipe()
+    feed(pipe, b"abc", failures)
+    assert (pipe.data, pipe.closed, failures) == (b"abc", True, [])
+    other = OSError(errno.EIO, "disk on fire")
+    failures = []
+    pipe = _Pipe(write_error=other)
+    feed(pipe, b"abc", failures)
+    assert pipe.closed and failures == [other]
+    failures = []
+    feed(_Pipe(close_error=other), b"", failures)
+    assert failures == [other]
+
+
+def test_a_failed_stdin_write_is_named_only_when_the_envelope_does_not_decide(fake: FakeClaudeCli, client: ClaudeCodeClient, monkeypatch: pytest.MonkeyPatch):
+    """A write error other than a broken pipe never becomes a start failure (the child ran): an envelope still
+    decides the call; without one, the error names the failed write beside the child's own output."""
+    real = claude_cli._feed_stdin
+
+    def failing(pipe, data, failures):
+        real(pipe, b"", failures)  # nothing written, stdin closed
+        failures.append(OSError(errno.EIO, "disk on fire"))
+
+    monkeypatch.setattr(claude_cli, "_feed_stdin", failing)
+    fake.queue(success("fine"), garbage("nope\n", exit_code=2, stderr="Error: empty prompt\n"), garbage("nope\n", exit_code=0, stderr=""))
+    assert client.complete(MODEL, _msgs()).content == "fine"
+    with pytest.raises(LLMError) as ei:
+        client.complete(MODEL, _msgs())
+    assert ei.value.code == "exit 2" and ei.value.sent is None
+    assert ei.value.message == "Error: empty prompt; writing the prompt to stdin failed (OSError: [Errno 5] disk on fire)"
+    with pytest.raises(LLMError) as ei:
+        client.complete(MODEL, _msgs())
+    assert ei.value.code == "unparseable" and ei.value.message.endswith("; writing the prompt to stdin failed (OSError: [Errno 5] disk on fire)")
+
+
+def test_non_utf8_bytes_on_stdout_and_stderr_are_replaced_never_raised(fake: FakeClaudeCli, client: ClaudeCodeClient):
+    good = json.dumps(envelope("caf__X__"), ensure_ascii=False).encode("utf-8").replace(b"__X__", b"\xe9\xff")
+    fake.queue(
+        reply_bytes(good, stderr=b"note \xff\xfe\n"),
+        reply_bytes(b"\xff\xfe not json\n", stderr=b"Error: \xc3\x28 bad\n", exit_code=1),
+        reply_bytes(b"plain \x80 words\n", exit_code=0),
+    )
+    resp = client.complete(MODEL, _msgs())
+    assert resp.content == "caf\ufffd\ufffd"
+    with pytest.raises(LLMError) as ei:
+        client.complete(MODEL, _msgs())
+    assert ei.value.kind == "http" and ei.value.code == "exit 1" and ei.value.message == "Error: \ufffd( bad"
+    with pytest.raises(LLMError) as ei:
+        client.complete(MODEL, _msgs())
+    assert ei.value.code == "unparseable" and "plain \ufffd words" in ei.value.message
 
 
 # ------------------------------------------------- discovery: paths, Windows
@@ -619,16 +887,35 @@ def test_sanitise_arg_rules():
     assert sanitise_arg("plain [user]\n\"quoted\" %PATH% & | ^ 한글") == "plain [user]\n\"quoted\" %PATH% & | ^ 한글"
 
 
+def test_encode_prompt_rules():
+    assert encode_prompt("a\x00b\x00") == (b"a b ", True)
+    assert encode_prompt("x\ud800y\udfff") == ("x\ufffdy\ufffd".encode("utf-8"), True)
+    assert encode_prompt("\ud83d\ude00") == ("\ufffd\ufffd".encode("utf-8"), True)  # two lone surrogates, not a pair, in a str
+    text = "plain [user]\n\"quoted\" %PATH% & | ^ 한글 Ω ± µ \x02\r\n"
+    assert encode_prompt(text) == (text.encode("utf-8"), False)  # other control characters and CRs pass unchanged
+    assert encode_prompt("") == (b"", False)
+
+
 @pytest.mark.parametrize("where", ["user", "system", "both"])
 def test_a_nul_or_a_lone_surrogate_in_a_message_is_sanitised_not_a_crash(fake: FakeClaudeCli, client: ClaudeCodeClient, where: str):
+    """The prompt (stdin) and the arguments (argv) are sanitised by the same rule but recorded apart:
+    ``prompt_sanitised`` for the prompt, ``argv_sanitised`` only for an argument."""
     user = "Part\x02number\x00XYZ\x03 \ud800" if where in ("user", "both") else "clean"
     system = "sys\x00tem \udfff" if where in ("system", "both") else "You answer tersely."
     fake.queue(success("OK"), success("OK"))
     resp = client.complete(MODEL, _msgs(user, system=system))
-    assert resp.content == "OK" and resp.raw["argv_sanitised"] is True
-    argv = fake.prompt_calls()[0]["argv"]
-    assert "\x00" not in "".join(argv) and argv[1] == sanitise_arg(user) and argv[argv.index("--system-prompt") + 1] == sanitise_arg(system)
-    assert "argv_sanitised" not in client.complete(MODEL, _msgs("clean")).raw
+    assert resp.content == "OK"
+    assert resp.raw.get("prompt_sanitised") is (True if where in ("user", "both") else None)
+    assert resp.raw.get("argv_sanitised") is (True if where in ("system", "both") else None)
+    call = fake.prompt_calls()[0]
+    argv = call["argv"]
+    assert "\x00" not in "".join(argv) and argv[argv.index("--system-prompt") + 1] == sanitise_arg(system)
+    data = fake.stdin_bytes(call)
+    assert b"\x00" not in data and data == sanitise_arg(user).encode("utf-8")
+    if where in ("user", "both"):
+        assert data == "Part\x02number XYZ\x03 \ufffd".encode("utf-8")  # NUL -> space, lone surrogate -> U+FFFD, \x02 / \x03 kept
+    clean = client.complete(MODEL, _msgs("clean")).raw
+    assert "argv_sanitised" not in clean and "prompt_sanitised" not in clean
 
 
 def test_the_feedback_turn_text_is_sanitised_too(fake: FakeClaudeCli, client: ClaudeCodeClient):
@@ -638,16 +925,18 @@ def test_the_feedback_turn_text_is_sanitised_too(fake: FakeClaudeCli, client: Cl
     feedback = [*msgs, LLMMessage(role="assistant", content=first.content or ""), LLMMessage(role="user", content="bad\x00reply")]
     second = client.complete(MODEL, feedback, response_schema=SCHEMA)
     call = fake.prompt_calls()[1]
-    assert "--resume" in call["argv"] and call["argv"][1] == "bad reply" and second.raw["argv_sanitised"] is True
+    assert "--resume" in call["argv"] and fake.stdin_bytes(call) == b"bad reply" and "bad reply" not in call["argv"]
+    assert second.raw["prompt_sanitised"] is True and "argv_sanitised" not in second.raw
 
 
 def test_an_argument_the_os_cannot_encode_is_an_llm_error_not_a_value_error(fake: FakeClaudeCli, client: ClaudeCodeClient, monkeypatch: pytest.MonkeyPatch):
-    """The safety net behind :func:`sanitise_arg`: ``subprocess`` refusing an argument is a typed error, nothing started."""
+    """The safety net behind :func:`sanitise_arg`: ``subprocess`` refusing an argument (here the system prompt; the
+    prompt itself is no argument) is a typed error, nothing started."""
     monkeypatch.setattr(claude_cli, "sanitise_arg", lambda text: text)
     fake.queue(success("never"))
     for text in ("x\x00y", "x\ud800y"):
         with pytest.raises(LLMError) as ei:
-            client.complete(MODEL, _msgs(text))
+            client.complete(MODEL, _msgs("hi", system=text))
         assert ei.value.kind == "transport" and ei.value.sent is False and not ei.value.maybe_billed
         assert "ValueError" in ei.value.message or "UnicodeEncodeError" in ei.value.message
     assert fake.prompt_calls() == [] and fake.remaining == 1
@@ -661,32 +950,71 @@ def test_argv_limit_problem_per_platform():
     over = base + ["a" * (32767 - len(subprocess.list2cmdline(base)) - 1)]
     problem = argv_limit_problem(over, {}, platform="windows")
     assert problem is not None and "32767 characters" in problem and "at most 32766" in problem and "CreateProcess" in problem
+    assert "the longest argument being argument 2 with" in problem  # "-p" takes no value: argv[2] is no prompt any more
     assert argv_limit_problem(base + ["한" * 20000], {}, platform="windows") is None  # characters, not bytes, count there
+    problem = argv_limit_problem(["C:\\claude.exe", "-p", "--model", "m", "--system-prompt", "S" * 40000], {}, platform="windows")
+    assert problem is not None and "the longest argument being the --system-prompt value (argument 5) with 40000 characters" in problem
     # Linux: one argument's bytes plus its NUL within 32 pages (measured: 131,071 bytes start, 131,072 do not)
     assert argv_limit_problem(["claude", "-p", "a" * 131071], {}, platform="linux", page_size=4096, arg_max=10**9) is None
     problem = argv_limit_problem(["claude", "-p", "a" * 131072], {}, platform="linux", page_size=4096, arg_max=10**9)
-    assert problem is not None and problem.startswith("the prompt would be 131072 bytes") and "MAX_ARG_STRLEN" in problem
-    problem = argv_limit_problem(["claude", "-p", "x", "--system-prompt", "한" * 43691], {}, platform="linux", page_size=4096, arg_max=10**9)
-    assert problem is not None and problem.startswith("argument 4 would be 131073 bytes")
+    assert problem is not None and problem.startswith("argument 2 would be 131072 bytes") and "MAX_ARG_STRLEN" in problem
+    assert "prompt" not in problem  # argv[2] is not the prompt: the prompt goes on stdin
+    problem = argv_limit_problem(["claude", "-p", "--system-prompt", "한" * 43691], {}, platform="linux", page_size=4096, arg_max=10**9)
+    assert problem is not None and problem.startswith("the --system-prompt value (argument 3) would be 131073 bytes")
+    # flags and values are walked in order: a value spelled like a flag is still that flag's value
+    schema = "{" + "x" * 131072 + "}"
+    problem = argv_limit_problem(["claude", "-p", "--system-prompt", "--json-schema", "--json-schema", schema], {}, platform="linux", page_size=4096, arg_max=10**9)
+    assert problem is not None and problem.startswith("the --json-schema value (argument 5) would be 131074 bytes")
     # every POSIX system: arguments + environment + pointers within ARG_MAX
     assert argv_limit_problem(["claude", "-p", "a" * 1000], {"K": "v" * 1000}, platform="posix", arg_max=4000) is None
     problem = argv_limit_problem(["claude", "-p", "a" * 1000], {"K": "v" * 3000}, platform="posix", arg_max=4000)
     assert problem is not None and "ARG_MAX" in problem and "at most 4000" in problem
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux") and os.name != "nt", reason="the per-argument (Linux) / command-line (Windows) limit")
-def test_a_prompt_the_os_would_refuse_is_a_typed_error_before_anything_starts(fake: FakeClaudeCli, client: ClaudeCodeClient):
-    fake.queue(success("never"))
-    hangul = "동" * 60000  # 180,000 UTF-8 bytes: over one Linux argument; 60,000 characters: over the Windows command line
-    before = set(Path(os.environ.get("TMPDIR", "/tmp")).glob("ai-eda-claude-*")) if os.name != "nt" else set()
-    with pytest.raises(LLMError) as ei:
-        client.complete(MODEL, _msgs(hangul))
-    e = ei.value
+def _nothing_may_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make creating the temporary cwd or starting a process fail the test (a refusal must come before both)."""
+
+    def boom(*args, **kwargs):
+        raise AssertionError(f"nothing may start: {args[:1]}")
+
+    monkeypatch.setattr(claude_cli.tempfile, "mkdtemp", boom)
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(subprocess, "Popen", boom)
+
+
+def _assert_refused_before_starting(e: LLMError) -> None:
     assert e.kind == "transport" and e.code == PROMPT_TOO_LONG and e.sent is False and not e.maybe_billed and e.retryable
-    assert "nothing was sent" in e.message and ("MAX_ARG_STRLEN" in e.message or "CreateProcess" in e.message)
+    assert "nothing was sent" in e.message and "the --system-prompt value" in e.message
+    # the prompt is on stdin: the message must not claim it is on the command line
+    assert "prompt on its command line" not in e.message and "takes the prompt" not in e.message
+    assert "the prompt would go on stdin" in e.message
+
+
+def test_a_system_prompt_too_long_for_the_windows_command_line_is_refused_before_anything_starts(
+    fake: FakeClaudeCli, client: ClaudeCodeClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """Windows' 32,767-character command line still binds the arguments; the check runs on the platform it names."""
+    monkeypatch.setattr(claude_cli, "_platform_kind", lambda: "windows")
+    _nothing_may_start(monkeypatch)
+    fake.queue(success("never"))
+    with pytest.raises(LLMError) as ei:
+        client.complete(MODEL, _msgs("a short prompt", system="S" * 40000))
+    _assert_refused_before_starting(ei.value)
+    assert "CreateProcess" in ei.value.message and "with 40000 characters" in ei.value.message
     assert fake.calls() == [] and fake.remaining == 1
-    if os.name != "nt":
-        assert set(Path(os.environ.get("TMPDIR", "/tmp")).glob("ai-eda-claude-*")) == before  # no temp cwd was made
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux's per-argument limit (MAX_ARG_STRLEN)")
+def test_a_system_prompt_over_one_linux_argument_is_refused_before_anything_starts(
+    fake: FakeClaudeCli, client: ClaudeCodeClient, monkeypatch: pytest.MonkeyPatch,
+):
+    _nothing_may_start(monkeypatch)
+    fake.queue(success("never"))
+    with pytest.raises(LLMError) as ei:
+        client.complete(MODEL, _msgs("a short prompt", system="동" * 60000))  # 180,000 UTF-8 bytes in one argument
+    _assert_refused_before_starting(ei.value)
+    assert "would be 180000 bytes" in ei.value.message and "MAX_ARG_STRLEN" in ei.value.message
+    assert fake.calls() == [] and fake.remaining == 1
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux's per-argument limit (E2BIG)")
@@ -695,12 +1023,31 @@ def test_the_os_refusing_the_command_line_is_the_same_typed_error(fake: FakeClau
     monkeypatch.setattr(claude_cli, "argv_limit_problem", lambda argv, env=None, **kw: None)
     fake.queue(success("never"))
     with pytest.raises(LLMError) as ei:
-        client.complete(MODEL, _msgs("동" * 60000))
+        client.complete(MODEL, _msgs("hi", system="동" * 60000))
     assert ei.value.code == PROMPT_TOO_LONG and ei.value.sent is False and "too long" in ei.value.message
     assert fake.calls() == []
 
 
-@pytest.mark.skipif(os.name == "nt", reason="60,000 characters exceed the Windows command line; that refusal is tested above")
+def test_a_60000_character_cjk_fact_prompt_reaches_the_cli_on_stdin(fake: FakeClaudeCli, client: ClaudeCodeClient):
+    """A capped datasheet-facts prompt of dense multi-byte text: over one Linux argument (131,072 bytes) and over the
+    Windows command line (32,767 characters), so the old command-line prompt refused it on both - on stdin it
+    arrives whole, and the command line that is left fits both platforms."""
+    from ai_eda.llm.prompts import FACT_PROMPT_MAX_CHARS, datasheet_fact_messages
+
+    page = "정격전압삼점삼볼트전형값동작온도영하사십도에서팔십오도까지저항십킬로옴 10 kΩ ± 1 %, 누설전류 1 µA.\n"
+    msgs = datasheet_fact_messages({"ref": "U1", "mpn": "부품-123"}, [page * 2000], ["v_max", "operating_temperature"])
+    content = msgs[-1].content or ""
+    assert len(content) > FACT_PROMPT_MAX_CHARS - 1000 and len(content) > 32767 and len(content.encode("utf-8")) > 131072
+    fake.queue(success("OK"))
+    assert client.complete(MODEL, msgs).content == "OK"
+    (call,) = fake.prompt_calls()
+    assert call["prompt_source"] == "stdin" and fake.stdin_bytes(call) == content.encode("utf-8")
+    assert not any("정격" in a for a in call["argv"])
+    argv = [client.cli, *call["argv"]]
+    assert argv_limit_problem(argv, platform="windows") is None
+    assert argv_limit_problem(argv, {}, platform="linux", page_size=4096, arg_max=10**9) is None
+
+
 def test_a_capped_ascii_fact_prompt_reaches_the_cli(fake: FakeClaudeCli, client: ClaudeCodeClient):
     from ai_eda.llm.prompts import FACT_PROMPT_MAX_CHARS, datasheet_fact_messages
 
@@ -708,7 +1055,7 @@ def test_a_capped_ascii_fact_prompt_reaches_the_cli(fake: FakeClaudeCli, client:
     assert len(msgs[-1].content or "") > FACT_PROMPT_MAX_CHARS - 1000
     fake.queue(success("OK"))
     assert client.complete(MODEL, msgs).content == "OK"
-    assert fake.prompt_calls()[0]["argv"][1] == msgs[-1].content
+    assert fake.stdin_bytes(fake.prompt_calls()[0]) == (msgs[-1].content or "").encode("utf-8")
 
 
 # ---------------------------------------------------------- through the service
@@ -781,11 +1128,13 @@ def test_a_cli_timeout_on_the_subscription_only_route_says_so(fake: FakeClaudeCl
 
 @pytest.mark.skipif(not sys.platform.startswith("linux") and os.name != "nt", reason="the per-argument (Linux) / command-line (Windows) limit")
 def test_a_prompt_too_long_for_the_cli_falls_back_to_a_configured_per_call_candidate(fake: FakeClaudeCli):
+    """A command line the OS would refuse (here a 60,000-character system prompt: 180,000 bytes in one Linux argument,
+    over the Windows command line) is a transport error that sent nothing, so the explicit fallback serves."""
     from ai_eda.llm.router import TaskKind
     from ai_eda.llm.service import LLMBudget
 
     svc, _ = _mixed_service(10.0, LLMBudget(max_usd=1.0))
-    resp = svc.complete(TaskKind.CHAT, _msgs("동" * 60000))
+    resp = svc.complete(TaskKind.CHAT, _msgs("hi", system="동" * 60000))
     assert resp.via == "openrouter" and fake.calls() == []
     assert [(a.outcome, a.via, a.usage) for a in svc.last_attempts][0] == ("transport", "claude", None)  # nothing sent, nothing recorded
     assert [r.via for r in svc.usage.records] == ["openrouter"]
