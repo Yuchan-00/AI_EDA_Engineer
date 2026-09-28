@@ -8,7 +8,7 @@ quasi-static (TEM, zero-frequency) values are computed: dispersion, conductor
 and dielectric loss, surface roughness and the solder mask over a microstrip
 are **not** modelled - a check that quotes these numbers says so. Every
 calculator is registered like the others (:data:`~ai_eda.tools.calc.basic.ROLES`,
-:data:`~ai_eda.tools.calc.recompute.CALCULATORS`, ``CALC_VERSION`` 0.8), so
+:data:`~ai_eda.tools.calc.recompute.CALCULATORS`; since ``CALC_VERSION`` 0.8), so
 ``calc.recompute`` re-derives a stored value from the ids its provenance
 names - including stackup numbers (``pcb.stackup.dielectrics[0].er``, see
 :meth:`ai_eda.ir.Stackup.lookup`).
@@ -101,6 +101,14 @@ Formulas (u = w/h normalised width, g = s/h normalised gap, t/h normalised thick
   is the lumped-circuit rule of H. Johnson and M. Graham, "High-Speed Digital
   Design", 1993 (dimensions below 1/6 of the rising edge's length). A rule,
   not a simulation: a longer line is handed to the SPICE check.
+
+* :func:`guided_wavelength_mm` / :func:`rf_critical_length_mm` (plain
+  functions, not registered calculators - like :func:`critical_length_mm`,
+  their numbers live in a check's details, never in the IR) - the RF form of
+  the same rule for a carrier of frequency f: lambda_g = 1 / (f t_pd)
+  (= c0 / (f sqrt(e_eff))), and l_crit = fraction lambda_g with
+  ``fraction`` ``ir.si.rf_length_fraction`` (a confirmed choice; lambda/10 is
+  the common rule of thumb below which a line is electrically short).
 """
 
 from __future__ import annotations
@@ -445,6 +453,21 @@ def critical_length_mm(t_r_s: float, t_pd_s_per_m: float, fraction: float) -> fl
     return f * t_r / t_pd * 1000.0
 
 
+def guided_wavelength_mm(f_hz: float, t_pd_s_per_m: float) -> float:
+    """lambda_g = 1 / (f t_pd) in mm: the wavelength along a line whose delay per length is ``t_pd`` (module docstring)."""
+    f = _positive(f_hz, "f")
+    t_pd = _positive(t_pd_s_per_m, "t_pd")
+    return 1000.0 / (f * t_pd)
+
+
+def rf_critical_length_mm(f_hz: float, t_pd_s_per_m: float, fraction: float) -> float:
+    """l_crit = fraction lambda_g in mm: the RF electrical-length rule (0.1 is the common lambda/10 rule of thumb; a confirmed choice)."""
+    frac = float(fraction)
+    if not math.isfinite(frac) or not 0.0 < frac <= 1.0:
+        raise ValueError(f"fraction must be in (0, 1], got {fraction!r}")
+    return frac * guided_wavelength_mm(f_hz, t_pd_s_per_m)
+
+
 # --------------------------------------------------------------------------- traced calculators (registered)
 
 
@@ -661,6 +684,7 @@ __all__ = [
     "edge_coupled_z_diff",
     "edge_coupled_z_even",
     "edge_coupled_z_odd",
+    "guided_wavelength_mm",
     "line_delay",
     "line_delay_s",
     "line_geometry",
@@ -668,6 +692,7 @@ __all__ = [
     "microstrip_e_eff",
     "microstrip_z0",
     "propagation_delay",
+    "rf_critical_length_mm",
     "solve_coupled_spacing",
     "solve_coupled_width",
     "solve_microstrip_width",

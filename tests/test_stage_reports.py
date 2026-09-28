@@ -169,7 +169,7 @@ def test_astable_theory_report_states_the_formulas_with_the_design_numbers(astab
     # the model card comes from the IR's SPICE binding, the tran window from the calculator parameters
     assert "`.model QNPN NPN (TR=200n)`" in text and "step  = 1/(200·f) = 5 µs" in text and "stop  = 20/f      = 20 ms" in text
     # the parameter table: key, value, origin, calculator id or the confirmed-choice label, the formula note
-    assert "| `c` | 64.817 nF | 계산기 출력 | `calc.astable.c_for_frequency` v0.8 ← f_osc, r_b, v_in, v_be | C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE))) |" in text
+    assert "| `c` | 64.817 nF | 계산기 출력 | `calc.astable.c_for_frequency` v0.9 ← f_osc, r_b, v_in, v_be | C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE))) |" in text
     assert f"| `r_b` | 10 kΩ | 사용자 확인 선택값 | template astable v{TEMPLATE_VERSION} |" in text
     assert "| `v_in` | 5 V | 사용자 요구사항 | req.input_voltage |" in text
     # constraints, simulation setup, the judging rule and the frequency measurement rule (Reduce.FREQUENCY is used)
@@ -188,7 +188,7 @@ def test_divider_theory_report(divider, tmp_path: Path):
     assert "= 10 kΩ·(12 V − 5 V)/5 V = 14 kΩ" in text and "R_th = R1‖R2" in text and "5.8333 kΩ" in text
     assert "|측정값 − 5 V| ≤ 1 % × 5 V = 50 mV" in text
     assert "주파수 측정식" not in text  # no Reduce.FREQUENCY expectation in a divider
-    assert "| `r1` | 14 kΩ | 계산기 출력 | `calc.divider.r1_for_v_out` v0.8 ← v_in, v_out_target, r2 | R1 = R2 * (V_in - V_out) / V_out |" in text
+    assert "| `r1` | 14 kΩ | 계산기 출력 | `calc.divider.r1_for_v_out` v0.9 ← v_in, v_out_target, r2 | R1 = R2 * (V_in - V_out) / V_out |" in text
     _assert_clean(text, tmp_path)
 
 
@@ -274,7 +274,7 @@ def test_divider_parts_report(divider, tmp_path: Path):
     assert "- 역할: R1: 상단 분압 저항 (VIN–VOUT), 출력 비율을 정함" in text
     assert f"- 저항값 14 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in text
     assert "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 3.5 mW = 7 mW" in text
-    assert "- 전기 특성: resistance = 14 kΩ [계산기 출력 (calc.divider.r1_for_v_out v0.8)]" in text
+    assert "- 전기 특성: resistance = 14 kΩ [계산기 출력 (calc.divider.r1_for_v_out v0.9)]" in text
     assert "- req.output_voltage (output_voltage: 5 V)" in text
     _assert_clean(text, tmp_path)
 
@@ -299,7 +299,7 @@ def test_non_template_design_gets_honest_fallbacks(tmp_path: Path):
     assert template_of(ir) is None and template_for(ir) is None
     theory, parts = theory_report(ir, lib), parts_report(ir, lib)
     assert f"- 설계 출처: {NO_TEMPLATE}" in theory and f"{NO_TEMPLATE}: 이 설계는 템플릿이 만들지 않았으므로" in theory
-    assert "| `v_out` | 6 V | 계산기 출력 | `calc.divider.v_out` v0.8 ← v_in, r1, r2 | V_out = V_in * R2 / (R1 + R2) |" in theory
+    assert "| `v_out` | 6 V | 계산기 출력 | `calc.divider.v_out` v0.9 ← v_in, r1, r2 | V_out = V_in * R2 / (R1 + R2) |" in theory
     assert "제약 조건 기록 없음." in theory and "- `dc_vin`: dc (source = VIN, start = 0 V, stop = 12 V, step = 1 V)" in theory
     assert f"{NO_TEMPLATE}: 템플릿의 이론 곡선이 없습니다." in theory and "![fig]" not in theory and NO_WAVEFORM in theory
     assert parts.count(f"{NO_TEMPLATE_INFO}: 역할·선정 이유·대체 기준은 템플릿이 만든 설계에만 있습니다.") == 3
@@ -434,6 +434,17 @@ def test_circuit_report_lists_nets_placements_routing_and_the_reference_values(a
     _assert_clean(text, tmp_path)
     before = ir.content_hash()
     assert circuit_report(ir, lib, state) == text and ir.content_hash() == before
+
+
+def test_a_non_positive_track_width_is_named_not_a_crash(astable_release):
+    # IPC-2221's area**0.725 of a negative width is a complex number: the section used to raise TypeError in quantity()
+    ir, lib, state = astable_release
+    bad = ir.model_copy(deep=True)
+    for track in bad.pcb.tracks:
+        track.width_mm = -0.2
+    text = circuit_report(bad, lib, state)
+    assert "- 폭 -0.2 mm 트랙: 폭이 양수가 아니라 IPC-2221 전류 용량을 계산하지 않습니다." in text
+    assert "의 구리 저항:" not in text  # no resistance of a negative width either
 
 
 def test_circuit_report_of_an_unrouted_board_says_so(tmp_path: Path):
@@ -828,7 +839,7 @@ def test_led_theory_and_parts_reports(tmp_path: Path):
     assert "R = (V_in − V_f)/I_f" in text and "= (5 V − 2 V)/10 mA = 300 Ω   (`calc.led.R`)" in text and "= 3 V/300 Ω = 10 mA   (`calc.led.I`)" in text
     assert "| 저항 소비전력 | P(R) = (V_in − V_f)·I = (V_in − V_f)²/R | 30 mW |" in text and "| LED 소비전력 | P(LED) = V_f·I | 20 mW |" in text
     assert "V_f 가 0.1 V 커지면 전류는 약 3.33 % 줄어듭니다" in text and "|측정값 − 10 mA| ≤ 1 % × 10 mA = 100 µA" in text
-    assert "| `r_led` | 300 Ω | 계산기 출력 | `calc.led.R` v0.8 ← v_in, v_f, i_f | R = (V_supply - V_f) / I_f |" in text
+    assert "| `r_led` | 300 Ω | 계산기 출력 | `calc.led.R` v0.9 ← v_in, v_f, i_f | R = (V_supply - V_f) / I_f |" in text
     parts = parts_report(ir, lib)
     notes = template_for(ir).part_notes(ir)
     assert set(notes) == {c.ref for c in ir.components} == {"R1", "D1", "J1"}

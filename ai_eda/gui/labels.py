@@ -31,9 +31,11 @@ from ai_eda.report.data import (
     MISSING_ON_DISK,
     MODEL_OUTPUT,
     NO_RECORDED_RUN,
+    NOT_READ_OUTSIDE,
     ON_DISK,
     OPINION,
     PIPELINE_DESCRIBES_IR,
+    PIPELINE_OTHER_IR,
     PIPELINE_STALE_IR,
     RUN_CURRENT_IR,
     RUN_EARLIER_IR,
@@ -57,8 +59,10 @@ KOREAN_LABELS: dict[str, str] = {
     EVIDENCE_NO_HASH: "있음 (기록된 해시 없음)",
     EVIDENCE_NO_PATH: "경로 없음",
     EVIDENCE_MISSING: "없음",
+    NOT_READ_OUTSIDE: "이 프로젝트 폴더 밖 (읽지 않음)",
     PIPELINE_DESCRIBES_IR: "pipeline.json이 이 ir.json을 기록했습니다",
     PIPELINE_STALE_IR: "pipeline.json을 쓴 뒤 ir.json이 바뀌었습니다",
+    PIPELINE_OTHER_IR: "pipeline.json이 다른 ir.json의 실행을 기록했습니다",
     RUN_CURRENT_IR: "현재 IR에 대한 실행 기록",
     RUN_EARLIER_IR: "이전 IR 버전에 대한 실행 기록",
     NO_RECORDED_RUN: "기록된 실행 없음: 먼저 `ai-eda run`을 실행하십시오",
@@ -71,6 +75,10 @@ KOREAN_PREFIXES: tuple[tuple[str, str], ...] = (
     (f"{STALE} (IR ", "낡음: 이전 설계 해시 (IR "),
     (f"{RUN_EARLIER_IR} (IR ", "이전 IR 버전에 대한 실행 기록 (IR "),
 )
+#: the composed forms ``f"{label}: <path>"`` (data.py ``pipeline_note`` of a record naming another ir.json): the Korean of the label, the path as written
+KOREAN_PATH_PREFIXES: tuple[tuple[str, str], ...] = (
+    (f"{PIPELINE_OTHER_IR}: ", "pipeline.json이 다른 ir.json의 실행을 기록했습니다: "),
+)
 
 
 def korean_label(text: object) -> str | None:
@@ -81,6 +89,9 @@ def korean_label(text: object) -> str | None:
         return KOREAN_LABELS[text]
     for prefix, korean in KOREAN_PREFIXES:
         if text.startswith(prefix) and text.endswith(")"):
+            return korean + text[len(prefix):]
+    for prefix, korean in KOREAN_PATH_PREFIXES:
+        if text.startswith(prefix) and len(text) > len(prefix):
             return korean + text[len(prefix):]
     return None
 
@@ -102,4 +113,4 @@ def label_map(*values: Any) -> dict[str, str]:
     return dict(sorted(found.items()))
 
 
-__all__ = ["KOREAN_LABELS", "KOREAN_PREFIXES", "korean_label", "label_map"]
+__all__ = ["KOREAN_LABELS", "KOREAN_PATH_PREFIXES", "KOREAN_PREFIXES", "korean_label", "label_map"]

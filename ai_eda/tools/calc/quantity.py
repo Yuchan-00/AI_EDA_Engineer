@@ -24,7 +24,22 @@ second(s)), ``m`` (m, meter(s), metre(s), 미터), ``g`` (g, gram(s), 그램),
 ``degC`` (°C, ℃, degC, deg C - no prefix), ``K/W`` (K/W, °C/W, ℃/W, degC/W,
 deg C/W - a thermal resistance; no prefix, and matched before the degC forms
 so ``62 °C/W`` is 62 K/W, never 62 degC), ``percent`` (%, percent, 퍼센트 -
-no prefix, value kept as written: ``90%`` is 90, not 0.9).
+no prefix, value kept as written: ``90%`` is 90, not 0.9), ``V/m`` (a field
+strength; takes a prefix: ``50 mV/m`` is 0.05 V/m, matched before the volt so it
+is never 50 mV followed by ``/m``).
+
+Level units (no prefix, never converted, case-insensitive: ``dBm`` = ``DBM``):
+``dB`` (a ratio), ``dBm`` (re 1 mW), ``dBW`` (re 1 W), ``dBc`` (re the carrier),
+``dBi`` (antenna gain re isotropic), ``dBuV/m`` (``dBµV/m``, ``dBμV/m``; field
+strength re 1 uV/m), and ``ppm`` (parts per million). A level is typed as
+written: ``-110 dBm`` is the value -110 with the unit ``dBm``, never a power in
+watts - a logarithmic level has no SI prefix (``5 kdBm`` is not a quantity) and
+turning it into watts is a calculation (``calc.rf.dbm_to_w``), which only
+:func:`ai_eda.design.inputs.read_value` performs, for a key whose unit is W, and
+names in its note. A level, a ``ppm`` figure or a field strength followed by
+``/`` is a density or a slope, not a level (``-174 dBm/Hz``, ``20 dB/dec``,
+``50 ppm/°C``, ``1 V/m/s``): the level forms do not match there
+(``1 V/m/s`` reads as the volt, as before the field-strength unit existed).
 
 Ambiguity rules (each one is pinned by ``tests/test_quantity.py``):
 
@@ -48,6 +63,16 @@ Ambiguity rules (each one is pinned by ``tests/test_quantity.py``):
   dropped from the unit.
 * A prefix may be separated from its unit by whitespace (``10k ohm``,
   ``10 k Ω``), and the unit from the number (``12 V``).
+* A minus may be typeset: the hyphen U+2010, the figure dash U+2012, the en
+  dash U+2013 and the full-width U+FF0D read as ``-`` when attached to the
+  digits where a number may start (``–120 dBm`` is -120 dBm, ``－40 °C`` is
+  -40 degC, ``–120 ~ –100 dBm`` is -120..-100 dBm; ``10–20 dBm`` stays the
+  range 10..20). A number that follows such a dash or an em dash U+2014 which
+  is neither its attached sign nor a range separator (``sensitivity – 120 dBm``,
+  ``1 kHz–3 dB``, ``spurious — 50 dBc``) is not read at all: the sign is
+  unknown, and a dropped minus would turn -120 dBm into +120 dBm. (The ASCII
+  ``-`` keeps its older rule: after a word or number it is a separator,
+  ``12-5V`` -> 5 V.)
 * ``±`` or ``+/-`` before a number marks a tolerance: :attr:`Quantity.plus_minus`
   is ``True`` and the value is the magnitude (``±5%`` -> 5 percent).
 * Ranges (:class:`QuantityRange`): ``3.3-5V``, ``3.3~5 V``, ``-20..85 °C``,
@@ -83,7 +108,9 @@ import re
 
 from pydantic import BaseModel, ConfigDict
 
-QUANTITY_VERSION = "0.2"
+#: 0.3: the level units (dB, dBm, dBW, dBc, dBi, dBuV/m), ppm and the field strength V/m;
+#: 0.4: a typeset minus (U+2010 / U+2012 / U+2013 / U+FF0D) is a sign, and a number after an unattached one is not read
+QUANTITY_VERSION = "0.4"
 
 #: SI prefix letter -> decimal exponent (engineering text: ``M`` is mega)
 PREFIX_EXPONENTS: dict[str, int] = {
@@ -146,17 +173,23 @@ _KOREAN: dict[str, str] = {
 #: units that never take a prefix; the regex below spells their forms (the thermal resistance first: its
 #: spellings start with a degC spelling, and the longer match must win)
 _PLAIN: dict[str, str] = {"%": "percent", "percent": "percent", "K/W": "K/W", "degc": "degC", "℃": "degC"}
+#: the level units and ppm (no prefix; matched case-insensitively): spelling -> canonical unit
+_LEVELS: dict[str, str] = {
+    "dB": "dB", "dBm": "dBm", "dBW": "dBW", "dBc": "dBc", "dBi": "dBi",
+    "dBuV/m": "dBuV/m", "dBµV/m": "dBuV/m", "dBμV/m": "dBuV/m", "ppm": "ppm",
+}
 
 #: canonical unit -> every accepted spelling (documentation and tests)
 UNITS: dict[str, tuple[str, ...]] = {}
-for _table in (_SYMBOLS, _WORDS, _KOREAN, _PLAIN):
+for _table in (_SYMBOLS, _WORDS, _KOREAN, _PLAIN, _LEVELS):
     for _spelling, _canon in _table.items():
         UNITS.setdefault(_canon, ())
         UNITS[_canon] = (*UNITS[_canon], _spelling)
 UNITS["degC"] = (*UNITS["degC"], "°C", "deg C")
 UNITS["K/W"] = (*UNITS["K/W"], "°C/W", "℃/W", "degC/W", "deg C/W")
+UNITS["V/m"] = ("V/m",)
 #: units that may carry a prefix
-PREFIXABLE_UNITS: frozenset[str] = frozenset({"V", "A", "W", "ohm", "F", "H", "Hz", "s", "m", "g"})
+PREFIXABLE_UNITS: frozenset[str] = frozenset({"V", "A", "W", "ohm", "F", "H", "Hz", "s", "m", "g", "V/m"})
 
 
 class Quantity(BaseModel):
@@ -186,7 +219,13 @@ def _alternation(spellings: dict[str, str]) -> str:
     return "|".join(re.escape(s) for s in sorted(spellings, key=len, reverse=True))
 
 
-_SIGN = r"[+\-−]?"
+#: the dashes typeset text uses for a minus: hyphen U+2010, figure dash U+2012, en dash U+2013, full-width
+#: hyphen-minus U+FF0D (datasheets write ``–40 °C`` / ``–120 dBm``); a sign only when attached to the digits
+#: where a number may start, read as ``-`` (the em dash U+2014 is punctuation, never a sign)
+_DASH_MINUS = "\u2010\u2012\u2013\uff0d"
+#: a dash that, left unconsumed right before a number (whitespace between allowed), makes its sign unknown
+_AMBIGUOUS_DASHES = frozenset(_DASH_MINUS + "\u2014")
+_SIGN = rf"[+\-−{_DASH_MINUS}]?"
 _UNSIGNED = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?|\.\d+(?:[eE][+\-]?\d+)?"
 #: what may not follow a unit (the unit must end its token; Hangul may follow)
 _END = r"(?![A-Za-z0-9_µμΩΩ°℃])"
@@ -198,7 +237,10 @@ _KWORD = _alternation(_KOREAN)
 #: the K/W forms stand before the degC forms: an alternation takes the first branch that matches, and
 #: ``°C`` alone would match inside ``°C/W`` (``/`` may follow a unit) and read a thermal resistance as a temperature
 _DEGC_RE = r"°\s?[Cc]|℃|(?i:deg\s?c)"
-_PLAIN_RE = rf"%|(?i:percent)|K/W|(?:{_DEGC_RE})\s?/\s?W|{_DEGC_RE}"
+#: a level / ppm / field strength followed by ``/`` is a density or a slope (dBm/Hz, dB/dec, ppm/°C), never the level
+_NO_SLASH = r"(?!\s*/)"
+_LEVEL_RE = rf"(?i:db(?:[uµμ]v/m|m|w|c|i)?|ppm){_NO_SLASH}"
+_PLAIN_RE = rf"%|(?i:percent)|K/W|(?:{_DEGC_RE})\s?/\s?W|{_DEGC_RE}|{_LEVEL_RE}"
 
 
 def _num(tag: str) -> str:
@@ -208,7 +250,7 @@ def _num(tag: str) -> str:
 def _unit(tag: str) -> str:
     return (
         rf"(?:(?P<pfx{tag}>{_PREFIX_CLASS})?\s*"
-        rf"(?:(?P<va{tag}>{_VA})(?:\s*(?i:dc|ac))?|(?P<sym{tag}>{_SYM})|(?P<word{tag}>(?i:{_WORD})))"
+        rf"(?:(?P<vm{tag}>V/m){_NO_SLASH}|(?P<va{tag}>{_VA})(?:\s*(?i:dc|ac))?|(?P<sym{tag}>{_SYM})|(?P<word{tag}>(?i:{_WORD})))"
         rf"|(?P<kword{tag}>{_KWORD})|(?P<plain{tag}>{_PLAIN_RE})){_END}"
     )
 
@@ -217,13 +259,16 @@ _SEP = r"(?P<sep>~|～|〜|\.{2,3}|…|–|—|−|-|(?i:to))"
 _SINGLE_RE = re.compile(rf"(?P<pm>±|\+/-)?\s*{_num('')}\s*{_unit('')}")
 _RANGE_RE = re.compile(rf"{_num('lo')}\s*(?:{_unit('lo')})?\s*{_SEP}\s*{_num('hi')}\s*{_unit('hi')}")
 _UNIT_ONLY_RE = re.compile(_unit(""))
-_START_RE = re.compile(r"±|\+/-|[+\-−]?(?:\d|\.\d)")
+_START_RE = re.compile(rf"±|\+/-|[+\-−{_DASH_MINUS}]?(?:\d|\.\d)")
 _DECIMAL_RE = re.compile(r"([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?")
+
+
+_MINUS_TO_ASCII = str.maketrans({ch: "-" for ch in "−" + _DASH_MINUS})
 
 
 def _value(numtext: str, exp10: int) -> float:
     """``numtext`` times ``10**exp10`` as the nearest double (exact decimal, single rounding)."""
-    s = numtext.replace(",", "").replace("−", "-")
+    s = numtext.replace(",", "").translate(_MINUS_TO_ASCII)
     m = _DECIMAL_RE.fullmatch(s)
     if m is None:  # pragma: no cover - the outer regex only admits these spellings
         raise ValueError(f"not a number: {numtext!r}")
@@ -236,6 +281,8 @@ def _unit_of(m: re.Match[str], tag: str) -> tuple[str, int]:
     """``(canonical unit, prefix exponent)`` for the unit groups tagged ``tag`` in a match."""
     prefix = m.group(f"pfx{tag}")
     exp10 = PREFIX_EXPONENTS[prefix] if prefix else 0
+    if m.group(f"vm{tag}") is not None:
+        return "V/m", exp10
     if m.group(f"va{tag}") is not None:
         return _SYMBOLS[m.group(f"va{tag}")], exp10
     if m.group(f"sym{tag}") is not None:
@@ -245,15 +292,20 @@ def _unit_of(m: re.Match[str], tag: str) -> tuple[str, int]:
     if m.group(f"kword{tag}") is not None:
         return _KOREAN[m.group(f"kword{tag}")], 0
     plain = m.group(f"plain{tag}")
-    if plain == "%" or plain.lower() == "percent":
+    low = plain.lower()
+    if plain == "%" or low == "percent":
         return "percent", 0
+    if low == "ppm":
+        return "ppm", 0
+    if low.startswith("db"):  # before the K/W test: "dBW" ends with W too
+        return {"db": "dB", "dbm": "dBm", "dbw": "dBW", "dbc": "dBc", "dbi": "dBi"}.get(low, "dBuV/m"), 0
     if plain.endswith("W"):
         return "K/W", 0
     return "degC", 0
 
 
 def _has_unit(m: re.Match[str], tag: str) -> bool:
-    return any(m.group(f"{g}{tag}") is not None for g in ("va", "sym", "word", "kword", "plain"))
+    return any(m.group(f"{g}{tag}") is not None for g in ("vm", "va", "sym", "word", "kword", "plain"))
 
 
 def _build_single(m: re.Match[str]) -> Quantity:
@@ -338,6 +390,23 @@ def parse_unit(text: str) -> tuple[str, int] | None:
     return None if m is None else _unit_of(m, "")
 
 
+def unit_key(unit: str | None) -> tuple[str, int | str] | None:
+    """A comparison key for a unit spelling, so two spellings of one unit compare equal and nothing else does.
+
+    ``(canonical unit, prefix exponent)`` when :func:`parse_unit` reads it -
+    ``'%'`` and ``'percent'`` -> ``('percent', 0)``, ``'Ω'`` / ``'ohms'`` ->
+    ``('ohm', 0)``, ``'kHz'`` / ``'khz'`` -> ``('Hz', 3)``, ``'DBM'`` ->
+    ``('dBm', 0)`` (``'mHz'`` is milli, never ``'MHz'``) - else
+    ``('?', <the stripped spelling, lower-cased>)``; ``None`` for no unit. The
+    reviewer compares an expectation's unit with a requirement's through it,
+    so it accepts exactly the spellings the parser gives a requirement.
+    """
+    if unit is None or not unit.strip():
+        return None
+    parsed = parse_unit(unit)
+    return parsed if parsed is not None else ("?", unit.strip().lower())
+
+
 def _start_ok(text: str, i: int) -> bool:
     """A number may start at ``i`` unless it continues a word, identifier or decimal (``LM7805``, ``v1.2``, ``1,5``)."""
     if i == 0:
@@ -382,9 +451,27 @@ def find_quantities(text: str) -> list[tuple[tuple[int, int], Quantity | Quantit
         if found is None:
             i = start + 1
             continue
+        if _dash_before(text, start):
+            i = end  # "– 120 dBm", "1 kHz–3 dB": the sign is unknown, so no value at all (never +120)
+            continue
         out.append(((start, end), found))
         i = end
     return out
+
+
+def _dash_before(text: str, start: int) -> bool:
+    """True when the number starting at ``start`` (unsigned) follows an unconsumed typeset dash, whitespace between.
+
+    Such a dash was neither the number's own sign (it is not attached, or it follows a word or number:
+    ``1 kHz–3 dB``) nor a range separator (the range was rejected or never there), so it may be a minus, a
+    separator or punctuation - the quantity is not read rather than read as positive.
+    """
+    if text[start] in "±+-−" + _DASH_MINUS:
+        return False
+    j = start - 1
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    return j >= 0 and text[j] in _AMBIGUOUS_DASHES
 
 
 def format_quantity(q: Quantity | QuantityRange) -> str:
@@ -406,4 +493,5 @@ __all__ = [
     "parse_answer",
     "parse_quantity",
     "parse_unit",
+    "unit_key",
 ]

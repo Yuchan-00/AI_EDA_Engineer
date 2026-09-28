@@ -157,6 +157,11 @@ REDUCE_LABELS: dict[Reduce, str] = {
     Reduce.MAX: "최댓값",
     Reduce.MIN: "최솟값",
     Reduce.FREQUENCY: "상승 에지 주파수",
+    Reduce.DB_AT: "한 주파수에서의 크기 (dB)",
+    Reduce.RMS: "구간 RMS",
+    Reduce.DB_RMS: "구간 RMS 비 (dB)",
+    Reduce.HARMONIC_DBC: "k차 고조파 레벨 (dBc)",
+    Reduce.AM_DEPTH: "AM 변조도",
 }
 
 
@@ -612,6 +617,22 @@ def _simulation_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
             "    f_measured = (N − 1) / (t_N − t_1)", "",
             "에지가 3개 미만이거나 swing 이 엔진 자체의 수렴 허용오차(reltol·max|v| + vntol) 이하이면 '발진 없음' 으로 FAIL 이며 절대 PASS 가 되지 않습니다.", "",
         ]
+    level_kinds = [k for k in (Reduce.DB_AT, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH) if any(e.reduce is k for e in sim.expectations)]
+    if level_kinds:
+        out += ["### 레벨·구간 측정식", "",
+                "ngspice 가 쓴 표본을 잇는 구간별 선형 보간 파형에서 이 프로젝트가 직접 계산합니다(덱에는 .meas / .four 가 없습니다). "
+                "구간 [t_start, t_stop] 은 저장된 표본 안에 있어야 하고, 결과마다 가장 큰 표본 간격이 기록됩니다.", ""]
+        formulas = {
+            Reduce.DB_AT: "    L = 20·log10(|v(at)| / R)   (R = |기준 벡터(at)| 또는 params.ref; 두 크기는 같은 두 표본 사이에서 읽음)",
+            Reduce.RMS: "    RMS = sqrt( (1/T) · Σ h·(v0² + v0·v1 + v1²)/3 )   (T = t_stop − t_start)",
+            Reduce.DB_RMS: "    L = 20·log10(RMS(v) / RMS(기준))   (기준 RMS 가 0 이면 값 없음)",
+            Reduce.HARMONIC_DBC: "    A_n = (2/T)·|∫ v(t)·e^(−j2πn·f0·t) dt|,  L_k = 20·log10(A_k / A_1) dBc   (정수 주기, 최대 간격 ≤ 1/(20·k·f0))",
+            Reduce.AM_DEPTH: "    m = 100·(A_max − A_min)/(A_max + A_min) %   (반송파 주기마다 A = (max − min)/2, f_carrier ≥ 20·f_mod, 최대 간격 ≤ 1/(16·f_carrier))",
+        }
+        for k in level_kinds:
+            out += [f"`{k.value}` ({REDUCE_LABELS[k]}):", "", formulas[k], ""]
+        out += ["dB 기대값은 tol_abs 로만 판정합니다(로그 값의 상대 허용치는 허용치가 아닙니다). 값을 낼 수 없는 경우(간격이 너무 큼, 기준 0, 기본파 없음)는 이유와 함께 FAIL 이고, "
+                "엔진 분해능 이하의 고조파 레벨은 PASS 가 되지 않습니다(NOT_VERIFIED).", ""]
     out += ["### 측정 파형", "",
             "아래 파형은 현재 IR 의 넷리스트로 실행된 최신 ngspice 결과(`results.json`)에서 기대값이 읽는 벡터(템플릿이 지정한 넷 포함)를 그대로 그린 것입니다. 판정은 최종 보고서의 '이론값 대 시뮬레이션' 표에 있습니다.", ""]
     out += figures.lines(SLOT_WAVEFORM)
@@ -1119,6 +1140,10 @@ def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     widths = sorted({t.width_mm for t in pcb.tracks})
     current = _largest_dc_current(ir)
     for width in widths:
+        if not width > 0:
+            # IPC-2221's area**0.725 of a non-positive width is complex / zero: no display value, say so instead
+            out += [f"- 폭 {width:g} mm 트랙: 폭이 양수가 아니라 IPC-2221 전류 용량을 계산하지 않습니다.", ""]
+            continue
         cap = ipc2221_current_a(width)
         area = (width / MIL_MM) * (COPPER_THICKNESS_UM / 1000.0 / MIL_MM)
         out += [
@@ -1133,7 +1158,7 @@ def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
             out.append("  이 설계의 템플릿은 정상 전류를 명시하지 않으므로 용량만 적습니다.")
         out.append("")
     longest = max(stats, key=lambda s: s["length_mm"]) if stats else None
-    if longest is not None and longest["length_mm"] > 0 and longest["widths"]:
+    if longest is not None and longest["length_mm"] > 0 and longest["widths"] and min(longest["widths"]) > 0:
         w_l = min(longest["widths"])
         r = copper_resistance_ohm(longest["length_mm"], w_l)
         out += [
@@ -1158,7 +1183,15 @@ def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
 
 
 def _routing_results(ir: CircuitIR) -> list[str]:
-    """The latest ``pcb.routing.connectivity`` / ``pcb.routing.clearance`` results with their per-net rows, copied."""
+    """The latest ``pcb.routing.connectivity`` / ``pcb.routing.clearance`` results with their per-net rows, copied.
+
+    The clearance pair / violation counts are printed only when the check
+    compared copper against a limit (``limit_mm`` a number, no malformed
+    copper); its no-limit, malformed and outline branches write
+    ``pairs_compared=0, violations=[]`` without comparing anything, so those
+    print :data:`NO_RECORD` - never "0 violations" for a comparison that did
+    not run.
+    """
     out = ["### IR 기하 검사 결과 (`pcb.routing.*`; DRC 아님)", ""]
     for check in (CONNECTIVITY_CHECK, CLEARANCE_CHECK):
         r = ir.validation.latest(check)
@@ -1173,7 +1206,12 @@ def _routing_results(ir: CircuitIR) -> list[str]:
                     out.append(f"  - `{row.get('net', '?')}`: {row.get('status', '?')}: {_cell(row.get('message', ''))}")
         if check == CLEARANCE_CHECK and isinstance(r.details, dict):
             lim = r.details.get("limit_mm")
-            out.append(f"  - 한계 {NO_RECORD if lim is None else f'{lim:g} mm'}, 비교한 쌍 {r.details.get('pairs_compared', NO_RECORD)}, 위반 {len(r.details.get('violations') or [])}")
+            compared = isinstance(lim, (int, float)) and not isinstance(lim, bool) and not r.details.get("malformed")
+            if compared:
+                counts = f"비교한 쌍 {r.details.get('pairs_compared', NO_RECORD)}, 위반 {len(r.details.get('violations') or [])}"
+            else:
+                counts = f"비교한 쌍 {NO_RECORD}, 위반 {NO_RECORD}"
+            out.append(f"  - 한계 {NO_RECORD if lim is None else f'{lim:g} mm'}, {counts}")
     out.append("")
     return out
 

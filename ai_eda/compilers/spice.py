@@ -48,6 +48,28 @@ Invariants this module enforces:
   ``at`` / ``final`` / ``max`` / ``min`` only on a sweep, and
   ``reduce=frequency`` (rising mid-level crossings over time) only on a
   ``tran`` analysis: a dc or ac sweep has no time axis to count edges on.
+  ``reduce=db_at`` only on an ``ac`` analysis, with ``at`` and a magnitude
+  vector (never ``vp`` / ``vr`` / ``vi``); ``rms`` / ``db_rms`` /
+  ``harmonic_dbc`` / ``am_depth`` only on a ``tran`` analysis, over a window
+  ``[t_start, t_stop]`` inside the analysis' saved window (with a tran
+  ``start`` > 0, ``t_start`` at least one step after it: ngspice-42 saves its
+  first point up to one step after ``start`` - measured). A level reduction
+  names exactly one reference (``reference_vector``, a magnitude of the same
+  kind, or ``params["ref"]`` > 0); ``harmonic_dbc`` takes an integer ``k >= 2``
+  and a window of whole periods of ``f0``; ``am_depth`` needs
+  ``f_carrier >= 20 f_mod`` and a window of at least one modulation period;
+  a dB level needs ``tol_abs`` and no ``tol_rel``; a stated nominal unit must
+  be the reduction's (``dB``, ``dBc``, ``percent``, the vector's for ``rms``).
+  Every param is a finite traced number through the same llm_generated
+  refusal; the other reductions take none. None of it reaches the deck: the
+  reductions are Python arithmetic on the vectors ngspice wrote, so no
+  ``.save`` / ``.meas`` / ``.four`` / ``sp`` / ``noise`` card or command
+  exists here.
+* **A modulated source is fully stated.** ``AM(VA VO MF FC TD)`` and
+  ``SFFM(VO VA FC MDI FS)`` take every parameter, finite; ``mf`` / ``fc``
+  (AM) and ``fc`` / ``fs`` (SFFM) must be > 0 and ``td`` >= 0 - ngspice-42
+  silently replaces a zero MF or FS by a default of its own and simulates
+  another waveform (measured, :class:`~ai_eda.ir.simulation.StimulusKind`).
 * **No analysis in the netlist.** No ``.control`` block and no
   ``.op``/``.dc``/``.ac``/``.tran`` cards: :func:`analysis_command` renders
   an :class:`AnalysisSpec` as the interactive command the runner issues
@@ -81,7 +103,7 @@ Netlist layout::
     <model cards, verbatim, sorted by model name>
     <elements: "<NAME> <nodes in pin_order> <value|model_name> [k=v ...]">
                (a lossless line: "T<ref> <p1+> <p1-> <p2+> <p2-> td=<s> z0=<ohm>")
-    <stimuli:  "V<id>|I<id> <net node> <reference node> DC <v> | PULSE(...) | SINE(...) | PWL(...) [AC <mag>]">
+    <stimuli:  "V<id>|I<id> <net node> <reference node> DC <v> | PULSE(...) | SINE(...) | PWL(...) | AM(...) | SFFM(...) [AC <mag>]">
     .end
 
 The element name is the IR ref when it already starts with the device
@@ -120,9 +142,17 @@ from ai_eda.ir.simulation import (
     MODEL_DEVICES,
     NODE_COUNTS,
     PARAM_DEVICES,
+    DB_REDUCES,
+    REDUCE_PARAM_UNITS,
+    REDUCE_PARAMS,
+    REDUCE_UNITS,
+    REFERENCE_REDUCES,
     SINE_OPTIONAL_PARAMS,
+    STIMULUS_NON_NEGATIVE_PARAMS,
     STIMULUS_PARAMS,
+    STIMULUS_POSITIVE_PARAMS,
     VALUE_DEVICES,
+    WINDOW_REDUCES,
     AnalysisSpec,
     Expectation,
     Reduce,
@@ -132,6 +162,7 @@ from ai_eda.ir.simulation import (
     StimulusKind,
 )
 from ai_eda.tools.calc.si import format_spice_number, ngspice_reads
+from ai_eda.tools.spice.measure import MIN_CARRIER_TO_MOD_RATIO, MIN_HARMONIC_PERIODS, PERIOD_REL_TOL
 from ai_eda.tools.spice.ngspice_shared import NODE_RE, validate_deck
 from ai_eda.tools.spice.runner import SpiceAnalysis
 
@@ -410,6 +441,15 @@ def _stimulus_spec(s: Stimulus, ledger: _Ledger) -> str:
             numbers = _pwl_points(ledger.accept(params["points"], f"{what} param points"), f"{what} param points", ledger)
         else:
             numbers = [_number(ledger.accept(params[k], f"{what} param {k}"), f"{what} param {k}", ledger) for k in required]
+            for k in STIMULUS_POSITIVE_PARAMS.get(s.kind, ()):
+                if float(params[k].value) <= 0.0:
+                    raise CompileError(
+                        f"{what}: {s.kind.value} param {k} must be > 0, got {params[k].value!r} "
+                        "(ngspice-42 silently replaces a zero one by a default of its own and simulates another waveform - measured)"
+                    )
+            for k in STIMULUS_NON_NEGATIVE_PARAMS.get(s.kind, ()):
+                if float(params[k].value) < 0.0:
+                    raise CompileError(f"{what}: {s.kind.value} param {k} (a delay) must be >= 0, got {params[k].value!r}")
             given = [k for k in optional if k in params]
             if given != list(optional[: len(given)]):
                 raise CompileError(f"{what}: optional sine params must be given in order {list(optional)}, got {given}")
@@ -595,7 +635,119 @@ def _check_expectation(exp: Expectation, ir: CircuitIR, setup: SimulationSetup, 
                 raise CompileError(f"{what} {label} must be a finite number")
     if float(exp.nominal.value) == 0.0 and exp.tol_abs is None and exp.tol_rel is not None:
         raise CompileError(f"{what}: nominal is 0 and only tol_rel is given - a relative tolerance on zero is no tolerance; give tol_abs")
+    _check_reduction(exp, ir, analysis, what, ledger)
     return vector
+
+
+def _vector_unit(vector: str) -> str:
+    """``V`` for a ``v(...)`` vector, ``A`` for an ``i(...)`` one (the grammar is checked before this is asked)."""
+    return "A" if vector.strip()[:1].lower() == "i" else "V"
+
+
+def _check_reduction(exp: Expectation, ir: CircuitIR, analysis: AnalysisSpec, what: str, ledger: _Ledger) -> None:
+    """The params, reference and window rules of the level / window reductions (``db_at`` ... ``am_depth``).
+
+    Every other reduction takes no params and no ``reference_vector``. Each
+    param is a finite number accepted through the ledger (``llm_generated`` is
+    refused); a unit, when the param states one, must be the one
+    :data:`~ai_eda.ir.simulation.REDUCE_PARAM_UNITS` names. The window of a
+    tran reduction lies inside the analysis' saved window; an RMS needs
+    ``f_max > 0``; a harmonic's window holds at least two whole periods of
+    ``f0``; an AM depth needs ``f_carrier >= 20 f_mod``
+    and a window of at least one modulation period; a dB level needs
+    ``tol_abs`` and no ``tol_rel`` (a relative tolerance on a logarithm is no
+    tolerance), and a stated ``nominal.unit`` must be the reduction's unit.
+    """
+    kind = exp.reduce
+    required, optional = REDUCE_PARAMS[kind]
+    allowed = (*required, *optional)
+    if not allowed and exp.params:
+        raise CompileError(f"{what}: reduce={kind.value} takes no params, got {sorted(exp.params)}")
+    extra = sorted(set(exp.params) - set(allowed))
+    if extra:
+        raise CompileError(f"{what}: unexpected params {extra} for reduce={kind.value} (it takes {list(allowed)})")
+    missing = [k for k in required if k not in exp.params]
+    if missing:
+        raise CompileError(f"{what}: reduce={kind.value} needs params {list(required)}, missing {missing}")
+    if kind not in REFERENCE_REDUCES and exp.reference_vector is not None:
+        raise CompileError(f"{what}: reduce={kind.value} takes no reference_vector")
+    values: dict[str, float] = {}
+    for key in sorted(exp.params):
+        traced = ledger.accept(exp.params[key], f"{what} param {key}")
+        if not _is_number(traced.value) or not math.isfinite(float(traced.value)):
+            raise CompileError(f"{what} param {key} must be a finite number, got {traced.value!r}")
+        want = _vector_unit(exp.vector) if key == "ref" else REDUCE_PARAM_UNITS.get(key)
+        if traced.unit is not None and _unit_key(traced.unit) != _unit_key(want):
+            raise CompileError(f"{what} param {key} carries unit {traced.unit!r}, reduce={kind.value} takes {key} " + (f"in {want}" if want else "as a plain number"))
+        values[key] = float(traced.value)
+    if kind == Reduce.DB_AT:
+        if analysis.kind != SpiceAnalysis.AC:
+            raise CompileError(f"{what}: reduce=db_at reads a magnitude at one frequency, which only an ac analysis produces ({exp.analysis_id} is {analysis.kind.value})")
+        if exp.at is None:
+            raise CompileError(f"{what}: reduce=db_at needs 'at'")
+        if vector_is_complex_part(exp.vector):
+            raise CompileError(f"{what}: reduce=db_at needs a magnitude vector (v(...) / i(...)), got {exp.vector!r}: 20 log10 of a phase or of a real / imaginary part is not a level")
+    if kind in WINDOW_REDUCES and analysis.kind != SpiceAnalysis.TRAN:
+        raise CompileError(f"{what}: reduce={kind.value} reads a time window, which only a tran analysis produces ({exp.analysis_id} is {analysis.kind.value})")
+    if kind in REFERENCE_REDUCES:
+        if (exp.reference_vector is not None) == ("ref" in values):
+            raise CompileError(f"{what}: reduce={kind.value} needs exactly one of reference_vector or params['ref'] (the level the vector is compared with)")
+        if "ref" in values and values["ref"] <= 0.0:
+            raise CompileError(f"{what} param ref must be > 0 (a level to divide by), got {values['ref']!r}")
+        if exp.reference_vector is not None:
+            spice_vector_name(exp.reference_vector, ir)  # the same grammar and IR checks as ``vector``
+            if vector_is_complex_part(exp.reference_vector):
+                raise CompileError(f"{what}: reference_vector {exp.reference_vector!r} names a part of a complex vector; a reference level is a magnitude (v(...) / i(...))")
+            if _vector_unit(exp.reference_vector) != _vector_unit(exp.vector):
+                raise CompileError(f"{what}: reference_vector {exp.reference_vector!r} and vector {exp.vector!r} are not the same kind of quantity (a voltage ratio or a current ratio)")
+    if kind in WINDOW_REDUCES:
+        t0, t1 = values["t_start"], values["t_stop"]
+        start = float(analysis.params["start"].value) if "start" in analysis.params else 0.0
+        stop = float(analysis.params["stop"].value)
+        if not (0.0 <= t0 < t1) or t0 < start or t1 > stop:
+            raise CompileError(f"{what}: the window [{t0:g}, {t1:g}] s must lie inside the tran window [{start:g}, {stop:g}] s of {exp.analysis_id} with 0 <= t_start < t_stop")
+        step = float(analysis.params["step"].value)
+        if start > 0.0 and t0 < start + step:
+            # measured on ngspice-42: `tran 1u 5m 1m` saves its first point at 1.00028 ms, `tran 10u 5m 2m` at 2.0028 ms (a
+            # breakpoint at the start is saved exactly): the first sample lies within one step after `start`, never before
+            raise CompileError(
+                f"{what}: t_start {t0:g} s must be at least one tran step after the analysis' start ({start:g} s + {step:g} s): "
+                "ngspice saves its first point after start, up to one step later, and a window is never extrapolated"
+            )
+        if kind in (Reduce.RMS, Reduce.DB_RMS) and values["f_max"] <= 0.0:
+            raise CompileError(f"{what} param f_max must be > 0 (the highest frequency the RMS must include; the grid guard is 1 / (20 f_max)), got {values['f_max']!r}")
+        if kind == Reduce.HARMONIC_DBC:
+            k = exp.params["k"].value
+            if isinstance(k, bool) or float(k) != int(k) or int(k) < 2:
+                raise CompileError(f"{what}: k must be an integer >= 2 (the harmonic's number; 1 is the fundamental itself), got {k!r}")
+            f0 = values["f0"]
+            if f0 <= 0.0:
+                raise CompileError(f"{what} param f0 must be > 0, got {f0!r}")
+            periods = (t1 - t0) * f0
+            if round(periods) < 1 or abs(periods - round(periods)) > PERIOD_REL_TOL * max(1.0, periods):
+                raise CompileError(f"{what}: the window must hold whole periods of f0 = {f0:g} Hz: (t_stop - t_start) f0 = {periods:.9g}")
+            if round(periods) < MIN_HARMONIC_PERIODS:
+                raise CompileError(f"{what}: the window must hold at least {MIN_HARMONIC_PERIODS} whole periods of f0 = {f0:g} Hz "
+                                   "(the samples must show that the waveform repeats at f0), got 1")
+        if kind == Reduce.AM_DEPTH:
+            fc, fm = values["f_carrier"], values["f_mod"]
+            if not fc > fm > 0.0:
+                raise CompileError(f"{what}: reduce=am_depth needs f_carrier > f_mod > 0, got f_carrier={fc:g} f_mod={fm:g}")
+            if fc < MIN_CARRIER_TO_MOD_RATIO * fm:
+                raise CompileError(
+                    f"{what}: carrier too slow for the envelope: f_carrier / f_mod = {fc / fm:.6g} < {MIN_CARRIER_TO_MOD_RATIO} "
+                    "(each carrier period's amplitude averages the envelope over that period)"
+                )
+            if (t1 - t0) * fm < 1.0 - PERIOD_REL_TOL:
+                raise CompileError(f"{what}: window shorter than one modulation period ({t1 - t0:g} s < 1 / f_mod = {1.0 / fm:g} s)")
+    if kind in DB_REDUCES:
+        if exp.tol_abs is None or exp.tol_rel is not None:
+            raise CompileError(f"{what}: a level in dB needs tol_abs (and no tol_rel): a relative tolerance on a logarithm is no tolerance")
+    unit = REDUCE_UNITS.get(kind) or (_vector_unit(exp.vector) if kind == Reduce.RMS else None)
+    if unit is not None and exp.nominal.unit is not None:
+        same = {_unit_key(unit)} | ({"%"} if unit == "percent" else set())
+        if _unit_key(exp.nominal.unit) not in same:
+            raise CompileError(f"{what}: nominal unit {exp.nominal.unit!r} is not the unit of reduce={kind.value} ({unit})")
 
 
 # --------------------------------------------------------------------------- the compile
@@ -937,7 +1089,8 @@ class SpiceNetlistCompiler(Compiler):
     """Writes ``<workdir>/<project.id>.cir`` (+ ``.cir.report.json``) and registers it as ``SPICE_NETLIST``."""
 
     id = "compiler.spice"
-    version = "0.5"
+    #: 0.6: AM / SFFM stimuli and the level / window reductions' rules (an IR 0.5 compiled writes the same bytes)
+    version = "0.6"
     kind = ArtifactKind.SPICE_NETLIST
 
     build = staticmethod(build)

@@ -114,8 +114,9 @@ from ai_eda.ir import (
     ValidationStatus,
     worst_status,
 )
+from ai_eda.ir.simulation import REDUCE_UNITS
 from ai_eda.review.areas import ReviewArea
-from ai_eda.tools.calc.quantity import QUANTITY_VERSION, parse_answer
+from ai_eda.tools.calc.quantity import QUANTITY_VERSION, parse_answer, unit_key
 from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters, resolve_input
 from ai_eda.tools.kicad.board import BoardFootprint, read_board_footprints
 from ai_eda.tools.kicad.geometry import normalize_angle
@@ -706,7 +707,15 @@ class IndependentReviewer:
         magnitude ratio) and whose sweep point ``at`` is in the requirement's
         unit, it is ``at`` that must be the requirement's value (the cutoff
         frequency the ratio is checked at); a unit-ful nominal keeps the
-        nominal comparison.
+        nominal comparison. A ``db_at`` nominal is always a level in dB, so
+        whenever its ``at`` is in the requirement's unit (a cutoff in Hz) it is
+        ``at`` that is compared, whether or not the nominal states ``dB``; a
+        level / depth reduction's nominal without a unit carries the
+        reduction's own (:data:`~ai_eda.ir.simulation.REDUCE_UNITS`), never the
+        requirement's. Units compare through
+        :func:`~ai_eda.tools.calc.quantity.unit_key` (``%`` is ``percent``,
+        ``Ω`` is ``ohm``; ``dB`` is not ``dBc`` - a level re the carrier is
+        another reference, so it is not comparable).
         """
         value = req.value
         if value is None:
@@ -721,17 +730,20 @@ class IndependentReviewer:
             return f"requirement {req.id} value {raw!r} is not a number", False
         else:
             target, unit_req = float(raw), value.unit
-        unit_e, unit_r = (exp.nominal.unit or "").strip().lower(), (unit_req or "").strip().lower()
-        if exp.reduce == Reduce.AT and exp.at is not None and not unit_e:
-            unit_at = (exp.at.unit or "").strip().lower()
-            if unit_at and unit_r and unit_at == unit_r:
+        key_r = unit_key(unit_req)
+        # a level / depth reduction's number is in the reduction's unit even when the nominal does not say so
+        key_e = unit_key(exp.nominal.unit or REDUCE_UNITS.get(exp.reduce))
+        sweep = (exp.reduce == Reduce.AT and unit_key(exp.nominal.unit) is None) or exp.reduce == Reduce.DB_AT
+        if sweep and exp.at is not None:
+            key_at = unit_key(exp.at.unit)
+            if key_at is not None and key_r is not None and key_at == key_r:
                 at = float(exp.at.value)
                 limit = abs(float(exp.tol_rel.value)) * abs(target) if exp.tol_rel is not None and target != 0.0 else 1e-9 * max(1.0, abs(target))
                 if abs(at - target) <= limit:
                     return None, True
                 return f"sweep point {at:.6g} {unit_req} is not requirement {req.id}'s {target:.6g} {unit_req} (+/- {limit:.3g} {unit_req})", True
-        if unit_e and unit_r and unit_e != unit_r:
-            return f"nominal unit {exp.nominal.unit!r} is not the requirement's {unit_req!r}", False
+        if key_e is not None and key_r is not None and key_e != key_r:
+            return f"nominal unit {exp.nominal.unit or REDUCE_UNITS.get(exp.reduce)!r} is not the requirement's {unit_req!r}", False
         nominal = float(exp.nominal.value)
         limits = [abs(float(exp.tol_abs.value))] if exp.tol_abs is not None else []
         if exp.tol_rel is not None and target != 0.0:

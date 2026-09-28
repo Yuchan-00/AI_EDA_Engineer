@@ -28,7 +28,15 @@ nothing. Each value is one argv item; there is never a shell.
 At most one run per project workdir is active (:class:`RunConflictError`,
 the server's 409): the runs this manager started by its own memory, and, on
 POSIX, a run another GUI process started - or one whose GUI was stopped
-while it ran - by the ``flock`` its log carries. The log's open file
+while it ran - by the ``flock`` its log carries, and a command-line
+``ai-eda run`` / ``review`` / ``stage-reports`` / ``relocate`` by the
+project lock it holds (:func:`ai_eda.workdir.is_locked`, probed only when a
+run is started, never while listing or polling). The GUI never takes that
+lock itself (only its run log's ``flock``, a different file): its child is
+the CLI, which takes it non-blockingly, and no lock in the system waits, so
+there is no deadlock. A project whose recorded workdir names another folder
+(copied or moved) is refused before anything starts, with the CLI's
+``ai-eda relocate`` remedy. The log's open file
 description is locked before the child starts and the child inherits it as
 its stdout / stderr, so the lock is held exactly as long as the run's
 output is open, whatever happens to the GUI: a log with no closing line
@@ -77,6 +85,7 @@ except ImportError:  # Windows: no flock (see the module docstring)
 
 from ai_eda.cli import RUN_OPTIONS, RunOption, build_parser, run_option_flags
 from ai_eda.gui.projects import ProjectInfo, openable_project_name
+from ai_eda.workdir import WorkdirMismatchError, is_locked
 
 #: what a run can be: the CLI subcommands the GUI starts
 RUN_KINDS: tuple[str, ...] = ("run", "review", "stage-reports")
@@ -326,11 +335,13 @@ def command_line(argv: Sequence[str]) -> str:
 
 
 def _workdir_of(ir_path: Path) -> Path:
-    from ai_eda.cli import project_workdir
     from ai_eda.ir import CircuitIR
+    from ai_eda.workdir import project_workdir
 
     try:
         return project_workdir(CircuitIR.load(ir_path), ir_path)
+    except WorkdirMismatchError as e:  # a copied / moved project: the CLI's own refusal, with its relocate remedy
+        raise RunRequestError(str(e)) from e
     except Exception as e:  # noqa: BLE001 - the run cannot be placed; refused before anything starts
         raise RunRequestError(f"{ir_path}: 작업 폴더를 정할 수 없습니다: {e}") from e
 
@@ -429,6 +440,11 @@ class RunManager:
             raise RunRequestError(f"프로젝트 이름이 아닙니다: {project.name!r}")
         if project.error is not None or project.workdir is None:
             raise RunRequestError(f"{project.name}: 실행할 수 없는 프로젝트입니다: {project.error or '작업 폴더 없음'}")
+        if project.workdir_mismatch:
+            raise RunRequestError(
+                f"{project.name}: 실행하지 않습니다: "
+                + (project.warning or f"기록된 작업 폴더가 이 폴더와 다릅니다; `ai-eda relocate {project.ir_path}`를 먼저 실행하십시오")
+            )
         args = form_args(kind, answers, options)
         return self.start(kind, project.ir_path, args, workdir=project.workdir)
 
@@ -439,7 +455,8 @@ class RunManager:
         for an unknown kind, an argument that is not text or holds a NUL,
         or a workdir that is not an existing folder (or whose log folder is
         a link); :class:`RunConflictError` while a run of that workdir is
-        active; :class:`RunStartError` when the process cannot be started.
+        active - this manager's, another GUI's, or a command-line one holding
+        the project lock; :class:`RunStartError` when the process cannot be started.
         """
         if kind not in RUN_KINDS:
             raise RunRequestError(f"알 수 없는 실행 종류: {kind!r} (가능: {', '.join(RUN_KINDS)})")
@@ -464,6 +481,8 @@ class RunManager:
                 raise RunConflictError(
                     f"이 프로젝트는 이미 실행 중입니다 ({elsewhere}: 다른 GUI 프로세스가, 또는 먼저 끝난 GUI가 시작한 실행); 끝난 뒤에 다시 시작하십시오"
                 )
+            if is_locked(place):  # a command-line ai-eda holds the project lock (probed here only: a user started this run)
+                raise RunConflictError("이 프로젝트는 다른 ai-eda 명령(명령줄 실행)이 쓰고 있습니다 (.ai-eda.lock); 끝난 뒤에 다시 시작하십시오")
             try:
                 log_dir.mkdir(parents=True, exist_ok=True)
                 run_id, log_path, log = _open_new_log(log_dir, kind)

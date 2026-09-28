@@ -90,7 +90,7 @@ from typing import Any
 from ai_eda.gui.projects import IR_FILE, safe_part
 from ai_eda.gui.schematic_render import render_kicad_sch_file
 from ai_eda.ir import ArtifactKind, CircuitIR
-from ai_eda.report.data import FRESH, ON_DISK, STALE, artifact_disk_state
+from ai_eda.report.data import FRESH, NOT_READ_OUTSIDE, ON_DISK, STALE, artifact_disk_state
 from ai_eda.report.figures import MAX_SERIES, board_figure, net_class_styles, vector_kind, waveform_figure
 from ai_eda.report.pipeline_log import PIPELINE_FILE
 from ai_eda.report.stages import REPORT_SUFFIXES, REPORT_TITLES, REPORTS_DIR, STAGE_REPORTS
@@ -119,6 +119,8 @@ ZIP_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 #: freshness labels of a results.json (facts about hashes)
 RESULTS_CURRENT = "현재 IR의 spice 결과가 가리키는 results.json입니다 (해시 일치)"
 RESULTS_NOT_CURRENT = "현재 IR의 결과로 확인되지 않은 results.json입니다"
+#: why a copied or moved project's results are not checked against the IR (its locators name the folder it came from)
+RESULTS_NOT_READ = "확인하지 않음: IR의 산출물 경로가 다른 폴더를 가리킵니다(복사하거나 옮긴 프로젝트 - 명령줄에서 ai-eda relocate를 실행하십시오)"
 #: what the page says where a preview has no input: the missing file and the stage (``Stage`` name) that writes it - never
 #: that the stage "has not run" (the stage table, copied from pipeline.json, says whether it ran and why nothing was written)
 NO_SCHEMATIC = "회로도 없음: 등록된 .kicad_sch가 없습니다 (SCHEMATIC 단계가 IR의 부품으로 그려 등록합니다; 개요의 schematic 줄을 보십시오)"
@@ -465,12 +467,15 @@ def _op_values(result: dict[str, Any]) -> dict[str, float | str]:
     return out
 
 
-def simulation_summary(ir: CircuitIR, workdir: Path) -> dict[str, Any]:
+def simulation_summary(ir: CircuitIR, workdir: Path, *, confine: bool = False) -> dict[str, Any]:
     """What ``spice/results.json`` records (engine, conditions, every analysis with its command and outcome, the op values, the waveform charts) and whether it is the current IR's run.
 
     ``current`` is ``True`` only when :func:`~ai_eda.tools.spice.evidence.fresh_spice_run`
     accepts the latest ``spice`` result and its ``results.json`` is this
     file; otherwise ``freshness`` carries the reason. Nothing is judged.
+    ``confine`` (a copied or moved project): ``fresh_spice_run`` is not
+    asked - it would follow the IR's locators into the folder the project
+    came from - and ``current`` is ``False`` with that reason.
     """
     from ai_eda.tools.spice.evidence import fresh_spice_run
 
@@ -480,7 +485,7 @@ def simulation_summary(ir: CircuitIR, workdir: Path) -> dict[str, Any]:
         return {"file": f"{RESULTS_DIR}/{RESULTS_FILE}", "error": " ".join(str(e).split()), "analyses": [], "waveforms": [], "current": False, "freshness": ""}
     if results is None:
         return {"file": None, "missing": NO_RESULTS, "analyses": [], "waveforms": [], "current": False, "freshness": ""}
-    run = fresh_spice_run(ir, needs="GUI preview")
+    run = RESULTS_NOT_READ if confine else fresh_spice_run(ir, needs="GUI preview")
     if isinstance(run, str):
         current, freshness = False, f"{RESULTS_NOT_CURRENT}: {run}"
     else:
@@ -583,8 +588,10 @@ def artifact_rows(ir: CircuitIR, workdir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for kind in sorted(ir.artifacts, key=str):
         art = ir.artifacts[kind]
-        disk = artifact_disk_state(art)
         parts = workdir_parts(art.path, workdir)
+        # a file outside the project folder (a copied or moved project's locator) is never read: its state is unknown here
+        outside = parts is None or any(workdir_parts(f, workdir) is None for f in art.files)
+        disk = NOT_READ_OUTSIDE if outside else artifact_disk_state(art)
         download = "/".join(parts) if parts is not None and confined_file(workdir, parts) is not None else None
         members = [workdir_parts(f, workdir) for f in art.files]
         rows.append(

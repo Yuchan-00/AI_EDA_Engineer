@@ -219,18 +219,27 @@ def test_a_mismatched_recorded_workdir_is_listed_with_the_warning(root: Projects
     shutil.copytree(alpha.folder, root.root / "beta")
     listed = {p.name: p for p in root.list()}
     beta = listed["beta"]
-    # listed by its own folder, run where `ai-eda run` would run it: the recorded (absolute) workdir
+    # listed by its own folder and confined to it: the recorded (absolute) workdir is alpha's and is never followed
     assert beta.error is None and beta.folder == root.root / "beta" and beta.ir_path == root.root / "beta" / "ir.json"
-    assert beta.workdir == alpha.folder and beta.workdir_mismatch and beta.workdir_exists
+    assert beta.workdir == root.root / "beta" and beta.workdir_mismatch and beta.workdir_exists
+    assert beta.recorded_workdir == str(alpha.folder)
     assert beta.warning is not None and "기록된 작업 폴더" in beta.warning and str(alpha.folder) in beta.warning
+    assert "ai-eda relocate" in beta.warning and str(beta.ir_path) in beta.warning
     assert not listed["alpha"].workdir_mismatch and listed["alpha"].warning is None
-    # the recorded workdir no longer exists: still listed (not hidden), and a run is refused before anything starts
+    # a run of it is refused before anything starts, as the CLI refuses it: nothing is written in either folder
+    with pytest.raises(RunRequestError, match="relocate"):
+        RunManager(python_args=SLEEPER).start_project("run", beta)
+    with pytest.raises(RunRequestError, match="ai-eda relocate"):  # the manager's own placement: the CLI's message
+        RunManager(python_args=SLEEPER).start("run", beta.ir_path, [])
+    assert not (root.root / "beta" / "gui").exists() and not (alpha.folder / "gui").exists()
+    # the recorded workdir no longer exists: the same mismatch - still listed (not hidden), confined, refused
     ir = CircuitIR.load(beta.ir_path)
     ir.project.workdir = str(tmp_path / "gone")
     ir.save(beta.ir_path)
     beta = root.get("beta")
-    assert beta.workdir_mismatch and not beta.workdir_exists and beta.last_run is None and "실행할 수 없습니다" in (beta.warning or "")
-    with pytest.raises(RunRequestError, match="작업 폴더가 없습니다"):
+    assert beta.workdir_mismatch and beta.workdir == root.root / "beta" and beta.workdir_exists and beta.last_run is None
+    assert "ai-eda relocate" in (beta.warning or "")
+    with pytest.raises(RunRequestError, match="relocate"):
         RunManager(python_args=SLEEPER).start_project("run", beta)
     assert not (tmp_path / "gone").exists()
     # a relative workdir naming the folder is the folder; one that does not is refused by project_workdir: error only

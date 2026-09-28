@@ -42,7 +42,7 @@ from pydantic import BaseModel
 from ai_eda.ir import CircuitIR, MissingInformation, Provenance, ProvenanceKind, Requirement, Traced
 from ai_eda.tools.kicad.library import KicadLibrary
 
-from ai_eda.design.inputs import BOARD_KEY_ALIASES, DesignInput, canonical_key
+from ai_eda.design.inputs import BOARD_KEY_ALIASES, UNIT_OF, DesignInput, canonical_key, read_inputs, read_value
 
 if TYPE_CHECKING:  # the report package imports this one (stages -> TEMPLATES), so the figure type is a type-only import here
     from ai_eda.design.board import BoardContext, SIDeclarations
@@ -72,6 +72,12 @@ IGNORED_KEYS: frozenset[str] = frozenset({"application", "jurisdiction"})
 #: canonical board keys every template serves through the board stackup (:mod:`ai_eda.design.stackup`): the layer
 #: count ``pcb_layers`` (read by :func:`~ai_eda.design.inputs.read_layer_count`) is a board decision, not a circuit one
 BOARD_KEYS: frozenset[str] = frozenset(BOARD_KEY_ALIASES)
+#: bare requirement keys that name a physical quantity but not *which* one (bare key -> its unit): never an alias of a
+#: template input, so no template reads them; the circuit agent asks which specific key is meant (:func:`specific_keys`)
+#: and a template counts one as served only beside the specific key stated with the same number
+#: (:func:`served_through_specific_key`). ``frequency`` could be an oscillator's output, a filter corner, an MCU clock
+#: or an RF carrier - reading it as any one of them would be a guess
+AMBIGUOUS_KEYS: dict[str, str] = {"frequency": "Hz"}
 
 
 def template_tool(template_id: str) -> str:
@@ -334,12 +340,57 @@ def requirement_text(r: Requirement) -> str:
     return f"{r.key}: {v!r}" if v is not None else r.key
 
 
+def specific_keys(bare_key: str) -> list[str]:
+    """The canonical keys an ambiguous bare key could mean, computed now: every ``*_<bare_key>`` key of the same unit (``frequency`` -> ``clock_frequency``, ...).
+
+    Read from :data:`~ai_eda.design.inputs.UNIT_OF` at call time, so a key
+    added to it later (an RF ``carrier_frequency``) is listed too.
+    """
+    unit = AMBIGUOUS_KEYS.get(bare_key)
+    return sorted(k for k, u in UNIT_OF.items() if u == unit and k.endswith(f"_{bare_key}"))
+
+
+def served_through_specific_key(ir: CircuitIR, template: Template) -> dict[str, str]:
+    """Confirmed requirements under an :data:`AMBIGUOUS_KEYS` key that the template serves after all: requirement id -> the canonical key.
+
+    One counts as served only when the template serves a canonical key of
+    the same unit whose confirmed value (:func:`~ai_eda.design.inputs.read_inputs`)
+    reads exactly the same number as the ambiguous one
+    (:func:`~ai_eda.design.inputs.read_value`): the user named the specific
+    quantity with the same value, so nothing is guessed. Any other value, an
+    unreadable one or no such key served leaves it unserved (closed world).
+    """
+    ambiguous = [
+        r for r in ir.requirements.requirements
+        if r.key in AMBIGUOUS_KEYS and canonical_key(r.key) is None and r.value is not None and r.value.provenance.is_authoritative
+    ]
+    if not ambiguous:
+        return {}
+    inputs, _ = read_inputs(ir)
+    out: dict[str, str] = {}
+    for r in ambiguous:
+        unit = AMBIGUOUS_KEYS[r.key]
+        traced, _why = read_value(r, unit)
+        if traced is None:
+            continue
+        for canon in template.serves:
+            if UNIT_OF.get(canon) == unit and canon in inputs and inputs[canon].traced.value == traced.value:
+                out[r.id] = canon
+                break
+    return out
+
+
 def unserved_requirements(ir: CircuitIR, template: Template) -> list[Requirement]:
     """Confirmed design-category requirements the template neither serves nor may ignore (an unconfirmed value is not counted).
 
     A board key (:data:`BOARD_KEYS`, the layer count) is served by every
-    template through the stackup, so it never refuses one.
+    template through the stackup, so it never refuses one. A requirement
+    under an ambiguous bare key (:data:`AMBIGUOUS_KEYS`, ``frequency``) is no
+    alias of anything and is unserved - unless
+    :func:`served_through_specific_key` finds the served specific key stated
+    with the same number.
     """
+    through = served_through_specific_key(ir, template)
     out: list[Requirement] = []
     for r in ir.requirements.requirements:
         if r.category not in DESIGN_CATEGORIES or r.key in IGNORED_KEYS:
@@ -347,13 +398,14 @@ def unserved_requirements(ir: CircuitIR, template: Template) -> list[Requirement
         if r.value is not None and r.value.provenance.needs_verification:
             continue
         canon = canonical_key(r.key) or r.key
-        if canon in template.serves or canon in template.ignores or canon in BOARD_KEYS:
+        if canon in template.serves or canon in template.ignores or canon in BOARD_KEYS or r.id in through:
             continue
         out.append(r)
     return out
 
 
 __all__ = [
+    "AMBIGUOUS_KEYS",
     "BOARD_KEYS",
     "CHOICE_NOTE_PREFIX",
     "CONFIRM_DESIGN_KEY",
@@ -375,6 +427,8 @@ __all__ = [
     "parameter_value",
     "quantity",
     "requirement_text",
+    "served_through_specific_key",
+    "specific_keys",
     "structural_provenance",
     "template_tool",
     "unserved_requirements",

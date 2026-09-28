@@ -346,4 +346,4 @@ def test_a_thermal_resistance_is_never_read_as_a_temperature() -> None:
     assert parse_quantity("62 °C/W") == Quantity(value=62.0, unit="K/W", original="62 °C/W")
     assert format_quantity(parse_quantity("62 °C/W")) == "62 K/W"  # type: ignore[arg-type]
     assert parse_quantity("5 K/Wh") is None and parse_quantity("62 k/W") is None  # the kelvin is capital; no prefix, no other unit
-    assert QUANTITY_VERSION == "0.2"  # the unit table changed: cached extractions re-ground (the fingerprint carries this)
+    assert QUANTITY_VERSION == "0.4"  # the unit table changed (0.3: the dB level units, ppm, V/m; 0.4: the typeset minus): cached extractions re-ground (the fingerprint carries this)

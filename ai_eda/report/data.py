@@ -6,7 +6,11 @@ Every status it carries is a stored ``ValidationResult.status`` or
 about hashes and files - whether a result's ``ir_hash`` is the current
 design hash (fresh / stale / unstamped), whether an artifact or an evidence
 file is still on disk with the recorded hash, and whether ``pipeline.json``
-describes the ir.json it sits next to (``ir_file_sha256``). The RELEASE
+describes the ir.json it sits next to (``ir_file_sha256``, and ``ir_file`` -
+the ir.json the run described by path: a copied project carries its
+original's record with the same design hash, so a record naming another
+ir.json is labelled :data:`PIPELINE_OTHER_IR` everywhere a hash label alone
+would read "recorded for the current IR"). The RELEASE
 verdict and its reasons come only from the recorded RELEASE outcome, and
 they carry the same run-freshness label as the stage table, so a recorded
 PASS is never shown as if it described a design that changed since; the
@@ -26,6 +30,7 @@ version's hash.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from pathlib import Path
 
@@ -60,9 +65,13 @@ EVIDENCE_OK = "on disk (hash matches)"
 EVIDENCE_NO_HASH = "present (no hash recorded)"
 EVIDENCE_NO_PATH = "no path"
 EVIDENCE_MISSING = "missing"
+#: a locator outside the project folder of a copied or moved project: never followed, so its state is unknown here
+NOT_READ_OUTSIDE = "outside this project folder (not read)"
 #: labels about the run log
 PIPELINE_DESCRIBES_IR = "pipeline.json describes this ir.json"
 PIPELINE_STALE_IR = "ir.json changed since pipeline.json was written"
+#: the record's ``ir_file`` names another ir.json (a copied or relocated project's inherited record); ``ir_file`` None -> the sha rules
+PIPELINE_OTHER_IR = "pipeline.json describes another ir.json"
 RUN_CURRENT_IR = "recorded for the current IR"
 RUN_EARLIER_IR = "recorded for an earlier IR version"
 NO_RECORDED_RUN = "no recorded run: run `ai-eda run` first"
@@ -89,7 +98,7 @@ class MetaSection(BaseModel):
     ir_file_sha256: str
     pipeline_file_path: str | None
     pipeline_file_sha256: str | None
-    #: PIPELINE_DESCRIBES_IR / PIPELINE_STALE_IR / why there is no usable record
+    #: PIPELINE_DESCRIBES_IR / PIPELINE_STALE_IR / ``f"{PIPELINE_OTHER_IR}: <ir_file>"`` / why there is no usable record
     pipeline_note: str
 
 
@@ -316,10 +325,22 @@ def _traced_fields(traced) -> tuple[str, str, str, str, bool]:
     return _s(traced.value), _s(traced.unit), _s(prov.kind), _s(prov.tool), bool(getattr(traced, "needs_verification", False))
 
 
-def evidence_state(ev: Evidence) -> str:
-    """Where an evidence file stands right now: re-hashed against the recorded hash."""
+def outside_folder(path: str | None, confine: Path | None) -> bool:
+    """Whether ``path`` lies outside ``confine`` (lexically; a relative path is taken as written, so it counts as outside); ``False`` when there is no ``confine``."""
+    if confine is None or not path:
+        return False
+    p = Path(path)
+    if not p.is_absolute():
+        return True
+    return not Path(os.path.normpath(p)).is_relative_to(Path(os.path.normpath(confine)))
+
+
+def evidence_state(ev: Evidence, confine: Path | None = None) -> str:
+    """Where an evidence file stands right now: re-hashed against the recorded hash (never read outside ``confine``, when given)."""
     if not ev.path:
         return EVIDENCE_NO_PATH
+    if outside_folder(ev.path, confine):
+        return NOT_READ_OUTSIDE
     p = Path(ev.path)
     if not p.is_file():
         return EVIDENCE_MISSING
@@ -328,7 +349,10 @@ def evidence_state(ev: Evidence) -> str:
     return EVIDENCE_OK if sha256_of_file(p) == ev.content_hash else CHANGED_ON_DISK
 
 
-def artifact_disk_state(art: ArtifactRef) -> str:
+def artifact_disk_state(art: ArtifactRef, confine: Path | None = None) -> str:
+    """The registered artifact's file against its content hash (never read outside ``confine``, when given)."""
+    if any(outside_folder(p, confine) for p in (art.path, *art.files) if p):
+        return NOT_READ_OUTSIDE
     on_disk = art.disk_hash()
     if on_disk is None:
         return MISSING_ON_DISK
@@ -361,7 +385,7 @@ class _Freshness:
         return f"{STALE} (IR {r.ir_hash[:16]})"
 
 
-def _validation_row(r: ValidationResult, index: int, fresh: _Freshness, kinds_by_hash: dict[str, str]) -> ValidationRow:
+def _validation_row(r: ValidationResult, index: int, fresh: _Freshness, kinds_by_hash: dict[str, str], confine: Path | None = None) -> ValidationRow:
     d = r.model_dump(mode="json")
     return ValidationRow(
         index=index,
@@ -376,7 +400,7 @@ def _validation_row(r: ValidationResult, index: int, fresh: _Freshness, kinds_by
         artifact_hash=_s(r.artifact_hash),
         artifact_kind=kinds_by_hash.get(r.artifact_hash or "", ""),
         evidence=[
-            EvidenceRow(description=e.description, path=_s(e.path), url=_s(e.url), content_hash=_s(e.content_hash), state=evidence_state(e))
+            EvidenceRow(description=e.description, path=_s(e.path), url=_s(e.url), content_hash=_s(e.content_hash), state=evidence_state(e, confine))
             for e in r.evidence
         ],
         details_json=_json(d["details"]) if r.details else "",
@@ -388,13 +412,22 @@ def _validation_row(r: ValidationResult, index: int, fresh: _Freshness, kinds_by
 # --- sections ------------------------------------------------------------------
 
 
+def describes_other_ir(record: PipelineRecord, ir_path: Path) -> bool:
+    """Whether the record names (``ir_file``) another ir.json than ``ir_path``; ``False`` for a record without ``ir_file`` (the sha rules then)."""
+    if record.ir_file is None:
+        return False
+    return Path(record.ir_file) != Path(ir_path).resolve()
+
+
 def _meta(
     ir: CircuitIR, ir_path: Path, workdir: Path, record: PipelineRecord | None, record_error: str | None, ir_sha: str, pipeline_sha: str | None
 ) -> MetaSection:
     p = ir.project.model_dump(mode="json")
     pipeline_path = workdir / PIPELINE_FILE
     has_file = pipeline_sha is not None or pipeline_path.is_file()  # a stat only: the file's bytes were read by load_pipeline_record
-    if record is not None:
+    if record is not None and describes_other_ir(record, ir_path):
+        note = f"{PIPELINE_OTHER_IR}: {record.ir_file}"
+    elif record is not None:
         note = PIPELINE_DESCRIBES_IR if record.ir_file_sha256 == ir_sha else PIPELINE_STALE_IR
     elif record_error is not None:
         note = record_error
@@ -424,7 +457,7 @@ def run_hash_label(record: PipelineRecord, design_hash: str) -> str:
     return f"{RUN_EARLIER_IR} (IR {record.ir_hash[:16]})"
 
 
-def _stages(record: PipelineRecord, design_hash: str) -> StagesSection:
+def _stages(record: PipelineRecord, design_hash: str, other_ir: bool = False) -> StagesSection:
     dumped = record.model_dump(mode="json")
     outcomes = {o.stage: (o, d) for o, d in zip(record.state.outcomes, dumped["state"]["outcomes"])}
     rows: list[StageRow] = []
@@ -437,7 +470,8 @@ def _stages(record: PipelineRecord, design_hash: str) -> StagesSection:
     return StagesSection(
         rows=rows,
         run_ir_hash=record.ir_hash,
-        run_hash_label=run_hash_label(record, design_hash),
+        # a copy has the same design hash: the hash label alone would say "recorded for the current IR"
+        run_hash_label=PIPELINE_OTHER_IR if other_ir else run_hash_label(record, design_hash),
         blocked=record.state.blocked,
         current=_s(record.state.current) or None,
         aborted=record.aborted,
@@ -493,12 +527,12 @@ def _questions(ir: CircuitIR, record: PipelineRecord | None, ir_path: Path) -> l
     return rows
 
 
-def _validation(ir: CircuitIR, fresh: _Freshness, kinds_by_hash: dict[str, str]) -> ValidationSection:
+def _validation(ir: CircuitIR, fresh: _Freshness, kinds_by_hash: dict[str, str], confine: Path | None = None) -> ValidationSection:
     results = ir.validation.results
     latest_index: dict[str, int] = {}
     for i, r in enumerate(results):
         latest_index[r.check_id] = i
-    latest = [_validation_row(results[i], i, fresh, kinds_by_hash) for _cid, i in sorted(latest_index.items())]
+    latest = [_validation_row(results[i], i, fresh, kinds_by_hash, confine) for _cid, i in sorted(latest_index.items())]
     history = [
         HistoryEntry(check_id=r.check_id, index=i, status=str(r.status), timestamp=r.model_dump(mode="json")["timestamp"], message=r.message)
         for i, r in sorted(enumerate(results), key=lambda ir_: (ir_[1].check_id, ir_[0]))
@@ -506,7 +540,7 @@ def _validation(ir: CircuitIR, fresh: _Freshness, kinds_by_hash: dict[str, str])
     return ValidationSection(latest=latest, history=history, aggregate=str(ir.validation.overall()), aggregate_note=AGGREGATE_NOTE)
 
 
-def _artifacts(ir: CircuitIR, design_hash: str) -> list[ArtifactRow]:
+def _artifacts(ir: CircuitIR, design_hash: str, confine: Path | None = None) -> list[ArtifactRow]:
     rows: list[ArtifactRow] = []
     for kind in sorted(ir.artifacts, key=str):
         art = ir.artifacts[kind]
@@ -515,7 +549,7 @@ def _artifacts(ir: CircuitIR, design_hash: str) -> list[ArtifactRow]:
             ArtifactRow(
                 kind=str(kind), path=art.path, files=len(art.files), generator=_s(art.generator), generator_version=_s(art.generator_version),
                 content_hash=_s(art.content_hash), generated_from_ir_hash=_s(art.generated_from_ir_hash),
-                freshness=STALE if art.is_stale(design_hash) else FRESH, disk=artifact_disk_state(art), notes=list(art.notes), created_at=d["created_at"],
+                freshness=STALE if art.is_stale(design_hash) else FRESH, disk=artifact_disk_state(art, confine), notes=list(art.notes), created_at=d["created_at"],
             )
         )
     return rows
@@ -560,14 +594,16 @@ def _domain(title: str, prefixes: tuple[str, ...], latest: list[ValidationRow], 
     return DomainSection(title=title, prefixes=list(prefixes), results=matching, ir_json=_json(ir_part), note=note)
 
 
-def _release(record: PipelineRecord | None, design_hash: str, describes: bool) -> ReleaseSection:
-    """The recorded RELEASE outcome, labelled with what it describes: the design changed since (``run_hash_label``),
-    or ir.json is no longer the file the run wrote (``describes`` False), or the current IR."""
+def _release(record: PipelineRecord | None, design_hash: str, describes: bool, other_ir: bool = False) -> ReleaseSection:
+    """The recorded RELEASE outcome, labelled with what it describes: another ir.json (``other_ir``), the design changed
+    since (``run_hash_label``), or ir.json is no longer the file the run wrote (``describes`` False), or the current IR."""
     if record is None:
         return ReleaseSection(status=None, message="", reasons=[], at="", note=NO_RECORDED_RUN, freshness="", current=False)
     label = run_hash_label(record, design_hash)
-    current = describes and label == RUN_CURRENT_IR
-    if label == RUN_CURRENT_IR and not describes:
+    current = describes and not other_ir and label == RUN_CURRENT_IR
+    if other_ir:
+        label = PIPELINE_OTHER_IR
+    elif label == RUN_CURRENT_IR and not describes:
         label = PIPELINE_STALE_IR
     outcome = record.state.outcome(Stage.RELEASE)
     if outcome is None:
@@ -597,10 +633,17 @@ def load_ir_file(ir_path: Path) -> tuple[CircuitIR, str]:
     return CircuitIR.loads(raw, source=str(ir_path)), sha256_of_bytes(raw)
 
 
-def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: str) -> ReportData:
+def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: str, confine: bool = False) -> ReportData:
     """Everything the report shows about ``ir`` (parsed from ``ir_path``, whose bytes hashed to ``ir_sha``) and
-    ``<workdir>/pipeline.json``; nothing is written and ir.json is not read again."""
+    ``<workdir>/pipeline.json``; nothing is written and ir.json is not read again.
+
+    ``confine`` (the GUI, for a copied or moved project): no artifact or
+    evidence file outside ``workdir`` is read - its state is
+    :data:`NOT_READ_OUTSIDE` - so the view never follows the IR's locators
+    into the folder the project came from.
+    """
     ir_path = Path(ir_path)
+    confine_dir = Path(workdir).resolve() if confine else None
     design_hash = ir.content_hash()
     record: PipelineRecord | None = None
     record_error: str | None = None
@@ -613,11 +656,12 @@ def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: st
     else:
         if loaded is not None:
             record, pipeline_sha = loaded
-    describes = record is not None and record.ir_file_sha256 == ir_sha
+    other_ir = record is not None and describes_other_ir(record, ir_path)
+    describes = record is not None and not other_ir and record.ir_file_sha256 == ir_sha
     fresh = _Freshness(design_hash, record.results_before if describes and record is not None else None)
     kinds_by_hash = {art.content_hash: str(kind) for kind, art in ir.artifacts.items() if art.content_hash}
-    validation = _validation(ir, fresh, kinds_by_hash)
-    stages = _stages(record, design_hash) if record is not None else None
+    validation = _validation(ir, fresh, kinds_by_hash, confine_dir)
+    stages = _stages(record, design_hash, other_ir) if record is not None else None
     if record is None:
         stages_reason = record_error or f"no {PIPELINE_FILE} in {workdir}: run `ai-eda run` to record stage outcomes"
     else:
@@ -629,7 +673,7 @@ def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: st
         requirements=_requirements(ir),
         questions=_questions(ir, record, ir_path),
         validation=validation,
-        artifacts=_artifacts(ir, design_hash),
+        artifacts=_artifacts(ir, design_hash, confine_dir),
         review=_review(ir, fresh),
         repair=_repair(ir, fresh),
         regulatory=_domain("Regulatory", REGULATORY_PREFIXES, validation.latest, ir.regulatory.model_dump(mode="json"),
@@ -640,7 +684,7 @@ def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: st
         simulation=_domain("Simulation", SIMULATION_PREFIXES, validation.latest,
                            ir.simulation.model_dump(mode="json") if ir.simulation is not None else None,
                            "latest spice / domain.analog.* results; ir.simulation as stored"),
-        release=_release(record, design_hash, describes),
+        release=_release(record, design_hash, describes, other_ir),
         stage_reports=_stage_reports(workdir),
     )
 

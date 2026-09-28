@@ -23,7 +23,9 @@ becomes a :class:`~ai_eda.ir.Requirement`:
   own ``number``/``unit`` must agree with that parse (relative tolerance
   :data:`REL_TOL`, unit in canonical form; ``500 mA`` and ``0.5 A`` both
   agree with the quote ``500mA``; a ``±5 %`` quote agrees with ``5 %`` or
-  ``-5..5 %`` and enters as the symmetric range ``[-5, 5]``). Anything that
+  ``-5..5 %`` and enters as the symmetric range ``[-5, 5]``; a level stays a
+  level - ``27 dBm`` grounds as 27 dBm, never as watts: only
+  :func:`ai_eda.design.inputs.read_value` converts it, through ``calc.rf``). Anything that
   fails is **demoted** to an assumption (``kind=assumption``,
   ``status=assumed``, ``assumption`` provenance) with the reason in the
   provenance note and in :attr:`GroundedExtraction.demoted` - it is never
@@ -109,7 +111,8 @@ from ai_eda.llm.prompts import JSON_ONLY_INSTRUCTION, REQUIREMENT_EXTRACTION_SYS
 from ai_eda.tools.calc.quantity import QUANTITY_VERSION, Quantity, QuantityRange, find_quantities, format_quantity, parse_quantity
 
 #: bumped whenever grounding rules, the prompt or the schema change in a way that makes a cached model reply stale
-EXTRACTION_VERSION = "0.2"
+#: (0.3: the RF requirement keys and the level units dBm / dBW / dB / dBc / dBi / dBuV/m / ppm in the prompt and the schema)
+EXTRACTION_VERSION = "0.3"
 
 #: the one question the agent always asks after an extraction; the user's answer decides the upgrade
 CONFIRM_KEY = "confirm_requirements"
@@ -238,7 +241,7 @@ class _Strict(BaseModel):
 class ExtractedValue(_Strict):
     quote: str = Field(description="verbatim phrase of the request that contains this number and its unit")
     number: float = Field(allow_inf_nan=False, description="the number as written in the quote (500 for '500mA', or 0.5 with unit 'A')")
-    unit: str = Field(description="the unit as written (V, mA, kΩ, uF, MHz, °C, %); SI symbols with SI prefixes")
+    unit: str = Field(description="the unit as written (V, mA, kΩ, uF, MHz, °C, %, V/m); SI symbols with SI prefixes; a level unit as written, never converted (dBm, dBW, dB, dBc, dBi, dBuV/m, ppm)")
     number_high: float | None = Field(allow_inf_nan=False, description="upper bound when the quote states a range (-20..85 °C); null otherwise")
 
 
@@ -325,9 +328,10 @@ def _collapse(s: str) -> str:
     return " ".join(s.split()).casefold()
 
 
-#: what may not precede a quote match: it would continue a number (sign, digit, decimal / thousands mark,
-#: tolerance mark) or an ASCII word / identifier
-_NO_BEFORE = frozenset("0123456789.,+-−±_")
+#: what may not precede a quote match: it would continue a number (sign - the typeset minus dashes U+2010 /
+#: U+2012 / U+2013 / U+2014 / U+FF0D included, so ``120 dBm`` is never quoted out of ``–120 dBm`` -, digit,
+#: decimal / thousands mark, tolerance mark) or an ASCII word / identifier
+_NO_BEFORE = frozenset("0123456789.,+-−±_\u2010\u2012\u2013\u2014\uff0d")
 
 
 def _boundary_before(ch: str) -> bool:

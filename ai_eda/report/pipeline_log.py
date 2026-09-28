@@ -7,7 +7,13 @@ only by ``ai-eda run`` (:func:`save_pipeline_record`) after the IR was saved.
 A record pins what it describes twice: ``ir_hash`` (the design view the run
 ended on) and ``ir_file_sha256`` (the bytes ``ir.save`` wrote), so a report
 can tell an outcome recorded for *this* ir.json from one recorded for an
-earlier save. ``results_before`` is the index in ``ir.validation.results``
+earlier save. ``ir_file`` names the ir.json the run described by its
+resolved absolute path (a copied project carries its original's
+``pipeline.json`` - same design hash, maybe the same bytes - so only the
+path tells the two apart; ``ir_path`` is the path as given on the command
+line and is never compared). A record written before ``ir_file`` existed
+loads with ``None`` and the reports keep their hash-based labels.
+``results_before`` is the index in ``ir.validation.results``
 where the recorded run started - the number RELEASE uses to tell a result
 the run produced from one carried over from an earlier run.
 
@@ -68,7 +74,11 @@ class PipelineRecord(BaseModel):
 
     schema_version: str = PIPELINE_SCHEMA_VERSION
     ai_eda_version: str
+    #: the ir.json path exactly as given on the command line (relative after ``ai-eda run ir.json``); shown, never compared
     ir_path: str
+    #: the resolved absolute path of the ir.json the run described - the one field the "describes another ir.json" rule
+    #: reads (``ai_eda.report.data.PIPELINE_OTHER_IR``); ``None`` in a record written before the field existed
+    ir_file: str | None = None
     #: the design hash the run ended on (``CircuitIR.content_hash`` of the saved IR)
     ir_hash: str
     #: sha256 of the ir.json bytes ``ir.save`` wrote at the end of the run; ``None`` when that save failed
@@ -92,10 +102,11 @@ def save_pipeline_record(
     ir_file_sha256: str | None,
     aborted: str | None = None,
 ) -> Path:
-    """Write ``workdir / PIPELINE_FILE`` describing ``state`` and return its path."""
+    """Write ``workdir / PIPELINE_FILE`` describing ``state`` and return its path (``ir_file`` = ``ir_path`` resolved)."""
     record = PipelineRecord(
         ai_eda_version=__version__,
         ir_path=str(ir_path),
+        ir_file=str(Path(ir_path).resolve()),
         ir_hash=ir.content_hash(),
         ir_file_sha256=ir_file_sha256,
         results_before=results_before,

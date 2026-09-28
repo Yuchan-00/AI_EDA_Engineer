@@ -400,11 +400,14 @@ class GuiApp:
         p = self._load(name)
         info, ir, workdir = p.info, p.ir, p.workdir
 
+        # a copied or moved project: nothing is read through the IR's locators outside its own folder (they name the folder it came from)
+        confine = info.workdir_mismatch
+
         def build() -> dict[str, Any]:
-            report = build_report_data(ir, info.ir_path, workdir, ir_sha=p.ir_sha).model_dump(mode="json")
+            report = build_report_data(ir, info.ir_path, workdir, ir_sha=p.ir_sha, confine=confine).model_dump(mode="json")
             last = info.last_run
             files = report_files(workdir)
-            simulation = simulation_summary(ir, workdir)
+            simulation = simulation_summary(ir, workdir, confine=confine)
             active = self.runs.active_id(workdir) if info.workdir_exists else None
             rows = artifact_rows(ir, workdir)
             providers = self._providers.rows()
@@ -472,11 +475,24 @@ class GuiApp:
             raise HttpError(503, f"project unavailable: {e}") from e
 
     def report_page(self, name: str) -> Response:
-        """The English report of the project rendered now (``ai-eda serve``'s page), for the page's sandboxed iframe."""
+        """The English report of the project rendered now (``ai-eda serve``'s page), for the page's sandboxed iframe.
+
+        409 with the ``ai-eda relocate`` refusal for a copied or moved project
+        (``workdir_mismatch``): ``ai-eda report`` / ``serve`` refuse that
+        ir.json, and the page would follow its locators into the other folder.
+        """
         from ai_eda.report.data import build_report_data
         from ai_eda.report.html import render_html
+        from ai_eda.workdir import WorkdirMismatchError, project_workdir
 
         p = self._load(name)
+        if p.info.workdir_mismatch:
+            # the page `ai-eda report` / `serve` refuse for this ir.json: refused here too, with the same relocate remedy
+            try:
+                project_workdir(p.ir, p.info.ir_path)
+            except WorkdirMismatchError as e:
+                raise HttpError(409, str(e)) from e
+            raise HttpError(409, p.info.warning or "the recorded workdir names another folder; run ai-eda relocate")
 
         def build() -> Response:
             page = render_html(build_report_data(p.ir, p.info.ir_path, p.workdir, ir_sha=p.ir_sha))

@@ -52,8 +52,12 @@ from ai_eda.report.stages import (
 
 
 def render_report_file(ir_path: Path, output: Path | None = None) -> Path:
-    """Write the report of ``ir_path`` to ``output`` (default ``<workdir>/report.html``) and return the path written."""
-    from ai_eda.cli import project_workdir
+    """Write the report of ``ir_path`` to ``output`` (default ``<workdir>/report.html``) and return the path written.
+
+    A copied or moved project (``project.workdir`` names another folder) is
+    refused with :class:`~ai_eda.workdir.WorkdirMismatchError` before anything is written.
+    """
+    from ai_eda.workdir import project_workdir
 
     ir_path = Path(ir_path)
     ir, ir_sha = load_ir_file(ir_path)

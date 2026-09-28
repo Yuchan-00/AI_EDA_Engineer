@@ -5,7 +5,10 @@
                              state, never a token, and the model is never called; --online additionally
                              fetches the key's limit/usage, which sends the key to OPENROUTER_BASE_URL and is
                              recorded as a SECRET_ACCESS approval granted by the flag)
-    ai-eda new NAME          create an empty project IR
+    ai-eda new NAME [--dir DIR] [--request TEXT]
+                             create an empty project IR at DIR/ir.json (default projects/NAME); refused
+                             (exit 2, nothing written) when that ir.json already exists - new never
+                             replaces a project; an existing folder without ir.json is fine
     ai-eda run IR.json       run the pipeline until it blocks or finishes (exit 1 when blocked or the
                              final stage is FAIL; NOT_VERIFIED is exit 0 - nothing wrong, nothing proven;
                              exit 2 for a usage error such as --answer without '=')
@@ -87,6 +90,18 @@
         with the full run record. Each write prints "  report written: reports/<name> (+ .html, .pdf)"
         or "(+ .html; pdf not produced: <reason>)".
     ai-eda review IR.json    run only the independent reviewer (exit 1 on any FAIL)
+    ai-eda relocate IR.json [--dry-run] [--from OLD]
+                             re-record project.workdir as this ir.json's folder after the project folder
+                             was copied or moved: artifact / evidence / archived-document paths under the
+                             old folder are rebased onto the new one (paths outside it are left as they
+                             are), the SPICE results reference is dropped (results.json names its rawfiles
+                             by absolute path under the old folder; the next run re-simulates),
+                             pipeline.json is not touched and the design hash does not change; the old
+                             folder is the recorded absolute workdir, else the one the artifacts show (a
+                             relative workdir's match, the root-level artifacts' folder), else --from OLD;
+                             it refuses (exit 2, nothing written) when an artifact would stay outside this
+                             folder; --dry-run prints what would change and writes nothing (exit 0; 2 for
+                             an IR error, a busy project or an old folder it cannot tell)
     ai-eda report IR.json [-o FILE]
                              write one self-contained HTML file (default <workdir>/report.html) showing
                              what ir.json and <workdir>/pipeline.json record: every status is copied, none
@@ -117,6 +132,22 @@
                              stage reports are printed with ($AI_EDA_BROWSER, PATH, a Playwright install,
                              the Windows / macOS install paths)
 
+Where a project writes: the folder that holds its ir.json, always
+(:func:`ai_eda.workdir.project_workdir`). ``run`` / ``review`` / ``report`` /
+``serve`` / ``stage-reports`` refuse (exit 2; nothing is run, read from or
+created in the other folder) an ir.json whose recorded absolute
+``project.workdir`` names another folder, or whose registered artifacts
+lie by absolute path outside its folder - a copied or moved project -
+naming both paths and ``ai-eda relocate``. ``run`` / ``review`` /
+``stage-reports`` / ``relocate`` hold the per-project lock
+``<workdir>/.ai-eda.lock`` while they work (non-blocking: a second one
+refuses with "another ai-eda run is using this project", exit 2; ``report``
+/ ``serve`` / ``gui`` / ``new`` / ``doctor`` and ``relocate --dry-run`` take
+none) and read ir.json again once they hold it, so a command that saved
+meanwhile is never overwritten with a stale copy. ``run`` records the
+resolved ir.json path in ``pipeline.json`` (``ir_file``), so a report can
+tell a record inherited by a copy from its own.
+
 Without ``--llm`` the pipeline is exactly what it was before the LLM stage.
 The ``run`` options live in one table, :data:`RUN_OPTIONS`, that builds the
 parser and :func:`run_option_flags` (the flag builder a GUI reuses, so the
@@ -144,7 +175,9 @@ artifact, not hashed) for ``report`` / ``serve``.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -152,6 +185,7 @@ from typing import Any, NamedTuple
 
 from ai_eda import __version__
 from ai_eda.errors import IRSchemaError
+from ai_eda.workdir import project_workdir  # re-export: the one "where does this project write" rule (ai_eda.workdir)
 
 FAKE_PREFIX = "fake:"
 #: the ``--llm`` provider names that are real routes (the fake is ``fake:<json>``, provider name ``script``)
@@ -371,24 +405,49 @@ def _browser_option(args: argparse.Namespace) -> tuple[Path | None, bool] | None
     return (Path(chosen) if chosen else None), not getattr(args, "no_pdf", False)
 
 
+class ProjectExistsError(FileExistsError):
+    """``<workdir>/ir.json`` already exists (``new`` never replaces a project); a :class:`FileExistsError`, so existing handlers still catch it."""
+
+
 def new_project(name: str, request: str | None = None, workdir: str | Path | None = None) -> Path:
     """Write the empty project IR ``ai-eda new`` creates and return the ir.json path (``<workdir>/ir.json``, absolute).
 
     The one code path of ``new`` and the GUI's "new project" form.
     ``workdir`` defaults to ``projects/<name>`` under the current directory.
+    :class:`ProjectExistsError` (a :class:`FileExistsError`; nothing
+    written) when ``<workdir>/ir.json`` already exists as a file or a link:
+    ``new`` never replaces a project. An existing folder without ir.json is
+    accepted; a ``workdir`` that is a file, or lies below one, raises the
+    ``FileExistsError`` / ``NotADirectoryError`` of creating the folder.
     """
     from ai_eda.ir import CircuitIR, ProjectMeta
 
     # recorded absolute: a relative workdir would be resolved against whatever directory a later `run` / `review`
     # is started from, and the artifacts, the archive and the parts cache would land away from ir.json
     resolved = Path(workdir or f"projects/{name}").resolve()
+    target = resolved / "ir.json"
+    if os.path.lexists(target):
+        raise ProjectExistsError(errno.EEXIST, "an ir.json already exists", str(target))
     ir = CircuitIR(project=ProjectMeta(id=name, name=name, workdir=str(resolved)))
     ir.requirements.raw_input = request or ""
-    return ir.save(resolved / "ir.json")
+    return ir.save(target)
 
 
 def cmd_new(args: argparse.Namespace) -> int:
-    path = new_project(args.name, args.request, args.dir)
+    try:
+        path = new_project(args.name, args.request, args.dir)
+    except ProjectExistsError as e:
+        print(
+            f"refusing to create {e.filename}: an ir.json already exists there (ai-eda new never replaces a project; choose another --dir or name)",
+            file=sys.stderr,
+        )
+        return 2
+    except (FileExistsError, NotADirectoryError) as e:
+        # creating the folder failed: the path, or a component of it, is a file - no ir.json is involved
+        where = args.dir if args.dir else f"projects/{args.name}"
+        print(f"refusing to create a project in {where}: it is not a folder ({e.filename or where} is a file, or lies below one); choose another --dir",
+              file=sys.stderr)
+        return 2
     print(f"created {path}")
     return 0
 
@@ -399,30 +458,38 @@ def _load(path: str):
     return CircuitIR.load(path)
 
 
-def project_workdir(ir, ir_path: str | Path) -> Path:
-    """The project's working directory for ``run`` / ``review`` (artifacts, sources, the parts cache).
+def _lock_project(workdir: Path, command: str):
+    """The held :class:`~ai_eda.workdir.ProjectLock` of ``workdir``, or ``None`` after printing why (busy, a linked lock file: exit 2).
 
-    ``project.workdir`` when it is absolute (``new`` records it so); the
-    ir.json's own directory when the IR records none. A *relative* workdir
-    (an ir.json written before ``new`` recorded absolute paths, or a hand
-    edit) is never resolved against the caller's cwd - that put the outputs
-    wherever the command happened to be started. It is accepted only when
-    the ir.json's directory ends with it (the layout ``new`` created:
-    ``<workdir>/ir.json``), otherwise refused as ambiguous.
+    A folder where no lock can be taken proceeds unlocked; the lock's note says so on stderr.
     """
-    here = Path(ir_path).resolve().parent
-    if not ir.project.workdir:
-        return here
-    workdir = Path(ir.project.workdir)
-    if workdir.is_absolute():
-        return workdir
-    parts = workdir.parts
-    if not parts or here.parts[-len(parts):] == parts:
-        return here
-    raise IRSchemaError(
-        f"{ir_path}: project.workdir {ir.project.workdir!r} is relative and does not name this ir.json's directory ({here}); "
-        "record an absolute path (ai-eda new does) or remove it to use the ir.json's directory"
-    )
+    from ai_eda.workdir import ProjectLock, ProjectLockError
+
+    lock = ProjectLock(workdir, command=command)
+    try:
+        lock.acquire()
+    except ProjectLockError as e:
+        print(str(e), file=sys.stderr)
+        return None
+    if lock.note is not None:
+        print(f"note: {lock.note}", file=sys.stderr)
+    return lock
+
+
+def _reload_locked(ir_path: str):
+    """ir.json read again once the lock is held, with its workdir judged again; ``None`` after printing why (exit 2).
+
+    The IR loaded before the lock only decided where the lock goes: another
+    command may have saved ir.json between that load and the lock, and a
+    run on the older copy would overwrite its work when it saves.
+    """
+    ir = _load(ir_path)
+    try:
+        project_workdir(ir, ir_path)
+    except IRSchemaError as e:
+        print(str(e), file=sys.stderr)
+        return None
+    return ir
 
 
 @dataclass
@@ -644,12 +711,6 @@ def build_source_session(args: argparse.Namespace, ir, workdir: Path, library):
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    from ai_eda.agents import AgentContext
-    from ai_eda.errors import ApprovalRequiredError, ToolUnavailableError
-    from ai_eda.tools.kicad import KicadCli, KicadLibrary
-    from ai_eda.tools.spice import NgspiceShared
-    from ai_eda.workflow import Orchestrator, PipelineState, SessionError
-
     try:
         answers = parse_answers(args.answer)
     except ValueError as e:
@@ -667,9 +728,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     ir = _load(args.ir)
     try:
         workdir = project_workdir(ir, args.ir)
-    except IRSchemaError as e:
+    except IRSchemaError as e:  # a copied / moved project is refused here: nothing is run or created anywhere
         print(str(e), file=sys.stderr)
         return 2
+    # the lock before anything is created in the workdir (the source session makes <workdir>/sources)
+    lock = _lock_project(workdir, "run")
+    if lock is None:
+        return 2
+    try:
+        locked_ir = _reload_locked(args.ir)
+        if locked_ir is None:
+            return 2
+        return _run_locked(args, locked_ir, workdir, answers, llm_options, browser, pdf)
+    finally:
+        lock.release()  # after the IR, pipeline.json and the printed summary
+
+
+def _run_locked(args: argparse.Namespace, ir, workdir: Path, answers: dict[str, str], llm_options, browser: Path | None, pdf: bool) -> int:
+    """The part of ``run`` that works on the project, with its lock held and ir.json read under it."""
+    from ai_eda.agents import AgentContext
+    from ai_eda.errors import ApprovalRequiredError, ToolUnavailableError
+    from ai_eda.tools.kicad import KicadCli, KicadLibrary
+    from ai_eda.tools.spice import NgspiceShared
+    from ai_eda.workflow import Orchestrator, PipelineState, SessionError
+
     if llm_options is not None:
         # the project pin: one project, one model - refused before any client exists or any call is made
         pinned = ir.requirements.llm_model_spec
@@ -851,20 +933,29 @@ def cmd_review(args: argparse.Namespace) -> int:
     except IRSchemaError as e:
         print(str(e), file=sys.stderr)
         return 2
-    archive = open_archive({}, workdir)  # earlier runs' archived copies, read-only: hashes are re-verified, nothing is fetched
-    tools = {"archive": archive} if archive is not None else {}
-    report = IndependentReviewer(tools=tools).review(ir, workdir)
-    for r in report.results:
-        print(f"{r.check_id:<36} {r.status:<20} {r.message}")
-    print(report.summary())
-    if args.json:
-        print(json.dumps(report.model_dump(mode="json"), indent=2, default=str))
-    return 0 if not report.failures else 1
+    lock = _lock_project(workdir, "review")
+    if lock is None:
+        return 2
+    try:
+        ir = _reload_locked(args.ir)
+        if ir is None:
+            return 2
+        archive = open_archive({}, workdir)  # earlier runs' archived copies, read-only: hashes are re-verified, nothing is fetched
+        tools = {"archive": archive} if archive is not None else {}
+        report = IndependentReviewer(tools=tools).review(ir, workdir)
+        for r in report.results:
+            print(f"{r.check_id:<36} {r.status:<20} {r.message}")
+        print(report.summary())
+        if args.json:
+            print(json.dumps(report.model_dump(mode="json"), indent=2, default=str))
+        return 0 if not report.failures else 1
+    finally:
+        lock.release()
 
 
 def _report_inputs(args: argparse.Namespace):
-    """``(ir, workdir, ir_sha)`` for ``report`` / ``serve`` - the IR, its workdir and the hash of the bytes the IR was parsed
-    from (one read) - or ``None`` after printing why (a usage / IR error, exit 2)."""
+    """``(ir, workdir, ir_sha)`` for ``report`` / ``serve`` / ``stage-reports`` - the IR, its workdir and the hash of the bytes the
+    IR was parsed from (one read) - or ``None`` after printing why (a usage / IR error, a copied or moved project: exit 2)."""
     from ai_eda.report.data import load_ir_file
 
     try:
@@ -906,8 +997,23 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def cmd_stage_reports(args: argparse.Namespace) -> int:
     """Write the four Korean stage reports from the saved IR and pipeline.json; exit 0 written, 2 for a usage / IR error - never 1 (a report is not a verdict)."""
+    loaded = _report_inputs(args)
+    if loaded is None:
+        return 2
+    lock = _lock_project(loaded[1], "stage-reports")
+    if lock is None:
+        return 2
+    try:
+        return _stage_reports_locked(args)
+    finally:
+        lock.release()
+
+
+def _stage_reports_locked(args: argparse.Namespace) -> int:
+    """The part of ``stage-reports`` that reads and writes, with the project lock held (ir.json read again under it)."""
     from ai_eda.report import load_pipeline_record, write_all_stage_reports
-    from ai_eda.report.pipeline_log import PipelineRecordError
+    from ai_eda.report.data import describes_other_ir
+    from ai_eda.report.pipeline_log import PIPELINE_FILE, PipelineRecordError
     from ai_eda.tools.kicad import KicadLibrary
 
     loaded = _report_inputs(args)
@@ -920,6 +1026,10 @@ def cmd_stage_reports(args: argparse.Namespace) -> int:
         print(f"{e} - the reports are written without a run record", file=sys.stderr)
         found = None
     record = found.record if found is not None else None
+    if record is not None and describes_other_ir(record, Path(args.ir)):
+        # a copied / relocated project's inherited record: its stages are not this ir.json's (the reports print no path)
+        print(f"{PIPELINE_FILE} describes another ir.json ({record.ir_file}) - the reports are written without a run record", file=sys.stderr)
+        record = None
     if record is None:
         print("no run record: the reports say so where they need one (run `ai-eda run` first to record stage outcomes)", file=sys.stderr)
     browser_option = _browser_option(args)
@@ -935,6 +1045,74 @@ def cmd_stage_reports(args: argparse.Namespace) -> int:
     for r in results:
         print(f"wrote {r.markdown} {r.summary()}")
     return 0
+
+
+def cmd_relocate(args: argparse.Namespace) -> int:
+    """Re-record ``project.workdir`` as the ir.json's folder (:func:`ai_eda.workdir.relocate_project`); exit 0 done / nothing to do, 2 IR error or busy."""
+    from ai_eda.workdir import RelocateError, relocate_project
+
+    ir_path = Path(args.ir)
+    try:
+        _load(args.ir)  # an unreadable IR is refused before the lock file is created
+    except (OSError, ValueError, IRSchemaError) as e:
+        print(f"{args.ir}: {e}" if isinstance(e, (OSError, ValueError)) else str(e), file=sys.stderr)
+        return 2
+    lock = None
+    if not args.dry_run:  # a dry run writes nothing, the lock file included
+        lock = _lock_project(ir_path.resolve().parent, "relocate")
+        if lock is None:
+            return 2
+    try:
+        report = relocate_project(ir_path, dry_run=args.dry_run, from_folder=args.from_folder)  # reads ir.json itself, under the lock
+    except (OSError, ValueError, IRSchemaError, RuntimeError, RelocateError) as e:
+        print(f"{args.ir}: {e}" if isinstance(e, (OSError, ValueError)) else str(e), file=sys.stderr)
+        return 2
+    finally:
+        if lock is not None:
+            lock.release()
+    print(relocate_summary(report))
+    for path in report.missing_on_disk:
+        print(f"  not on disk at the new place: {_below(path, report.new_workdir)}")
+    return 0
+
+
+def _below(path: str, folder: Path) -> str:
+    """``path`` relative to ``folder`` (``/``-joined) when it lies below it, else as written."""
+    try:
+        return Path(path).relative_to(folder).as_posix()
+    except ValueError:
+        return path
+
+
+def relocate_summary(report) -> str:
+    """The one line ``ai-eda relocate`` prints for a :class:`~ai_eda.workdir.RelocateReport`."""
+    from ai_eda.workdir import foreign_absolute
+
+    new, old = report.new_workdir, report.old_workdir
+    if not report.changed:
+        if not old:
+            return f"nothing to relocate: project.workdir is not recorded, so this ir.json's folder {new} is the workdir"
+        if not (Path(old).is_absolute() or foreign_absolute(old)):
+            return f"nothing to relocate: the relative project.workdir {old!r} names this ir.json's folder {new}"
+        return f"nothing to relocate: project.workdir already is {new}"
+    dry = report.dry_run
+    breakdown = ", ".join(f"{k} {n}" for k, n in report.rebased.items() if n) or "none"
+    parts = [
+        f"{'would relocate' if dry else 'relocated'} {report.ir_path}: project.workdir {old} -> {new}",
+        *([f"the artifacts were compiled into {report.rebased_from}"] if report.rebased_from and report.rebased_from != old else []),
+        f"{'would rebase' if dry else 'rebased'} {report.rebased_total} path(s) ({breakdown})",
+        f"{report.untouched} path(s) outside the old folder left as they are",
+        *report.notes,
+    ]
+    if report.dropped:
+        parts.append(
+            f"SPICE results reference {'would be dropped' if dry else 'dropped'} (results.json names its rawfiles by absolute path "
+            "under the old folder; the next `ai-eda run` re-simulates)"
+        )
+    parts.append(f"design hash unchanged ({report.design_hash[:23]})")
+    if dry:
+        parts.append("nothing was written (--dry-run)")
+    return "; ".join(parts)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -990,6 +1168,16 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("ir")
     v.add_argument("--json", action="store_true")
     v.set_defaults(fn=cmd_review)
+
+    rl = sub.add_parser(
+        "relocate",
+        help="re-record project.workdir as this ir.json's folder after a copy or move; rebases artifact / evidence paths; no design change",
+    )
+    rl.add_argument("ir")
+    rl.add_argument("--dry-run", action="store_true", help="print what would change and write nothing (no lock file either)")
+    rl.add_argument("--from", dest="from_folder", metavar="OLD", help="the absolute folder the project was copied or moved from, when the IR "
+                    "cannot tell it (no recorded workdir and no root-level artifact, or several candidates)")
+    rl.set_defaults(fn=cmd_relocate)
 
     rp = sub.add_parser("report", help="write a self-contained HTML report of the IR, its validation log and the last run (read-only; no verdict)")
     rp.add_argument("ir")

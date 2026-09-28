@@ -15,7 +15,13 @@ requirement (the RC's |H(f_c)| expectation names ``cutoff_frequency`` and the
 reviewer compares the sweep point with it). A calculator that refuses its
 inputs, overflows (``ValueError``) or divides by an underflowed product
 (``ZeroDivisionError``) refuses the template with that sentence as the note -
-a build never raises on a number the user typed. A part's ``value`` (the
+a build never raises on a number the user typed. A template with validity
+ranges checks every input that is stated *before* it asks for a missing
+one: an out-of-range input refuses at once, and only an in-range input
+beside a missing one asks the required question. No template reads a bare
+``frequency`` (:data:`~ai_eda.design.base.AMBIGUOUS_KEYS`): it does not say
+which frequency is meant, so it is asked about, never read as an
+oscillator's output. A part's ``value`` (the
 schematic, BOM and board text) is the design number in KiCad's spelling to 5
 significant digits (``100n``, ``1.5915k``, :mod:`ai_eda.tools.calc.part_value`);
 the SPICE binding and the netlist keep the calculator's exact number, and no
@@ -37,7 +43,9 @@ Templates:
   excluded from the netlist - a modelling choice the user confirms) and the
   expectation measures the current through that ideal source;
 * ``rc_lowpass`` - first-order RC low-pass from ``cutoff_frequency`` (C
-  chosen, R computed), checked by an ac sweep at the corner;
+  chosen, R computed), checked by an ac sweep at the corner; the cutoff is
+  a validity condition (2 Hz..100 kHz: outside it R leaves the range the
+  ideal, unloaded RC model holds for - an RF filter is not an RC);
 * ``astable`` - collector-coupled BJT astable multivibrator from
   ``oscillation_frequency`` and ``input_voltage`` (R_c, R_b, V_BE and a
   generic NPN model chosen, C computed), checked by a transient run
@@ -786,6 +794,23 @@ def _missing_inputs(plan: Plan, who: str, missing: list[str], unusable: dict[str
 
 
 class RcLowpassTemplate(Template):
+    """First-order RC low-pass from ``cutoff_frequency``: C chosen (100 nF), R = 1 / (2 pi f_c C) computed, |H(f_c)| checked by an ac sweep.
+
+    Validity: 2 Hz <= ``cutoff_frequency`` <= 100 kHz, checked before any
+    choice or calculator (a refusal names the range). Below 2 Hz R with the
+    template's 100 nF exceeds ~800 kohm, where the unloaded-output model (no
+    load, no leakage, an ideal probe) stops holding; above 100 kHz R falls
+    below ~16 ohm, comparable to a real source's output impedance the ideal
+    source leaves out, and the capacitor's ESL / ESR and the board's trace
+    inductance - not in the model - become a visible share of its impedance.
+    An RF filter needs an LC or transmission-line design, not this template.
+    The bounds are engineering bounds chosen for this template, not
+    measured. Every input inside them builds exactly what it built before
+    the range existed (``TEMPLATE_VERSION`` unchanged); a design built
+    earlier from a cutoff outside them is not re-judged by the template
+    (templates only start an empty design).
+    """
+
     id = "rc_lowpass"
     title = "first-order RC low-pass"
     triggers = ("cutoff_frequency",)
@@ -797,12 +822,23 @@ class RcLowpassTemplate(Template):
     AC_PROBE_V = 1.0
     AC_VARIATION = "dec"
     AC_POINTS = 100
+    #: the cutoff frequencies (Hz) the ideal RC model with the 100 nF choice is stated valid for (engineering bounds, not measured)
+    F_MIN, F_MAX = 2.0, 100_000.0
 
     def build(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str], library: KicadLibrary, *, confirmed: bool) -> Plan:
         t = self.id
         plan = Plan(template=t, title=self.title)
         f_c = inputs["cutoff_frequency"]
         plan.inputs = {"cutoff_frequency": f_c}
+        f = f_c.traced.value
+        if not self.F_MIN <= f <= self.F_MAX:
+            return _refused(plan, (
+                f"cutoff frequency {f:.12g} Hz ({f_c.requirement.id}) is outside {self.F_MIN:.12g}..{self.F_MAX:.12g} Hz: below {self.F_MIN:g} Hz "
+                f"R = 1/(2 pi f_c C) with the template's 100 nF exceeds ~800 kohm, where the unloaded-output model (no load, no leakage, an ideal probe) "
+                f"stops holding; above {self.F_MAX:g} Hz R falls below ~16 ohm, comparable to a real source's output impedance the ideal source leaves out, "
+                f"and the capacitor's ESL / ESR and the board's trace inductance - not in the model - become a visible share of its impedance; an RF "
+                f"filter needs an LC or transmission-line design (engineering bounds chosen for this template, not measured)"
+            ))
         c_choice, c = _choice(t, "c", self.C_FARAD, "F", "shunt capacitor of the low-pass (R is solved from it and f_c)", confirmed)
         tol_choice, tol = _choice(t, "tol_rel", self.TOL_REL, None, "relative tolerance of the |H(f_c)| expectation (2 %: the ac grid is interpolated between 100 points per decade)", confirmed)
         probe_choice, probe = _choice(t, "ac_probe", self.AC_PROBE_V, "V", "small-signal probe amplitude of the ac sweep (unit input, so v(OUT) is |H|)", confirmed)
@@ -1039,9 +1075,38 @@ class AstableTemplate(Template):
         "collector (nominal 0 V)"
     )
 
+    def _out_of_range(self, inputs: dict[str, DesignInput]) -> str | None:
+        """The refusal sentence for the first *present* input outside the validity range (supply, then frequency), or ``None``."""
+        v_in, f_osc = inputs.get("input_voltage"), inputs.get("oscillation_frequency")
+        if v_in is not None and not self.V_IN_MIN <= v_in.traced.value <= self.V_IN_MAX:
+            v, req_v = v_in.traced.value, v_in.requirement.id
+            reverse = v - self.V_BE_V  # what calc.astable.v_be_reverse would report for this supply
+            verb = "exceeds" if reverse > self.V_EBO_V else "approaches"
+            return (
+                f"supply {v:.12g} V ({req_v}) is outside {self.V_IN_MIN:.12g}..{self.V_IN_MAX:.12g} V: below {self.V_IN_MIN:.12g} V the drops V_BE / V_CE(sat) are not small "
+                f"against Vcc (the period expression and the saturation margin do not hold); above {self.V_IN_MAX:.12g} V the reverse base-emitter voltage Vcc - V_BE "
+                f"(here {reverse:.12g} V) {verb} the {self.V_EBO_V:.12g} V V_EBO absolute maximum of small-signal NPNs such as the 2N3904 (exceeded from "
+                f"{self.V_EBO_V + self.V_BE_V:.12g} V; the template stops at {self.V_IN_MAX:.12g} V for margin; a family rating asserted conservatively, not a datasheet fact "
+                f"in this IR), and B-E breakdown is not in the model"
+            )
+        if f_osc is not None and not self.F_MIN <= f_osc.traced.value <= self.F_MAX:
+            f, req_f = f_osc.traced.value, f_osc.requirement.id
+            return (
+                f"oscillation frequency {f:.12g} Hz ({req_f}) is outside {self.F_MIN:.12g}..{self.F_MAX:.12g} Hz: below {self.F_MIN:.12g} Hz the timing capacitor exceeds "
+                f"~0.65 uF while seeing both polarities (non-polar parts only) - impractical; above {self.F_MAX:.12g} Hz the transistors' switching and storage times, "
+                f"absent from the generic model, become a visible share of the period"
+            )
+        return None
+
     def build(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str], library: KicadLibrary, *, confirmed: bool) -> Plan:
         t = self.id
         plan = Plan(template=t, title=self.title)
+        # range first: an input that is present and outside the validity range refuses the template before a missing one is
+        # asked for - a required question whose only possible outcome is this refusal would block the user for nothing
+        why = self._out_of_range(inputs)
+        if why is not None:
+            plan.inputs = {k: inputs[k] for k in self.needs if k in inputs}
+            return _refused(plan, why)
         missing = [k for k in self.needs if k not in inputs]
         if missing:
             return _missing_inputs(plan, "The BJT astable multivibrator template", missing, unusable)
@@ -1049,22 +1114,6 @@ class AstableTemplate(Template):
         plan.inputs = {"oscillation_frequency": f_osc, "input_voltage": v_in}
         req_f, req_v = f_osc.requirement.id, v_in.requirement.id
         v, f = v_in.traced.value, f_osc.traced.value
-        if not self.V_IN_MIN <= v <= self.V_IN_MAX:
-            reverse = v - self.V_BE_V  # what calc.astable.v_be_reverse would report for this supply
-            verb = "exceeds" if reverse > self.V_EBO_V else "approaches"
-            return _refused(plan, (
-                f"supply {v:.12g} V ({req_v}) is outside {self.V_IN_MIN:.12g}..{self.V_IN_MAX:.12g} V: below {self.V_IN_MIN:.12g} V the drops V_BE / V_CE(sat) are not small "
-                f"against Vcc (the period expression and the saturation margin do not hold); above {self.V_IN_MAX:.12g} V the reverse base-emitter voltage Vcc - V_BE "
-                f"(here {reverse:.12g} V) {verb} the {self.V_EBO_V:.12g} V V_EBO absolute maximum of small-signal NPNs such as the 2N3904 (exceeded from "
-                f"{self.V_EBO_V + self.V_BE_V:.12g} V; the template stops at {self.V_IN_MAX:.12g} V for margin; a family rating asserted conservatively, not a datasheet fact "
-                f"in this IR), and B-E breakdown is not in the model"
-            ))
-        if not self.F_MIN <= f <= self.F_MAX:
-            return _refused(plan, (
-                f"oscillation frequency {f:.12g} Hz ({req_f}) is outside {self.F_MIN:.12g}..{self.F_MAX:.12g} Hz: below {self.F_MIN:.12g} Hz the timing capacitor exceeds "
-                f"~0.65 uF while seeing both polarities (non-polar parts only) - impractical; above {self.F_MAX:.12g} Hz the transistors' switching and storage times, "
-                f"absent from the generic model, become a visible share of the period"
-            ))
         r_c_choice, r_c = _choice(t, "r_c", self.R_C_OHM, "ohm", "collector load; sets the output drive and the ~Vcc/R_c saturation current", confirmed)
         r_b_choice, r_b = _choice(t, "r_b", self.R_B_OHM, "ohm", "base resistor, 10 x R_c so a transistor with beta >= 30 saturates with margin (forced beta ~10); C is solved from it and the frequency", confirmed)
         v_be_choice, v_be = _choice(t, "v_be", self.V_BE_V, "V", "base-emitter drop the period expression assumes for the switching threshold", confirmed)

@@ -2,7 +2,10 @@
 
 :class:`AnalogBiasValidator` and :class:`PowerThermalValidator` read real
 SPICE evidence through :func:`~ai_eda.tools.spice.evidence.fresh_spice_run`;
-the others still return NOT_VERIFIED until an analysis backend exists.
+:class:`RFImpedanceValidator` judges the RF nets' routed copper through the
+``si.impedance`` machinery (IR geometry + calculators, never DRC, and only on
+a design that carries RF); the others still return NOT_VERIFIED until an
+analysis backend exists.
 Keeping the stubs here means the *selection* mechanism is exercised end to
 end and the GUI can show "this check exists but has not run".
 """
@@ -14,6 +17,10 @@ from typing import Any
 from ai_eda.ir import CircuitDomain, CircuitIR, Evidence, NetKind, ValidationResult, ValidationStatus, worst_status
 from ai_eda.tools.calc.basic import CALC_VERSION, junction_temperature
 from ai_eda.tools.calc.recompute import unit_key
+from ai_eda.tools.kicad.library import KicadLibrary
+from ai_eda.tools.si.measure import NOT_DRC, measure_nets
+from ai_eda.tools.si.paths import net_pads
+from ai_eda.tools.si.rf import RF_IMPEDANCE_CHECK, has_rf, rf_domain, rf_nets
 from ai_eda.tools.spice.evidence import FreshSpiceRun, fresh_spice_run
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK_ID
 from ai_eda.validation.base import ValidationContext, Validator
@@ -29,6 +36,8 @@ NO_THERMAL_KEYS = "no component carries theta_ja / t_j_max (datasheet facts: the
 NO_THERMAL_KEYS_OUTSIDE_POWER = NO_THERMAL_KEYS + "; the design is not in the POWER domain, so nothing is claimed"
 
 S = ValidationStatus
+#: what an RF impedance result says it is (the SI checks' kind)
+SI_KIND = "ir_geometry+calculators"
 
 
 class PowerThermalValidator(Validator):
@@ -144,13 +153,143 @@ class PowerThermalValidator(Validator):
         return [self._result(ir, overall, message, run, aid, **details)]
 
 
+#: tool id / version of ``domain.rf.impedance`` (bumped when its judgement rules change)
+RF_TOOL = "domain.rf"
+RF_VERSION = "0.1"
+#: what the RF impedance check does not judge, named in every result
+RF_NOT_JUDGED = ["matching networks", "S-parameters", "the antenna"]
+NO_RF = ("the design carries no RF: no net of kind rf, no net class states rf_frequency_hz, "
+         "and the topology does not declare the RF domain")
+
+
+def _rf_rows_verdict(r: ValidationResult, members: list[str]) -> tuple[ValidationStatus, str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(status, reason, RF rows, other rows)`` of a class's ``si.impedance`` result, judged on the RF member nets' rows only.
+
+    A class may hold RF and non-RF nets (a default class, a class a digital
+    net was promoted into): the non-RF rows are context, never the RF verdict -
+    a non-RF PASS never stands in for RF copper nobody judged, and a non-RF
+    FAIL is not an RF failure (it stays in ``si.impedance.<class>``). When
+    ``impedance_result`` returned before building rows (no stackup), its
+    status applies to every net, RF included. No RF row PASS or FAIL (all
+    neck-downs, fewer than two pads) is NOT_VERIFIED with each net's reason.
+    """
+    segments = r.details.get("segments")
+    if segments is None:
+        reason = r.message.removesuffix(f" ({NOT_DRC})")
+        if r.status is S.NOT_APPLICABLE:
+            return S.NOT_VERIFIED, f"no judged segment of the RF nets: {reason}", [], []
+        return r.status, reason, [], []
+    rf_rows = [row for row in segments if row.get("net") in members]
+    others = [row for row in segments if row.get("net") not in members]
+    missing = [n for n in members if not any(row.get("net") == n for row in rf_rows)]
+    rows = rf_rows + [{"net": n, "status": S.NOT_VERIFIED.value, "reason": "not a member of the class's impedance check"} for n in missing]
+
+    def where(row: dict[str, Any]) -> str:
+        at = f" {row['layer']} {row['width_mm']:g} mm" if "layer" in row and "width_mm" in row else ""
+        return f"{row['net']}{at}: {row['reason']}"
+
+    if not any(row["status"] in (S.PASS.value, S.FAIL.value) for row in rows) and not any(row["status"] == S.NOT_VERIFIED.value for row in rows):
+        return S.NOT_VERIFIED, "no judged segment of the RF nets: " + "; ".join(where(row) for row in rows), rows, others
+    status = worst_status(S(row["status"]) for row in rows)
+    target = r.details.get("target_ohm")
+    if status is S.PASS:
+        judged = [row for row in rows if row["status"] == S.PASS.value]
+        reason = f"{len(judged)} segment(s) of the RF net(s) {', '.join(members)} within {target:g} ohm (calc.tline.microstrip.z0 over the plane)"
+    else:
+        reason = "; ".join(where(row) for row in rows if row["status"] in (S.FAIL.value, S.NOT_VERIFIED.value))
+    unjudged = [where(row) for row in rows if row["status"] == S.NOT_APPLICABLE.value]
+    if unjudged:
+        reason += f"; not judged: {'; '.join(unjudged)}"
+    return status, reason, rows, others
+
+
 class RFImpedanceValidator(Validator):
-    id = "domain.rf.impedance"
+    """The characteristic impedance of the RF nets' routed copper against their net class's target Z0.
+
+    Applies only to a design that carries RF (:func:`ai_eda.tools.si.rf.has_rf`:
+    a net of kind ``rf``, a net class stating ``rf_frequency_hz``, or the RF
+    domain in the topology) - every other design gets no row, and
+    :meth:`validate` on one answers NOT_APPLICABLE naming why. The verdict is
+    the existing ``si.impedance`` machinery
+    (:func:`ai_eda.validation.si.impedance_result`: Z0 of each routed segment
+    over its plane from ``calc.tline.microstrip.z0``, within ``target_z0_ohm``
+    +/- ``z0_tol_rel``), grouped by the classes that hold the RF nets - IR
+    geometry and calculators, never DRC and never a measurement. NOT_VERIFIED
+    with the reason: the RF domain without an RF net ("which nets carry RF is
+    not stated"), no ``ir.si``, no placed board, an RF net in no class or in a
+    class without ``target_z0_ohm``, unrouted RF copper (``si.impedance``'s own
+    NOT_VERIFIED row); and a class whose impedance check found nothing to
+    judge (every segment a neck-down, or no member net with two pads -
+    ``si.impedance`` says NOT_APPLICABLE there) is NOT_VERIFIED here with that
+    reason: on a design that carries RF, "none of the RF copper was judged"
+    never reads as "does not apply". Only the rows of the class's RF member
+    nets decide (:func:`_rf_rows_verdict`): a class that also holds non-RF
+    nets never lends their PASS to RF copper nobody judged, nor their FAIL to
+    the RF verdict (it stays in ``si.impedance.<class>``); those rows are
+    ``details["classes"][<class>]["other_members"]``, context only. PASS only
+    through PASSing rows of RF nets. Matching networks, S-parameters and the
+    antenna are not judged (``details["not_judged"]``). Result: the worst class row.
+    """
+
+    id = RF_IMPEDANCE_CHECK
     domains = frozenset({CircuitDomain.RF})
-    description = "Trace impedance / matching / S-parameter checks"
+    description = "RF nets' trace impedance against their net class's target Z0 (IR geometry + calculators, not DRC; matching, S-parameters and the antenna not judged)"
+
+    def applies_to(self, ir: CircuitIR) -> bool:
+        return has_rf(ir)
+
+    def _result(self, status: ValidationStatus, message: str, **details: Any) -> ValidationResult:
+        return ValidationResult(
+            check_id=self.id, status=status, message=f"{message} ({NOT_DRC})", tool=RF_TOOL, tool_version=RF_VERSION,
+            details={"kind": SI_KIND, "not_judged": list(RF_NOT_JUDGED), **details},
+        )
 
     def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
-        return [self.not_verified("RF analysis backend not implemented")]
+        from ai_eda.validation.si import impedance_result
+
+        nets = rf_nets(ir)
+        if not nets:
+            if not rf_domain(ir):
+                return [self._result(S.NOT_APPLICABLE, NO_RF, rf_nets=[])]
+            return [self._result(S.NOT_VERIFIED, "the topology declares the RF domain, but which nets carry RF is not stated "
+                                 "(no net of kind rf, no net class states rf_frequency_hz)", rf_nets=[])]
+        si = ir.si
+        if si is None:
+            return [self._result(S.NOT_VERIFIED, f"no ir.si: no net class states a target Z0 for the RF nets {', '.join(nets)}", rf_nets=nets)]
+        if ir.pcb is None or not ir.pcb.placements:
+            return [self._result(S.NOT_VERIFIED, f"no placed board: the copper of the RF nets {', '.join(nets)} does not exist yet", rf_nets=nets)]
+        library = ctx.tools.get("kicad_library")
+        library = library if isinstance(library, KicadLibrary) else None
+        measures = measure_nets(ir, library=library)
+        pads = net_pads(ir, library) if library is not None else None
+        groups: dict[str | None, list[str]] = {}
+        for net in nets:
+            cls = si.class_of(net)
+            groups.setdefault(None if cls is None else cls.name, []).append(net)
+        classes: dict[str, dict[str, Any]] = {}
+        for name, members in groups.items():
+            if name is None:
+                classes["(no class)"] = {"status": S.NOT_VERIFIED.value, "rf_nets": members,
+                                         "reason": f"{', '.join(members)}: in no net class (no default class), so no target Z0 is stated"}
+                continue
+            cls = si.net_class(name)
+            assert cls is not None
+            if cls.target_z0_ohm is None:
+                classes[name] = {"status": S.NOT_VERIFIED.value, "rf_nets": members,
+                                 "reason": f"class {name} states no target_z0_ohm (its RF nets: {', '.join(members)})"}
+                continue
+            r = impedance_result(ir, si, cls, measures, pads)
+            status, reason, rf_rows, others = _rf_rows_verdict(r, members)
+            classes[name] = {"status": status.value, "rf_nets": members, "check": r.check_id, "copied_status": r.status.value, "reason": reason,
+                             "target_ohm": r.details.get("target_ohm"), "window_ohm": r.details.get("window_ohm"), "segments": rf_rows,
+                             "other_members": others}
+        overall = worst_status(S(c["status"]) for c in classes.values())
+        message = "; ".join(f"class {name}: {c['status']} - {c['reason']}" for name, c in classes.items())
+        message += f"; not judged: {', '.join(RF_NOT_JUDGED)}"
+        details: dict[str, Any] = {"classes": classes, "rf_nets": nets}
+        if overall is S.FAIL:
+            details["repair"] = "human"
+        return [self._result(overall, message, **details)]
 
 
 class SignalIntegrityValidator(Validator):

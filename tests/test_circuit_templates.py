@@ -57,7 +57,7 @@ from ai_eda.llm.extraction import ACCEPT_KEY, CONFIRM_KEY
 from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.tools.calc import CALC_VERSION, parse_answer, recompute_parameters
 from ai_eda.design.templates import AstableTemplate
-from ai_eda.tools.calc.basic import astable_c_for_frequency, astable_frequency, led_series_resistor
+from ai_eda.tools.calc.basic import astable_c_for_frequency, astable_frequency, led_series_resistor, rc_r_for_cutoff
 from ai_eda.tools.calc.part_value import parse_part_value, part_value_agrees
 from ai_eda.tools.calc.quantity import QUANTITY_VERSION
 from ai_eda.tools.kicad import sexpr
@@ -688,7 +688,7 @@ ASTABLE_C_VALUE = "64.817n"
 
 def test_astable_calculators_refuse_out_of_domain_inputs():
     c = astable_c_for_frequency(user_requirement(1000.0, "Hz"), user_requirement(10_000.0, "ohm"), user_requirement(5.0, "V"), user_requirement(0.7, "V"))
-    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.8"
+    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.9"
     assert c.provenance.inputs == {"f_osc": "f_osc", "r_b": "r_b", "v_cc": "v_cc", "v_be": "v_be"}
     f = astable_frequency(user_requirement(10_000.0, "ohm"), c, user_requirement(5.0, "V"), user_requirement(0.7, "V"))
     assert f.value == pytest.approx(1000.0) and f.unit == "Hz" and f.provenance.tool == "calc.astable.f"
@@ -1137,12 +1137,18 @@ def test_a_calculator_that_overflows_refuses_the_template_with_a_sentence(tmp_pa
     ir = _ir(tmp_path, "div")
     state, _ = _run(ir, tmp_path, lib, {**BASE, "input_voltage": "1e308 V", "output_voltage": "1e-308 V"})
     assert ir.components == [] and "template divider not proposed: calc.divider.r1_for_v_out overflows" in state.outcome(Stage.ARCHITECTURE).message
-    ir = _ir(tmp_path, "rc")
-    state, _ = _run(ir, tmp_path, lib, {**BASE, "cutoff_frequency": "1e-310 Hz"})
-    assert ir.components == [] and "template rc_lowpass not proposed: calc.rc.r_for_cutoff overflows: R = 1 / (2 pi f_c C) is not a finite number" in state.outcome(Stage.ARCHITECTURE).message
-    ir = _ir(tmp_path, "rc0")
-    state, _ = _run(ir, tmp_path, lib, {**BASE, "cutoff_frequency": "1e-320 Hz"})  # the product underflows to zero: a sentence, not a ZeroDivisionError
-    assert ir.components == [] and "template rc_lowpass not proposed: calc.rc.r_for_cutoff underflows: 2 pi f_c C is zero" in state.outcome(Stage.ARCHITECTURE).message
+    # the RC template's validity range (2 Hz..100 kHz) now refuses these cutoffs before its calculator runs; the calculator's own
+    # overflow / underflow sentences stay covered directly
+    with pytest.raises(ValueError, match=r"^calc\.rc\.r_for_cutoff overflows: R = 1 / \(2 pi f_c C\) is not a finite number"):
+        rc_r_for_cutoff(user_requirement(1e-310, "Hz"), user_requirement(100e-9, "F"))
+    with pytest.raises(ValueError, match=r"^calc\.rc\.r_for_cutoff underflows: 2 pi f_c C is zero"):  # a sentence, not a ZeroDivisionError
+        rc_r_for_cutoff(user_requirement(1e-320, "Hz"), user_requirement(100e-9, "F"))
+    for name, cutoff in (("rc", "1e-310 Hz"), ("rc0", "1e-320 Hz")):
+        ir = _ir(tmp_path, name)
+        state, _ = _run(ir, tmp_path, lib, {**BASE, "cutoff_frequency": cutoff})
+        message = state.outcome(Stage.ARCHITECTURE).message
+        assert ir.components == [] and "template rc_lowpass not proposed: cutoff frequency " in message and "(req.cutoff_frequency) is outside 2..100000 Hz" in message
+        assert "r_for_cutoff" not in message
 
 
 def test_inputs_check_reports_a_non_finite_edited_requirement_as_not_verified(tmp_path: Path):

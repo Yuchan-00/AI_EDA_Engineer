@@ -9,6 +9,7 @@ model is involved anywhere in this package.
 """
 
 from ai_eda.design.base import (
+    AMBIGUOUS_KEYS,
     CHOICE_NOTE_PREFIX,
     CONFIRM_DESIGN_KEY,
     DESIGN_CATEGORIES,
@@ -26,16 +27,26 @@ from ai_eda.design.base import (
     number,
     parameter_value,
     quantity,
+    served_through_specific_key,
+    specific_keys,
     unserved_requirements,
     unverified,
 )
 from ai_eda.design.checks import INPUTS_CHECK, check_inputs_vs_requirements
 from ai_eda.design.inputs import (
+    BATTERY_ALIASES,
     DEFAULT_LAYER_COUNT,
     KEY_ALIASES,
     LAYER_COUNT_KEY,
     LAYER_COUNT_OPTIONS,
+    MODULATION_ALIASES,
+    MODULATION_KEY,
+    MODULATIONS,
     PARSED_NOTE_PREFIX,
+    RATIO_UNIT,
+    RF_KEY_ALIASES,
+    RF_UNIT_OF,
+    SYMMETRIC_TOLERANCE_KEYS,
     UNIT_OF,
     DesignInput,
     LayerCountInput,
@@ -43,6 +54,7 @@ from ai_eda.design.inputs import (
     is_template_input,
     read_inputs,
     read_layer_count,
+    read_modulation,
     read_value,
 )
 from ai_eda.design.stackup import GENERIC_STACKS, board_layers, generic_stackup, plane_zones, stackup_choices, with_planes
@@ -50,6 +62,16 @@ from ai_eda.design.library_parts import TemplateRefusal, library_component, pin_
 from ai_eda.design.templates import TEMPLATES, Atmega128DevboardTemplate, AstableTemplate, DividerTemplate, LateLoad, LedTemplate, RcLowpassTemplate, design_from_requirements, late_load_changes, template_keys_text
 
 __all__ = [
+    "AMBIGUOUS_KEYS",
+    "BATTERY_ALIASES",
+    "MODULATIONS",
+    "MODULATION_ALIASES",
+    "MODULATION_KEY",
+    "RATIO_UNIT",
+    "RF_KEY_ALIASES",
+    "RF_UNIT_OF",
+    "SYMMETRIC_TOLERANCE_KEYS",
+    "read_modulation",
     "DEFAULT_LAYER_COUNT",
     "GENERIC_STACKS",
     "LAYER_COUNT_KEY",
@@ -100,6 +122,8 @@ __all__ = [
     "quantity",
     "read_inputs",
     "read_value",
+    "served_through_specific_key",
+    "specific_keys",
     "template_keys_text",
     "unserved_requirements",
     "unverified",

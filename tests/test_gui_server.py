@@ -1248,12 +1248,15 @@ def test_the_page_shows_the_report_labels_in_korean(shared):
     from ai_eda.report.pipeline_log import PipelineRecord
 
     constants = ["FRESH", "STALE", "UNSTAMPED_PRODUCED", "UNSTAMPED_CARRIED", "UNSTAMPED_UNKNOWN", "ON_DISK", "CHANGED_ON_DISK", "MISSING_ON_DISK",
-                 "EVIDENCE_OK", "EVIDENCE_NO_HASH", "EVIDENCE_NO_PATH", "EVIDENCE_MISSING", "PIPELINE_DESCRIBES_IR", "PIPELINE_STALE_IR",
-                 "RUN_CURRENT_IR", "RUN_EARLIER_IR", "NO_RECORDED_RUN", "OPINION", "MODEL_OUTPUT", "AGGREGATE_NOTE"]
+                 "EVIDENCE_OK", "EVIDENCE_NO_HASH", "EVIDENCE_NO_PATH", "EVIDENCE_MISSING", "NOT_READ_OUTSIDE", "PIPELINE_DESCRIBES_IR", "PIPELINE_STALE_IR",
+                 "PIPELINE_OTHER_IR", "RUN_CURRENT_IR", "RUN_EARLIER_IR", "NO_RECORDED_RUN", "OPINION", "MODEL_OUTPUT", "AGGREGATE_NOTE"]
     assert sorted(KOREAN_LABELS) == sorted(getattr(data_module, name) for name in constants)
     hangul = re.compile(r"[\uac00-\ud7a3]")
     for name in constants:
         assert hangul.search(korean_label(getattr(data_module, name)) or ""), name
+    # the meta note of a record naming another ir.json: the label in Korean, the path as written
+    other_note = f"{data_module.PIPELINE_OTHER_IR}: /elsewhere/ir.json"
+    assert korean_label(other_note) == "pipeline.json\uc774 \ub2e4\ub978 ir.json\uc758 \uc2e4\ud589\uc744 \uae30\ub85d\ud588\uc2b5\ub2c8\ub2e4: /elsewhere/ir.json"
     stale = _Freshness("sha256:" + "a" * 64, None).label(
         ValidationResult(check_id="x", status=ValidationStatus.PASS, message="m", ir_hash="sha256:" + "b" * 64), 0)
     assert stale.startswith("stale (IR ") and korean_label(stale) == "낡음: 이전 설계 해시 (IR sha256:bbbbbbbbb)"
@@ -1671,3 +1674,55 @@ def test_request_path_and_header_helpers():
         "attachment; filename=\"01_______.pdf\"; filename*=UTF-8''01_%EC%9D%B4%EB%A1%A0_%EB%B3%B4%EA%B3%A0%EC%84%9C.pdf"
     )
     assert content_disposition("inline", 'a"b.txt') == "inline; filename=\"a_b.txt\"; filename*=UTF-8''a%22b.txt"
+
+
+# --------------------------------------------------------------------------- a copied project reads nothing in the folder it came from
+
+#: prefixes whose opens :func:`_audit_open` records while set (an audit hook cannot be removed: it is inert while this is empty)
+_WATCHED: list[str] = []
+_OPENED: list[str] = []
+
+
+def _audit_open(event: str, args: tuple) -> None:
+    if event == "open" and _WATCHED and args and isinstance(args[0], (str, bytes, os.PathLike)):
+        path = os.fsdecode(args[0])
+        if any(path.startswith(w) for w in _WATCHED):
+            _OPENED.append(path)
+
+
+sys.addaudithook(_audit_open)
+
+
+def test_a_copied_project_is_confined_to_its_own_folder_and_its_report_is_refused(tmp_path: Path):
+    """Regression: the GUI followed a copy's absolute ArtifactRef / Evidence paths into the original folder (141 file syscalls there)
+    and rendered the report `ai-eda report` refuses for the same ir.json."""
+    from ai_eda.gui.server import GuiApp, HttpError
+    from ai_eda.report.data import NOT_READ_OUTSIDE
+
+    root = tmp_path / "root"
+    ir, lib, ir_path = build_project(root)
+    orig = ir_path.parent
+    shutil.copytree(orig, root / "copy")
+    (root / "onlyir").mkdir()
+    shutil.copy2(ir_path, root / "onlyir" / "ir.json")
+    app = GuiApp(root, library=lib, providers_ttl=0)
+    _WATCHED[:], _OPENED[:] = [str(orig) + os.sep], []
+    try:
+        for name in ("copy", "onlyir"):
+            data = app.project_json(name)
+            assert data["info"]["workdir_mismatch"] and "ai-eda relocate" in data["info"]["warning"], name
+            disks = {r["kind"]: r["disk"] for r in data["report"]["artifacts"]}
+            assert disks and set(disks.values()) == {NOT_READ_OUTSIDE}, (name, disks)
+            states = {e["state"] for row in data["report"]["validation"]["latest"] for e in row["evidence"] if str(orig) in e["path"]}
+            assert states <= {NOT_READ_OUTSIDE}, (name, states)
+            assert data["simulation"]["current"] is False
+            assert data["previews"]["schematic_state"]["disk"] == NOT_READ_OUTSIDE and not data["previews"]["schematic"]
+            with pytest.raises(HttpError) as e:
+                app.report_page(name)
+            assert e.value.code == 409 and "ai-eda relocate" in str(e.value), name
+        assert _OPENED == [], _OPENED[:10]  # formerly bom.csv, the netlist, the board, results.json, the rawfiles ... of the original
+    finally:
+        _WATCHED[:] = []
+    # the original is unaffected: its report renders and its files are read
+    assert app.report_page("divider").code == 200
+    assert not app.project_json("divider")["info"]["workdir_mismatch"]

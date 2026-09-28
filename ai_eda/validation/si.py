@@ -31,6 +31,19 @@ their verdicts. Results (tool :data:`~ai_eda.tools.si.measure.SI_TOOL`):
   path); supply / ground nets and nets whose class states no edge are
   NOT_APPLICABLE rows. The result is the worst row; when every judged net is
   long over a plane it is NOT_APPLICABLE naming them (no net is short).
+* ``si.rf_length`` - only when the design has RF nets (a net of kind ``rf``
+  or a class stating ``rf_frequency_hz``, :func:`ai_eda.tools.si.rf.rf_nets`):
+  each RF net's line (the same line, t_pd and bound flag as the rule above)
+  against l_crit = ``rf_length_fraction`` x lambda_g at its frequency (the
+  class's ``rf_frequency_hz``, else the confirmed ``carrier_frequency``).
+  PASS rows "electrically short at <f> (<fraction> lambda_g rule, not a
+  simulation)" (valid with the no-plane bound too: l_crit is then a lower
+  bound); a line longer over a plane is a NOT_APPLICABLE row "judged by
+  si.impedance.<class> / domain.rf.impedance" when its class states a
+  target Z0, NOT_VERIFIED "needs impedance control" when it does not;
+  longer only by a bound (no plane, or a multi-pad net's whole copper) is
+  NOT_VERIFIED "possibly long"; no frequency, no stated fraction or no
+  routed copper is NOT_VERIFIED naming it. Nothing is promoted or re-routed.
 * ``si.impedance.<class>`` - per routed segment of the class's nets, Z0 of
   the routed width on its layer over its plane (``calc.tline.microstrip.z0``)
   within ``target_z0_ohm`` +/- ``z0_tol_rel``. A track narrower than the
@@ -82,6 +95,7 @@ from ai_eda.tools.routing.coupling import COUPLED_GAP_FACTOR, coupled_pieces, un
 from ai_eda.tools.si.measure import NOT_DRC, SI_TOOL, SI_VERSION, NetMeasure, line_model, measure_nets, undefined_impedance_reason
 from ai_eda.tools.si.paths import NetPads, PadBox, net_pads
 from ai_eda.tools.si.promote import critical_rows
+from ai_eda.tools.si.rf import RF_IMPEDANCE_CHECK, RF_LENGTH_CHECK, format_hz, rf_length_rows, rf_nets
 from ai_eda.tools.si.rules import controlled_width, round_up
 from ai_eda.validation.base import ValidationContext, Validator
 from ai_eda.validation.registry import default_registry
@@ -172,6 +186,40 @@ def critical_result(ir: CircuitIR, measures: dict[str, NetMeasure]) -> Validatio
     if other:
         parts.append(f"{len(other)} net(s) not judged: " + "; ".join(other))
     return _result(CRITICAL_CHECK, status, "; ".join(parts), **details)
+
+
+# --------------------------------------------------------------------------- RF electrical length
+
+
+def rf_length_result(ir: CircuitIR, measures: dict[str, NetMeasure]) -> ValidationResult:
+    """``si.rf_length``: every RF net's line against fraction x lambda_g at its frequency (module docstring, :mod:`ai_eda.tools.si.rf`)."""
+    si = ir.si
+    rows: list[dict] = []
+    for r in rf_length_rows(ir, measures):
+        row = r.as_dict()
+        cls = si.net_class(r.net_class) if si is not None and r.net_class is not None else None
+        if r.status == "short":
+            row["status"] = S.PASS.value
+        elif r.status == "not_applicable":
+            row["status"] = S.NOT_APPLICABLE.value
+        elif r.status == "long" and cls is not None and cls.target_z0_ohm is not None:
+            row["status"] = S.NOT_APPLICABLE.value
+            row["reason"] = f"electrically long at {format_hz(float(r.f_hz))}: judged by si.impedance.{cls.name} / {RF_IMPEDANCE_CHECK} ({r.reason})"
+        elif r.status == "long":
+            row["status"] = S.NOT_VERIFIED.value
+            owner = f"class {cls.name}" if cls is not None else f"{r.net} (in no net class)"
+            row["reason"] = f"needs impedance control: {owner} carries RF at {format_hz(float(r.f_hz))} but states no target_z0_ohm ({r.reason})"
+        else:  # possibly_long, unknown
+            row["status"] = S.NOT_VERIFIED.value
+        rows.append(row)
+    status = _worst(rows)
+    fraction = None if si is None or si.rf_length_fraction is None else float(si.rf_length_fraction.value)
+    details = {"nets": rows, "fraction": fraction, "rule": "l_crit = fraction * lambda_g, lambda_g = 1 / (f t_pd) (calc.tline t_pd; a rule, not a simulation)",
+               "promotes": "nothing (the router is unchanged; the rule informs)"}
+    short = [r["net"] for r in rows if r["status"] == S.PASS.value]
+    parts = [f"{len(short)} RF net(s) electrically short" + (f" ({', '.join(short)})" if short else "")]
+    parts += [f"{r['net']}: {r['reason']}" for r in rows if r["status"] != S.PASS.value]
+    return _result(RF_LENGTH_CHECK, status, "; ".join(parts), **details)
 
 
 # --------------------------------------------------------------------------- impedance, width, length, delay
@@ -591,6 +639,8 @@ def si_results(ir: CircuitIR, library: KicadLibrary | None = None) -> list[Valid
     measures = measure_nets(ir, library=library)
     pads = net_pads(ir, library) if library is not None and ir.pcb is not None else None
     out = [critical_result(ir, measures)]
+    if rf_nets(ir):
+        out.append(rf_length_result(ir, measures))
     for cls in si.net_classes:
         out.append(impedance_result(ir, si, cls, measures, pads))
         w = width_result(ir, si, cls)
@@ -629,6 +679,7 @@ __all__ = [
     "diff_results",
     "impedance_result",
     "length_result",
+    "rf_length_result",
     "si_results",
     "skew_results",
     "timing_results",

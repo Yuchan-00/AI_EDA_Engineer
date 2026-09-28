@@ -46,10 +46,14 @@ def host_allowed(host_header: str | None) -> bool:
 
 
 def render_page(ir_path: Path) -> str:
-    """The report of ``ir_path`` right now (reads ir.json and pipeline.json afresh, each exactly once; saves nothing)."""
-    from ai_eda.cli import project_workdir
+    """The report of ``ir_path`` right now (reads ir.json and pipeline.json afresh, each exactly once; saves nothing).
+
+    A project whose recorded workdir names another folder raises
+    :class:`~ai_eda.workdir.WorkdirMismatchError` (the handler's 503 line names ``ai-eda relocate``).
+    """
     from ai_eda.report.data import build_report_data, load_ir_file
     from ai_eda.report.html import render_html
+    from ai_eda.workdir import project_workdir
 
     ir, ir_sha = load_ir_file(ir_path)
     return render_html(build_report_data(ir, ir_path, project_workdir(ir, ir_path), ir_sha=ir_sha))

@@ -38,6 +38,15 @@ saved before the field existed keeps its hash.
 * ``critical_fraction`` - the fraction of the rise time in the
   critical-length rule l_crit = fraction * t_r / t_pd (a confirmed choice;
   1/2 is the round-trip rule).
+* RF: ``NetClass.rf_frequency_hz`` - the highest RF frequency the class's
+  nets carry (they are RF nets, like a net of kind ``NetKind.RF``; a class
+  without it uses the design's confirmed ``carrier_frequency``) - and
+  ``rf_length_fraction`` - the fraction of the guided wavelength in the RF
+  electrical-length rule l_crit = fraction * lambda_g (a confirmed choice;
+  0.1 is the common lambda/10 rule of thumb; never defaulted). ``si.rf_length``
+  and ``domain.rf.impedance`` read them. Both fields, added after IRs were
+  saved, are left out of the design view while ``None`` (every older IR
+  keeps its hash).
 """
 
 from __future__ import annotations
@@ -47,7 +56,7 @@ import re
 
 from pydantic import BaseModel, Field, model_validator
 
-from ai_eda.ir.provenance import Provenance, Traced
+from ai_eda.ir.provenance import Provenance, Traced, drop_empty_in_design_view
 
 #: the id prefix of every traced SI number (``si.net_classes[Z50].target_z0_ohm``), resolved by :meth:`SIConstraints.lookup`
 SI_PREFIX = "si"
@@ -59,11 +68,11 @@ TIMING_TERMS: dict[str, str] = {"t_co_max_s": "s", "t_co_min_s": "s", "t_su_min_
 CLASS_UNITS: dict[str, str | None] = {
     "target_z0_ohm": "ohm", "z0_tol_rel": None, "target_zdiff_ohm": "ohm", "zdiff_tol_rel": None, "pair_uncoupled_max_mm": "mm",
     "pair_max_skew_s": "s", "max_length_mm": "mm", "max_delay_s": "s", "max_skew_s": "s", "min_width_mm": "mm", "power_current_a": "A",
-    "power_temp_rise_c": "degC", "t_rise_s": "s", "r_drive_ohm": "ohm", "c_load_f": "F", "ringing_tol_rel": None,
+    "power_temp_rise_c": "degC", "t_rise_s": "s", "r_drive_ohm": "ohm", "c_load_f": "F", "ringing_tol_rel": None, "rf_frequency_hz": "Hz",
 }
 #: fields of a class that must be > 0 when given (the rest: >= 0)
 _POSITIVE = frozenset({"target_z0_ohm", "target_zdiff_ohm", "max_length_mm", "max_delay_s", "min_width_mm", "power_current_a", "power_temp_rise_c",
-                       "t_rise_s", "c_load_f", "z0_tol_rel", "zdiff_tol_rel", "ringing_tol_rel"})
+                       "t_rise_s", "c_load_f", "z0_tol_rel", "zdiff_tol_rel", "ringing_tol_rel", "rf_frequency_hz"})
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*$")
 
 
@@ -154,7 +163,12 @@ class NetClass(BaseModel):
     #: the controlled-impedance class a net of this class is promoted to when it is electrically long
     promote_to: str | None = None
     promoted: list[Promotion] = Field(default_factory=list)
+    #: the highest RF frequency the class's nets carry (Hz, > 0): marks them as RF nets for ``si.rf_length`` and
+    #: ``domain.rf.impedance``; left out of the design view while ``None``
+    rf_frequency_hz: Traced[float] | None = None
     provenance: Provenance
+
+    _design = drop_empty_in_design_view("rf_frequency_hz")
 
     @model_validator(mode="after")
     def _consistent(self) -> NetClass:
@@ -245,7 +259,13 @@ class SIConstraints(BaseModel):
     net_classes: list[NetClass] = Field(default_factory=list)
     timing_paths: list[TimingPath] = Field(default_factory=list)
     critical_fraction: Traced[float] | None = None
+    #: the fraction of the guided wavelength in the RF electrical-length rule l_crit = fraction * lambda_g
+    #: (dimensionless, (0, 1]; a confirmed choice - 0.1 is the common lambda/10 rule of thumb - never defaulted);
+    #: left out of the design view while ``None``
+    rf_length_fraction: Traced[float] | None = None
     provenance: Provenance
+
+    _design = drop_empty_in_design_view("rf_length_fraction")
 
     @model_validator(mode="after")
     def _consistent(self) -> SIConstraints:
@@ -291,6 +311,9 @@ class SIConstraints(BaseModel):
         _check_number(self.critical_fraction, "si.critical_fraction", None, True)
         if self.critical_fraction is not None and self.critical_fraction.value > 1.0:
             raise ValueError(f"si.critical_fraction must be in (0, 1], got {self.critical_fraction.value!r}")
+        _check_number(self.rf_length_fraction, "si.rf_length_fraction", None, True)
+        if self.rf_length_fraction is not None and self.rf_length_fraction.value > 1.0:
+            raise ValueError(f"si.rf_length_fraction must be in (0, 1], got {self.rf_length_fraction.value!r}")
         return self
 
     # --- lookups -------------------------------------------------------------
@@ -339,6 +362,8 @@ class SIConstraints(BaseModel):
         out: list[tuple[str, Traced]] = []
         if self.critical_fraction is not None:
             out.append((f"{prefix}.critical_fraction", self.critical_fraction))
+        if self.rf_length_fraction is not None:
+            out.append((f"{prefix}.rf_length_fraction", self.rf_length_fraction))
         for c in self.net_classes:
             for field in CLASS_UNITS:
                 t = getattr(c, field)

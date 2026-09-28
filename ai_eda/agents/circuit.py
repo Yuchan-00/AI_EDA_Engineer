@@ -64,7 +64,17 @@ Invariants this agent keeps:
   key (a typed value is kept by the requirement agent): it says the
   requirement must change or another design be chosen. Only a template
   input that no requirement states at all is a required question (the
-  LED's missing ``led_forward_current``).
+  LED's missing ``led_forward_current``). A template checks the validity
+  range of every input that *is* stated before it asks for a missing one,
+  so no required question is asked whose only outcome is a refusal.
+* A bare key that names no specific quantity (:data:`~ai_eda.design.base.AMBIGUOUS_KEYS`:
+  ``frequency``) is read by no template and mapped to nothing. When no
+  template is selected, each confirmed requirement under such a key gets a
+  non-required question under its own key listing the specific keys it
+  could mean (``clock_frequency``, ``cutoff_frequency``,
+  ``oscillation_frequency``, ... computed from ``UNIT_OF`` at call time).
+  Beside a template's specific key stated with the same number it counts as
+  served, and the plan's parts that serve that key list it too.
 """
 
 from __future__ import annotations
@@ -77,14 +87,17 @@ from ai_eda.design import (
     CONFIRM_DESIGN_KEY,
     DESIGN_CATEGORIES,
     IGNORED_KEYS,
+    TEMPLATES,
     Plan,
+    canonical_key,
     check_inputs_vs_requirements,
     design_from_requirements,
     late_load_changes,
     read_inputs,
     template_keys_text,
 )
-from ai_eda.ir import CircuitIR, MissingInformation
+from ai_eda.design.base import AMBIGUOUS_KEYS, requirement_text, served_through_specific_key, specific_keys
+from ai_eda.ir import CircuitIR, Component, MissingInformation, Net
 from ai_eda.llm.extraction import is_confirmation, is_rejection
 from ai_eda.llm.router import TaskKind
 from ai_eda.tools.kicad.library import KicadLibrary
@@ -112,14 +125,16 @@ class CircuitDesignAgent(Agent):
         plan = design_from_requirements(ir, library, inputs, unusable, confirmed=confirmed)
         if plan is None:
             notes.append(f"no template matches the confirmed requirements (templates: {template_keys_text()}); nothing proposed")
+            questions = _ambiguity_questions(ir, notes)
             if answer is not None:
                 notes.append(f"{CONFIRM_DESIGN_KEY} ignored: no template to confirm")
-            return self._result(notes=notes)
+            return self._result(questions=questions, notes=notes)
         notes.extend(plan.notes)
         if not plan.buildable:
             if answer is not None:
                 notes.append(f"{CONFIRM_DESIGN_KEY} ignored: template {plan.template} proposes nothing")
             return self._result(questions=plan.questions, notes=notes)
+        _trace_ambiguous(ir, plan, notes)
         clash = sorted(k for k in ir.parameters if any(c.target == f"parameters.{k}" for c in plan.changes))
         if clash:
             notes.append(f"template {plan.template} not proposed: ir.parameters {clash} already exist and the template would overwrite them")
@@ -202,6 +217,73 @@ def _unserved(ir: CircuitIR) -> list[str]:
         if r.category in DESIGN_CATEGORIES and r.key not in IGNORED_KEYS and r.id not in served
         and not (r.value is not None and r.value.provenance.needs_verification)
     ]
+
+
+#: per ambiguous bare key, the examples its question gives (the keys themselves are listed from ``UNIT_OF`` at call time)
+_AMBIGUITY_EXAMPLES: dict[str, str] = {
+    "frequency": "e.g. --answer oscillation_frequency=\"1 kHz\" for an oscillator's output, cutoff_frequency for a filter corner, clock_frequency for an MCU clock",
+}
+
+
+def _ambiguity_questions(ir: CircuitIR, notes: list[str]) -> list[MissingInformation]:
+    """One non-required question (and a stage note) per confirmed requirement under an :data:`AMBIGUOUS_KEYS` key.
+
+    Such a key names no specific quantity, so no template reads it: it is
+    never mapped to one (a bare ``frequency`` is not silently an audio
+    oscillator); the user is asked which key they mean. Non-required: the
+    design cannot proceed from it anyway, and an optional question does not
+    block the other stages. The requirement itself is left as written.
+    """
+    out: list[MissingInformation] = []
+    for r in ir.requirements.requirements:
+        if r.key not in AMBIGUOUS_KEYS or canonical_key(r.key) is not None:
+            continue
+        if r.value is None or not r.value.provenance.is_authoritative:
+            continue
+        specific = specific_keys(r.key)
+        keys = ", ".join(specific)
+        example = _AMBIGUITY_EXAMPLES.get(r.key) or f"e.g. --answer {specific[0] if specific else r.key}=<value>"
+        question = (
+            f"'{r.key}' does not say which {r.key}, so no template reads it: state the quantity you mean instead - one of {keys} "
+            f"({example}); the requirement {r.id} stays as written"
+        )
+        why = f"{r.id} ({requirement_text(r)}) does not say which {r.key}: no template reads it (state one of {keys})"
+        out.append(MissingInformation(key=r.key, question=question, required=False, rationale=why))
+        notes.append(why)
+    return out
+
+
+def _trace_ambiguous(ir: CircuitIR, plan: Plan, notes: list[str]) -> None:
+    """Trace an ambiguous requirement the template serves through its specific key (same number) to the parts serving that key.
+
+    :func:`~ai_eda.design.base.served_through_specific_key` let the template
+    build beside it; the plan's components and nets that serve the specific
+    key's requirement also list the ambiguous one in
+    ``serves_requirements``, so the reviewer's traceability check sees the
+    same thing the template decided. Nothing changes for a plan without such
+    a requirement.
+    """
+    template = next((t for t in TEMPLATES if t.id == plan.template), None)
+    if template is None:
+        return
+    extra: dict[str, list[str]] = {}
+    for rid, canon in served_through_specific_key(ir, template).items():
+        inp = plan.inputs.get(canon)
+        if inp is None:
+            continue
+        extra.setdefault(inp.requirement.id, []).append(rid)
+        notes.append(f"{rid} is served as {canon} ({inp.requirement.id}): the specific key states the same number")
+    if not extra:
+        return
+    changes = []
+    for c in plan.changes:
+        payload = c.payload
+        if c.target in ("components", "nets") and isinstance(payload, (Component, Net)):
+            added = [rid for base in payload.serves_requirements for rid in extra.get(base, []) if rid not in payload.serves_requirements]
+            if added:
+                c = c.model_copy(update={"payload": payload.model_copy(update={"serves_requirements": [*payload.serves_requirements, *dict.fromkeys(added)]})})
+        changes.append(c)
+    plan.changes = changes
 
 
 __all__ = ["CONFIRM_DESIGN_KEY", "CircuitDesignAgent", "Plan", "table_hash"]

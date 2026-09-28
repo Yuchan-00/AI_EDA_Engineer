@@ -277,9 +277,37 @@ class Atmega128DevboardTemplate(Template):
         "(the symbol's '+' mark and CP_Radial's square pad 1), pin 2 = - on GND - check the part's marking before assembly"
     )
 
+    def _out_of_range(self, inputs: dict[str, DesignInput]) -> str | None:
+        """The refusal sentence for the first *present* input outside the validity range (supply, then clock), or ``None``."""
+        v_in, f_in = inputs.get("input_voltage"), inputs.get("clock_frequency")
+        if v_in is not None and not self.V_IN_MIN <= v_in.traced.value <= self.V_IN_MAX:
+            v, req_v = v_in.traced.value, v_in.requirement.id
+            p_at = (v - self.V_OUT_REG_V) * self.I_LOAD_BUDGET_A
+            return (
+                f"supply {v:.12g} V ({req_v}) is outside {self.V_IN_MIN:.12g}..{self.V_IN_MAX:.12g} V: below {self.V_IN_MIN:.12g} V the input is less than "
+                f"{self.V_OUT_REG_V:.12g} V + the L7805's ~{self.DROPOUT_TYP_V:.12g} V dropout (the regulator family's typical value, not a grounded datasheet fact), "
+                f"so the +5V rail would not hold; above {self.V_IN_MAX:.12g} V the regulator dissipation (V_in - {self.V_OUT_REG_V:.12g} V) x {self.I_LOAD_BUDGET_A:.12g} A "
+                f"at the design load budget" + (f" (here {p_at:.12g} W)" if p_at > 0 else "") + f" exceeds half of the {self.P_REG_MAX_W:.12g} W no-heatsink budget "
+                f"of U2's TO-220 package (the template's conservative rule: a 2x margin because the load budget is an estimate)"
+            )
+        if f_in is not None and not self.F_MIN <= f_in.traced.value <= self.F_MAX:
+            f, req_f = f_in.traced.value, f_in.requirement.id
+            return (
+                f"clock frequency {f:.12g} Hz ({req_f}) is outside {self.F_MIN:.12g}..{self.F_MAX:.12g} Hz: above {self.F_MAX / 1e6:.12g} MHz exceeds the "
+                f"ATmega128-16A's maximum (the KiCad symbol's Description reads '16MHz'); below {self.F_MIN / 1e6:.12g} MHz is outside the crystal range the "
+                f"ATmega128 datasheet gives for its oscillator (stated by the template, not grounded in this IR)"
+            )
+        return None
+
     def build(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str], library: KicadLibrary, *, confirmed: bool) -> Plan:
         t = self.id
         plan = Plan(template=t, title=self.title)
+        # range first: a present input outside the validity range refuses before a missing one is asked for (the answer
+        # to that required question could only lead to this refusal)
+        why = self._out_of_range(inputs)
+        if why is not None:
+            plan.inputs = {k: inputs[k] for k in self.needs if k in inputs}
+            return _refused(plan, why)
         missing = [k for k in self.needs if k not in inputs]
         if missing:
             return _missing_inputs(plan, "The ATmega128 development board template", missing, unusable, examples={"input_voltage": "9 V", "clock_frequency": "16 MHz"})
@@ -287,21 +315,6 @@ class Atmega128DevboardTemplate(Template):
         plan.inputs = {"clock_frequency": f_in, "input_voltage": v_in}
         req_f, req_v = f_in.requirement.id, v_in.requirement.id
         v, f = v_in.traced.value, f_in.traced.value
-        if not self.V_IN_MIN <= v <= self.V_IN_MAX:
-            p_at = (v - self.V_OUT_REG_V) * self.I_LOAD_BUDGET_A
-            return _refused(plan, (
-                f"supply {v:.12g} V ({req_v}) is outside {self.V_IN_MIN:.12g}..{self.V_IN_MAX:.12g} V: below {self.V_IN_MIN:.12g} V the input is less than "
-                f"{self.V_OUT_REG_V:.12g} V + the L7805's ~{self.DROPOUT_TYP_V:.12g} V dropout (the regulator family's typical value, not a grounded datasheet fact), "
-                f"so the +5V rail would not hold; above {self.V_IN_MAX:.12g} V the regulator dissipation (V_in - {self.V_OUT_REG_V:.12g} V) x {self.I_LOAD_BUDGET_A:.12g} A "
-                f"at the design load budget" + (f" (here {p_at:.12g} W)" if p_at > 0 else "") + f" exceeds half of the {self.P_REG_MAX_W:.12g} W no-heatsink budget "
-                f"of U2's TO-220 package (the template's conservative rule: a 2x margin because the load budget is an estimate)"
-            ))
-        if not self.F_MIN <= f <= self.F_MAX:
-            return _refused(plan, (
-                f"clock frequency {f:.12g} Hz ({req_f}) is outside {self.F_MIN:.12g}..{self.F_MAX:.12g} Hz: above {self.F_MAX / 1e6:.12g} MHz exceeds the "
-                f"ATmega128-16A's maximum (the KiCad symbol's Description reads '16MHz'); below {self.F_MIN / 1e6:.12g} MHz is outside the crystal range the "
-                f"ATmega128 datasheet gives for its oscillator (stated by the template, not grounded in this IR)"
-            ))
 
         def ch(key: str, value: float, unit: str | None, description: str) -> tuple[Choice, Traced]:
             return _choice(t, key, value, unit, description, confirmed)

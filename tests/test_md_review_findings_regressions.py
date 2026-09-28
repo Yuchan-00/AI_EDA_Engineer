@@ -1285,8 +1285,13 @@ def test_58_a_relative_project_workdir_is_never_resolved_against_the_cwd(tmp_pat
     assert project_workdir(ir, path) == project.resolve()
     ir.project.workdir = None
     assert project_workdir(ir, path) == project.resolve()
-    ir.project.workdir = str(tmp_path / "elsewhere")
-    assert project_workdir(ir, path) == tmp_path / "elsewhere"
+    from ai_eda.workdir import WorkdirMismatchError
+
+    ir.project.workdir = str(tmp_path / "elsewhere")  # an absolute other folder (a copied / moved project): refused, never followed
+    with pytest.raises(WorkdirMismatchError, match="ai-eda relocate"):
+        project_workdir(ir, path)
+    ir.project.workdir = str(project)  # absolute and this folder
+    assert project_workdir(ir, path) == project.resolve()
     ir.project.workdir = "other/dir"
     with pytest.raises(IRSchemaError, match="relative"):
         project_workdir(ir, path)

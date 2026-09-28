@@ -6,7 +6,8 @@ again on the inputs its provenance names gives the stored value back. The
 CALCULATION stage records the outcome as the ``calc.recompute``
 :class:`~ai_eda.ir.ValidationResult`:
 
-* every derived value recomputed and equal (relative 1e-9) -> PASS;
+* every derived value recomputed and equal (relative 1e-9 of the larger magnitude, no absolute floor: a pF or nH
+  value is compared as closely as a kilohm; exact zeros are equal) -> PASS;
 * a recomputed value that differs -> FAIL with both values (``repair: human``:
   either the stored number, its inputs or its recorded provenance is wrong,
   and a tool must not pick);
@@ -82,6 +83,7 @@ from ai_eda.tools.calc.basic import (
     voltage_divider_output,
     voltage_divider_ratio,
 )
+from ai_eda.tools.calc.rf import RF_CALCULATORS
 from ai_eda.tools.calc.tline import (
     critical_length,
     edge_coupled_e_eff_even,
@@ -160,6 +162,8 @@ CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     "calc.tline.critical_length": (critical_length, ROLES["calc.tline.critical_length"]),
     "calc.ipc2221.width_for_current": (ipc2221_width_for_current, ROLES["calc.ipc2221.width_for_current"]),
     "calc.clock.divided": (clock_divided, ROLES["calc.clock.divided"]),
+    # RF (ai_eda.tools.calc.rf): every calc.rf.* calculator and calc.crystal.c_for_load, with the roles basic.ROLES names
+    **{tool: (fn, ROLES[tool]) for tool, fn in RF_CALCULATORS.items()},
 }
 
 #: lower-cased unit spelling -> the key a role's expected unit lower-cases to. A thermal resistance is written
@@ -194,7 +198,9 @@ def _same(a: float, b: float) -> bool:
         return a == b
     if math.isnan(a) or math.isnan(b) or math.isinf(a) or math.isinf(b):
         return False
-    return abs(a - b) <= REL_TOL * max(1.0, abs(a), abs(b))
+    # purely relative: an absolute floor (the former max(1.0, ...)) made every pF / nH value "equal" to any other,
+    # so a tampered matching or filter capacitor recomputed PASS; exact zeros are still equal (0 <= 0)
+    return abs(a - b) <= REL_TOL * max(abs(a), abs(b))
 
 
 def derived_values(ir: CircuitIR) -> Iterator[tuple[str, Traced]]:
@@ -238,6 +244,9 @@ def derived_values(ir: CircuitIR) -> Iterator[tuple[str, Traced]]:
         for label, t in (("nominal", e.nominal), ("at", e.at), ("tol_abs", e.tol_abs), ("tol_rel", e.tol_rel)):
             if t is not None and t.provenance.kind == ProvenanceKind.DERIVED:
                 yield f"simulation.expectations[{e.id}].{label}", t
+        for k, t in e.params.items():
+            if t.provenance.kind == ProvenanceKind.DERIVED:
+                yield f"simulation.expectations[{e.id}].params[{k}]", t
     if setup.temperature_c is not None and setup.temperature_c.provenance.kind == ProvenanceKind.DERIVED:
         yield "simulation.temperature_c", setup.temperature_c
 

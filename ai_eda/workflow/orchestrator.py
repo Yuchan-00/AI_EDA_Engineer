@@ -65,6 +65,7 @@ from ai_eda.agents import (
     ReviewAgent,
     SimulationAgent,
 )
+from ai_eda.agents.requirement import EXTRACTION_CHECK
 from ai_eda.compilers import (
     BOMCompiler,
     CPLCompiler,
@@ -83,6 +84,7 @@ from ai_eda.compilers import (
 from ai_eda.errors import CompileError, NothingToCompileError, ToolExecutionError, ToolUnavailableError
 from ai_eda.ir import ArtifactKind, CircuitIR, MissingInformation, ValidationResult, ValidationStatus, worst_status
 from ai_eda.ir.provenance import design_data
+from ai_eda.llm.extraction import request_hash
 from ai_eda.tools.calc import recompute_parameters
 from ai_eda.tools.kicad.cli import KicadCli, run_drc_for, run_erc_for
 from ai_eda.tools.kicad.library import KicadLibrary
@@ -381,10 +383,40 @@ class Orchestrator:
         }[agent.name]
 
     def _missing_information(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
+        """Open required questions stop the pipeline; otherwise the stage says what "nothing missing" rests on.
+
+        No open question is not evidence that nothing is missing (CLAUDE.md
+        #3): PASS only when the request text *as it is now* was analysed by
+        the model and the user confirmed that extraction (the latest
+        ``requirements.extraction`` is PASS and was made for
+        ``request_hash(request_text())``). Without a request text, without an
+        extraction (no ``--llm``: only the baseline checklist was asked) or
+        with one that is not confirmed / was made for another text the stage
+        is NOT_VERIFIED with that reason - never a silent PASS. Nothing else
+        is recorded: the checklist already is the requirement stage's own
+        question list, so copying it into ``requirements.missing`` would ask
+        twice and still verify nothing.
+        """
         pending = [q for q in ir.requirements.missing if q.required and q.key not in ctx.answers]
         if pending:
             return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.USER_INPUT_REQUIRED, questions=pending, message=f"{len(pending)} required question(s)")
-        return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.PASS)
+        text = ir.requirements.request_text()
+        x = ir.validation.latest(EXTRACTION_CHECK)
+        if x is not None and x.status is ValidationStatus.PASS and x.details.get("request_hash") == request_hash(text):
+            return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.PASS, message=(
+                f"no required question open; the request was analysed by the model and the extraction confirmed by the user ({EXTRACTION_CHECK} PASS)"
+            ))
+        if not ir.requirements.raw_input.strip():
+            why = "no required question open, but there is no request text: only the baseline checklist was asked; nothing checked the design for missing information"
+        elif x is None:
+            why = ("no required question open, but the request was not analysed for missing information (no --llm: only the baseline checklist was asked; "
+                   "the request's own numbers and terms are not read)")
+        elif x.status is not ValidationStatus.PASS:
+            why = f"no required question open, but the request extraction is {x.status} for this request text: missing information was not checked"
+        else:
+            why = ("no required question open, but the confirmed request extraction was made for another request text (the request changed since): "
+                   "missing information was not checked for this text")
+        return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.NOT_VERIFIED, message=why)
 
     def _ir_validate(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         results = default_registry.run(ir, ValidationContext(workdir=ctx.workdir, tools=ctx.tools))
