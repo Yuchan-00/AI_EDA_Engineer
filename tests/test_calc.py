@@ -205,6 +205,17 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
                                            user_requirement(50.0, "ohm"), user_requirement(40.0), user_requirement(447.5625e6, "Hz")),
         "calc.rf.resonator.top_c.rel_s21_db": (user_requirement(3.0), user_requirement(447.5625e6, "Hz"), user_requirement(20e6, "Hz"), user_requirement(4.7e-9, "H"), user_requirement(50.0, "ohm"),
                                                user_requirement(50.0, "ohm"), user_requirement(40.0), user_requirement(410.265625e6, "Hz"), user_requirement(447.5625e6, "Hz")),
+        "calc.rf.resonator.top_c.port_r": (user_requirement(1000.0, "ohm"), user_requirement(1e-6, "H"), user_requirement(40.0), user_requirement(223.78125e6, "Hz")),
+        "calc.rf.resonator.top_c.port_x": (user_requirement(1000.0, "ohm"), user_requirement(1e-6, "H"), user_requirement(40.0), user_requirement(223.78125e6, "Hz")),
+        "calc.rf.resonator.top_c.c_tap_reactive": (user_requirement(2.0), user_requirement(223.78125e6, "Hz"), user_requirement(15.8237e6, "Hz"), user_requirement(68e-9, "H"),
+                                                   user_requirement(660.44, "ohm"), user_requirement(461.22, "ohm")),
+        "calc.rf.resonator.top_c.ported_s21_db": (user_requirement(2.0), user_requirement(223.78125e6, "Hz"), user_requirement(15.8237e6, "Hz"), user_requirement(68e-9, "H"),
+                                                  user_requirement(1000.0, "ohm"), user_requirement(1e-6, "H"), user_requirement(40.0), user_requirement(500.0, "ohm"),
+                                                  user_requirement(374.909, "ohm"), user_requirement(40.0), user_requirement(223.78125e6, "Hz")),
+        "calc.rf.resonator.top_c.ported_rel_s21_db": (user_requirement(2.0), user_requirement(223.78125e6, "Hz"), user_requirement(15.8237e6, "Hz"),
+                                                      user_requirement(68e-9, "H"), user_requirement(1000.0, "ohm"), user_requirement(1e-6, "H"), user_requirement(40.0),
+                                                      user_requirement(500.0, "ohm"), user_requirement(374.909, "ohm"), user_requirement(40.0),
+                                                      user_requirement(261.078125e6, "Hz"), user_requirement(223.78125e6, "Hz")),
         "calc.rf.bpf.dissipation_loss": (user_requirement(3.0), user_requirement(447.5625e6, "Hz"), user_requirement(20e6, "Hz"), user_requirement(40.0)),
         "calc.rf.resonator.single_tuned.rejection": (user_requirement(20.0), user_requirement(447.5625e6, "Hz"), user_requirement(484.859375e6, "Hz")),
         "calc.rf.resonator.single_tuned.insertion_loss": (user_requirement(20.0), user_requirement(40.0)),
@@ -326,4 +337,4 @@ def test_regulator_crystal_lc_and_rc_window_calculators():
     for fn in (rc_tran_step, rc_tran_stop):
         with pytest.raises(ValueError, match="time constant must be positive"):
             fn(user_requirement(0.0, "s"))
-    assert CALC_VERSION == "0.10" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")
+    assert CALC_VERSION == "0.11" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")

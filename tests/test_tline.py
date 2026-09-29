@@ -336,7 +336,7 @@ def test_propagation_delay_and_the_critical_length():
 def test_traced_wrappers_write_roles_units_and_the_calc_version():
     w, h, t, er = user_requirement(0.35, "mm"), user_requirement(0.2, "mm"), user_requirement(35.0, "um"), user_requirement(4.5)
     z = microstrip_z0(w, h, t, er, ("w_sig", "h_pp", "t_cu", "er_pp"))
-    assert z.unit == "ohm" and z.provenance.kind is ProvenanceKind.DERIVED and z.provenance.tool == "calc.tline.microstrip.z0" and z.provenance.tool_version == CALC_VERSION == "0.10"
+    assert z.unit == "ohm" and z.provenance.kind is ProvenanceKind.DERIVED and z.provenance.tool == "calc.tline.microstrip.z0" and z.provenance.tool_version == CALC_VERSION == "0.11"
     assert z.provenance.inputs == {"w": "w_sig", "h": "h_pp", "t": "t_cu", "er": "er_pp"} and "Hammerstad & Jensen 1980" in (z.provenance.note or "")
     e = microstrip_e_eff(w, h, t, er)
     assert e.unit is None and e.value == pytest.approx(microstrip(0.35, 0.2, 35.0, 4.5).e_eff)

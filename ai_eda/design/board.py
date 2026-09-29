@@ -44,7 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from ai_eda.ir import CircuitIR, MissingInformation, NetClass, PCBDesign, Provenance, SIConstraints, Stackup, TimingPath, Traced
+from ai_eda.ir import CircuitIR, Keepout, MissingInformation, NetClass, PCBDesign, Provenance, SIConstraints, Stackup, TimingPath, Traced
 
 from ai_eda.design.base import Choice, DesignChange, Plan, choice_provenance, structural_provenance
 from ai_eda.design.inputs import LAYER_COUNT_KEY, DesignInput, LayerCountInput, read_layer_count
@@ -145,6 +145,14 @@ def class_line(c: NetClass) -> str:
     return "; ".join(parts)
 
 
+def keepout_line(k: Keepout) -> str:
+    """One table line for a keep-out the template proposes: its area, layers, bans, exceptions and reason."""
+    area = (f"rect x {k.rect.value[0]:g} y {k.rect.value[1]:g} w {k.rect.value[2]:g} h {k.rect.value[3]:g} mm" if k.rect is not None
+            else f"polygon of {len(k.polygon.value)} points (mm)")  # type: ignore[union-attr]
+    extra = "".join(f"; allowed {label} {', '.join(names)}" for label, names in (("refs", k.allowed_refs), ("nets", k.allowed_nets)) if names)
+    return f"keep-out {k.id}: {area} on {', '.join(k.layers)}, no {', '.join(k.forbids)}{extra} - {k.reason}"
+
+
 def path_line(p: TimingPath) -> str:
     known = [k for k in ("t_co_max_s", "t_co_min_s", "t_su_min_s", "t_h_min_s") if getattr(p, k) is not None]
     return (
@@ -204,7 +212,14 @@ def layer_policy_refusal(template: Template, ir: CircuitIR) -> MissingInformatio
 
 
 def add_board(template: Template, ir: CircuitIR, plan: Plan, *, confirmed: bool) -> str | None:
-    """Append the board's stack and SI classes to a buildable ``plan`` (choices, inputs, table lines, changes); the refusal reason otherwise."""
+    """Append the board's stack and SI classes to a buildable ``plan`` (choices, inputs, table lines, changes); the refusal reason otherwise.
+
+    The plan's own keep-outs (:attr:`~ai_eda.design.base.Plan.keepouts`, the
+    transceiver's antenna band) go into the proposed ``PCBDesign`` with the
+    stack, or are appended to an existing ``ir.pcb`` (one whose id is already
+    there refuses: a keep-out is never replaced); each gets a table line. A
+    plan without keep-outs proposes exactly the board it proposed before.
+    """
     t = template.id
     policy = template.layer_policy
     layers, why = read_board_layers(template, ir)
@@ -239,7 +254,8 @@ def add_board(template: Template, ir: CircuitIR, plan: Plan, *, confirmed: bool)
             )
         if ir.pcb is None:
             changes.append(DesignChange(description=f"board stack: {layers.value} layers", target="pcb", operation="set",
-                                        payload=PCBDesign(layers=board_layers(stack), stackup=stack), rationale=f"template {t}: generic {layers.value}-layer stack"))
+                                        payload=PCBDesign(layers=board_layers(stack), stackup=stack, keepouts=list(plan.keepouts)),
+                                        rationale=f"template {t}: generic {layers.value}-layer stack" + (f" and {len(plan.keepouts)} keep-out(s)" if plan.keepouts else "")))
         else:
             changes.append(DesignChange(description=f"board layers: {layers.value}", target="pcb.layers", operation="set", payload=board_layers(stack),
                                         rationale=f"template {t}: generic {layers.value}-layer stack"))
@@ -247,6 +263,14 @@ def add_board(template: Template, ir: CircuitIR, plan: Plan, *, confirmed: bool)
                                         rationale=f"template {t}: generic {layers.value}-layer stack"))
         plan.board.append(f"stackup: generic {layers.value}-layer ({'from ' + layers.requirement.id if layers.requirement is not None else 'the default'}); "
                           + ("planes In1.Cu = " + ground + ", In2.Cu = " + power if layers.value == 4 else "no plane: impedance is undefined, only delay bounds are computed"))
+    if ir.pcb is not None and plan.keepouts:
+        have = {k.id for k in ir.pcb.keepouts}
+        clash = sorted(k.id for k in plan.keepouts if k.id in have)
+        if clash:
+            return f"keep-out(s) {clash} already exist in ir.pcb.keepouts; the template never replaces a keep-out"
+        changes += [DesignChange(description=f"keep-out {k.id}", target="pcb.keepouts", operation="append", payload=k, rationale=f"template {t}: {k.reason}")
+                    for k in plan.keepouts]
+    plan.board.extend(keepout_line(k) for k in plan.keepouts)
     ctx = BoardContext(template_id=t, confirmed=confirmed, params={**params, **board_params}, stackup=stack, driver={})
     ctx.driver = {
         "t_rise_s": ctx.choice("si.t_rise", T_RISE_S, "s", (
@@ -305,6 +329,7 @@ __all__ = [
     "SIDeclarations",
     "add_board",
     "class_line",
+    "keepout_line",
     "layer_policy_refusal",
     "path_line",
     "read_board_layers",

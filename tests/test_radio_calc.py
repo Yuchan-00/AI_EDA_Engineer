@@ -59,8 +59,8 @@ def w(f: float) -> float:
 
 
 def test_every_radio_calculator_is_registered_with_its_roles_units_and_the_new_version() -> None:
-    assert CALC_VERSION == "0.10"
-    assert len(R.RADIO_CALCULATORS) == 57
+    assert CALC_VERSION == "0.11"
+    assert len(R.RADIO_CALCULATORS) == 62
     for tool, fn in R.RADIO_CALCULATORS.items():
         assert CALCULATORS[tool] == (fn, ROLES[tool])
         params = [p for p in inspect.signature(fn).parameters if p != "ids"]
@@ -75,7 +75,7 @@ def test_every_radio_calculator_is_registered_with_its_roles_units_and_the_new_v
 def test_a_traced_radio_value_records_its_tool_roles_and_version() -> None:
     lo = R.superhet_lo(U(FC, "Hz"), U(IF1, "Hz"), U(-1.0), ("req.carrier_frequency", "rf.if1", "rf.lo1_side"))
     assert lo.value == pytest.approx(426.1625e6, abs=1e-6) and lo.unit == "Hz"
-    assert lo.provenance.tool == "calc.rf.superhet.lo" and lo.provenance.tool_version == "0.10"
+    assert lo.provenance.tool == "calc.rf.superhet.lo" and lo.provenance.tool_version == "0.11"
     assert lo.provenance.inputs == {"f": "req.carrier_frequency", "f_if": "rf.if1", "side": "rf.lo1_side"}
     assert lo.provenance.derived_from == ["req.carrier_frequency", "rf.if1", "rf.lo1_side"]
     assert "LO = f + side IF" in (lo.provenance.note or "")
@@ -405,6 +405,77 @@ def test_the_top_c_design_refuses_a_tap_that_cannot_transform_and_a_negative_res
         R.top_c_network(2, 100e6, 60e6, 10e-9, 50, 50)
     with pytest.raises(ValueError, match="the inductor's Q_u must be positive"):
         R.top_c_s21_db_value(2, f0, bw, l, 50, 50, 0.0, f0)
+
+
+def _nodal_ported_s21_db(p: R.PortedTopC, q_u: float, f: float) -> float:
+    """An independent nodal solve of a ported top-C network: the source port R_port with its shunt choke (series loss at f0) to ground, the
+    network, the load port R_load with the extra shunt conductance; S21 normalised to the two port resistances."""
+    net, s = p.net, 1j * w(f)
+    n = net.n
+    m = n + 2
+    y = [[0j] * m for _ in range(m)]
+
+    def add(a: int, b: int | None, adm: complex) -> None:
+        y[a][a] += adm
+        if b is not None:
+            y[b][b] += adm
+            y[a][b] -= adm
+            y[b][a] -= adm
+
+    add(0, None, 1 / p.r_port + 1 / (w(net.f0) * p.l_port / p.q_port + s * p.l_port))
+    add(0, 1, s * net.c_tap_source)
+    rq = w(net.f0) * net.l / q_u
+    for i in range(1, n + 1):
+        add(i, None, s * net.c_shunt[i - 1] + 1 / (rq + s * net.l))
+        if i < n:
+            add(i, i + 1, s * net.c_couple[i - 1])
+    add(n, n + 1, s * net.c_tap_load)
+    add(n + 1, None, 1 / p.r_load + p.g_extra)
+    a = [row[:] + [1 / p.r_port if i == 0 else 0j] for i, row in enumerate(y)]
+    for c in range(m):
+        piv = max(range(c, m), key=lambda r: abs(a[r][c]))
+        a[c], a[piv] = a[piv], a[c]
+        for r in range(c + 1, m):
+            f_ = a[r][c] / a[c][c]
+            for k in range(c, m + 1):
+                a[r][k] -= f_ * a[c][k]
+    v = [0j] * m
+    for r in range(m - 1, -1, -1):
+        v[r] = (a[r][m] - sum(a[r][k] * v[k] for k in range(r + 1, m))) / a[r][r]
+    return 20 * math.log10(abs(2 * v[n + 1] * math.sqrt(p.r_port / p.r_load)))
+
+
+def test_the_ported_top_c_network_absorbs_the_collector_choke_and_loads_the_next_divider() -> None:
+    """kr447 wave-2 review finding 2: a tank between a collector with its feed choke and a base with its divider is designed for those loads."""
+    f0, l, l_ch, q = 223.78125e6, 68e-9, 1e-6, 40.0  # the x6 tank: 68 nH resonators, the 1 uH collector choke, Q 40 everywhere
+    bw = R.top_c_bw_for_qe_hz(2, f0, 20.0)
+    r_eff = 1 / (1 / 500 + 1 / 4700 + 1 / 2200)  # the next stage's 500 ohm port model // its base divider
+    z = 1000 * complex(w(f0) * l_ch / q, w(f0) * l_ch) / (1000 + complex(w(f0) * l_ch / q, w(f0) * l_ch))
+    ids = ("r_port", "l_port", "q_port", "f0")
+    pr = R.top_c_port_r(U(1000.0, "ohm"), U(l_ch, "H"), U(q), U(f0, "Hz"), ids)
+    px = R.top_c_port_x(U(1000.0, "ohm"), U(l_ch, "H"), U(q), U(f0, "Hz"), ids)
+    assert (pr.value, px.value) == pytest.approx((z.real, z.imag), rel=1e-12) and pr.unit == px.unit == "ohm" and pr.provenance.tool_version == "0.11"
+    assert pr.value == pytest.approx(660.44, abs=0.01) and px.value == pytest.approx(461.22, abs=0.01)  # the choke is of the port's order
+    p = R.top_c_ported_network(2, f0, bw, l, 1000, l_ch, q, 500, r_eff)
+    for f in (f0, f0 - FT, f0 + FT):
+        assert R.top_c_ported_s21_db_value(2, f0, bw, l, 1000, l_ch, q, 500, r_eff, q, f) == pytest.approx(_nodal_ported_s21_db(p, q, f), abs=1e-9)
+    s21 = R.top_c_ported_s21_db(U(2.0), U(f0, "Hz"), U(bw, "Hz"), U(l, "H"), U(1000.0, "ohm"), U(l_ch, "H"), U(q), U(500.0, "ohm"), U(r_eff, "ohm"), U(q),
+                                U(f0, "Hz"))
+    assert s21.value == pytest.approx(-5.5417, abs=1e-4) and s21.provenance.tool == "calc.rf.resonator.top_c.ported_s21_db"
+    rel_p = R.top_c_ported_rel_s21_db(U(2.0), U(f0), U(bw), U(l), U(1000.0), U(l_ch), U(q), U(500.0), U(r_eff), U(q), U(f0 + FT), U(f0))
+    assert rel_p.value == pytest.approx(-17.6727, abs=1e-4)
+    # the tap into R' + j X': the resistive tap's formula with X' absorbed
+    c_s = R.top_c_c_tap_reactive(U(2.0), U(f0), U(bw), U(l), pr, px).value
+    r_p = math.sqrt(2) * f0 / bw * w(f0) * l  # Q_e w0 L with g_1 = sqrt(2)
+    assert c_s == pytest.approx(1 / (w(f0) * (px.value + math.sqrt(pr.value * (r_p - pr.value)))), rel=1e-12) == p.net.c_tap_source
+    # the choke is not negligible: the plain network between the bare port models is another network (the review's 2-3 dB on one side)
+    plain = R.top_c_rel_s21_db_value(2, f0, bw, l, 660.4436, r_eff, q, f0 + FT, f0)
+    assert abs(plain - rel_p.value) > 0.1
+    # with a choke far above the port and no extra load the ported network is the plain one
+    far = R.top_c_ported_s21_db_value(2, f0, bw, l, 500, 1.0, 1e9, 500, 500, q, f0 + FT)
+    assert far == pytest.approx(R.top_c_s21_db_value(2, f0, bw, l, 500, 500, q, f0 + FT), abs=1e-4)
+    with pytest.raises(ValueError, match="the load the network sees .* cannot exceed it"):
+        R.top_c_ported_network(2, f0, bw, l, 1000, l_ch, q, 500, 600)
 
 
 def test_the_symmetric_tuned_circuit_formulas_and_the_single_resonator_loss() -> None:

@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
-from ai_eda.ir import CircuitIR, MissingInformation, Provenance, ProvenanceKind, Requirement, Traced
+from ai_eda.ir import CircuitIR, Keepout, MissingInformation, Provenance, ProvenanceKind, Requirement, Traced
 from ai_eda.tools.kicad.library import KicadLibrary
 
 from ai_eda.design.inputs import (
@@ -181,6 +181,9 @@ class Plan:
     simulation: list[str] = field(default_factory=list)
     #: one line per board decision: the stack and every signal-integrity class / timing path (:mod:`ai_eda.design.board`)
     board: list[str] = field(default_factory=list)
+    #: keep-out areas the template's board needs (the transceiver's antenna band): :func:`~ai_eda.design.board.add_board` writes them into
+    #: ``ir.pcb.keepouts`` with the board stack and lists them in the table; empty for every other template (its board is unchanged)
+    keepouts: list[Keepout] = field(default_factory=list)
 
     @property
     def buildable(self) -> bool:

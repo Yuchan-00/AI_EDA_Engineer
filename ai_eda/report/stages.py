@@ -60,7 +60,17 @@ nothing. A design with ``ir.si`` also gets the circuit report's
 width over the plane, the ``si.critical_length`` delay bars, the step
 response of each fresh ``spice.si.<net>`` result read from its rawfile) -
 the same rule: the ``si.*`` / ``spice.si.*`` statuses copied, a display
-value named as one. ``.md`` and ``.html`` are deterministic; the
+value named as one. A design with ``ir.rf`` gets the RF sections of
+:mod:`ai_eda.report.rf_report` under the same rule: every report of a
+design with a regulatory profile starts with the UNVERIFIED-profile banner,
+the theory report carries the frequency plan, the profile, the model values
+and the fixture networks, the circuit report the RF blocks / keep-outs and
+every ``spice.rf.*`` verdict copied with the S-parameter charts
+(:mod:`ai_eda.report.rf_figures`, read from the fixture rawfiles only while
+the summary carries the current design hash and each rawfile its recorded
+hash), the final report the RF results, the lab list and the rail budgets. A
+one-sided ``bound`` expectation is printed and drawn as a one-sided limit.
+``.md`` and ``.html`` are deterministic; the
 PDF bytes carry the browser's own creation date and are a derived document
 like a rawfile. None of the three is an artifact or hashed.
 """
@@ -79,7 +89,9 @@ from ai_eda.design.templates import display_spelled
 from ai_eda.errors import CompileError
 from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, Component, Provenance, ProvenanceKind, Reduce, SilkKind, Traced, ValidationResult, ValidationStatus
 from ai_eda.parts.existence import CHECK_PREFIX as EXISTENCE_PREFIX
-from ai_eda.report.figures import Figure, bar_figure, board_figure, expectation_limit, model3d_figure_from_scene, plot_vector, tolerance_figure, tolerance_rows, waveform_figures
+from ai_eda.report.figures import (
+    BOUND_RULE, Figure, bar_figure, board_figure, bound_text, expectation_limit, model3d_figure_from_scene, plot_vector, tolerance_figure, tolerance_rows, waveform_figures,
+)
 from ai_eda.report.pdf import NO_BROWSER_REASON, find_browser, html_to_pdf, markdown_to_html
 from ai_eda.report.pipeline_log import PipelineRecord
 from ai_eda.report.si_figures import delay_bar_figure, delay_rows, fresh_si_rawfile, step_response_figure, z0_width_figure
@@ -272,7 +284,14 @@ def _header(title: str, ir: CircuitIR) -> list[str]:
         "- 이 보고서는 IR(설계 데이터)과 그 검증 기록을 읽어 만든 뷰입니다. 판정을 새로 계산하지 않고, 산출물로 등록되지 않으며, IR 에 아무것도 쓰지 않습니다. "
         "IR 에 없는 값은 '" + NO_RECORD + "' 으로 표시합니다.",
         "",
-    ]
+    ] + _rf_report().profile_banner(ir)
+
+
+def _rf_report():
+    """The RF sections (:mod:`ai_eda.report.rf_report`, imported lazily: it imports this module's helpers lazily too)."""
+    from ai_eda.report import rf_report
+
+    return rf_report
 
 
 # --- figures ---------------------------------------------------------------------------
@@ -544,6 +563,7 @@ def stage_figures(stage: Stage, ir: CircuitIR, library: KicadLibrary | None) -> 
     elif stage is Stage.PCB:
         board_figures_of(ir, library, figures)
         si_figures_of(ir, library, figures)
+        _rf_report().rf_figures_of(ir, figures)
         model3d_figure_of(ir, library, figures)
     elif stage is Stage.RELEASE:
         tolerance_figure_of(ir, figures)
@@ -597,13 +617,15 @@ def _simulation_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     for e in sim.expectations:
         rows.append([
             f"`{e.id}`", e.analysis_id, f"`{e.vector}`", REDUCE_LABELS.get(e.reduce, str(e.reduce)) + (f" at {_traced_text(e.at)}" if e.at is not None else ""),
-            _traced_text(e.nominal), _traced_text(e.tol_abs) if e.tol_abs is not None else "-",
+            _traced_text(e.nominal), _traced_text(e.tol_abs) if e.tol_abs is not None else (bound_text(e.bound) if e.bound else "-"),
             (f"{float(e.tol_rel.value) * 100:.4g} %" if e.tol_rel is not None else "-"), e.requirement_id or "(요구사항 없음)",
         ])
     out.append(_table(["id", "해석", "벡터", "축약", "이론 공칭값", "허용치(절대)", "허용치(상대)", "검증하는 요구사항"], rows))
     out += ["", "### 판정식", "", "    |측정값 − 공칭값| ≤ max(tol_abs, tol_rel · |공칭값|)", "",
             "허용치가 하나만 있으면 그 하나가 한계이고, 공칭값이 0 이면 tol_rel 은 허용치가 아니므로 tol_abs 가 있어야 판정합니다(없으면 UNRESOLVED). "
             "기대값은 부품 공칭값과 한 온도에서만 판정하며(공차 코너 없음), 결과가 없으면 PASS 가 아니라 NOT_VERIFIED 입니다.", ""]
+    if any(e.bound for e in sim.expectations):
+        out += [BOUND_RULE, ""]
     if any(e.reduce is Reduce.FREQUENCY for e in sim.expectations):
         out += [
             "### 주파수 측정식 (`Reduce.FREQUENCY`)", "",
@@ -676,6 +698,7 @@ def theory_report(ir: CircuitIR, library: KicadLibrary | None = None, *, figures
         from ai_eda.report.si_report import si_theory_section
 
         out += si_theory_section(ir)
+    out += _rf_report().rf_theory_section(ir)
     out += ["## 제약 조건", ""]
     if ir.constraints:
         rows = [[f"`{c.id}`", c.kind.value, c.target, c.description, ", ".join(f"{k} = {_traced_text(v)}" for k, v in c.parameters.items()) or "-"] for c in ir.constraints]
@@ -1443,6 +1466,7 @@ def circuit_report(ir: CircuitIR, library: KicadLibrary | None, record: RunRecor
         from ai_eda.report.si_report import si_circuit_section
 
         out += si_circuit_section(ir, figures)
+    out += _rf_report().rf_circuit_section(ir, figures)
     out += _silkscreen_section(ir)
     out += _model3d_section(ir, figures)
     out += _stage_record_section(record, CIRCUIT_STAGES, "단계 기록 (PLACEMENT / SCHEMATIC / PCB / DRC)")
@@ -1528,7 +1552,7 @@ def _theory_vs_simulation(ir: CircuitIR, figures: ReportFigures) -> list[str]:
         rows.append([
             f"`{e.id}`", f"`{e.vector}` / {REDUCE_LABELS.get(e.reduce, str(e.reduce))}" + (f" at {_traced_text(e.at)}" if e.at is not None else ""),
             _traced_text(e.nominal), quantity(measured, unit) if measured is not None else NO_MEASUREMENT, dev_text, pct,
-            quantity(limit, unit) if limit is not None else "-", r.status if r is not None else NO_RECORD,
+            quantity(limit, unit) if limit is not None else (bound_text(e.bound, _traced_text(e.nominal)) if e.bound else "-"), r.status if r is not None else NO_RECORD,
         ])
         if r is not None and r.status is not ValidationStatus.PASS:
             extra.append(f"- `{e.id}`: {r.status} — {_cell(r.message) or '(메시지 없음)'}")
@@ -1646,6 +1670,7 @@ def final_report(ir: CircuitIR, record: RunRecord, *, figures: ReportFigures | N
     out += _requirements_section(ir)
     out += _all_stages_section(record)
     out += _theory_vs_simulation(ir, figures)
+    out += _rf_report().rf_final_section(ir)
     out += _matrix_section(ir)
     out += _artifacts_section(ir)
     out += _release_section(record)

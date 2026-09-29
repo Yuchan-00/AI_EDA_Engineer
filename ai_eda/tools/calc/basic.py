@@ -24,7 +24,9 @@ from ai_eda.ir.provenance import Traced, derived
 #: crystal-ladder networks, pads, audio filters, rail budget and regulator headroom); every derived value a build writes
 #: from now on records "0.10", so a fresh template build hashes differently from the same build under 0.9 (saved IRs keep
 #: their recorded version and hash; the recompute never compares the version)
-CALC_VERSION = "0.10"
+#: 0.11: the top-C network between loaded ports (``calc.rf.resonator.top_c.port_r`` / ``.port_x`` / ``.c_tap_reactive`` /
+#: ``.ported_s21_db`` / ``.ported_rel_s21_db``: a collector feed choke on the source port, a base divider on the load port)
+CALC_VERSION = "0.11"
 
 #: tool id -> input roles, in the calculator's parameter order
 ROLES: dict[str, tuple[str, ...]] = {
@@ -159,6 +161,11 @@ ROLES: dict[str, tuple[str, ...]] = {
     "calc.rf.resonator.top_c.c_shunt": ("n", "i", "f0", "bw", "l", "r_source", "r_load"),
     "calc.rf.resonator.top_c.s21_db": ("n", "f0", "bw", "l", "r_source", "r_load", "q_u", "f"),
     "calc.rf.resonator.top_c.rel_s21_db": ("n", "f0", "bw", "l", "r_source", "r_load", "q_u", "f", "f_ref"),
+    "calc.rf.resonator.top_c.port_r": ("r_port", "l_port", "q_port", "f0"),
+    "calc.rf.resonator.top_c.port_x": ("r_port", "l_port", "q_port", "f0"),
+    "calc.rf.resonator.top_c.c_tap_reactive": ("n", "f0", "bw", "l", "r_term", "x_term"),
+    "calc.rf.resonator.top_c.ported_s21_db": ("n", "f0", "bw", "l", "r_source", "l_port", "q_port", "r_load", "r_load_eff", "q_u", "f"),
+    "calc.rf.resonator.top_c.ported_rel_s21_db": ("n", "f0", "bw", "l", "r_source", "l_port", "q_port", "r_load", "r_load_eff", "q_u", "f", "f_ref"),
     "calc.rf.bpf.dissipation_loss": ("n", "f0", "bw", "q_u"),
     "calc.rf.resonator.single_tuned.rejection": ("q_l", "f0", "f"),
     "calc.rf.resonator.single_tuned.insertion_loss": ("q_l", "q_u"),
@@ -324,6 +331,11 @@ ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.rf.resonator.top_c.c_shunt": (None, None, "Hz", "Hz", "H", "ohm", "ohm"),
     "calc.rf.resonator.top_c.s21_db": (None, "Hz", "Hz", "H", "ohm", "ohm", None, "Hz"),
     "calc.rf.resonator.top_c.rel_s21_db": (None, "Hz", "Hz", "H", "ohm", "ohm", None, "Hz", "Hz"),
+    "calc.rf.resonator.top_c.port_r": ("ohm", "H", None, "Hz"),
+    "calc.rf.resonator.top_c.port_x": ("ohm", "H", None, "Hz"),
+    "calc.rf.resonator.top_c.c_tap_reactive": (None, "Hz", "Hz", "H", "ohm", "ohm"),
+    "calc.rf.resonator.top_c.ported_s21_db": (None, "Hz", "Hz", "H", "ohm", "H", None, "ohm", "ohm", None, "Hz"),
+    "calc.rf.resonator.top_c.ported_rel_s21_db": (None, "Hz", "Hz", "H", "ohm", "H", None, "ohm", "ohm", None, "Hz", "Hz"),
     "calc.rf.bpf.dissipation_loss": (None, "Hz", "Hz", None),
     "calc.rf.resonator.single_tuned.rejection": (None, "Hz", "Hz"),
     "calc.rf.resonator.single_tuned.insertion_loss": (None, None),

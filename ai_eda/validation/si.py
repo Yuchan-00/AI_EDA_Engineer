@@ -59,7 +59,10 @@ their verdicts. Results (tool :data:`~ai_eda.tools.si.measure.SI_TOOL`):
   never judged as a microstrip. NOT_APPLICABLE for a class without a target
   or without nets.
 * ``si.width.<class>`` - every track of the class's nets at least
-  ``min_width_mm`` (a class with one).
+  ``min_width_mm`` (a class with one). A member net with two or more pads
+  and no track is a NOT_VERIFIED row (the width it needs is not judged; a
+  net joined only through a plane zone says so) - never NOT_APPLICABLE,
+  which is kept for a class none of whose members needs copper.
 * ``si.length.<class>`` / ``si.delay.<class>`` - each net the class declares
   (the default class: every net no class lists): routed length (tracks + via
   barrels from the stackup) against ``max_length_mm``, delay against
@@ -393,15 +396,34 @@ def width_result(ir: CircuitIR, si: SIConstraints, cls: NetClass) -> ValidationR
     need = float(cls.min_width_mm.value)
     nets = _members(ir, si, cls)
     tracks = [t for t in (ir.pcb.tracks if ir.pcb is not None else []) if t.net in set(nets)]
-    details: dict[str, Any] = {"min_width_mm": need, "source": cls.min_width_mm.provenance.tool or cls.min_width_mm.provenance.kind.value, "nets": nets}
-    if not tracks:
-        return _result(check, S.NOT_APPLICABLE, f"class {cls.name}: no routed track", **details)
+    routed = {t.net for t in tracks}
+    zoned = {z.net for z in (ir.pcb.zones if ir.pcb is not None else [])}
+    # one row per member, like the length / delay / impedance checks: a member that needs copper (two or more pads) and has no
+    # track is a requirement nobody measured - NOT_VERIFIED, never NOT_APPLICABLE ("the class states no width" it does state)
+    rows: list[dict[str, Any]] = []
+    for net in nets:
+        if net in routed:
+            continue
+        if _pads(ir, net) < 2:
+            rows.append({"net": net, "status": S.NOT_APPLICABLE.value, "reason": "fewer than two pads"})
+        else:
+            plane = " (joined through a plane zone, whose current capacity is not judged here)" if net in zoned else ""
+            rows.append({"net": net, "status": S.NOT_VERIFIED.value, "reason": f"no routed track{plane}: the minimum width is not judged"})
+    unrouted = [r["net"] for r in rows if r["status"] == S.NOT_VERIFIED.value]
+    details: dict[str, Any] = {"min_width_mm": need, "source": cls.min_width_mm.provenance.tool or cls.min_width_mm.provenance.kind.value, "nets": nets,
+                               "unrouted": rows}
     narrow = sorted({(t.net, t.layer, float(t.width_mm)) for t in tracks if float(t.width_mm) < need - _TOL})
     details["narrow"] = [{"net": n, "layer": layer, "width_mm": w} for n, layer, w in narrow]
     if narrow:
         details["repair"] = "human"
         return _result(check, S.FAIL, f"class {cls.name}: track(s) narrower than the minimum {need:.6g} mm: " + ", ".join(f"{n} {layer} {w:g} mm" for n, layer, w in narrow), **details)
-    return _result(check, S.PASS, f"class {cls.name}: {len(tracks)} track(s) of {len(set(t.net for t in tracks))} net(s) at least {need:.6g} mm wide", **details)
+    if unrouted:
+        done = f"; {len(tracks)} track(s) of {len(routed)} other net(s) at least {need:.6g} mm wide" if tracks else ""
+        return _result(check, S.NOT_VERIFIED, f"class {cls.name}: {', '.join(unrouted)} {'has' if len(unrouted) == 1 else 'have'} no routed track, "
+                       f"the minimum width {need:.6g} mm is not judged{done}", **details)
+    if not tracks:
+        return _result(check, S.NOT_APPLICABLE, f"class {cls.name}: no member net needs copper (fewer than two pads each)", **details)
+    return _result(check, S.PASS, f"class {cls.name}: {len(tracks)} track(s) of {len(routed)} net(s) at least {need:.6g} mm wide", **details)
 
 
 def length_result(ir: CircuitIR, si: SIConstraints, cls: NetClass, measures: dict[str, NetMeasure]) -> ValidationResult:

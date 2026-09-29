@@ -71,9 +71,20 @@ layers it lists (mirrored on the bottom side). Only the convex shapes
 (``circle`` / ``rect`` / ``oval`` / ``roundrect``) lie inside their
 ``(size)`` box: a ``custom`` pad's primitives and a ``trapezoid``'s
 ``rect_delta`` reach beyond it and the library reader keeps neither, so such
-a pad makes both results NOT_VERIFIED naming it, like a component without a
-placement or footprint, or whose footprint is not on disk: its copper is
-unknown, and a check that skipped it would claim more than it measured. Every distance is rounded
+a pad's copper is unknown, like every pad of a component without a placement
+or footprint, or whose footprint is not on disk. Neither result is then ever
+PASS (a check that skipped that copper would claim more than it measured):
+connectivity makes each net holding an unknown pad a NOT_VERIFIED row naming
+it (never the "no such pad" FAIL), still judges every other net - its union
+joins only the net's own copper, so copper of another net cannot join its
+pads, and an open between known pads is a measured FAIL - and is FAIL when
+such a net is, NOT_VERIFIED naming the unknown pads otherwise (a placement-only
+board whose router refused a custom pad FAILs on its open nets, like any
+other unrouted board); clearance stays NOT_APPLICABLE without IR copper
+(pad-to-pad is DRC's anyway), FAILs on a malformed item, an outline row or a
+violation between known items, and is NOT_VERIFIED naming the unknown pads
+otherwise. Only a missing KiCad library makes both NOT_VERIFIED for the whole
+board. Every distance is rounded
 to KiCad's 1e-6 mm resolution before it is compared, and the derived
 numbers stay in ``details``, never in the IR.
 
@@ -370,21 +381,29 @@ class _Board:
         self.pads: list[_PadItem] = []
         self.pad_labels: set[str] = set()
         self.unknown: list[str] = []
+        #: the components none of whose pads is known (no placement / footprint, or a footprint that cannot be read) and the
+        #: ``REF.NUMBER`` labels of single pads whose copper is unknown (custom / trapezoid): a net holding one is never judged
+        self.unknown_refs: set[str] = set()
+        self.unknown_pads: set[str] = set()
         for comp in sorted(ir.components, key=lambda c: natural_ref_key(c.ref)):
             placement = pcb.placement(comp.ref)
             if placement is None:
                 self.unknown.append(f"{comp.ref} has no placement")
+                self.unknown_refs.add(comp.ref)
                 continue
             if comp.footprint is None:
                 self.unknown.append(f"{comp.ref} has no footprint")
+                self.unknown_refs.add(comp.ref)
                 continue
             try:
                 fp = library.load_footprint(comp.footprint)
             except LibraryLookupError:
                 self.unknown.append(f"footprint {comp.footprint.library}:{comp.footprint.name} of {comp.ref} was not found in a KiCad library")
+                self.unknown_refs.add(comp.ref)
                 continue
             except CompileError as e:  # LibraryFormatError: a malformed .kicad_mod is a reason, not a crash
                 self.unknown.append(f"footprint {comp.footprint.library}:{comp.footprint.name} of {comp.ref}: {e}")
+                self.unknown_refs.add(comp.ref)
                 continue
             for pad in fp.pads:
                 if pad.shape not in CONVEX_PAD_SHAPES:
@@ -392,6 +411,8 @@ class _Board:
                         f"pad {comp.ref}.{pad.number or '(unnumbered)'} of footprint {comp.footprint.library}:{comp.footprint.name} has shape "
                         f"{pad.shape!r}, whose copper is not bounded by its (size) box (custom primitives / trapezoid rect_delta are not read)"
                     )
+                    if pad.number:
+                        self.unknown_pads.add(f"{comp.ref}.{pad.number}")
                     continue
                 cx, cy = pad_center(placement, pad)
                 angle = pad_angle(placement, pad)
@@ -432,6 +453,10 @@ class _Board:
             else:
                 self.malformed.append({"item": item.label, "status": str(ValidationStatus.FAIL), "message": f"{item.label} {why}"})
         self.zones = [(f"zone[{i}:{z.net}]", z.net, z.layer) for i, z in enumerate(pcb.zones)]
+
+    def is_unknown(self, ref: str, pin: str) -> bool:
+        """Whether the copper of pin ``ref.pin`` is unknown (its component unread, or the pad itself a custom / trapezoid shape)."""
+        return ref in self.unknown_refs or f"{ref}.{pin}" in self.unknown_pads
 
 
 def _track_item(i: int, t: Track) -> _TrackItem:
@@ -498,7 +523,9 @@ def connectivity_rows(ir: CircuitIR, board: _Board) -> tuple[list[dict[str, Any]
     for net in ir.nets:
         pads = [p for p in board.pads if p.net == net.name]
         labels = list(dict.fromkeys(p.label for p in pads))  # same-numbered pads of one footprint: one logical pad
-        missing = [f"{pin.component_ref}.{pin.pin_number}" for pin in net.pins if f"{pin.component_ref}.{pin.pin_number}" not in board.pad_labels]
+        unknown = list(dict.fromkeys(f"{pin.component_ref}.{pin.pin_number}" for pin in net.pins if board.is_unknown(pin.component_ref, pin.pin_number)))
+        missing = [f"{pin.component_ref}.{pin.pin_number}" for pin in net.pins
+                   if f"{pin.component_ref}.{pin.pin_number}" not in board.pad_labels and not board.is_unknown(pin.component_ref, pin.pin_number)]
         items: list[_Item] = [*pads, *(t for t in board.tracks if t.net == net.name), *(v for v in board.vias if v.net == net.name)]
         zones = [label for label, zone_net, _ in board.zones if zone_net == net.name]
         row: dict[str, Any] = {
@@ -511,6 +538,11 @@ def connectivity_rows(ir: CircuitIR, board: _Board) -> tuple[list[dict[str, Any]
             row["zones"] = zones
         if missing:
             row.update(status=str(ValidationStatus.FAIL), unconnected=missing, message=f"{', '.join(missing)}: no such pad in the placed footprint")
+            rows.append(row)
+            continue
+        if unknown:  # copper this check cannot see may join (or be) the net's pads: never judged, never a FAIL for the pad it cannot read
+            row.update(status=str(ValidationStatus.NOT_VERIFIED), unknown_pads=unknown,
+                       message=f"the copper of {', '.join(unknown)} is unknown (see details['unknown']): the net is not judged")
             rows.append(row)
             continue
         if len(labels) < 2:
@@ -650,9 +682,11 @@ class RoutingValidator(Validator):
         if not isinstance(library, KicadLibrary):
             return self._both(ValidationStatus.NOT_VERIFIED, "no KiCad library: pad geometry unknown")
         board = _Board(ir, library)
-        if board.unknown:
-            return self._both(ValidationStatus.NOT_VERIFIED, "pad geometry unknown: " + "; ".join(board.unknown), unknown=board.unknown)
         return [self._connectivity(ir, board), self._clearance(pcb, board)]
+
+    @staticmethod
+    def _unknown_part(board: _Board) -> str:
+        return "pad geometry unknown: " + "; ".join(board.unknown)
 
     @staticmethod
     def _malformed_part(board: _Board) -> str:
@@ -668,9 +702,12 @@ class RoutingValidator(Validator):
     def _connectivity(self, ir: CircuitIR, board: _Board) -> ValidationResult:
         rows, item_rows = connectivity_rows(ir, board)
         failed = [r["net"] for r in rows if r["status"] == str(ValidationStatus.FAIL)]
-        pour = [r["net"] for r in rows if r["status"] == str(ValidationStatus.NOT_VERIFIED)]
+        unread = [r["net"] for r in rows if r.get("unknown_pads")]
+        pour = [r["net"] for r in rows if r["status"] == str(ValidationStatus.NOT_VERIFIED) and not r.get("unknown_pads")]
         connected = [r["net"] for r in rows if r["status"] == str(ValidationStatus.PASS)]
-        details = {"nets": rows, "items": item_rows, "tracks": board.track_total, "vias": board.via_total, "zones": len(board.zones)}
+        details = {"nets": rows, "items": item_rows, "tracks": board.track_total, "vias": board.via_total, "zones": len(board.zones), "unknown": board.unknown}
+        # a FAIL row is a net whose every pad is known and whose own copper leaves a pad out: copper this check cannot read belongs to
+        # other nets (a union joins only the net's own items), so it cannot join these pads - a measured open, whatever else is unknown
         if failed or item_rows:
             parts = []
             if failed:
@@ -680,7 +717,12 @@ class RoutingValidator(Validator):
                 parts.append(f"{len(stray)} track(s) / via(s) on a net or layer the IR does not have: " + "; ".join(r["message"] for r in stray))
             if board.malformed:
                 parts.append(self._malformed_part(board))
+            if board.unknown:
+                parts.append(f"{len(unread)} net(s) not judged because of pads whose geometry is unknown ({'; '.join(board.unknown)})")
             return self._result(CONNECTIVITY_CHECK, ValidationStatus.FAIL, "; ".join(parts) + f" ({NOT_DRC})", **details)
+        if board.unknown:  # never a PASS while a pad's copper is unknown: it may join or cut what the check measured
+            tail = f"; {len(unread)} net(s) holding such a pad not judged" + (f", {len(connected)} other net(s) connected through IR copper" if connected else "")
+            return self._result(CONNECTIVITY_CHECK, ValidationStatus.NOT_VERIFIED, self._unknown_part(board) + tail + f" ({NOT_DRC})", **details)
         if pour:
             return self._result(
                 CONNECTIVITY_CHECK, ValidationStatus.NOT_VERIFIED,
@@ -707,14 +749,18 @@ class RoutingValidator(Validator):
             "tracks": board.track_total,
             "vias": board.via_total,
         }
+        if board.unknown:
+            details["unknown"] = board.unknown
         if board.malformed:  # copper the compiler refuses: FAIL whatever the limit, nothing else is claimed about the board
             return self._result(CLEARANCE_CHECK, ValidationStatus.FAIL, self._malformed_part(board) + f" ({NOT_DRC})", pairs_compared=0, violations=[], **details)
-        if not board.tracks and not board.vias:
+        if not board.tracks and not board.vias:  # pad-to-pad is DRC's even when every pad is known: nothing here to compare
             return self._result(CLEARANCE_CHECK, ValidationStatus.NOT_APPLICABLE, f"no IR copper (tracks / vias) to compare ({NOT_DRC})", pairs_compared=0, violations=[], **details)
         if limit is None:
             if outline_rows:
                 return self._result(CLEARANCE_CHECK, ValidationStatus.FAIL, f"{len(outline_rows)} track(s) / via(s) outside the outline or too close to it: "
                                     + "; ".join(r["message"] for r in outline_rows) + f" ({NOT_DRC})", pairs_compared=0, violations=[], **details)
+            if board.unknown:
+                return self._result(CLEARANCE_CHECK, ValidationStatus.NOT_VERIFIED, self._unknown_part(board) + f" ({NOT_DRC})", pairs_compared=0, violations=[], **details)
             return self._result(
                 CLEARANCE_CHECK, ValidationStatus.NOT_VERIFIED,
                 f"no clearance limit in ir.pcb.manufacturing; the router's own clearance is a parameter, not a rule; DRC with the fab rules decides ({NOT_DRC})",
@@ -730,6 +776,9 @@ class RoutingValidator(Validator):
             if outline_rows:
                 parts.append(f"{len(outline_rows)} track(s) / via(s) outside the outline or too close to it: " + "; ".join(r["message"] for r in outline_rows))
             return self._result(CLEARANCE_CHECK, ValidationStatus.FAIL, "; ".join(parts) + f" ({NOT_DRC})", **details)
+        if board.unknown:  # the copper nobody read may be closer than the limit (or a short): no PASS
+            return self._result(CLEARANCE_CHECK, ValidationStatus.NOT_VERIFIED,
+                                self._unknown_part(board) + f"; {compared} copper pair(s) of known items keep >= {lim:g} mm ({NOT_DRC})", **details)
         edge = "" if pcb.outline is None else f", {len(board.tracks)} track(s) / {len(board.vias)} via(s) inside the outline"
         if pcb.outline is None:
             return self._result(

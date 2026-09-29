@@ -232,7 +232,7 @@ def test_existing_templates_keep_their_selection_and_their_generic_layer_policy(
         assert t.triggered_by(ir, inputs) == t.triggered(inputs)
     assert DEFAULT_LAYER_POLICY == LayerPolicy(allowed=LAYER_COUNT_OPTIONS, default=DEFAULT_LAYER_COUNT)
     assert layer_count_choice_text() == layer_count_choice_text(DEFAULT_LAYER_POLICY) == OLD_DEFAULT_ROW
-    assert len(TEMPLATES) == 5 and [t.id for t in all_templates()] == [t.id for t in TEMPLATES]
+    assert len(TEMPLATES) == 5 and [t.id for t in all_templates()][:5] == [t.id for t in TEMPLATES]  # the radio family follows the base five
 
 
 def test_a_registered_radio_template_changes_nothing_for_the_existing_templates(tmp_path: Path, radio: list[Template]):

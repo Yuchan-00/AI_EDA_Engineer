@@ -11,7 +11,8 @@ placeholders (``kr447.*``, never grounded, never a PASS),
 closed-world serve / need table and the selector question,
 :mod:`~ai_eda.design.rf.blocks` the block builder API and
 :mod:`~ai_eda.design.rf.registry` the RF templates the selection appends to
-the base five (empty until the block templates are merged).
+the base five (the four KR 447 MHz stage boards and the stage-5
+transceiver with its conducted variant).
 """
 
 from ai_eda.design.rf.family import BUILDS, SELECTOR_KEY, BuildInfo, selector_question, serving_builds, unserved_message

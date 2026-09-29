@@ -33,7 +33,7 @@ def U(value: float, unit: str | None = None):
 
 
 def test_every_rf_calculator_is_registered_with_roles_units_and_the_new_version() -> None:
-    assert CALC_VERSION == "0.10"
+    assert CALC_VERSION == "0.11"
     assert len(rf.RF_CALCULATORS) == 57
     for tool, fn in rf.RF_CALCULATORS.items():
         assert tool.startswith("calc.rf.") or tool == "calc.crystal.c_for_load"
@@ -47,7 +47,7 @@ def test_a_traced_rf_value_records_its_tool_roles_and_version() -> None:
     p = rf.dbm_to_w(U(27.0, "dBm"), ("req.tx_power",))
     assert p.value == pytest.approx(1e-3 * 10 ** 2.7, rel=1e-15) and p.value == pytest.approx(0.501187233627, rel=1e-12)
     assert p.unit == "W" and p.provenance.kind is ProvenanceKind.DERIVED and p.provenance.tool == "calc.rf.dbm_to_w"
-    assert p.provenance.inputs == {"p_dbm": "req.tx_power"} and p.provenance.derived_from == ["req.tx_power"] and p.provenance.tool_version == "0.10"
+    assert p.provenance.inputs == {"p_dbm": "req.tx_power"} and p.provenance.derived_from == ["req.tx_power"] and p.provenance.tool_version == "0.11"
     c = rf.lmatch_lowpass_c_shunt(U(900e6, "Hz"), U(50.0, "ohm"), U(12.5, "ohm"), ("f0", "rs", "rl"))
     assert c.provenance.inputs == {"f": "f0", "r_source": "rs", "r_load": "rl"} and c.unit == "F"
     with pytest.raises(ValueError, match="takes 1 input ids"):

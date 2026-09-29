@@ -446,6 +446,23 @@ def test_model_grounding_names_every_ungrounded_model_value():
 
 
 @needs_rf_ir
+def test_model_grounding_names_a_listed_card_as_a_card():
+    """A model card (SPICE text in the confirm_design table, no number in ir.parameters) is named as a card by the parts bound to it, never grounded."""
+    from ai_eda.ir import SpiceBinding, SpiceDevice
+
+    ir = new_ir(**{"model.opamp.gbw": u(1e6, "Hz", "op-amp GBW [UNVERIFIED]")})
+    card = Traced(value=".subckt OPA1P inp inn out\nEo out 0 inp inn 100k\n.ends",
+                  provenance=Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="confirmed: model.opamp: generic op-amp macro [UNVERIFIED]"))
+    ir.components = [Component(ref="U1", value="MCP6001", provenance=USER,
+                               spice=SpiceBinding(device=SpiceDevice.X, model_name="OPA1P", model_card=card, pin_order=["3", "4", "1"], provenance=USER))]
+    ir.rf = RFDesign(model_values=["model.opamp", "model.opamp.gbw", "model.xtal21"])
+    rows = rows_of(run(ir)[rfv.MODEL_CHECK], "key")
+    assert rows["model.opamp"]["status"] == "NOT_VERIFIED" and rows["model.opamp"]["card"] is True and rows["model.opamp"]["bound_by"] == ["U1"]
+    assert "is a model card" in rows["model.opamp"]["reason"] and "has no value" not in rows["model.opamp"]["reason"]
+    assert "has no value in ir.parameters" in rows["model.xtal21"]["reason"] and "card" not in rows["model.xtal21"]  # listed, bound by nothing
+
+
+@needs_rf_ir
 def test_lab_items_are_never_verified_here():
     ir = new_ir()
     ir.rf = RFDesign(lab_items=[LabItem(id="deviation", block="tx_chain", what="peak deviation and modulation response", instruments=["modulation analyser"],

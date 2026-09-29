@@ -8,7 +8,7 @@ What runs where:
   its nested ``.model``), the inductor-Q bands, the regulatory profile
   (placeholders never grounded; the 25-channel raster and its refusal), the
   family table (the kr447 design §2.0 serve / need table, the closed-world
-  message, the required selector question), the empty registry, the block
+  message, the required selector question), the registry's four stage templates, the block
   API (prefixing, structure checks, composition, ``exclude_floating``) and
   the name-based pin lookup on synthetic libraries (a missing or ambiguous
   name, a changed stack, a lost description fact, a pad without a pin all
@@ -172,8 +172,8 @@ def test_model_values_are_unverified_choices_under_the_model_prefix() -> None:
         _, confirmed = models.model_choice("t_rf", key, True)
         assert confirmed.provenance.kind is ProvenanceKind.USER_REQUIREMENT and confirmed.provenance.note.startswith(CHOICE_NOTE_PREFIX)
         assert confirmed.value == pending.value == mv.value and confirmed.unit == mv.unit
-    # the design's named values (kr447 design §2.0 table and the update pass)
-    expect = {"model.xtal21.cm": 6e-15, "model.xtal21.rm": 25.0, "model.xtal21.c0": 4e-12, "model.sa605.port_r": 1500.0, "model.bfr92.r_out": 1000.0,
+    # the design's named values (kr447 design §2.0 table and the update pass; model.xtal21.cm 16 fF since the wave-2 merge: 6 fF admits no 7.5 kHz ladder)
+    expect = {"model.xtal21.cm": 16e-15, "model.xtal21.rm": 25.0, "model.xtal21.c0": 4e-12, "model.sa605.port_r": 1500.0, "model.bfr92.r_out": 1000.0,
               "model.bfr92.r_in": 500.0, "model.pin.r_on": 1.0, "model.pin.c_off": 0.3e-12, "model.buf.r_in": 10e3, "model.buf.r_out": 50.0,
               "model.opamp.a0": 1e5, "model.opamp.gbw": 1e6, "model.varactor.cjo": 20e-12, "model.varactor.vj": 0.7, "model.varactor.m": 0.5}
     assert {k: models.MODEL_VALUES[k].value for k in expect} == expect
@@ -232,7 +232,7 @@ def test_crystal_lm_is_a_calculator_output_that_recompute_rederives(tmp_path: Pa
     ir.parameters["model.xtal21.cm"] = _choice("model.xtal21.cm")
     lm = models.crystal_lm(ir.parameters["rf.if1"], ir.parameters["model.xtal21.cm"])
     assert lm.provenance.tool == "calc.rf.lc.l_for_resonance" and lm.provenance.derived_from == ["rf.if1", "model.xtal21.cm"]
-    assert lm.value == pytest.approx(1.0 / ((2 * math.pi * 21.4e6) ** 2 * 6e-15)) and lm.value == pytest.approx(9.219e-3, rel=1e-3)
+    assert lm.value == pytest.approx(1.0 / ((2 * math.pi * 21.4e6) ** 2 * 16e-15)) and lm.value == pytest.approx(3.457e-3, rel=1e-3)
     ir.parameters["xtal21.lm"] = lm
     assert recompute_parameters(ir).status is ValidationStatus.PASS
     card = models.crystal_card(lm, _choice("model.xtal21.cm"), _choice("model.xtal21.rm"), _choice("model.xtal21.c0"))
@@ -351,7 +351,7 @@ def test_crystal_card_resonates_in_series_at_21_4_mhz(tmp_path: Path) -> None:
 
     def expected(f: float) -> float:  # the Butterworth-Van Dyke network between two 50 ohm terminations, by complex arithmetic
         w = 2 * math.pi * f
-        zs = 25.0 + 1j * (w * lm.value - 1 / (w * 6e-15))
+        zs = 25.0 + 1j * (w * lm.value - 1 / (w * 16e-15))
         zc = 1 / (1j * w * 4e-12)
         return abs(50.0 / (100.0 + zs * zc / (zs + zc)))
 
@@ -360,7 +360,7 @@ def test_crystal_card_resonates_in_series_at_21_4_mhz(tmp_path: Path) -> None:
     assert expected(21.4e6) == pytest.approx(0.4, rel=1e-3)  # R_m = 25 ohm at the series resonance f_s = 1 / (2 pi sqrt(L_m C_m))
     f, v = res.vectors["frequency"], res.vectors["out"]
     k = max(range(len(v)), key=lambda i: v[i])
-    assert 21.4e6 - 30.0 <= f[k] <= 21.4e6 - 22.0  # C_0 bridging the terminations moves the peak 26.1 Hz below f_s (4 Hz grid)
+    assert 21.4e6 - 74.0 <= f[k] <= 21.4e6 - 64.0  # C_0 bridging the terminations moves the peak 69.6 Hz below f_s at C_m 16 fF (4 Hz grid)
 
 
 @needs_ngspice
@@ -492,8 +492,10 @@ def test_the_build_names_equal_the_requirement_key_constants() -> None:
     assert tuple(family.BUILDS) == design_inputs.RADIO_BUILDS and family.SELECTOR_KEY == design_inputs.RADIO_BUILD_KEY == "radio_build"
 
 
-def test_the_registry_starts_empty() -> None:
-    assert RF_TEMPLATES == [] and isinstance(RF_TEMPLATES, list)
+def test_the_registry_holds_the_five_templates_in_staging_order() -> None:
+    """Filled at the wave-2 merge in the staging order, the transceiver last (tests/test_kr447_registry.py checks the selection end to end)."""
+    assert isinstance(RF_TEMPLATES, list) and [t.id for t in RF_TEMPLATES] == [
+        "kr447_audio_ptt", "kr447_rx_backend", "kr447_rx_frontend", "kr447_tx_exciter", "kr447_transceiver"]
 
 
 # --------------------------------------------------------------------------- block API

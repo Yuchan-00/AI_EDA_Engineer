@@ -120,9 +120,14 @@ def test_without_a_library_or_a_placed_footprint_nothing_is_claimed(tmp_path: Pa
     ir.pcb.tracks = [_track("N", (3.0, 3.0), (9.0, 3.0))]
     for check in _checks(ir, tmp_path, None).values():
         assert check.status is S.NOT_VERIFIED and check.message.startswith("no KiCad library: pad geometry unknown")
-    # a component without a placement / footprint, or with a footprint the library does not have: its pads are unknown, so is the board
+    # a component without a placement / footprint, or with a footprint the library does not have: its pads are unknown, so is its net;
+    # without IR copper clearance has nothing to compare (pad-to-pad is DRC's), with copper it is not verified
     x = _two_pads(tmp_path, lib)
     x.pcb.placements = x.pcb.placements[:1]
+    checks = _checks(x, tmp_path, lib)
+    assert checks[CONNECTIVITY_CHECK].status is S.NOT_VERIFIED and checks[CONNECTIVITY_CHECK].message.startswith("pad geometry unknown: R2 has no placement")
+    assert checks[CLEARANCE_CHECK].status is S.NOT_APPLICABLE
+    x.pcb.tracks = [_track("N", (3.0, 3.0), (9.0, 3.0))]
     for check in _checks(x, tmp_path, lib).values():
         assert check.status is S.NOT_VERIFIED and check.message.startswith("pad geometry unknown: R2 has no placement") and check.details["unknown"] == ["R2 has no placement"]
     x = _two_pads(tmp_path, lib)
@@ -403,7 +408,7 @@ def test_copper_that_cannot_exist_is_a_fail_row_never_a_pass(tmp_path: Path, lib
 
 
 def test_pads_and_vias_with_copper_the_size_box_does_not_bound_are_not_verified(tmp_path: Path, lib: KicadLibrary):
-    """A trapezoid (rect_delta) or custom (primitives) pad: its copper is unknown to the library reader, so nothing is claimed about the board."""
+    """A trapezoid (rect_delta) or custom (primitives) pad: its copper is unknown to the library reader, so nothing that copper could change is claimed: the routed net A is not a PASS and the pad's net B is not judged."""
     for name, shape in (("TRAP", "trapezoid"), ("CUST", "custom")):
         ir = board_ir(tmp_path, lib, [("R1", "PAD1", 2.0, 4.0), ("R2", "PAD1", 10.0, 4.0), ("U1", name, 6.0, 4.0)], {"A": [("R1", "1"), ("R2", "1")], "B": [("U1", "1")]}, (12.0, 8.0))
         _limit(ir)
@@ -412,6 +417,43 @@ def test_pads_and_vias_with_copper_the_size_box_does_not_bound_are_not_verified(
             assert check.status is S.NOT_VERIFIED, check
             assert check.message.startswith(f"pad geometry unknown: pad U1.1 of footprint Test:{name} has shape '{shape}', whose copper is not bounded by its (size) box")
             assert check.details["unknown"] == [f"pad U1.1 of footprint Test:{name} has shape '{shape}', whose copper is not bounded by its (size) box (custom primitives / trapezoid rect_delta are not read)"]
+
+
+def test_an_unknown_pad_does_not_hide_the_open_nets_of_a_placement_only_board(tmp_path: Path, lib: KicadLibrary):
+    """A board without copper whose router refused a custom pad (the KR 447 MHz boards' MK301 / PHA-1 pads): the nets of known pads are a
+    measured open - FAIL - while the net holding the custom pad is a NOT_VERIFIED row naming it (never "no such pad"), and clearance has no
+    IR copper to compare (NOT_APPLICABLE). Before the fix the one custom pad made both results NOT_VERIFIED for the whole board."""
+    for name, shape in (("TRAP", "trapezoid"), ("CUST", "custom")):
+        ir = board_ir(tmp_path, lib, [("R1", "PAD1", 2.0, 4.0), ("R2", "PAD1", 10.0, 4.0), ("U1", name, 6.0, 4.0), ("R3", "PAD1", 6.0, 7.0)],
+                      {"A": [("R1", "1"), ("R2", "1")], "B": [("U1", "1"), ("R3", "1")]}, (12.0, 9.0))
+        _limit(ir)
+        checks = _checks(ir, tmp_path, lib)
+        conn, clr = checks[CONNECTIVITY_CHECK], checks[CLEARANCE_CHECK]
+        assert conn.status is S.FAIL, conn
+        assert conn.message.startswith("1 net(s) not connected through IR copper: A: R2.1 not connected to R1.1")
+        assert "1 net(s) not judged because of pads whose geometry is unknown" in conn.message and f"has shape '{shape}'" in conn.message
+        rows = {r["net"]: r for r in conn.details["nets"]}
+        assert rows["A"]["status"] == str(S.FAIL) and rows["A"]["unconnected"] == ["R2.1"]
+        assert rows["B"]["status"] == str(S.NOT_VERIFIED) and rows["B"]["unknown_pads"] == ["U1.1"] and "no such pad" not in rows["B"]["message"]
+        assert conn.details["unknown"][0].startswith(f"pad U1.1 of footprint Test:{name} has shape '{shape}'")
+        assert clr.status is S.NOT_APPLICABLE and clr.message.startswith("no IR copper (tracks / vias) to compare") and clr.details["unknown"] == conn.details["unknown"]
+        # every known net connected: never a PASS while a pad's copper is unknown
+        ir.pcb.tracks = [_track("A", (2.0, 4.0), (2.0, 1.0)), _track("A", (2.0, 1.0), (10.0, 1.0)), _track("A", (10.0, 1.0), (10.0, 4.0))]
+        checks = _checks(ir, tmp_path, lib)
+        assert checks[CONNECTIVITY_CHECK].status is S.NOT_VERIFIED and checks[CONNECTIVITY_CHECK].message.startswith("pad geometry unknown: pad U1.1")
+        assert "1 net(s) holding such a pad not judged, 1 other net(s) connected through IR copper" in checks[CONNECTIVITY_CHECK].message
+        assert checks[CLEARANCE_CHECK].status is S.NOT_VERIFIED and checks[CLEARANCE_CHECK].message.startswith("pad geometry unknown: pad U1.1")
+        # a violation between known items still FAILs clearance
+        ir.pcb.tracks.append(_track("A", (6.0, 5.5), (6.0, 7.0)))  # onto R3.1 of net B: a short between known copper
+        assert _checks(ir, tmp_path, lib)[CLEARANCE_CHECK].status is S.FAIL
+    # a component without a placement: the nets of its pins are not judged, the others are
+    x = board_ir(tmp_path, lib, [("R1", "PAD1", 2.0, 4.0), ("R2", "PAD1", 10.0, 4.0), ("R3", "PAD1", 6.0, 7.0), ("R4", "PAD1", 9.0, 7.0)],
+                 {"A": [("R1", "1"), ("R2", "1")], "B": [("R3", "1"), ("R4", "1")]}, (12.0, 9.0))
+    x.pcb.placements = [p for p in x.pcb.placements if p.component_ref != "R4"]
+    conn = _checks(x, tmp_path, lib)[CONNECTIVITY_CHECK]
+    rows = {r["net"]: r for r in conn.details["nets"]}
+    assert conn.status is S.FAIL and rows["A"]["status"] == str(S.FAIL) and rows["B"]["status"] == str(S.NOT_VERIFIED) and rows["B"]["unknown_pads"] == ["R4.1"]
+    assert conn.details["unknown"] == ["R4 has no placement"]
 
 
 def test_pads_sharing_a_number_are_one_logical_pad(tmp_path: Path, lib: KicadLibrary):

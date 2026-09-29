@@ -432,6 +432,22 @@ def test_length_delay_width_and_skew_checks(tmp_path: Path, lib):
     res = _results(ir)
     assert res["si.length.B"].status is S.FAIL and "90.000 mm > 50 mm" in res["si.length.B"].message
     assert res["si.width.B"].status is S.FAIL and "SHORT F.Cu 0.3 mm" in res["si.width.B"].message
+    # a member that needs copper and has none: the stated minimum width is not judged - NOT_VERIFIED, never "not applicable"
+    ir.pcb.tracks = [track("LONG", (5.0, 5.0), (95.0, 5.0))]
+    w = _results(ir)["si.width.B"]
+    assert w.status is S.NOT_VERIFIED and "class B: SHORT has no routed track, the minimum width 0.4 mm is not judged" in w.message
+    assert "1 track(s) of 1 other net(s) at least 0.4 mm wide" in w.message and [r["net"] for r in w.details["unrouted"]] == ["SHORT"]
+    ir.pcb.tracks = []  # a placed, unrouted board (the KR 447 MHz boards' POWER_PA)
+    w = _results(ir)["si.width.B"]
+    assert w.status is S.NOT_VERIFIED and "LONG, SHORT have no routed track" in w.message
+    from ai_eda.report.si_report import budget_lines  # the circuit report copies it with its rows, not under "not applicable"
+    ir.validation.add(w)
+    text = "\n".join(budget_lines(ir))
+    assert "해당 없음" not in text and "  - SHORT: NOT_VERIFIED: no routed track: the minimum width is not judged" in text
+    # NOT_APPLICABLE only when no member needs copper
+    ir.si = si_of(*default_classes(), cls("B", nets=["LONG"], min_width_mm=u(0.4, "mm")))
+    ir.net("LONG").pins = ir.net("LONG").pins[:1]
+    assert _results(ir)["si.width.B"].status is S.NOT_APPLICABLE
     # without a plane the delay is an upper bound: a budget it breaks is not a FAIL
     two = long_board(tmp_path / "2", lib, 2)
     two.si = si_of(*default_classes(), cls("B", nets=["LONG"], max_delay_s=u(400e-12, "s")))

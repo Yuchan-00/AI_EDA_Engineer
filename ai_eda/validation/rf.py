@@ -54,7 +54,10 @@ design with ``ir.rf`` and again after the SPICE stage (it consumes
   and every ``model.*`` key of ``ir.parameters``): PASS only when every one is
   grounded, else NOT_VERIFIED naming them - a fixture or principle PASS
   resting on them is a verdict under confirmed model values, not about a
-  measured part.
+  measured part. A listed model *card* (``model.opamp``, ``model.xtal21``
+  ...: a SPICE text shown as a confirm_design row, no number in
+  ``ir.parameters``) is recognised by the parts whose binding carries it and
+  named as a card, never as a missing value; it is never grounded.
 * ``rf.deviation`` - Delta_f = N K_pm a V_max / (2 pi tau_i) from
   ``rf.n_mult``, ``tx.tau_i``, K_pm = the sum over the ``pm_mod*`` fixture
   networks of each tank's chord slope (phi_hi - phi_lo) / (V_hi - V_lo) from
@@ -607,6 +610,23 @@ def profile_result(ir: CircuitIR) -> ValidationResult | None:
 # --------------------------------------------------------------------------- rf.model_grounding
 
 
+def _card_users(ir: CircuitIR, key: str) -> list[str]:
+    """The parts whose SPICE binding - the design deck's or an RF fixture's (``ir.rf.networks[*]``, their states) - carries the model card ``key``
+    (the card text's provenance names the key, ``models.card_choice``)."""
+    marker = f"{key}: "
+
+    def carries(b: Any) -> bool:
+        return b is not None and b.model_card is not None and marker in (b.model_card.provenance.note or "")
+
+    refs = {c.ref for c in ir.components if carries(c.spice)}
+    rf = _rf(ir)
+    for nw in (rf.networks if rf is not None else []):
+        refs |= {ref for ref, b in nw.bindings.items() if carries(b)}
+        for st in nw.states:
+            refs |= {ref for ref, b in st.bindings.items() if carries(b)}
+    return sorted(refs)
+
+
 def model_grounding_result(ir: CircuitIR) -> ValidationResult | None:
     """``rf.model_grounding`` (module docstring); ``None`` when the design has no model value."""
     rf = _rf(ir)
@@ -618,7 +638,12 @@ def model_grounding_result(ir: CircuitIR) -> ValidationResult | None:
     for key in [*listed, *unlisted]:
         t = ir.parameters.get(key)
         row: dict[str, Any] = {"key": key, "listed": key in listed}
-        if t is None:
+        cards = _card_users(ir, key) if t is None else []
+        if cards:
+            row.update(status=S.NOT_VERIFIED.value, card=True, bound_by=cards,
+                       reason=(f"{key} is a model card (its SPICE text is a confirm_design row, no number in ir.parameters) bound by {', '.join(cards)}: "
+                               "a confirmed modelling choice, not grounded"))
+        elif t is None:
             row.update(status=S.NOT_VERIFIED.value, reason=f"{key} is listed in ir.rf.model_values but has no value in ir.parameters")
         else:
             p = t.provenance

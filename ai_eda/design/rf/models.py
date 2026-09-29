@@ -112,7 +112,10 @@ _Q_SOURCE = "Coilcraft / Murata inductor Q data at the tank frequency"
 
 #: every numeric model value of the kr447 design (§2.0 table, the update pass's ``model.buf.*``, the fixture port models)
 MODEL_VALUES: dict[str, ModelValue] = {m.key: m for m in (
-    ModelValue("model.xtal21.cm", 6e-15, "F", "motional capacitance C_m of each 21.4 MHz ladder crystal (L_m follows from the series resonance, calc.rf.lc.l_for_resonance)",
+    ModelValue("model.xtal21.cm", 16e-15, "F",
+               "motional capacitance C_m of each 21.4 MHz ladder crystal: C0 / 250, the typical capacitance ratio of an AT-cut fundamental crystal "
+               "(the earlier 6 fF, ratio 667, admits no 7.5 kHz ladder - calc.crystal.ladder's C0 bound); a procurement spec the ordered crystals must meet "
+               "(L_m follows from the series resonance, calc.rf.lc.l_for_resonance)",
                "crystal datasheet, or a G3UUR measurement of the ordered crystals"),
     ModelValue("model.xtal21.rm", 25.0, "ohm", "motional resistance R_m of each 21.4 MHz ladder crystal", "crystal datasheet, or a G3UUR measurement of the ordered crystals"),
     ModelValue("model.xtal21.c0", 4e-12, "F", "shunt capacitance C_0 of each 21.4 MHz ladder crystal", "crystal datasheet, or a capacitance measurement of the ordered crystals"),
@@ -221,6 +224,32 @@ def pmos_card() -> ModelCard:
     text = "\n".join((".subckt PMOSG3 d g s", "M1 d g s s PMOSG", ".model PMOSG PMOS (VTO=-1 KP=0.5)", ".ends"))
     return ModelCard("model.pmos", "PMOSG3", text, SpiceDevice.X, ("D", "G", "S"),
                      "level-1 PMOS (VTO = -1 V, KP = 0.5 A/V^2) as a 3-terminal subcircuit with the bulk tied to the source", "AOS AO3401A vendor model")
+
+
+def pa_supply_card(r_on: Traced, r_off: Traced, v_pd: Traced) -> ModelCard:
+    """``.subckt PASUP v g pd``: the PA (no RF model) as its supply draw, switched by its POWER_DOWN pin.
+
+    ``R_on`` from VCC1 through a voltage-controlled switch that is closed
+    while V(pd) is below ``v_pd`` (the PA powered up) and ``R_off`` across
+    VCC1 always (its powered-down draw) - so a supply discharge that the
+    circuit's own POWER_DOWN edge switches off is not credited to the PA.
+    The switch has 0.1 V of hysteresis around ``v_pd`` (without any,
+    ngspice-42's ideal switch stopped a 120 ms PTT transient with "timestep
+    too small" at the edge). The node names avoid ``gnd`` (ngspice's alias of
+    node 0).
+    """
+    for t, what in ((r_on, "R_on"), (r_off, "R_off"), (v_pd, "the POWER_DOWN threshold")):
+        if not (isinstance(t.value, (int, float)) and not isinstance(t.value, bool) and t.value > 0):
+            raise ValueError(f"PA supply model: {what} must be positive, got {t.value!r}")
+    if not r_off.value > r_on.value:
+        raise ValueError("PA supply model: the powered-down draw R_off must exceed the powered-up R_on")
+    text = "\n".join((".subckt PASUP v g pd", f"Ron v a {_n(r_on, 'R_on')}", "S1 a g g pd SWPD", f"Roff v g {_n(r_off, 'R_off')}",
+                      f".model SWPD SW (VT=-{_n(v_pd, 'V_pd')} VH=0.1 RON=1m ROFF=1e12)", ".ends"))
+    return ModelCard("model.pa.supply", "PASUP", text, SpiceDevice.X, ("VCC1", "GND", "POWER_DOWN"),
+                     "the PA as its supply draw from VCC1: R_on (model.pa.r_supply) while POWER_DOWN is below model.pa.v_pd, only R_off "
+                     "(model.pa.r_off) while it is above (a voltage-controlled switch, 0.1 V hysteresis; no RF, no bias pins)",
+                     "NXP MMZ09332B datasheet (supply currents powered up and down, POWER_DOWN levels)",
+                     ("model.pa.r_supply", "model.pa.r_off", "model.pa.v_pd"))
 
 
 def varactor_card(cjo: Traced, vj: Traced, m: Traced) -> ModelCard:
@@ -341,6 +370,7 @@ __all__ = [
     "model_keys",
     "npn_card",
     "opamp_card",
+    "pa_supply_card",
     "pmos_card",
     "potentiometer_card",
     "varactor_card",

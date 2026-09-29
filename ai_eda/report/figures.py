@@ -14,7 +14,9 @@ Chart rules (from the data-visualization skill, applied throughout):
 * the form follows the data's job - change over time is a line
   (:func:`svg_line_chart`, :func:`waveform_figure`), magnitude per category
   a bar (:func:`bar_figure`), a measurement against a tolerance a band with
-  a marker (:func:`tolerance_figure`); one y axis per chart, never two
+  a marker (:func:`tolerance_figure`; a one-sided ``bound`` row shades its
+  passing half and shows only the side the measurement is on - there is no
+  tolerance to measure a distance in); one y axis per chart, never two
   (branch currents get their own chart, :func:`waveform_figures`);
 * categorical hues in the fixed order :data:`SERIES_COLOURS`, never cycled,
   at most :data:`MAX_SERIES` series per chart (a 5th is a ``ValueError``);
@@ -76,6 +78,9 @@ from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK
 __all__ = [
     "AXIS",
     "BAND_FILL",
+    "BOUND_MARKER_X",
+    "BOUND_RULE",
+    "BOUND_SYMBOLS",
     "Band",
     "COLUMN_PX",
     "COPPER_COLOURS",
@@ -106,6 +111,7 @@ __all__ = [
     "VIA_COLOUR",
     "bar_figure",
     "board_figure",
+    "bound_text",
     "downsample",
     "esc",
     "expectation_limit",
@@ -256,6 +262,22 @@ class ToleranceRow:
     tolerance: float | None = None
     status: str | None = None
     tolerance_recorded: bool = False
+    #: a one-sided limit (``at_least`` / ``at_most``: the recorded ``details["bound"]``, else the IR's ``Expectation.bound``) in place of a tolerance
+    bound: str | None = None
+
+
+#: the symbol of each one-sided bound (``Expectation.bound``)
+BOUND_SYMBOLS: dict[str, str] = {"at_least": "≥", "at_most": "≤"}
+#: the judging rule of a one-sided expectation, in the words of the reports (``ai_eda.tools.spice.stage.judge``)
+BOUND_RULE = ("한쪽 한계(`bound`) 기대값은 허용치 대신 공칭값의 한쪽만 봅니다: at_least 는 측정값 ≥ 공칭값, at_most 는 측정값 ≤ 공칭값이면 PASS(같으면 통과)이고, "
+              "보간·편향 구간 전체가 반대쪽이면 FAIL, 공칭값에 걸치면 UNRESOLVED 입니다. 한쪽 한계는 요구사항을 검증한다고 주장하지 않습니다.")
+#: where the tolerance chart puts the marker of a one-sided row (only the side is shown: there is no tolerance to measure the distance in)
+BOUND_MARKER_X = 0.75
+
+
+def bound_text(bound: str, nominal: str | None = None) -> str:
+    """``≥ 공칭 (한쪽 한계)`` / ``≤ 5.4 V (한쪽 한계)``: a one-sided limit in the words of the reports."""
+    return f"{BOUND_SYMBOLS.get(bound, bound)} {nominal if nominal is not None else '공칭'} (한쪽 한계)"
 
 
 # --------------------------------------------------------------------------- text and numbers
@@ -1567,8 +1589,37 @@ def tolerance_rows(ir: CircuitIR) -> list[ToleranceRow]:
             nominal = recorded_nominal
         measured = _finite_number(details.get("measured")) if details is not None else None
         tolerance, recorded = expectation_limit(e, details)
-        rows.append(ToleranceRow(e.id, nominal, e.nominal.unit, measured, tolerance, r.status.value if r is not None else None, recorded))
+        # the recorded judgement first (a bound or a tolerance, whichever the verdict was judged with); the IR's only without one
+        bound = details.get("bound") if recorded and details is not None else getattr(e, "bound", None)
+        rows.append(ToleranceRow(e.id, nominal, e.nominal.unit, measured, tolerance, r.status.value if r is not None else None, recorded,
+                                 bound if bound in BOUND_SYMBOLS else None))
     return rows
+
+
+def _bound_row(out: list[str], r: ToleranceRow, sx: _Scale, y0: float, yc: float, width: int, mr: int) -> None:
+    """One one-sided row of the tolerance figure: the passing half shaded, the nominal line, the marker on the side the recorded measurement is on.
+
+    A bound has no tolerance, so there is no distance to draw: the marker
+    sits at ``±`` :data:`BOUND_MARKER_X` (on the nominal when the measurement
+    equals it), coloured by the recorded status like every other marker.
+    """
+    lo, hi = (0.0, _TOL_LIMIT) if r.bound == "at_least" else (-_TOL_LIMIT, 0.0)
+    out.append(f'<rect class="band bound" data-bound="{esc(r.bound or "")}" x="{_f(sx(lo))}" y="{_f(y0 + 6)}" width="{_f(sx(hi) - sx(lo))}" '
+               f'height="{_f(_TOL_ROW_H - 12)}" fill="{BAND_FILL}"/>')
+    out.append(f'<line class="nominal" x1="{_f(sx(0))}" y1="{_f(y0)}" x2="{_f(sx(0))}" y2="{_f(y0 + _TOL_ROW_H)}" stroke="{INK_SECONDARY}" stroke-width="1.5"/>')
+    limit_text = bound_text(r.bound or "", si_format(r.nominal, r.unit))
+    if r.measured is None:
+        out.append(f'<text class="no-measurement" x="{_f(sx(0) + 12)}" y="{_f(yc + 4)}" fill="{INK_SECONDARY}">{esc(NO_MEASUREMENT)} / {esc(limit_text)}</text>')
+        return
+    deviation = r.measured - r.nominal
+    shown = 0.0 if deviation == 0 else math.copysign(BOUND_MARKER_X, deviation)
+    colour = STATUS_COLOURS.get(r.status or "", STATUS_OTHER)
+    px = sx(shown)
+    out.append(f'<circle class="marker" data-bound="{esc(r.bound or "")}" data-side="{_g(shown, 4)}" cx="{_f(px)}" cy="{_f(yc)}" r="6" '
+               f'fill="{colour}" stroke="{SURFACE}" stroke-width="2"/>')
+    text = f"측정 {si_format(r.measured, r.unit)} / {limit_text}"
+    flip = px + 12 + _text_width(text, _TEXT_PX) > width - mr
+    out.append(f'<text class="marker-label" x="{_f(px - 12 if flip else px + 12)}" y="{_f(yc + 4)}" text-anchor="{"end" if flip else "start"}">{esc(text)}</text>')
 
 
 def tolerance_figure(rows: Sequence[ToleranceRow], *, title: str = "이론 공칭값 대 시뮬레이션 측정값", fig_id: str = "tolerance", width: int = COLUMN_PX) -> Figure:
@@ -1592,7 +1643,9 @@ def tolerance_figure(rows: Sequence[ToleranceRow], *, title: str = "이론 공�
     ml = min(max(120, label_w), 300)
     mr = 28
     top = 46
-    legend_entries: list[tuple[str, str, str]] = [("box", BAND_FILL, "허용치 (±1)")]
+    one_sided = {r.bound is not None for r in rows}
+    band_label = {frozenset({False}): "허용치 (±1)", frozenset({True}): "한쪽 한계의 통과 쪽"}.get(frozenset(one_sided), "허용치 (±1) / 한쪽 한계의 통과 쪽")
+    legend_entries: list[tuple[str, str, str]] = [("box", BAND_FILL, band_label)]
     seen = {r.status for r in rows if r.measured is not None}
     for status, colour in STATUS_COLOURS.items():
         if status in seen:
@@ -1624,6 +1677,10 @@ def tolerance_figure(rows: Sequence[ToleranceRow], *, title: str = "이론 공�
             out.append(f'<line x1="{_f(ml)}" y1="{_f(y0)}" x2="{_f(width - mr)}" y2="{_f(y0)}" stroke="{GRID}" stroke-width="1"/>')
         out.append(f'<text x="{_f(ml - 10)}" y="{_f(yc + 4)}" text-anchor="end">{esc(r.label)}</text>')
         out.append(f'<text x="{_f(ml - 10)}" y="{_f(yc + 18)}" text-anchor="end" font-size="{_SMALL_PX}" fill="{INK_SECONDARY}">{esc(status_word)}</text>')
+        if r.bound is not None:
+            _bound_row(out, r, sx, y0, yc, width, mr)
+            out.append("</g>")
+            continue
         if r.tolerance is not None and r.tolerance > 0:
             out.append(f'<rect class="band" x="{_f(sx(-1))}" y="{_f(y0 + 6)}" width="{_f(sx(1) - sx(-1))}" height="{_f(_TOL_ROW_H - 12)}" fill="{BAND_FILL}"/>')
         # the nominal line after the band (painted over it) and before the marker and the labels (painted under them)
@@ -1674,6 +1731,9 @@ def tolerance_figure(rows: Sequence[ToleranceRow], *, title: str = "이론 공�
         f"기대값 {len(rows)}개 중 측정값이 기록된 {n_measured}개의 편차를 허용치 단위로 표시. 띠 = 허용치 ±1, 점 = 시뮬레이션 측정값(색은 기록된 판정: 초록 PASS, 빨강 FAIL, 회색 그 외), "
         f"세로선 = 이론 공칭값. {source}"
     )
+    if any(r.bound is not None for r in rows):
+        caption += (f" 한쪽 한계 행(≥ / ≤ 공칭)은 허용치가 없어 거리를 재지 않습니다: 통과 쪽 반을 색칠하고, 점은 측정값이 공칭값의 어느 쪽에 있는지만 "
+                    f"±{_g(BOUND_MARKER_X)} 에 표시합니다(같으면 0).")
     return Figure(fig_id, title, caption, "\n".join(out) + "\n")
 
 

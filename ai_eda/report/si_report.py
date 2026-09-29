@@ -461,13 +461,14 @@ def budget_lines(ir: CircuitIR) -> list[str]:
         shown += 1
         out.append(_result_line(r))
         details = r.details if isinstance(r.details, dict) else {}
-        for row in (details.get("nets") or details.get("rows") or [])[:40]:
+        rows = [x for x in (details.get("nets") or details.get("rows") or []) if isinstance(x, dict)] + [x for x in details.get("unrouted") or [] if isinstance(x, dict)]
+        for row in rows[:40]:
             if isinstance(row, dict) and row.get("reason"):
                 out.append(f"  - {row.get('net', '')}: {row.get('status', '?')}: {st._cell(row.get('reason'))}".replace(" : ", " "))
     if not shown:
         out.append("판정한 예산 검사가 없습니다.")
     if na:
-        out += ["", f"해당 없음 (클래스가 그 예산을 말하지 않음): {', '.join(na)}."]
+        out += ["", f"해당 없음 (클래스가 그 예산을 말하지 않거나, 구리가 필요한 구성 넷이 없음): {', '.join(na)}."]
     out.append("")
     return out
 

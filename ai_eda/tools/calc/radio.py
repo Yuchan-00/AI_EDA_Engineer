@@ -7,7 +7,7 @@ other calculator (the ``calc.rf.*`` / ``calc.crystal.ladder.*`` /
 ``calc.audio.*`` / ``calc.power.rail_budget`` / ``calc.regulator.headroom``
 ids of :data:`RADIO_CALCULATORS` in :data:`~ai_eda.tools.calc.basic.ROLES` /
 :data:`~ai_eda.tools.calc.basic.ROLE_UNITS` and
-:data:`~ai_eda.tools.calc.recompute.CALCULATORS`, ``CALC_VERSION`` 0.10), so
+:data:`~ai_eda.tools.calc.recompute.CALCULATORS`, ``CALC_VERSION`` 0.10, 0.11 since the ported top-C network), so
 ``calc.recompute`` re-derives a stored value from the ids its provenance
 names. A calculator refuses (``ValueError`` with a sentence) every input
 outside its formula's domain - a tap that cannot transform, a crystal ladder
@@ -97,6 +97,23 @@ Formulas and references (each calculator's note repeats its formula):
   filter: at -/+ 8-33 % offsets the + side of a top-C network is 5-12 dB
   weaker than the formula. ``.bw_for_qe`` BW = g_1 f0 / Q_e (a tank specified
   by its end Q). ``calc.rf.q_parallel`` Q = R / (w L).
+  A network between *loaded* ports (``CALC_VERSION`` 0.11; a multiplier
+  tank whose source port carries the collector feed choke to AC ground and
+  whose load port the next stage's base divider): ``.port_r`` / ``.port_x``
+  the series equivalent R' + j X' of Z = R_port // (j w0 L_p + w0 L_p / Q_p)
+  at f0 (the choke with the fixture runner's loss model, fixed at f0);
+  ``.c_tap_reactive`` the source tap that makes the end resonator see
+  R_p = Q_e w0 L through R' + j X': C_s = 1/(w0 (X' + sqrt(R' (R_p - R')))) -
+  the parallel equivalent it takes off the end resonator is the resistive
+  tap's for R' (so ``.c_shunt`` with r_source = R' and r_load = the load the
+  network sees, R_load // the divider, is the network's shunt capacitor);
+  ``.ported_s21_db`` / ``.ported_rel_s21_db`` the exact S21 of that network
+  with the shunt L_p (loss w0 L_p / Q_p) at the source port and the extra
+  shunt conductance 1 / r_load_eff - 1 / R_load at the load port, normalised
+  to the two *port* resistances (the fixture's own S21 definition). A tap
+  designed for R_port alone mistunes the end resonator: a 1 uH choke on a
+  1 kohm port at 223.8 MHz cost the kr447 x6 tank 2-3 dB of rejection per
+  side on ngspice-42.
 * Crystal ladder (lower-sideband ladder: crystals in series, shunt coupling
   capacitors, series mesh-tuning capacitors; Dishal; W. Hayward, R. Campbell,
   B. Larkin, "Experimental Methods in RF Design" (EMRFD), ARRL 2003, ch. 3):
@@ -209,7 +226,7 @@ what a built board does.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ai_eda.ir.provenance import Traced
 from ai_eda.tools.calc.basic import _derived
@@ -647,6 +664,114 @@ def top_c_rel_s21_db_value(n: float, f0: float, bw: float, l: float, r_source: f
     net = top_c_network(n, f0, bw, l, r_source, r_load)
     tool = "calc.rf.resonator.top_c.rel_s21_db"
     return _db_mag(top_c_s21_complex(net, q_u, f), tool) - _db_mag(top_c_s21_complex(net, q_u, f_ref), tool)
+
+
+# --------------------------------------------------------------------------- a top-C network between loaded ports (a collector choke, a base divider)
+
+
+def port_shunt_l_impedance(r_port: float, l_port: float, q_port: float, f0: float) -> complex:
+    """R_port // (w0 L_p / Q_p + j w0 L_p) at f0: a port resistance shunted by an inductor (a collector feed choke to AC ground) whose series
+    loss is the fixture runner's ``loss_q`` model, fixed at f0."""
+    rp = _positive(r_port, "the port resistance")
+    lp = _positive(l_port, "the port's shunt inductance")
+    q = _positive(q_port, "the shunt inductor's Q")
+    w0 = _omega(f0, "the centre frequency")
+    zb = complex(w0 * lp / q, w0 * lp)
+    return rp * zb / (rp + zb)
+
+
+def top_c_port_r_ohm(r_port: float, l_port: float, q_port: float, f0: float) -> float:
+    """Re Z of R_port // (L_p with its loss) at f0 (ohm): the resistance the network's source tap transforms."""
+    return port_shunt_l_impedance(r_port, l_port, q_port, f0).real
+
+
+def top_c_port_x_ohm(r_port: float, l_port: float, q_port: float, f0: float) -> float:
+    """Im Z of R_port // (L_p with its loss) at f0 (ohm, inductive > 0): the reactance the source tap absorbs."""
+    return port_shunt_l_impedance(r_port, l_port, q_port, f0).imag
+
+
+def _tap_reactive(q_e: float, w0: float, l: float, r_t: float, x_t: float, end: str) -> float:
+    """The series tap into a termination R_t + j X_t: 1 / (w0 (X_t + sqrt(R_t (R_p - R_t)))), so the end resonator sees R_p = Q_e w0 L."""
+    r_p = q_e * w0 * l
+    if r_t >= r_p:
+        raise ValueError(f"the {end} termination's resistance {r_t:.6g} ohm is not below the end resonator's R_p = Q_e w0 L = {r_p:.6g} ohm: a capacitive "
+                         "tap only transforms down - choose a larger L or another tap")
+    x_need = x_t + math.sqrt(r_t * (r_p - r_t))
+    if not x_need > 0.0:
+        raise ValueError(f"the {end} termination's reactance {x_t:.6g} ohm is too capacitive for a series tap capacitor to absorb")
+    return 1.0 / (w0 * x_need)
+
+
+def top_c_tap_reactive_f(n: float, f0: float, bw: float, l: float, r_term: float, x_term: float) -> float:
+    """The capacitive end tap into a termination R + j X (F): the resistive tap of ``.c_tap`` with the termination's reactance absorbed."""
+    order, g = _prototype(n, 1, RESONATOR_MAX_ORDER, "the resonator count n")
+    fc, b = _narrowband(f0, bw)
+    return _tap_reactive(g[0] * fc / b, 2.0 * math.pi * fc, _positive(l, "the resonator inductance"), _positive(r_term, "the termination's resistance"),
+                         _finite(x_term, "the termination's reactance"), "end")
+
+
+@dataclass(frozen=True)
+class PortedTopC:
+    """A top-C network designed between loaded ports: the source R_port shunted by L_p (Q_p), the load R_load shunted by more resistance.
+
+    ``net`` is the Butterworth network designed between Re Z_source (with the
+    source tap absorbing Im Z_source) and ``r_load_eff`` = R_load // the load
+    port's other shunt resistance; ``g_extra`` = 1 / r_load_eff - 1 / R_load
+    is that shunt as a conductance at the load node.
+    """
+
+    net: TopCNetwork
+    r_port: float
+    l_port: float
+    q_port: float
+    r_load: float
+    g_extra: float
+
+
+def top_c_ported_network(n: float, f0: float, bw: float, l: float, r_source: float, l_port: float, q_port: float, r_load: float,
+                         r_load_eff: float) -> PortedTopC:
+    """Design the top-C network of ``n`` resonators between a source port with a shunt inductor and a load port with extra shunt resistance."""
+    z = port_shunt_l_impedance(r_source, l_port, q_port, f0)
+    rl, re_ = _positive(r_load, "the load port's resistance"), _positive(r_load_eff, "the load the network sees")
+    if re_ > rl * (1.0 + 1e-12):
+        raise ValueError(f"the load the network sees ({re_:.6g} ohm) is the load port's {rl:.6g} ohm in parallel with more: it cannot exceed it")
+    net = top_c_network(n, f0, bw, l, z.real, re_)
+    c_s = _tap_reactive(net.q_e, 2.0 * math.pi * net.f0, net.l, z.real, z.imag, "source")
+    return PortedTopC(net=replace(net, c_tap_source=c_s), r_port=float(r_source), l_port=float(l_port), q_port=float(q_port), r_load=rl,
+                      g_extra=max(0.0, 1.0 / re_ - 1.0 / rl))
+
+
+def top_c_ported_s21_complex(p: PortedTopC, q_u: float, f: float) -> complex:
+    """The exact S21 of a ported top-C network at f: the source port's shunt inductor (series loss w0 L_p / Q_p fixed at f0), the network (every
+    resonator inductor with w0 L / Q_u), the load port's extra shunt conductance; normalised to the two port resistances."""
+    net = p.net
+    w = _omega(f)
+    r_q = 2.0 * math.pi * net.f0 * net.l / _positive(q_u, "the inductor's Q_u")
+    r_qp = 2.0 * math.pi * net.f0 * p.l_port / p.q_port
+    elements: list[tuple[str, complex]] = [("shunt", 1.0 / (r_qp + 1j * w * p.l_port)), ("series", _cap_z(w, net.c_tap_source))]
+    for i in range(net.n):
+        elements.append(("shunt", 1j * w * net.c_shunt[i] + 1.0 / (r_q + 1j * w * net.l)))
+        if i < net.n - 1:
+            elements.append(("series", _cap_z(w, net.c_couple[i])))
+    elements.append(("series", _cap_z(w, net.c_tap_load)))
+    if p.g_extra > 0.0:
+        elements.append(("shunt", complex(p.g_extra, 0.0)))
+    return _s21(elements, p.r_port, p.r_load, "calc.rf.resonator.top_c.ported_s21_db")
+
+
+def top_c_ported_s21_db_value(n: float, f0: float, bw: float, l: float, r_source: float, l_port: float, q_port: float, r_load: float, r_load_eff: float,
+                              q_u: float, f: float) -> float:
+    """20 log10 |S21| (dB) of the ported top-C network at f."""
+    p = top_c_ported_network(n, f0, bw, l, r_source, l_port, q_port, r_load, r_load_eff)
+    return _db_mag(top_c_ported_s21_complex(p, q_u, f), "calc.rf.resonator.top_c.ported_s21_db")
+
+
+def top_c_ported_rel_s21_db_value(n: float, f0: float, bw: float, l: float, r_source: float, l_port: float, q_port: float, r_load: float,
+                                  r_load_eff: float, q_u: float, f: float, f_ref: float) -> float:
+    """s21_db(f) - s21_db(f_ref) of the ported top-C network."""
+    p = top_c_ported_network(n, f0, bw, l, r_source, l_port, q_port, r_load, r_load_eff)
+    tool = "calc.rf.resonator.top_c.ported_rel_s21_db"
+    return _db_mag(top_c_ported_s21_complex(p, q_u, f), tool) - _db_mag(top_c_ported_s21_complex(p, q_u, f_ref), tool)
 
 
 def dissipation_loss_db(n: float, f0: float, bw: float, q_u: float) -> float:
@@ -1205,6 +1330,52 @@ def top_c_rel_s21_db(n: Traced[float], f0: Traced[float], bw: Traced[float], l: 
     return _derived(value, "calc.rf.resonator.top_c.rel_s21_db", ids, "dB", "rel = S21_dB(f) - S21_dB(f_ref) of the designed top-C network (exact)")
 
 
+_PORT_IDS = ("r_port", "l_port", "q_port", "f0")
+_PORTED_IDS = ("n", "f0", "bw", "l", "r_source", "l_port", "q_port", "r_load", "r_load_eff", "q_u", "f")
+
+
+def top_c_port_r(r_port: Traced[float], l_port: Traced[float], q_port: Traced[float], f0: Traced[float], ids: tuple[str, ...] = _PORT_IDS) -> Traced[float]:
+    """Re (R_port // (L_p + w0 L_p / Q_p)) at f0 (ohm)."""
+    value = top_c_port_r_ohm(_num(r_port, "r_port"), _num(l_port, "l_port"), _num(q_port, "q_port"), _num(f0, "f0"))
+    return _derived(value, "calc.rf.resonator.top_c.port_r", ids, "ohm", "Re Z, Z = R_port (j w0 L_p + w0 L_p / Q_p) / (R_port + j w0 L_p + w0 L_p / Q_p)")
+
+
+def top_c_port_x(r_port: Traced[float], l_port: Traced[float], q_port: Traced[float], f0: Traced[float], ids: tuple[str, ...] = _PORT_IDS) -> Traced[float]:
+    """Im (R_port // (L_p + w0 L_p / Q_p)) at f0 (ohm)."""
+    value = top_c_port_x_ohm(_num(r_port, "r_port"), _num(l_port, "l_port"), _num(q_port, "q_port"), _num(f0, "f0"))
+    return _derived(value, "calc.rf.resonator.top_c.port_x", ids, "ohm", "Im Z, Z = R_port (j w0 L_p + w0 L_p / Q_p) / (R_port + j w0 L_p + w0 L_p / Q_p)")
+
+
+def top_c_c_tap_reactive(n: Traced[float], f0: Traced[float], bw: Traced[float], l: Traced[float], r_term: Traced[float], x_term: Traced[float],
+                         ids: tuple[str, ...] = ("n", "f0", "bw", "l", "r_term", "x_term")) -> Traced[float]:
+    """The capacitive end tap into a termination R + j X (F)."""
+    value = top_c_tap_reactive_f(_num(n, "n"), _num(f0, "f0"), _num(bw, "bw"), _num(l, "l"), _num(r_term, "r_term"), _num(x_term, "x_term"))
+    return _derived(value, "calc.rf.resonator.top_c.c_tap_reactive", ids, "F",
+                    "C_s = 1 / (w0 (X_t + sqrt(R_t (R_p - R_t)))), R_p = Q_e w0 L, Q_e = g_1 f0 / BW (the resistive tap with X_t absorbed)")
+
+
+def _ported_args(vals: tuple[Traced[float], ...]) -> tuple[float, ...]:
+    return tuple(_num(v, name) for v, name in zip(vals, _PORTED_IDS))
+
+
+def top_c_ported_s21_db(n: Traced[float], f0: Traced[float], bw: Traced[float], l: Traced[float], r_source: Traced[float], l_port: Traced[float],
+                        q_port: Traced[float], r_load: Traced[float], r_load_eff: Traced[float], q_u: Traced[float], f: Traced[float],
+                        ids: tuple[str, ...] = _PORTED_IDS) -> Traced[float]:
+    """The exact S21 of the ported top-C network at f (dB)."""
+    value = top_c_ported_s21_db_value(*_ported_args((n, f0, bw, l, r_source, l_port, q_port, r_load, r_load_eff, q_u, f)))
+    return _derived(value, "calc.rf.resonator.top_c.ported_s21_db", ids, "dB",
+                    "S21 = 20 log10 |2 V_out / V_s sqrt(R_source / R_load)| of the top-C network with the source port's shunt L_p (loss w0 L_p / Q_p) and "
+                    "the load port's extra shunt R (1 / (1 / r_load_eff - 1 / R_load)); taps designed for Re Z_source (Im Z absorbed) and r_load_eff (exact)")
+
+
+def top_c_ported_rel_s21_db(n: Traced[float], f0: Traced[float], bw: Traced[float], l: Traced[float], r_source: Traced[float], l_port: Traced[float],
+                            q_port: Traced[float], r_load: Traced[float], r_load_eff: Traced[float], q_u: Traced[float], f: Traced[float],
+                            f_ref: Traced[float], ids: tuple[str, ...] = (*_PORTED_IDS, "f_ref")) -> Traced[float]:
+    """S21(f) - S21(f_ref) of the ported top-C network (dB)."""
+    value = top_c_ported_rel_s21_db_value(*_ported_args((n, f0, bw, l, r_source, l_port, q_port, r_load, r_load_eff, q_u, f)), _num(f_ref, "f_ref"))
+    return _derived(value, "calc.rf.resonator.top_c.ported_rel_s21_db", ids, "dB", "rel = S21_dB(f) - S21_dB(f_ref) of the ported top-C network (exact)")
+
+
 def bpf_dissipation_loss(n: Traced[float], f0: Traced[float], bw: Traced[float], q_u: Traced[float], ids: tuple[str, str, str, str] = ("n", "f0", "bw", "q_u")) -> Traced[float]:
     """Cohn's midband dissipation loss of a Butterworth coupled-resonator filter (dB)."""
     return _derived(dissipation_loss_db(_num(n, "n"), _num(f0, "f0"), _num(bw, "bw"), _num(q_u, "q_u")), "calc.rf.bpf.dissipation_loss", ids, "dB",
@@ -1425,6 +1596,11 @@ RADIO_CALCULATORS = {
     "calc.rf.resonator.top_c.c_shunt": top_c_c_shunt,
     "calc.rf.resonator.top_c.s21_db": top_c_s21_db,
     "calc.rf.resonator.top_c.rel_s21_db": top_c_rel_s21_db,
+    "calc.rf.resonator.top_c.port_r": top_c_port_r,
+    "calc.rf.resonator.top_c.port_x": top_c_port_x,
+    "calc.rf.resonator.top_c.c_tap_reactive": top_c_c_tap_reactive,
+    "calc.rf.resonator.top_c.ported_s21_db": top_c_ported_s21_db,
+    "calc.rf.resonator.top_c.ported_rel_s21_db": top_c_ported_rel_s21_db,
     "calc.rf.bpf.dissipation_loss": bpf_dissipation_loss,
     "calc.rf.resonator.single_tuned.rejection": single_tuned_rejection,
     "calc.rf.resonator.single_tuned.insertion_loss": single_tuned_insertion_loss,
@@ -1472,6 +1648,7 @@ __all__ = [
     "RESONATOR_MAX_ORDER",
     "TOT_Q14_PERIODS",
     "CrystalLadder",
+    "PortedTopC",
     "TopCNetwork",
     "attenuator_pi_r_series",
     "attenuator_pi_r_shunt",
@@ -1538,6 +1715,7 @@ __all__ = [
     "pm_tank_phase_deg",
     "pm_tank_phase_loaded",
     "pm_tank_phase_loaded_deg",
+    "port_shunt_l_impedance",
     "power_rail_budget",
     "q_parallel",
     "q_parallel_value",
@@ -1573,12 +1751,24 @@ __all__ = [
     "top_c_c_couple",
     "top_c_c_shunt",
     "top_c_c_tap",
+    "top_c_c_tap_reactive",
     "top_c_network",
+    "top_c_port_r",
+    "top_c_port_r_ohm",
+    "top_c_port_x",
+    "top_c_port_x_ohm",
+    "top_c_ported_network",
+    "top_c_ported_rel_s21_db",
+    "top_c_ported_rel_s21_db_value",
+    "top_c_ported_s21_complex",
+    "top_c_ported_s21_db",
+    "top_c_ported_s21_db_value",
     "top_c_rel_s21_db",
     "top_c_rel_s21_db_value",
     "top_c_s21_complex",
     "top_c_s21_db",
     "top_c_s21_db_value",
+    "top_c_tap_reactive_f",
     "tot_period",
     "tot_period_s",
     "varactor_c_at_bias",

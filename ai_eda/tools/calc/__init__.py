@@ -26,7 +26,7 @@ and the link budget, kTB / noise figure / sensitivity, AM / FM bandwidths,
 field strength, LC resonance and Q) and ``calc.crystal.c_for_load``. A level
 in dB is never converted silently: dBm -> W only through ``calc.rf.dbm_to_w``.
 :mod:`ai_eda.tools.calc.radio` holds the radio-design calculators
-(``CALC_VERSION`` 0.10): the frequency plan (multiplier stages and spurs,
+(``CALC_VERSION`` 0.10; 0.11 adds the top-C network between loaded ports): the frequency plan (multiplier stages and spurs,
 harmonics, superhet LO / image / half-IF / second image / LO-spur responses),
 the FM 99 % bandwidth (Bessel) and the PM-to-FM integrator, varactor and
 phase-modulator tank (its exact network phase), the top-C coupled-resonator
@@ -152,7 +152,12 @@ from ai_eda.tools.calc.radio import (
     top_c_c_couple,
     top_c_c_shunt,
     top_c_c_tap,
+    top_c_c_tap_reactive,
     top_c_network,
+    top_c_port_r,
+    top_c_port_x,
+    top_c_ported_rel_s21_db,
+    top_c_ported_s21_db,
     top_c_rel_s21_db,
     top_c_s21_db,
     tot_period,
@@ -468,7 +473,12 @@ __all__ = [
     "top_c_c_couple",
     "top_c_c_shunt",
     "top_c_c_tap",
+    "top_c_c_tap_reactive",
     "top_c_network",
+    "top_c_port_r",
+    "top_c_port_x",
+    "top_c_ported_rel_s21_db",
+    "top_c_ported_s21_db",
     "top_c_rel_s21_db",
     "top_c_s21_db",
     "tot_period",
