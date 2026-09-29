@@ -67,7 +67,7 @@ from xml.sax.saxutils import escape as _xml_escape
 from ai_eda.ir import CircuitIR, Expectation, SilkKind, ValidationStatus
 from ai_eda.tools.calc.si import parse_spice_number
 from ai_eda.tools.kicad import sexpr
-from ai_eda.tools.kicad.geometry import footprint_bbox, mirrored_layer, pad_angle, pad_center, pad_copper_center, pad_layers, to_board
+from ai_eda.tools.kicad.geometry import custom_pad_parts, footprint_bbox, mirrored_layer, pad_angle, pad_center, pad_copper_center, pad_layers, to_board
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary, Pad
 from ai_eda.tools.model3d.iso import iso_svg
 from ai_eda.tools.model3d.scene import GRAPHIC_HEADS, Scene, build_scene, graphic_paths, scene_caption, stroke_width
@@ -1428,20 +1428,28 @@ def board_figure(
         for pad in fp.pads:
             cx, cy = pad_copper_center(placement, pad)  # the copper; the hole is at pad_center (they differ by a drill offset)
             angle = pad_angle(placement, pad)
-            reach = max(pad.size_w, pad.size_h) / 2 * scale
-            own_pads.append((X(cx) - reach, Y(cy) - reach, X(cx) + reach, Y(cy) + reach))
-            if math.isclose(angle % 90.0, 0.0, abs_tol=1e-9):  # the drawn copper: exact at quarter turns, the reach square otherwise
-                hw, hh = (pad.size_w, pad.size_h) if math.isclose(angle % 180.0, 0.0, abs_tol=1e-9) else (pad.size_h, pad.size_w)
-                own_copper.append((X(cx) - hw / 2 * scale, Y(cy) - hh / 2 * scale, X(cx) + hw / 2 * scale, Y(cy) + hh / 2 * scale))
-            else:
-                own_copper.append(own_pads[-1])
             layers = pad_layers(placement, pad)
             fill, tht = _pad_fill(pad, layers)
             if by_class and not tht:
                 fill = NEUTRAL_PAD
             order = 2 if tht else (1 if "F.Cu" in layers else 0)
             parts = [f'<g class="pad" data-ref="{esc(comp.ref)}" data-pad="{esc(pad.number)}" data-tht="{"true" if tht else "false"}">']
-            parts.append(_pad_shape(pad, X(cx), Y(cy), angle, scale, fill))
+            if pad.shape == "custom" and not pad.unread_primitives:  # the boxes the router and the checks read: its anchor, each primitive
+                for part in custom_pad_parts(placement, pad):
+                    b = part.box
+                    box = (X(b.x1), Y(b.y1), X(b.x2), Y(b.y2))
+                    own_pads.append(box)
+                    own_copper.append(box)
+                    parts.append(f'<rect x="{_f(box[0])}" y="{_f(box[1])}" width="{_f(box[2] - box[0])}" height="{_f(box[3] - box[1])}" fill="{fill}"/>')
+            else:
+                reach = max(pad.size_w, pad.size_h) / 2 * scale
+                own_pads.append((X(cx) - reach, Y(cy) - reach, X(cx) + reach, Y(cy) + reach))
+                if math.isclose(angle % 90.0, 0.0, abs_tol=1e-9):  # the drawn copper: exact at quarter turns, the reach square otherwise
+                    hw, hh = (pad.size_w, pad.size_h) if math.isclose(angle % 180.0, 0.0, abs_tol=1e-9) else (pad.size_h, pad.size_w)
+                    own_copper.append((X(cx) - hw / 2 * scale, Y(cy) - hh / 2 * scale, X(cx) + hw / 2 * scale, Y(cy) + hh / 2 * scale))
+                else:
+                    own_copper.append(own_pads[-1])
+                parts.append(_pad_shape(pad, X(cx), Y(cy), angle, scale, fill))
             if pad.drill:
                 hx, hy = pad_center(placement, pad)
                 parts.append(f'<circle class="drill" cx="{_f(X(hx))}" cy="{_f(Y(hy))}" r="{_f(pad.drill / 2 * scale)}" fill="{DRILL_COLOUR}"/>')

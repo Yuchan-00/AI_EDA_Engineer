@@ -8,8 +8,10 @@ plus the through-hole and SMD fixture footprints written by
 0.5 x 20 mm SMD pad on ``F.Cu``, ``Test:CAGE`` a THT pad fenced by four
 unnumbered THT bars, ``Test:TINY`` a 0.2 mm SMD pad, ``Test:PAD2`` / ``Test:SMD2`` / ``Test:WALL2``
 two-pad versions of the first three, ``Test:SMD054`` a 0.54 x 0.64 mm and
-``Test:SMD0510`` a 0.5 x 1.0 mm SMD pad, ``Test:TRAP`` a trapezoid and
-``Test:CUST`` a custom-shape pad, ``Test:DUP1`` two pads numbered "1", ``Test:VBAR`` /
+``Test:SMD0510`` a 0.5 x 1.0 mm SMD pad, ``Test:TRAP`` a trapezoid,
+``Test:CUST`` a custom-shape pad, ``Test:CUSTX`` a custom pad with a primitive the
+library reader does not read (custom pads themselves: ``tests/test_routing_custom_pads.py``),
+``Test:DUP1`` two pads numbered "1", ``Test:VBAR`` /
 ``Test:HBAR`` net-less 0.5 x 4 mm F.Cu bars and ``Test:BPLANE`` a net-less 60 x 60 mm
 B.Cu pad - a copper plane that leaves one routable layer and no via site). Boards are a few
 millimetres, so the grids are small. Nothing here claims DRC: the router's
@@ -93,6 +95,11 @@ _FOOTPRINTS = {
     "CUST": (
         '(pad "1" smd custom (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask" "F.Paste")\n'
         '    (primitives (gr_poly (pts (xy -2 -2) (xy 2 -2) (xy 2 2) (xy -2 2)) (width 0) (fill yes))))'
+    ),
+    # a custom pad with a primitive head the library reader does not know: its copper is unknown
+    "CUSTX": (
+        '(pad "1" smd custom (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask" "F.Paste")\n'
+        '    (primitives (gr_blob (pts (xy -2 -2) (xy 2 -2) (xy 2 2)) (width 0))))'
     ),
     # two pads that share the number "1" (split thermal / mounting pads): one logical pad in KiCad
     "DUP1": '(pad "1" thru_hole circle (at -1.5 0) (size 1.6 1.6) (drill 0.8) (layers "*.Cu" "*.Mask"))\n  (pad "1" thru_hole circle (at 1.5 0) (size 1.6 1.6) (drill 0.8) (layers "*.Cu" "*.Mask"))',
@@ -457,11 +464,14 @@ def test_a_via_is_drilled_beside_a_pad_never_through_it(tmp_path: Path, lib: Kic
 
 
 def test_pads_whose_copper_is_not_bounded_by_the_size_box_are_refused(tmp_path: Path, lib: KicadLibrary):
-    """A trapezoid (rect_delta) or custom (primitives) pad has copper the library reader does not keep: refused, never modelled as its size box."""
-    for name, shape in (("TRAP", "trapezoid"), ("CUST", "custom")):
-        ir = board_ir(tmp_path, lib, [("R1", "PAD1", 2.0, 4.0), ("R2", "PAD1", 10.0, 4.0), ("U1", name, 6.0, 4.0)], {"A": [("R1", "1"), ("R2", "1")], "B": [("U1", "1")]}, (12.0, 8.0))
-        with pytest.raises(CompileError, match=rf"cannot route: pad U1.1 of footprint Test:{name} has shape '{shape}'; its copper is not bounded by its \(size\) box"):
-            route_board(ir, lib)
+    """A trapezoid (rect_delta) has copper the library reader does not keep, and so has a custom pad with a primitive the reader does not
+    read: refused, never modelled as the size box (a custom pad whose primitives are read is routed: tests/test_routing_custom_pads.py)."""
+    ir = board_ir(tmp_path, lib, [("R1", "PAD1", 2.0, 4.0), ("R2", "PAD1", 10.0, 4.0), ("U1", "TRAP", 6.0, 4.0)], {"A": [("R1", "1"), ("R2", "1")], "B": [("U1", "1")]}, (12.0, 8.0))
+    with pytest.raises(CompileError, match=r"cannot route: pad U1.1 of footprint Test:TRAP has shape 'trapezoid'; its copper is not bounded by its \(size\) box"):
+        route_board(ir, lib)
+    ir = board_ir(tmp_path, lib, [("R1", "PAD1", 2.0, 4.0), ("R2", "PAD1", 10.0, 4.0), ("U1", "CUSTX", 6.0, 4.0)], {"A": [("R1", "1"), ("R2", "1")], "B": [("U1", "1")]}, (12.0, 8.0))
+    with pytest.raises(CompileError, match=r"cannot route: pad U1.1 of footprint Test:CUSTX: custom pad '1' has primitive\(s\) gr_blob the library reader does not read"):
+        route_board(ir, lib)
 
 
 def test_an_unreachable_terminal_leaves_the_net_unrouted_without_copper_and_the_others_routed(tmp_path: Path, lib: KicadLibrary):

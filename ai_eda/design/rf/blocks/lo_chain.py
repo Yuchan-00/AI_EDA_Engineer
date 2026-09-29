@@ -45,7 +45,9 @@ Every network is designed between *loaded* ports, and every part on its port
 nets is a member of its fixture: the source is the collector port model
 ``model.bfr92.r_out`` (1 kohm) in parallel with the stage's collector choke
 (its Q at the stage frequency, returned to AC ground through the 0 ohm link,
-the fixture's rail port ``rx_5v`` on ``RX_5V``), whose reactance the input
+the fixture's rail port ``rx_5v`` on ``RX_5V``; the feed decoupling between
+link and choke is a member too - across the 0 V link it changes nothing in
+the fixture, but it is a part on the network's node), whose reactance the input
 tap absorbs (``calc.rf.resonator.top_c.port_r`` / ``.port_x`` /
 ``.c_tap_reactive``); the load of a tank is the next stage's port model
 ``model.bfr92.r_in`` (500 ohm) in parallel with that stage's base divider
@@ -333,7 +335,7 @@ class LoChainBlock(Block):
                     out_net = f"LO_{names[k + 1].upper()}_B"
                     nxt_refs = stage_refs[k + 1]
                     b.result.networks.append(RFNetwork(
-                        id=net_id, block=self.id, members=[*top.members, refs["choke"], refs["link"], nxt_refs["r_b1"], nxt_refs["r_b2"]], bindings=top.bindings,
+                        id=net_id, block=self.id, members=[*top.members, refs["choke"], refs["link"], refs["c_dec"], nxt_refs["r_b1"], nxt_refs["r_b2"]], bindings=top.bindings,
                         loss_q={**{r: q_k[1] for r in top.inductors}, refs["choke"]: q_k[1]}, q_ref_hz=f_k,
                         ports=[fixture_port("coll", collector, r_out[1], "in"), fixture_port("next", out_net, r_in[1], "out"), rail_port],
                         sweep=[ac_sweep(b, f"{net_id}_sweep", lin, pts, f_lo, f_hi, f"lo_tank{k + 1}: f_{k + 1} / 2 .. 1.5 f_{k + 1}")],
@@ -356,7 +358,7 @@ class LoChainBlock(Block):
                     f_lo = b.choice("lo.bpf.sweep.fstart", 300e6, "Hz", "start of the LO output band-pass sweep")
                     f_hi = b.choice("lo.bpf.sweep.fstop", 600e6, "Hz", "stop of the LO output band-pass sweep")
                     b.result.networks.append(RFNetwork(
-                        id="lo_bpf", block=self.id, members=[*top.members, refs["choke"], refs["link"]], bindings=top.bindings,
+                        id="lo_bpf", block=self.id, members=[*top.members, refs["choke"], refs["link"], refs["c_dec"]], bindings=top.bindings,
                         loss_q={**{r: q_u[1] for r in top.inductors}, refs["choke"]: q_u[1]}, q_ref_hz=f3,
                         ports=[fixture_port("coll", collector, r_out[1], "in"), fixture_port("buf_in", "LO1_RAW", pha1[1], "out"), rail_port],
                         sweep=[ac_sweep(b, "lo_bpf_sweep", lin, pts, f_lo, f_hi, "LO output band-pass: 300-600 MHz")],

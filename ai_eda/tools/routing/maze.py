@@ -97,11 +97,12 @@ with :func:`ai_eda.tools.kicad.geometry._q`). The static part is 0.1's:
   emits copper that breaks its own clearance at a pad.
 * pad shapes: ``circle`` / ``rect`` / ``oval`` / ``roundrect`` are convex and
   lie inside their ``(size)`` box, so the box is a conservative obstacle and
-  the inscribed circle a safe terminal. A ``custom`` pad (its ``primitives``
-  may reach beyond the anchor's size) or a ``trapezoid`` (``rect_delta``
-  extends one side beyond the box) is refused (:class:`CompileError` naming
-  the pad): the library reader keeps neither, and an obstacle box that is
-  smaller than the copper would be a guess.
+  the inscribed circle a safe terminal. A ``custom`` pad is several boxes
+  (below: routing.maze 0.5). A ``trapezoid`` (``rect_delta`` extends one side
+  beyond the box) is refused (:class:`CompileError` naming the pad): the
+  library reader does not keep ``rect_delta``, and an obstacle box that is
+  smaller than the copper would be a guess; so is a ``custom`` pad with a
+  primitive the library reader does not read.
 
 **Net rules (routing.maze 0.3).** :func:`route_board` takes ``rules``, net
 name -> :class:`NetRule`, supplied by the caller (the IR's net classes are
@@ -247,6 +248,33 @@ either, every track and via is stamped :data:`ROUTER_KEEPOUT_VERSION`
   Whether the plane's fill really joins the vias is KiCad's fill and DRC;
   ``pcb.routing.connectivity`` reports such a net NOT_VERIFIED.
 
+**Custom pads (routing.maze 0.5).** A ``custom`` pad's copper is bounded by
+:func:`ai_eda.tools.kicad.geometry.custom_pad_parts` - the one extent the
+``pcb.routing.*`` / ``pcb.keepout`` checks, the silkscreen, the SI paths, the
+3D scene and the figures also read: the box of its anchor (the ``(size)``
+rectangle or circle at the pad's copper centre) and one box around each
+copper primitive (``gr_poly`` / ``gr_line`` / ``gr_rect`` / ``gr_circle`` /
+``gr_arc`` / ``gr_curve``, grown by half its stroke), each an outer bound of
+its copper. Each box is a pad entry of its own for the owner maps, the
+no-via-in-pad rule, the rule fences, the pair breakouts and the exact audit,
+so every clearance rule above holds against the whole bound. A track lands
+on the anchor: the terminal is the grid cell nearest the anchor's centre
+inside its inscribed circle (else inside the inscribed circle of the first
+part known to be copper there - an exact filled rectangle, a filled disc -,
+else the anchor's refusal); a plane net's pad-via walk starts beyond the
+pad's whole copper in each direction. A box larger than the copper (a ring's
+square, a circle's corners) keeps other copper further away than needed and
+may enclose another pad (the ``CUI_CMC-4013-SMT`` microphone's ring pad 1
+around its pad 2: pad 2's terminal is then inside pad 1's keep-out and its
+net is unrouted with that reason - on the real copper too, a closed ring
+leaves no way out on its layer). A board with at least one custom pad is
+stamped :data:`ROUTER_CUSTOM_PAD_VERSION` ``"0.5"`` on every track and via
+(whatever else it has: rules, keep-outs, plane nets), ``derived_from`` names
+the pads (``custom_pads:...;model=anchor+primitive_boxes``) and
+``stats["custom_pads"]`` lists every part's box. Such a board was refused
+before, so no saved copper changes; a board without a custom pad is exactly
+0.2's / 0.3's / 0.4's.
+
 What this is not: a DRC. The clearances above are the router's own
 parameters; whether the board is valid is decided by ``kicad-cli pcb drc``
 on the compiled board (:meth:`ai_eda.tools.kicad.cli.KicadCli.run_drc`), and
@@ -260,7 +288,8 @@ only honours the widths, spacings and lengths it is given.
 
 Traceability: every :class:`~ai_eda.ir.Track` / :class:`~ai_eda.ir.Via`
 carries ``derived`` provenance naming this router (:data:`ROUTER_ID` /
-:data:`ROUTER_VERSION` or :data:`ROUTER_RULES_VERSION`), the net, the
+:data:`ROUTER_VERSION`, :data:`ROUTER_RULES_VERSION`, :data:`ROUTER_KEEPOUT_VERSION`
+or :data:`ROUTER_CUSTOM_PAD_VERSION`), the net, the
 placements of the net's components and every parameter in
 ``derived_from``; the note names the iteration count and how the net's route
 was obtained. ``Provenance.inputs`` stays empty: it is the calculator role
@@ -279,7 +308,7 @@ from typing import Any
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import CircuitIR, Net, Provenance, ProvenanceKind, Track, Via
-from ai_eda.tools.kicad.geometry import _q, pad_angle, pad_center, pad_layers
+from ai_eda.tools.kicad.geometry import PadPart, _q, custom_pad_parts, pad_angle, pad_center, pad_layers
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary, Pad
 from ai_eda.tools.keepout import allowed_nets as keepout_allowed_nets
 from ai_eda.tools.keepout import area_bbox, area_points, covers_layer, forbids, keepout_id, point_area_distance, segment_area_distance
@@ -290,6 +319,7 @@ __all__ = [
     "ROUTER_VERSION",
     "ROUTER_RULES_VERSION",
     "ROUTER_KEEPOUT_VERSION",
+    "ROUTER_CUSTOM_PAD_VERSION",
     "PLANE_VIA_REACH_MM",
     "LAYERS",
     "BLOCKED",
@@ -313,6 +343,9 @@ ROUTER_VERSION = "0.2"
 ROUTER_RULES_VERSION = "0.3"
 #: the version stamped on every track and via of a board routed with keep-outs or plane nets (module docstring)
 ROUTER_KEEPOUT_VERSION = "0.4"
+#: the version stamped on every track and via of a board with at least one ``custom`` pad (module docstring: custom pads); it takes
+#: the place of 0.2 / 0.3 / 0.4 on such a board, whose copper was refused before
+ROUTER_CUSTOM_PAD_VERSION = "0.5"
 #: how far (mm, along one axis from the terminal cell) a plane net's SMD pad looks for the site of its via
 PLANE_VIA_REACH_MM = 3.0
 #: the only copper layers this router routes (index 0 / 1 in the owner maps)
@@ -831,7 +864,11 @@ def _seg_box(a: tuple[float, float], b: tuple[float, float], box: tuple[float, f
 
 @dataclass(frozen=True, slots=True)
 class _PadGeom:
-    """One placed pad in the board frame: centre, half extents of its obstacle box, copper layers, net index."""
+    """One placed pad in the board frame: centre, half extents of its obstacle box, copper layers, net index.
+
+    A ``custom`` pad is several of these (one per :class:`~ai_eda.tools.kicad.geometry.PadPart`, sharing ``ref`` / ``number`` /
+    ``net``): the part a track lands on carries ``reach`` - how far the pad's whole copper extends east, south, west and north of its
+    centre (the plane-via walk starts beyond it); ``None`` for a convex pad (its box is its whole copper)."""
 
     ref: str
     number: str
@@ -842,6 +879,7 @@ class _PadGeom:
     inscribed_r: float
     layers: tuple[int, ...]  # indices into LAYERS
     net: int  # net index or BLOCKED
+    reach: tuple[float, float, float, float] | None = None
 
     @property
     def box(self) -> tuple[float, float, float, float]:
@@ -966,8 +1004,11 @@ class _Board:
         self._halos: dict[float, _Halo] = {}
         self.net_index = {net.name: k for k, net in enumerate(ir.nets)}
         self.terminals: dict[str, list[_Terminal]] = {net.name: [] for net in ir.nets}
-        #: every placed pad (the rule fences and the exact audits read them)
+        #: every placed pad (the rule fences and the exact audits read them); a custom pad is one entry per part
         self.pads: list[_PadGeom] = []
+        #: the custom pads of the board (``REF.NUMBER``, natural ref order) and their parts (routing.maze 0.5, module docstring)
+        self.custom_pads: list[str] = []
+        self.custom_pad_stats: list[dict[str, Any]] = []
         self._load_pads(ir, library)
         #: routing.maze 0.4 (module docstring): what each keep-out blocked, the via keep-outs (cell -> the nets allowed a via
         #: there), the track keep-outs as areas (the pair breakouts check them), and each plane net's pad vias or why not
@@ -1071,27 +1112,70 @@ class _Board:
             fp = library.load_footprint(comp.footprint)
             self._check_net_pads(ir, comp.ref, fp)
             for pad in fp.pads:
-                if pad.shape not in CONVEX_PAD_SHAPES:
+                parts: list[PadPart] | None = None
+                if pad.shape == "custom":
+                    try:
+                        parts = custom_pad_parts(placement, pad)
+                    except CompileError as e:
+                        raise CompileError(f"cannot route: pad {comp.ref}.{pad.number or '(unnumbered)'} of footprint {fp.lib_id}: {e}") from e
+                elif pad.shape not in CONVEX_PAD_SHAPES:
                     raise CompileError(
                         f"cannot route: pad {comp.ref}.{pad.number or '(unnumbered)'} of footprint {fp.lib_id} has shape {pad.shape!r}; "
-                        f"its copper is not bounded by its (size) box (custom primitives / trapezoid rect_delta are not read), "
-                        f"so this router models only {sorted(CONVEX_PAD_SHAPES)}"
+                        f"its copper is not bounded by its (size) box (a trapezoid's rect_delta is not read), "
+                        f"so this router models only {sorted(CONVEX_PAD_SHAPES)} and custom pads (by their primitives)"
                     )
                 net_name = pin_net.get((comp.ref, pad.number)) if pad.number else None
-                cx, cy, hw, hh, r_in = _pad_box(placement, pad)
                 layers = _pad_copper_layers(placement, pad)
-                geom = _PadGeom(comp.ref, pad.number, cx, cy, hw, hh, r_in, layers, self.net_index[net_name] if net_name else BLOCKED)
-                self.pads.append(geom)
-                for layer in layers:
-                    self._mark_box(layer, geom)
-                self._forbid_vias_in(geom)
+                net_idx = self.net_index[net_name] if net_name else BLOCKED
+                if parts is None:
+                    cx, cy, hw, hh, r_in = _pad_box(placement, pad)
+                    geoms = [_PadGeom(comp.ref, pad.number, cx, cy, hw, hh, r_in, layers, net_idx)]
+                else:
+                    geoms = self._custom_geoms(comp.ref, pad.number, parts, layers, net_idx)
+                for geom in geoms:
+                    self.pads.append(geom)
+                    for layer in layers:
+                        self._mark_box(layer, geom)
+                    self._forbid_vias_in(geom)
                 if net_name is None:
                     continue
                 if not layers:
                     raise CompileError(f"cannot route net {net_name!r}: pad {comp.ref}.{pad.number} is on no copper layer ({pad.layers})")
-                self.terminals[net_name].append(self._terminal(geom))
+                self.terminals[net_name].append(self._terminal(geoms[0]) if parts is None else self._custom_terminal(geoms))
         for terms in self.terminals.values():
             terms.sort(key=lambda t: (natural_ref_key(t.pad.ref), natural_ref_key(t.pad.number)))
+
+    def _custom_geoms(self, ref: str, number: str, parts: list[PadPart], layers: tuple[int, ...], net: int) -> list[_PadGeom]:
+        """A ``custom`` pad as one obstacle box per part (its anchor first), each knowing how far the whole pad reaches from its centre;
+        recorded in :attr:`custom_pads` / :attr:`custom_pad_stats`."""
+        x1, y1 = min(p.box.x1 for p in parts), min(p.box.y1 for p in parts)
+        x2, y2 = max(p.box.x2 for p in parts), max(p.box.y2 for p in parts)
+        geoms: list[_PadGeom] = []
+        for part in parts:
+            cx, cy = part.center
+            hw, hh = part.box.width / 2.0, part.box.height / 2.0
+            geoms.append(_PadGeom(ref, number, cx, cy, hw, hh, part.inscribed_r, layers, net, (x2 - cx, y2 - cy, cx - x1, cy - y1)))
+        label = f"{ref}.{number or '(unnumbered)'}"
+        self.custom_pads.append(label)
+        self.custom_pad_stats.append({"pad": label, "parts": [
+            {"part": part.what, "box": [part.box.x1, part.box.y1, part.box.x2, part.box.y2], "exact": part.exact, "inscribed_r": _q(part.inscribed_r)}
+            for part in parts
+        ]})
+        return geoms
+
+    def _custom_terminal(self, geoms: list[_PadGeom]) -> _Terminal:
+        """The terminal of a ``custom`` pad: on its anchor when the nearest grid point lies inside the anchor's inscribed circle, else on
+        the first part whose inscribed circle (copper for sure: an exact rectangle, a filled disc) holds its nearest grid point; the
+        anchor's refusal when none does."""
+        first: CompileError | None = None
+        for geom in geoms:
+            if geom.inscribed_r <= 0.0:
+                continue
+            try:
+                return self._terminal(geom)
+            except CompileError as e:
+                first = first or e
+        raise first or CompileError(f"cannot route: custom pad {geoms[0].ref}.{geoms[0].number} has no part a track can land on")
 
     @staticmethod
     def _check_net_pads(ir: CircuitIR, ref: str, fp: FootprintDef) -> None:
@@ -1302,8 +1386,12 @@ class _Board:
                     break
                 j0, i0 = divmod(t.cell, self.nx)
                 # the walk crosses the pad's own copper first: the reach counts from where a via disc clears the pad box on that axis
-                clear = (math.ceil((t.pad.hw + rv) / g - _EPS) + 1, math.ceil((t.pad.hh + rv) / g - _EPS) + 1)
-                limits = [reach + (clear[0] if di else clear[1]) for di, _dj in _DIRS]
+                # (a custom pad's whole copper, every part, in each direction)
+                if t.pad.reach is None:
+                    clear = (math.ceil((t.pad.hw + rv) / g - _EPS) + 1, math.ceil((t.pad.hh + rv) / g - _EPS) + 1)
+                    limits = [reach + (clear[0] if di else clear[1]) for di, _dj in _DIRS]
+                else:
+                    limits = [reach + math.ceil((t.pad.reach[d] + rv) / g - _EPS) + 1 for d in range(4)]
                 open_dirs = [True, True, True, True]
                 site: tuple[int, int] | None = None
                 for step in range(1, max(limits) + 1):
@@ -2835,6 +2923,15 @@ def route_board(
         ir, library, p, {index[name]: r.clearance_mm for name, r in eff.items()}, inner_layers,
         keepouts=list(keepouts or ()) or None, ko_width=max(widths), plane=plane_width or None, plane_areas=plane_areas or None,
     )
+    if board.custom_pads:  # routing.maze 0.5 (module docstring: custom pads): its own stamp and the pads it modelled, on every item
+        entry = "custom_pads:" + ",".join(board.custom_pads) + ";model=anchor+primitive_boxes"
+        words = (f"custom pad(s) {', '.join(board.custom_pads)} are obstacles as the box of their anchor plus one box around each copper "
+                 "primitive; a track lands on the anchor")
+        head = f"routing.maze {ROUTER_CUSTOM_PAD_VERSION}: "
+        if plan is None:
+            plan = _Plan(ROUTER_CUSTOM_PAD_VERSION, (entry,), head + words)
+        else:
+            plan = _Plan(ROUTER_CUSTOM_PAD_VERSION, (*plan.derived, entry), head + plan.note.removeprefix(f"routing.maze {ROUTER_KEEPOUT_VERSION}: ") + "; " + words)
     clearance = {index[name]: r.clearance_mm for name, r in eff.items()}
 
     def clear_of(idx: int) -> float:
@@ -2978,6 +3075,8 @@ def route_board(
             clear_of, plan,
         )
     _add_planes(ir, board, p, result, plan, plane_width, plane_rules, plane_layers, iterations, legal)
+    if board.custom_pads:
+        result.stats["custom_pads"] = list(board.custom_pad_stats)
     return result
 
 

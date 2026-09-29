@@ -35,11 +35,13 @@ top at the thickness ``T``):
   pad opens the mask, under it otherwise), centred on the copper (the pad's
   ``(at)`` plus its drill offset; the drill stays at ``(at)``); circle / oval /
   rect / roundrect are drawn as such, a trapezoid by KiCad's corner formula
-  from its ``rect_delta``, a ``custom`` pad as the rectangle around its
-  anchor and every copper primitive (each grown by half its width; counted
-  in the notes as 외접 사각형), and a pad whose copper this module cannot
-  read (an unknown primitive or shape) as its ``(size)`` box, said in the
-  notes to be possibly smaller than the copper;
+  from its ``rect_delta``, a ``custom`` pad as the rectangles of
+  :func:`ai_eda.tools.kicad.geometry.custom_pad_parts` - its anchor's and
+  each copper primitive's box (grown by half its width), the extent the
+  router and the checks read; counted in the notes as 외접 사각형 -, and a
+  pad whose copper is not read (a primitive the library reader does not
+  read, an unknown shape) as its ``(size)`` box, said in the notes to be
+  possibly smaller than the copper;
 * drills (pads and vias) as dark 8-sided cylinders through the board; oval
   drills are drawn round;
 * silkscreen **strokes** of the footprints' own library graphics
@@ -72,7 +74,7 @@ from types import EllipsisType
 from ai_eda.errors import CompileError
 from ai_eda.ir import BoardSide, CircuitIR, Placement
 from ai_eda.tools.kicad import sexpr
-from ai_eda.tools.kicad.geometry import mirrored_layer, pad_angle, pad_center, pad_copper_center, pad_layers, rotate, to_board
+from ai_eda.tools.kicad.geometry import custom_pad_parts, mirrored_layer, pad_angle, pad_center, pad_copper_center, pad_layers, rotate, to_board
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary, Pad
 from ai_eda.tools.model3d.models import ModelRef, find_3dmodel_dir, footprint_models, resolve_model_path, transformed_box
 from ai_eda.tools.model3d.step_bbox import Box3, StepEnvelope, read_step_envelope
@@ -321,88 +323,11 @@ def _rounded_rect(w: float, h: float, r: float, n: int = _CORNER_SEGMENTS) -> li
     return pts
 
 
-#: custom-pad primitives that are copper (``gr_bbox`` / ``gr_vector`` are editor annotations, not copper)
-_PAD_PRIMITIVE_HEADS = frozenset({"gr_poly", "gr_line", "gr_rect", "gr_circle", "gr_arc", "gr_curve"})
-_PAD_ANNOTATION_HEADS = frozenset({"gr_bbox", "gr_vector"})
-
-
-def _arc_extremes(start: Point, mid: Point, end: Point) -> list[Point]:
-    """The points that bound the arc ``start`` -> ``mid`` -> ``end``: its ends and every axis extreme of its circle on the arc."""
-    (x1, y1), (x2, y2), (x3, y3) = start, mid, end
-    d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
-    if abs(d) < 1e-12:
-        return [start, mid, end]
-    ux = ((x1 * x1 + y1 * y1) * (y2 - y3) + (x2 * x2 + y2 * y2) * (y3 - y1) + (x3 * x3 + y3 * y3) * (y1 - y2)) / d
-    uy = ((x1 * x1 + y1 * y1) * (x3 - x2) + (x2 * x2 + y2 * y2) * (x1 - x3) + (x3 * x3 + y3 * y3) * (x2 - x1)) / d
-    r = math.hypot(x1 - ux, y1 - uy)
-    a1, am, a3 = math.atan2(y1 - uy, x1 - ux), math.atan2(y2 - uy, x2 - ux), math.atan2(y3 - uy, x3 - ux)
-    tau = 2 * math.pi
-    sweep = (a3 - a1) % tau
-    ccw = (am - a1) % tau <= sweep  # mid on the counter-clockwise way (in this frame's angles) from start to end
-    out = [start, mid, end]
-    for k in range(4):
-        t = k * math.pi / 2
-        on = (t - a1) % tau <= sweep if ccw else (a1 - t) % tau <= tau - sweep
-        if on:
-            out.append((ux + r * math.cos(t), uy + r * math.sin(t)))
-    return out
-
-
-def _custom_pad_box(pad: Pad, node: list) -> tuple[list[Point], bool]:
-    """The rectangle (pad frame) around a ``custom`` pad's anchor and every copper primitive, each grown by half its width, and
-    whether every primitive was read (an unknown primitive head leaves its copper out of the box)."""
-    hx, hy = pad.size_w / 2.0, pad.size_h / 2.0
-    options = sexpr.find(node, "options")
-    if options is not None and str(sexpr.get(options, "anchor", 1, "rect")) == "circle":
-        hy = hx  # a circle anchor's diameter is the size's x
-    xs, ys = [-hx, hx], [-hy, hy]
-    complete = True
-    prims = sexpr.find(node, "primitives")
-    for prim in (prims[1:] if prims is not None else []):
-        head = sexpr.head(prim)
-        if head is None or head in _PAD_ANNOTATION_HEADS:
-            continue
-        if head not in _PAD_PRIMITIVE_HEADS:
-            complete = False
-            continue
-        half = _stroke_width(prim) / 2.0
-        pts: list[Point] = []
-        if head in ("gr_poly", "gr_curve"):
-            pts_node = sexpr.find(prim, "pts")
-            for child in (pts_node[1:] if pts_node is not None else []):
-                if sexpr.head(child) == "xy":
-                    q = _xy(child)
-                    if q:
-                        pts.append(q)
-                elif sexpr.head(child) == "arc":
-                    a, m, b = _xy(sexpr.find(child, "start")), _xy(sexpr.find(child, "mid")), _xy(sexpr.find(child, "end"))
-                    if a and m and b:
-                        pts += _arc_extremes(a, m, b)
-        elif head in ("gr_line", "gr_rect"):
-            pts = [q for q in (_xy(sexpr.find(prim, "start")), _xy(sexpr.find(prim, "end"))) if q]
-        elif head == "gr_circle":
-            c, e = _xy(sexpr.find(prim, "center")), _xy(sexpr.find(prim, "end"))
-            if c and e:
-                r = math.hypot(e[0] - c[0], e[1] - c[1])
-                pts = [(c[0] - r, c[1] - r), (c[0] + r, c[1] + r)]
-        else:  # gr_arc
-            a, m, b = _xy(sexpr.find(prim, "start")), _xy(sexpr.find(prim, "mid")), _xy(sexpr.find(prim, "end"))
-            if a and m and b:
-                pts = _arc_extremes(a, m, b)
-        if not pts:
-            complete = False
-            continue
-        xs += [q[0] - half for q in pts] + [q[0] + half for q in pts]
-        ys += [q[1] - half for q in pts] + [q[1] + half for q in pts]
-    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-    return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)], complete
-
-
 def _pad_outline(pad: Pad, node: list | None = None) -> tuple[list[Point], str]:
     """The pad's copper outline in its own frame (library orientation, y down) and how it is drawn: ``""`` exactly (circle / oval /
-    rect / roundrect as such; a trapezoid by KiCad's corner formula from ``rect_delta``), ``"bound"`` for a ``custom`` pad (the
-    rectangle around its anchor and every copper primitive), ``"anchor"`` when the copper is not known beyond the ``(size)`` box
-    (a custom pad with a primitive this module does not read, an unknown shape)."""
+    rect / roundrect as such; a trapezoid by KiCad's corner formula from ``rect_delta``), ``"anchor"`` when the copper is not known
+    beyond the ``(size)`` box (a custom pad with a primitive the library reader does not read, an unknown shape). A custom pad whose
+    primitives were all read is drawn by :meth:`_Builder.pads` from :func:`~ai_eda.tools.kicad.geometry.custom_pad_parts` instead."""
     w, h = pad.size_w, pad.size_h
     if pad.shape == "circle":
         return _circle(0.0, 0.0, w / 2.0, _CIRCLE_SIDES), ""
@@ -423,9 +348,6 @@ def _pad_outline(pad: Pad, node: list | None = None) -> tuple[list[Point], str]:
         # KiCad's trapezoid corners (PAD polygon): the delta's x widens / narrows the y sides, its y the x sides
         hx, hy = w / 2.0, h / 2.0
         return [(-hx - dy, hy + dx), (-hx + dy, -hy - dx), (hx - dy, -hy + dx), (hx + dy, hy - dx)], ""
-    if pad.shape == "custom" and node is not None:
-        box, complete = _custom_pad_box(pad, node)
-        return box, "bound" if complete else "anchor"
     return rect, "anchor"
 
 
@@ -581,7 +503,7 @@ class _Builder:
         self.cache = step_cache
         self.T = thickness
         self.scene = Scene(ir.project.id, (o.origin_x_mm, o.origin_y_mm, o.width_mm, o.height_mm), thickness, grounded, model_dir_found=model_dir is not None)
-        self.approximated_pads = 0  # custom pads drawn as the rectangle around their anchor and primitives
+        self.approximated_pads = 0  # custom pads drawn as the rectangles around their anchor and each primitive
         self.anchor_only_pads = 0  # pads whose copper is not known beyond their (size) box
 
     # --- emitters ---------------------------------------------------------------------------------
@@ -693,7 +615,7 @@ class _Builder:
             self.silk(comp.ref, placement, fp)
             self.body(comp.ref, placement, fp)
         if self.approximated_pads:
-            self.scene.notes.append(f"사용자 정의 모양 패드 {self.approximated_pads}개는 앵커와 모든 구리 도형을 감싸는 사각형(외접 사각형)으로 그림")
+            self.scene.notes.append(f"사용자 정의 모양 패드 {self.approximated_pads}개는 앵커와 각 구리 도형을 감싸는 사각형(외접 사각형)들로 그림")
         if self.anchor_only_pads:
             self.scene.notes.append(f"구리 모양을 읽지 못한 패드 {self.anchor_only_pads}개는 (size) 사각형으로만 그림 - 실제 구리는 더 넓을 수 있음")
 
@@ -707,17 +629,23 @@ class _Builder:
                 self.drill(cx, cy, pad.drill, f"{ref}.{pad.number}")
             if pad.pad_type == "np_thru_hole":
                 continue
-            cx, cy = pad_copper_center(placement, pad)  # the copper sits at the drill offset; the hole stays at (at)
-            local, drawn_as = _pad_outline(pad, node)
-            if mirror:
-                local = [(u, -v) for u, v in local]
-            angle = pad_angle(placement, pad)
-            outline = [(cx + dx, cy + dy) for dx, dy in (rotate(u, v, angle) for u, v in local)]
+            if pad.shape == "custom" and not pad.unread_primitives:  # the boxes every user of the pad reads (anchor, each primitive)
+                boxes = [part.box for part in custom_pad_parts(placement, pad)]
+                outlines = [[(b.x1, b.y1), (b.x2, b.y1), (b.x2, b.y2), (b.x1, b.y2)] for b in boxes]
+                drawn_as = "bound"
+            else:
+                cx, cy = pad_copper_center(placement, pad)  # the copper sits at the drill offset; the hole stays at (at)
+                local, drawn_as = _pad_outline(pad, node)
+                if mirror:
+                    local = [(u, -v) for u, v in local]
+                angle = pad_angle(placement, pad)
+                outlines = [[(cx + dx, cy + dy) for dx, dy in (rotate(u, v, angle) for u, v in local)]]
             drawn = False
             for top, cu, mask in ((True, "F.Cu", "F.Mask"), (False, "B.Cu", "B.Mask")):
                 if cu in layers or "*.Cu" in layers:
                     exposed = mask in layers or "*.Mask" in layers
-                    self.decal("pad", "pad" if exposed else "copper", outline, top, PAD_MM if exposed else COPPER_MM, f"{ref}.{pad.number}")
+                    for outline in outlines:
+                        self.decal("pad", "pad" if exposed else "copper", outline, top, PAD_MM if exposed else COPPER_MM, f"{ref}.{pad.number}")
                     drawn = True
             if drawn and drawn_as == "bound":
                 self.approximated_pads += 1

@@ -120,9 +120,12 @@ never tracks.
 
 Expected statuses on this machine (ngspice-42, the packed KiCad 10.0.6
 libraries, no kicad-cli; ``tests/test_kr447_transceiver.py``): every
-``spice.rf.*`` row of the 22 fixture networks PASS as "a network verdict
-under confirmed model values (not a measured part)" (the trx block's
-``trsw`` / ``lpf`` among them); the design deck's rows (the stage-1 rows,
+``spice.rf.*`` row of the 23 fixture networks (24 with the antenna match)
+PASS as "a network verdict under confirmed model values (not a measured
+part)" (the trx block's ``trsw`` / ``lpf`` among them, and the
+composition-level cascade ``ant_end`` - the match, the switch, the low-pass
+and ``fe_bpf2`` as the board joins them, :func:`~ai_eda.design.rf.blocks.trx.ant_end_result`,
+the fixture-membership pass, part A1); the design deck's rows (the stage-1 rows,
 the RF transistors' bias, ``pm_couple_*`` and ``pin_bias``) PASS;
 ``block.interface.*`` PASS (IR arithmetic); ``rf.freq_plan`` NOT_VERIFIED
 (its margin rows PASS; the response / gated rows point to lab items);
@@ -197,6 +200,7 @@ from ai_eda.design.rf.blocks.trx import (
     VARIANT_CONDUCTED,
     AntennaBlock,
     TrxBlock,
+    ant_end_result,
 )
 from ai_eda.design.rf.blocks.tx_audio import TxAudioBlock
 from ai_eda.design.rf.blocks.tx_chain import CHAIN_ID as TX_CHAIN_ID
@@ -407,8 +411,10 @@ class Kr447TransceiverTemplate(Template):
                 r = blk.build(ctx, prefix)
                 results.append(r)
                 ctx.shared.update({k: v for k, v in r.params.items() if k not in ctx.shared})
+            # the antenna end's cascade fixture (ant_end): the networks the board joins with no resistive node between them, as one fixture
+            ant_end = ant_end_result(ctx, results, with_match=with_match)
             board_values = self._board_values(ctx, [r.block_id for r in results], variant)
-            merged = merge_results([board_values, *results], t)
+            merged = merge_results([board_values, *results, ant_end], t)
         except TemplateRefusal as e:
             return _refused(plan, str(e))
         components, report = exclude_floating(merged.components, merged.nets, merged.stimuli, t)
@@ -773,6 +779,13 @@ class Kr447TransceiverTemplate(Template):
                 "4단계의 7차 0.1 dB 체비셰프 저역통과 필터(리플 모서리 "
                 f"{q('lpf.f_edge', 'Hz')}, `calc.rf.lpf.*`)를 T/R 스위치 뒤로 옮겼습니다(설계 §1.2): 스위치 자체의 고조파도 걸러지고, 수신은 그 손실을 치릅니다. "
                 "픽스처 `lpf`: f_c 에서 S21 ≥ −1.5 dB, S11 ≤ −15 dB, 2 f_c 에서 ≤ −45 dB, 3 f_c 에서 ≤ −60 dB (병렬 소자마다 접지면 비아가 있는 배치에서만 성립).\n\n"
+                "안테나 쪽 회로망들은 기판에서 저항성 노드 없이 바로 이어집니다: TX_RF 에서 부하선 정합의 DC 차단과 스위치의 TX DC 차단, LPF_IN 에서 스위치의 공통 DC 차단과 "
+                "저역통과 필터의 첫 병렬 C, RX_RF 에서 스위치의 RX DC 차단과 fe_bpf2 의 입력 탭(안테나 정합이 있으면 ANT_PORT 에서 필터와 정합). 각 픽스처는 그곳을 "
+                "시스템 임피던스로 가정했으므로, 조합 수준의 캐스케이드 픽스처 `ant_end` 가 네(다섯) 회로망의 부품 전체를 PA 부하선, 안테나 급전, LNA 베이스 사이에서 "
+                "스위치의 tx / rx 상태로 판정합니다: TX 에서 S21 ≥ " + q("ant_end.tx_s21_min", "dB") + " (정합·스위치·필터 한계의 합), 부하선에서 S11 ≤ "
+                + q("pa.match.s11_max", "dB") + ", 2 f_c / 3 f_c ≤ " + q("lpf.h2_max", "dB") + " / " + q("lpf.h3_max", "dB") + ", TX → LNA ≤ " + q("trx.tx_iso_max", "dB")
+                + "; RX 에서 S21 ≥ " + q("ant_end.rx_s21_min", "dB") + " (필터·스위치 한계와 fe_bpf2 의 정확한 S21 의 합), 영상(f_c 기준) ≤ " + q("ant_end.rx_image_max", "dB")
+                + ", RX → PA ≤ " + q("trx.rx_iso_max", "dB") + ".\n\n"
                 + ant_text
             )),
             TheorySection("수신 감도와 방사 수치 (추정, 판정 아님)", (

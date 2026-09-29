@@ -126,8 +126,14 @@ MODEL_VALUES: dict[str, ModelValue] = {m.key: m for m in (
     ModelValue("model.l_q.hf", 40.0, None, "inductor Q in the 30-100 MHz band (35.5 / 37.3 MHz PM tanks and first multiplier inputs)", _Q_SOURCE),
     ModelValue("model.l_q.vhf", 40.0, None, "inductor Q in the 100-300 MHz band (106.5 / 111.9 and 213.1 / 223.8 MHz multiplier tanks)", _Q_SOURCE),
     ModelValue("model.l_q.uhf", 40.0, None, "inductor Q in the 300-1000 MHz band (426.2 / 447.6 MHz tanks, BPFs, the harmonic LPF, the T/R switch, matches)", _Q_SOURCE),
-    ModelValue("model.bfr92.r_out", 1000.0, "ohm", "output resistance of a BFR92 class-C multiplier stage (its port model in the tank fixtures)", "NXP BFR92AW datasheet (S-parameters)"),
-    ModelValue("model.bfr92.r_in", 500.0, "ohm", "input resistance of a BFR92 class-C multiplier stage (its port model in the tank fixtures)", "NXP BFR92AW datasheet (S-parameters)"),
+    ModelValue("model.bfr92.r_out", 1000.0, "ohm",
+               ("the BFR92 class-C multiplier transistor's own output resistance at its collector, as a tank or band-pass fixture's source port sees "
+                "it; the collector feed choke (with its link and feed decoupling) is not inside it - they are fixture members beside the port"),
+               "NXP BFR92AW datasheet (S-parameters)"),
+    ModelValue("model.bfr92.r_in", 500.0, "ohm",
+               ("the BFR92 class-C multiplier transistor's own input resistance at its base, as a tank fixture's load port sees it; the stage's base "
+                "divider is not inside it - it is a fixture member beside the port"),
+               "NXP BFR92AW datasheet (S-parameters)"),
     ModelValue("model.varactor.cjo", 20e-12, "F", "zero-bias junction capacitance CJO of the phase-modulator varactor", "varactor datasheet C(V) curve"),
     ModelValue("model.varactor.vj", 0.7, "V", "junction potential VJ of the phase-modulator varactor", "varactor datasheet C(V) curve"),
     ModelValue("model.varactor.m", 0.5, None, "grading coefficient M of the phase-modulator varactor", "varactor datasheet C(V) curve"),
@@ -135,8 +141,15 @@ MODEL_VALUES: dict[str, ModelValue] = {m.key: m for m in (
     ModelValue("model.pin.c_off", 0.3e-12, "F", "PIN diode capacitance at zero bias (the T/R switch's RX state)", "BAR64-03W class PIN diode datasheet"),
     ModelValue("model.opamp.a0", 1e5, None, "open-loop DC gain of the generic single-pole op-amp macro", "Microchip MCP6001 datasheet"),
     ModelValue("model.opamp.gbw", 1e6, "Hz", "gain-bandwidth product of the generic single-pole op-amp macro", "Microchip MCP6001 datasheet (1 MHz in the library description)"),
-    ModelValue("model.buf.r_in", 10e3, "ohm", "input resistance of the MMBT3904 emitter follower between the PM tanks (enters the tanks' loaded Q)", "MMBT3904 datasheet / a bias-point measurement"),
-    ModelValue("model.buf.r_out", 50.0, "ohm", "output resistance of the MMBT3904 emitter follower between the PM tanks (the second tank's drive port)", "MMBT3904 datasheet / a bias-point measurement"),
+    ModelValue("model.buf.r_in", 10e3, "ohm",
+               ("input resistance of the MMBT3904 emitter follower between the PM tanks as a tank sees it through its coupling capacitor (enters the "
+                "tanks' loaded Q): the follower's base divider in parallel with the transistor's own input (about beta times its emitter load) - the "
+                "divider is inside this port model, so no PM fixture carries it as a member, and the model cannot exceed the divider's parallel "
+                "resistance"), "MMBT3904 datasheet / a bias-point measurement"),
+    ModelValue("model.buf.r_out", 50.0, "ohm",
+               ("output resistance of the MMBT3904 emitter follower between the PM tanks (the second tank's drive port): the emitter's own resistance "
+                "(r_e plus the source over beta) in parallel with its emitter resistor - the emitter resistor is inside this port model, so the second "
+                "PM fixture carries no member for it, and the model cannot exceed that resistor"), "MMBT3904 datasheet / a bias-point measurement"),
     ModelValue("model.tcxo.r_out", 50.0, "ohm", "output resistance of the KT2520K-T TCXO (the PM fixture's drive port)", "Kyocera KT2520K datasheet"),
     ModelValue("model.fuse.r", 0.05, "ohm", "cold resistance of the pack fuse in the design deck", "fuse datasheet"),
     ModelValue("model.k_pm", 1.257, "rad/V", "phase-modulator slope of the two buffered tanks together (audio_ptt only; on tx_exciter it is the pm_mod fixtures' measured slope)",

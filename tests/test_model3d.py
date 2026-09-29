@@ -449,17 +449,21 @@ def test_custom_and_trapezoid_pads_are_drawn_around_their_real_copper(tmp_path: 
     for side, sign in ((BoardSide.TOP, 1.0), (BoardSide.BOTTOM, -1.0)):
         scene = build_scene(_ir([("U1", "ODD", _place("U1", side=side))]), lib, model_dir=None)
         pads = {p.label: p for p in _only(scene, "pad")}
-        custom, trap, offset = pads["U1.1"], pads["U1.2"], pads["U1.3"]
-        # every primitive point (the polygon's vertices grown by half its 0.1 mm width, the circle's extremes, the arc's) is inside
+        trap, offset = pads["U1.2"], pads["U1.3"]
+        # a custom pad is drawn as the boxes every user of it reads (geometry.custom_pad_parts): the anchor's and each primitive's
+        customs = [p for p in _only(scene, "pad") if p.label == "U1.1"]
+        assert len(customs) == 4  # the anchor, the polygon, the circle, the arc
+        # every primitive point (the polygon's vertices grown by half its 0.1 mm width, the circle's extremes, the arc's) is inside one
         prim = [(-0.35, -0.65), (0.95, -0.45), (0.55, 0.75), (-0.3, 1.0), (0.3, 1.0), (0.0, 1.3), (0.0, 0.7), (-0.85, 0.3), (-0.55, 0.65)]
-        assert all(_inside_convex(custom.polygon, (10.0 - 2.0 + x, 10.0 + sign * y)) for x, y in prim), custom.polygon
+        assert all(any(_inside_convex(c.polygon, (10.0 - 2.0 + x, 10.0 + sign * y)) for c in customs) for x, y in prim), [c.polygon for c in customs]
         box = (8.0 - 0.85, 10.0 - 0.65, 8.0 + 0.95, 10.0 + 1.3) if sign > 0 else (8.0 - 0.85, 10.0 - 1.3, 8.0 + 0.95, 10.0 + 0.65)
-        assert _xy_box(custom) == pytest.approx(box)
+        boxes = [_xy_box(c) for c in customs]
+        assert (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)) == pytest.approx(box)
         corners = {(round(12.0 + x, 6), round(10.0 + sign * y, 6)) for x, y in ((-0.65, 0.15), (-0.35, -0.15), (0.35, -0.15), (0.65, 0.15))}
         assert set(trap.polygon) == corners
         assert _xy_box(offset) == pytest.approx((14.5, 10.0 + sign * 0.4 - 0.9, 15.5, 10.0 + sign * 0.4 + 0.9))
         assert any(_xy_box(d) == pytest.approx((15.0 - 0.375, 10.0 - 0.375, 15.0 + 0.375, 10.0 + 0.375), abs=0.01) for d in _only(scene, "drill"))
-        assert "사용자 정의 모양 패드 1개는 앵커와 모든 구리 도형을 감싸는 사각형(외접 사각형)으로 그림" in scene.notes
+        assert "사용자 정의 모양 패드 1개는 앵커와 각 구리 도형을 감싸는 사각형(외접 사각형)들로 그림" in scene.notes
         assert not any("사다리꼴" in n or "(size) 사각형" in n for n in scene.notes)
 
 

@@ -24,10 +24,19 @@ by ``r``). :func:`shape_distance` is the exact distance between two shapes
   capsule; each rotated by the stored pad angle and centred where KiCad puts
   the copper - the pad's ``(at)`` plus its ``(drill (offset x y))`` rotated
   by the pad angle (``PAD::ShapePos``; the hole stays at ``(at)``). A chamfer only removes
-  copper, so the rounded rectangle stays an outer bound. A ``custom`` pad's
-  primitives and a ``trapezoid``'s ``rect_delta`` are not read by the library
-  reader: such a pad has ``shape=None`` (copper unknown) and every user says
-  so instead of guessing. A pad is on the front / back silk side when any of
+  copper, so the rounded rectangle stays an outer bound. A ``custom`` pad is
+  one :class:`PadCopper` (same label) per part of
+  :func:`ai_eda.tools.kicad.geometry.custom_pad_parts` - the extent the
+  router reads -: its anchor exactly (the turned rectangle or the disc),
+  a circle primitive as its disc (the ring's disc covers its hole), every
+  other primitive as its box, which is the copper for an exact part (a
+  filled axis-aligned rectangle) and only an outer bound otherwise
+  (``bound``: a ring's disc, a line's box - a silk item meeting it may or
+  may not meet copper, and the checks say NOT_VERIFIED, never FAIL, there;
+  the placer keeps its texts off the whole bound). A ``trapezoid``'s ``rect_delta``
+  is not read by the library reader, nor is a custom pad's unread primitive:
+  such a pad has ``shape=None`` (copper unknown) and every user says so
+  instead of guessing. A pad is on the front / back silk side when any of
   its layers is a copper or mask layer of that side (``*.Cu`` / ``*.Mask``
   and through holes: both).
 * **Footprint silk** (:func:`footprint_silk`): ``fp_line`` a capsule of half
@@ -70,7 +79,7 @@ from typing import Mapping
 
 from ai_eda.ir import BoardSide, Placement, SilkKind, SilkText
 from ai_eda.tools.kicad import sexpr
-from ai_eda.tools.kicad.geometry import _q, mirrored_layer, pad_angle, pad_copper_center, pad_layers, rotate, text_angle, to_board
+from ai_eda.tools.kicad.geometry import _q, custom_pad_parts, mirrored_layer, pad_angle, pad_copper_center, pad_layers, rotate, text_angle, to_board
 from ai_eda.tools.kicad.library import FootprintDef
 
 __all__ = [
@@ -257,7 +266,8 @@ def expand_text(text: str, ref: str, value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class PadCopper:
-    """One pad's copper in the board frame; ``shape`` is ``None`` when it is not modelled (custom / trapezoid)."""
+    """One pad's copper in the board frame (a custom pad: one of its parts); ``shape`` is ``None`` when it is not modelled (a trapezoid, a
+    custom pad with an unread primitive)."""
 
     label: str  # "R1.2"
     ref: str
@@ -265,6 +275,8 @@ class PadCopper:
     sides: frozenset[str]  # {"F"}, {"B"} or both
     shape: Shape | None
     pad_shape: str
+    #: the shape only bounds the copper (a custom pad's ring / line / arc ... box): a silk item meeting it may or may not meet copper
+    bound: bool = False
 
 
 def _pad_sides(layers: list[str], pad_type: str) -> frozenset[str]:
@@ -287,6 +299,21 @@ def pad_copper(ref: str, fp: FootprintDef, placement: Placement) -> list[PadCopp
     for pad in fp.pads:
         label = f"{ref}.{pad.number}" if pad.number else f"{ref}.(unnumbered)"
         sides = _pad_sides(pad_layers(placement, pad), pad.pad_type)
+        if pad.shape == "custom" and not pad.unread_primitives:
+            cx, cy = pad_copper_center(placement, pad)
+            for part in custom_pad_parts(placement, pad):  # the anchor and each primitive's box: the extent the router reads
+                b = part.box
+                box = Shape(((b.x1, b.y1), (b.x2, b.y1), (b.x2, b.y2), (b.x1, b.y2)))
+                if part.disc is not None:  # a circle anchor / circle primitive: its disc (a ring's covers the hole: a bound)
+                    shape, bound = Shape(((part.disc[0], part.disc[1]),), part.disc[2]), part.inscribed_r <= 0.0
+                elif part.anchor:  # the rect anchor exactly: the rectangle turned by the pad angle
+                    hw, hh, angle = pad.size_w / 2.0, pad.size_h / 2.0, pad_angle(placement, pad)
+                    shape = Shape(tuple((_q(cx + rx), _q(cy + ry)) for rx, ry in (rotate(u, v, angle) for u, v in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)))))
+                    bound = False
+                else:
+                    shape, bound = box, not part.exact
+                out.append(PadCopper(label, ref, pad.number, sides, shape, pad.shape, bound))
+            continue
         if pad.shape not in CONVEX_PAD_SHAPES:
             out.append(PadCopper(label, ref, pad.number, sides, None, pad.shape))
             continue

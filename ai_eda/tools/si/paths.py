@@ -22,7 +22,12 @@ The graph of one net (board frame, mm, coordinates rounded to KiCad's 1e-6 mm):
   repeat a number are one pad) *contracts* the nodes inside its copper box on
   a layer it is on: copper inside a pad is the pad, its own length (the
   router's stub to the pad centre, a through-hole pad's barrel) is not
-  counted;
+  counted. A ``custom`` pad's copper boxes are those of
+  :func:`ai_eda.tools.kicad.geometry.custom_pad_parts` known to hold copper
+  around their centre - its anchor, an exact filled rectangle, a filled disc
+  (``inscribed_r`` > 0); a part whose box only bounds its copper (a ring, a
+  line, an arc) contracts nothing, so copper merely inside such a box is not
+  taken as reaching the pad and no line is shortened by it;
 * **edges** - the track pieces (length, layer, width) and the via barrels.
 
 The path is extracted only when every pad of the net is in one connected
@@ -34,7 +39,8 @@ barrel bound), whether any piece's delay is the no-plane upper bound, and the
 width with the most copper along it. Otherwise the reason is returned: a pad
 the copper does not reach, a loop (the path is not unique), a track on an
 inner layer (the via barrel between layers is not split here), a pad whose
-footprint is not on disk or whose shape is not bounded by its ``(size)`` box.
+footprint is not on disk, a trapezoid (its ``rect_delta`` is not read) or a
+custom pad with a primitive the library reader does not read.
 """
 
 from __future__ import annotations
@@ -45,7 +51,7 @@ from dataclasses import dataclass, field
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import CircuitIR, Stackup, Track, Via
-from ai_eda.tools.kicad.geometry import _q, pad_angle, pad_copper_center, pad_layers
+from ai_eda.tools.kicad.geometry import _q, custom_pad_parts, pad_angle, pad_copper_center, pad_layers
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError
 
 #: coordinates are rounded to KiCad's 1 nm; a point this close to a segment or a box edge touches it
@@ -77,6 +83,13 @@ class NetPads:
 
     pads: dict[str, dict[str, list[PadBox]]] = field(default_factory=dict)
     problems: dict[str, list[str]] = field(default_factory=dict)
+
+
+def _copper_of(layers: list[str], pad_type: str, copper: list[str]) -> frozenset[str]:
+    """The copper layers a placed pad is on: every board copper layer for a through-hole / ``*.Cu`` pad, else the ones it lists."""
+    if pad_type == "thru_hole" or "*.Cu" in layers:
+        return frozenset(copper)
+    return frozenset(name for name in layers if name.endswith(".Cu"))
 
 
 def net_pads(ir: CircuitIR, library: KicadLibrary) -> NetPads:
@@ -111,6 +124,18 @@ def net_pads(ir: CircuitIR, library: KicadLibrary) -> NetPads:
             if net is None or pad.pad_type == "np_thru_hole":
                 continue
             label = f"{comp.ref}.{pad.number}"
+            if pad.shape == "custom":
+                try:
+                    parts = custom_pad_parts(placement, pad)
+                except CompileError as e:
+                    out.problems.setdefault(net, []).append(f"pad {label}: {e}")
+                    continue
+                on = _copper_of(pad_layers(placement, pad), pad.pad_type, copper)
+                for part in parts:
+                    if part.inscribed_r > 0.0:  # copper for sure around its centre (module docstring)
+                        (cx, cy), hw, hh = part.center, part.box.width / 2.0, part.box.height / 2.0
+                        out.pads[net].setdefault(label, []).append(PadBox(label, cx, cy, hw, hh, on))
+                continue
             if pad.shape not in CONVEX_PAD_SHAPES:
                 out.problems.setdefault(net, []).append(f"pad {label} has shape {pad.shape!r}, whose copper is not bounded by its (size) box")
                 continue

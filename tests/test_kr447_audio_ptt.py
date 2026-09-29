@@ -18,7 +18,9 @@ does. What is checked:
   carries the five floorplan regions, the rails, the lab items and the model
   keys; two independent builds are the same design, place the same and
   compile to byte-identical schematic, board and netlist files; the router
-  refuses this board (the microphone footprint's custom pad) - so the
+  reads the microphone footprint's custom ring pad but finds no route for
+  any net of the microphone or its 0.4 mm-pitch preamp (pad 2 inside the
+  ring, the DFN pads closer than the fine rules' clearance) - so the
   deliverable is placement only; the Korean theory / figures / part notes
   render with the design's numbers.
 * ``needs_ngspice`` too (ngspice-42 here): the design deck's 27 expectations
@@ -29,8 +31,9 @@ does. What is checked:
   and 20 MB),
   and the whole pipeline runs to RELEASE (routing skipped) with exactly one
   FAIL, the honest one - ``pcb.routing.connectivity``: the placed board has no
-  copper, so its nets of known pads are open (the microphone's custom-pad net
-  is not judged) - and ``rf.deviation`` / ``rf.model_grounding`` /
+  copper, so its nets are open (the microphone's custom ring pad is read as
+  the boxes of its anchor and ring, so its nets are judged too) - and
+  ``rf.deviation`` / ``rf.model_grounding`` /
   ``rf.regulatory_profile`` / ``rf.lab.*`` / ``power.*`` NOT_VERIFIED,
   ``block.interface.*`` PASS, RELEASE FAIL.
 """
@@ -62,6 +65,7 @@ from ai_eda.design.rf.t_audio_ptt import KR447_AUDIO_PTT, REGIONS, TEMPLATE_ID, 
 from ai_eda.ir import CircuitIR, ProjectMeta, ValidationStatus as S
 from ai_eda.tools.calc import recompute_parameters
 from ai_eda.tools.kicad.library import KicadLibrary
+from ai_eda.tools.routing.maze import ROUTER_CUSTOM_PAD_VERSION, RoutingParams, route_board
 from ai_eda.tools.spice import NgspiceShared
 from ai_eda.workflow import Orchestrator, Stage
 
@@ -272,13 +276,22 @@ def test_two_builds_are_one_design_and_compile_byte_identical(registered: None, 
 
 @needs_libs
 def test_the_router_cannot_route_this_board_so_the_deliverable_is_placement_only(registered: None, tmp_path: Path):
-    """A known limit, named: the microphone footprint's pad 1 is a custom-shaped pad the maze router does not model, so it refuses
-    the whole board (placement only, never half the nets) - the real routing is left to KiCad."""
+    """A known limit, named. routing.maze 0.5 reads the microphone footprint's custom pad 1 (a ring, its circle anchor on it) as the
+    boxes of its anchor and its ring, but no net of the microphone or its preamp has a route: MK301.2, the capsule's centre contact, lies
+    inside the ring's box (on the real copper too the closed ring leaves it no way out on F.Cu), and the MAX9814's 0.4 mm-pitch DFN pads
+    are 0.15 mm apart, below the fine rules' 0.2 mm clearance, so each of its terminal cells is inside a neighbour's keep-out. The router
+    is run here on those nets alone (GND left out - a plane net; about 0.2 s): by the all-or-nothing rule the agent's proposal for the
+    whole board (about 45 s of routing) is the placement only, never half the nets - the real routing is left to KiCad."""
     ir = _confirmed(AUDIO, tmp_path)
-    res = PCBAgent().run(ir, AgentContext(workdir=tmp_path, tools={"kicad_library": LIB}))
-    notes = " | ".join(res.notes)
-    assert "not routed: cannot route: pad MK301.1 of footprint Sensor_Audio:CUI_CMC-4013-SMT has shape 'custom'" in notes
-    assert res.proposals and res.proposals[0].payload.tracks == [] and len(res.proposals[0].payload.placements) == 144
+    _placed(ir, tmp_path)
+    mic = {"MK301", "U301"}
+    ir.nets = [n for n in ir.nets if any(p.component_ref in mic for p in n.pins) and n.name != "GND"]
+    r = route_board(ir, LIB, RoutingParams.for_board(ir, LIB), inner_layers=True)
+    assert r.version == ROUTER_CUSTOM_PAD_VERSION and r.tracks == [] and r.stats["routed_nets"] == 0
+    assert set(r.unrouted) == {n.name for n in ir.nets} and len(r.unrouted) == 9
+    assert r.unrouted["MIC_P"].startswith("MK301.2 terminal cell") and "is inside a keep-out on every copper layer" in r.unrouted["MIC_P"]
+    assert all(why.startswith("U301.") and "is inside a keep-out" in why for net, why in r.unrouted.items() if net != "MIC_P")
+    assert [(c["pad"], [p["part"] for p in c["parts"]]) for c in r.stats["custom_pads"]] == [("MK301.1", ["anchor circle", "gr_circle[0]"])]
 
 
 @needs_libs
@@ -397,12 +410,13 @@ def test_the_pipeline_runs_to_release_with_every_deck_expectation_passing_and_no
     state = Orchestrator(AgentContext(workdir=tmp_path, tools={"kicad_library": LIB, "spice": runner}, answers={CONFIRM_DESIGN_KEY: "yes", ROUTING_KEY: "skip"})).run(ir)
     assert not state.blocked and state.outcomes[-1].stage is Stage.RELEASE
     latest = ir.validation.latest_by_check()
-    # routing skipped: the one FAIL is the measured open of the placed board's nets (the microphone's custom-pad net is not judged), as on rx_backend
+    # routing skipped: the one FAIL is the measured open of the placed board's nets (the microphone's custom ring pad is read, so its nets
+    # are judged too), as on rx_backend
     assert [c for c, r in latest.items() if r.status is S.FAIL] == ["pcb.routing.connectivity"]
     conn = latest["pcb.routing.connectivity"]
-    assert any("MK301.1" in u for u in conn.details["unknown"])
+    assert conn.details["unknown"] == [] and conn.details["custom_pads"] == ["MK301.1"]
     rows = {r["net"]: r for r in conn.details["nets"]}
-    assert rows["VBAT"]["status"] == "FAIL" and all(r["status"] == "NOT_VERIFIED" for r in rows.values() if "MK301.1" in r.get("unknown_pads", []))
+    assert rows["VBAT"]["status"] == "FAIL" and rows["MIC_P"]["status"] == "FAIL"
     # the design deck: every expectation PASSes on ngspice (principle verdicts; no IC is simulated), within the run-time budget
     assert state.outcome(Stage.SPICE).status is S.PASS and latest["spice"].tool == "ngspice-shared"
     for eid in EXPECTATIONS:

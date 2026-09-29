@@ -77,7 +77,36 @@ that coupling, because the only load ``calc.rf.pm.tank_phase_loaded`` models
 is a resistance at the tank node - so both tanks are the same designed
 network (between ``model.tcxo.r_out`` / ``model.buf.r_out`` and
 ``model.buf.r_in``, 50 ohm / 10 kohm by default) and their fixtures measure
-exactly what the calculator computes.
+exactly what the calculator computes. The followers' bias parts on the PM
+fixtures' port nets are inside those port models, by statement rather than
+by membership: ``model.buf.r_in`` is the follower's input *with* its base
+divider (``tx.buf<k>.r_b1`` // ``.r_b2`` = 10.3 kohm at the defaults, so
+the 10 kohm model cannot exceed it) and ``model.buf.r_out`` the first
+follower's output *with* its emitter resistor ``tx.buf1.r_e`` (1.5 kohm) -
+the model texts say so, every fixture port's resistance carries its text in
+its provenance, and ``rf.model_grounding`` names them
+(``tests/test_rf_fixture_members.py`` checks both and the two bounds). The
+two tanks' inductors return to the one bypassed bias node ``VAR_B``: each
+fixture holds the feed ``pm.r_feed`` and the bypass ``pm.c_bypass`` there
+but not the other tank's inductor. That inductor runs into the other tank's
+own shunt capacitance, which resonates with it at f_T, so from ``VAR_B`` the
+branch is series-resonant at about 14-15 ohm (not its 142 ohm reactance) and
+the bypass's 0.43 ohm is about 3 % of it; hung on passively (the other
+tank's ports at their port models) it moves each fixture's phases by at
+most 0.032 deg (a linear nodal solve of the joint circuit; ngspice-42 reads
+the same). On the board, though, follower 1 drives tank 2 with tank 1's own
+signal, so the shared bypass carries both tanks' inductor currents: a linear
+estimate at the default choices (the followers as unity-gain sources behind
+``model.buf.r_out``) moves tank 1's phase by +0.70 to +1.04 deg and tank
+2's, against its own drive, by +2.85 deg in every state - centre offsets the
+trimmers align, while the chord (phi_hi - phi_lo) of the two tanks together
+moves by about 0.03 deg of 79.4 deg. So the fixtures' absolute
+``phase21_deg`` rows hold for each tank alone, not joined on the board: the
+lab item ``tx_pm_coupling`` carries the joint circuit
+(``tests/test_rf_fixture_members.py`` checks the branch share, the passive
+bound and the estimate). A bias and bypass node per tank would remove the
+coupling (a design change for a human); a larger ``pm.c_bypass`` would not,
+because its low-pass with ``pm.r_feed`` would move into the voice band.
 
 ``pm_mod1`` / ``pm_mod2``: three states ``bias_lo`` / ``bias_nom`` /
 ``bias_hi`` on the control port at ``PM_BIAS`` (``pm.v_lo`` / ``pm.v_bias``
@@ -109,7 +138,9 @@ between *loaded* ports, and every part on its port nets is a member of its
 fixture: the source is the collector port model ``model.bfr92.r_out``
 (1 kohm) in parallel with the stage's collector choke (its Q at the stage
 frequency, returned to AC ground through the 0 ohm link, the fixture's rail
-port ``tx_5v`` on ``TX_5V``), whose reactance the input tap absorbs
+port ``tx_5v`` on ``TX_5V``; the feed decoupling between link and choke is
+a member too - across the 0 V link it changes nothing in the fixture, but it
+is a part on the network's node), whose reactance the input tap absorbs
 (``calc.rf.resonator.top_c.port_r`` / ``.port_x`` /
 ``.c_tap_reactive``); the load of a tank is the next stage's port model
 ``model.bfr92.r_in`` (500 ohm) in parallel with that stage's base divider
@@ -942,6 +973,14 @@ class TxModBlock(Block):
                           "full deviation, the varactor's real C(V)"),
                     instruments=["modulation analyser", "audio analyser", "C-V meter or VNA"],
                     reason="the varactor is model.varactor (UNVERIFIED); the fixtures judge the tank network, not the part"),
+            LabItem(id="tx_pm_coupling", block=self.id,
+                    what=("the two PM tanks' coupling through their shared bias node VAR_B: follower 1 drives tank 2 with tank 1's own signal, so the "
+                          "shared bypass pm.c_bypass carries both tanks' inductor currents - each tank's phase at f_T with both tanks fitted and driven, "
+                          "and its centre after trimming (a linear estimate at the default choices: tank 1 about +0.7 to +1.0 deg, tank 2 against its "
+                          "own drive about +2.85 deg, the chord slope nearly unchanged)"),
+                    instruments=["VNA", "modulation analyser"],
+                    reason=("each pm_mod fixture judges its tank alone between its port models: the followers are not simulated and a fixture has "
+                            "no controlled source, so its phase21 rows hold for the tank alone, not for the two tanks joined on the board")),
             LabItem(id="tx_deviation", block=self.id, what="peak deviation and modulation response of the transmitter",
                     instruments=["modulation analyser"], reason="rf.deviation multiplies network and principle verdicts under confirmed model values"),
             LabItem(id="tx_obw", block=self.id, what="occupied bandwidth with the prescribed test modulation, adjacent-channel power",
@@ -1113,7 +1152,7 @@ class TxChainBlock(Block):
                     f_hi = b.choice(f"tx.tank{k + 1}.sweep.fstop", round(float(f_k.value) * 1.5 / 1e6) * 1e6, "Hz", f"stop of tx_tank{k + 1}'s sweep (about 1.5 f_{k + 1})")
                     out_net = f"TX_{names[k + 1].upper()}_B"
                     nxt_refs = stage_refs[k + 1]
-                    members = [*top.members, refs["choke"], refs["link"], nxt_refs["r_b1"], nxt_refs["r_b2"]]
+                    members = [*top.members, refs["choke"], refs["link"], refs["c_dec"], nxt_refs["r_b1"], nxt_refs["r_b2"]]
                     b.result.networks.append(RFNetwork(
                         id=net_id, block=self.id, members=members, bindings=top.bindings,
                         loss_q={**{r: q_k[1] for r in top.inductors}, refs["choke"]: q_k[1]}, q_ref_hz=f_k,
@@ -1137,7 +1176,7 @@ class TxChainBlock(Block):
                     bound = {nm: calc(b, f"tx_bpf.bound_{nm}", lambda nm=nm: radio.db_sum(rel[nm], margin, (f"tx_bpf.rel_{nm}", "tx.bpf.margin")))
                              for nm in ("m1", "p1")}
                     b.result.networks.append(RFNetwork(
-                        id="tx_bpf", block=self.id, members=[*top.members, refs["choke"], refs["link"]], bindings=top.bindings,
+                        id="tx_bpf", block=self.id, members=[*top.members, refs["choke"], refs["link"], refs["c_dec"]], bindings=top.bindings,
                         loss_q={**{r: q_u[1] for r in top.inductors}, refs["choke"]: q_u[1]}, q_ref_hz=f_c,
                         ports=[fixture_port("coll", collector, r_out[1], "in"), fixture_port("pad", "TX_RAW", tp.z_mid[1], "out"), rail_port],
                         sweep=[ac_sweep(b, "tx_bpf_sweep", lin, pts, bpf_lo, bpf_hi, "TX output band-pass: 150-1000 MHz")],

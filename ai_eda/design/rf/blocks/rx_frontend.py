@@ -31,7 +31,13 @@ every part of its block (``placement.rf_floorplan``):
   series ``L50`` - ``C50`` resonant at IF1 to the post-amp; ``C51`` + the
   absorptive ``R50`` to ground for the LO / RF / sum products) -> the BFR92
   IF1 post-amplifier ``Q50`` (bias as the LNA's, choke ``L51``, link
-  ``R54``, output DC block ``C54``) -> ``IF1``.
+  ``R54``, output DC block ``C54``) -> ``IF1``. The diplexer's fixture
+  loads it with the post-amp's base as the board does: the port model
+  ``model.ifamp.port_r`` (the transistor's own input) beside the base
+  divider ``R51`` / ``R52`` (members; the divider costs the IF1 row about
+  0.16 dB: -0.462 dB against -0.299 dB without it, bound -1 dB). The
+  post-amp's output into ``IF1`` is not matched: the IF1 port declares the
+  system impedance, which only the lab item ``ifamp_output`` can confirm.
 
 Interface nets (never prefixed): ``RX_RF`` (the 50 ohm RF input: the stage
 board's U.FL, the transceiver's T/R switch), ``MIX_RF`` (between the two
@@ -40,19 +46,41 @@ back-end's input, the name part P10 uses), ``RX_5V`` and ``GND``.
 
 The filters are Butterworth top-C coupled-resonator networks designed by
 ``calc.rf.resonator.top_c.*`` (Dishal / Zverev: capacitive end taps, top
-coupling capacitors, shunt capacitors) between their own port resistances -
-the system impedance at ``RX_RF``, ``model.lna.port_r`` at the LNA,
-``model.adex10.port_r`` at the mixer - with every inductor carrying the
-series loss w0 L / Q_u of ``model.l_q.uhf``. Every fixture row's nominal is
-the exact network response (``.s21_db`` / ``.rel_s21_db``, tol_abs
+coupling capacitors, shunt capacitors) between their *loaded* ports, and
+every part the board hangs on their port nets is a member of their fixture
+(the kr447 fixture-membership pass, part A1; ``tests/test_rf_fixture_members.py``
+audits it on every build):
+
+* ``fe_bpf2`` runs from the system impedance at ``RX_RF`` into the LNA's base:
+  the port model ``model.lna.port_r`` (the transistor's own input) in
+  parallel with the base divider ``R1`` / ``R2`` (``fe.lna.r_div``, members,
+  ``R1`` returned to ``RX_5V`` - the fixture's rail port, an ac short). The
+  network is designed for ``fe_bpf2.r_load_eff`` = port // divider, and its
+  s21 row reads the power reaching the port model: the network's own S21
+  into r_load_eff (``fe_bpf2.s21_net``) plus the share
+  ``fe_bpf2.load_share_db`` = 10 log10(R_div / (R_port + R_div))
+  (``calc.divider.ratio``, ``calc.rf.power_ratio_to_db``; -0.1615 dB at the
+  default choices), ``calc.rf.db_sum``;
+* ``fe_bpf3`` runs from the LNA's collector port - ``model.lna.port_r`` in
+  parallel with the collector feed choke ``L3`` (its Q ``model.l_q.uhf``,
+  returned to ``RX_5V`` through the 0 ohm link ``R4``; ``R4`` and the feed
+  decoupling ``C7`` are members too) whose reactance the input tap absorbs
+  (``calc.rf.resonator.top_c.port_r`` / ``.port_x`` / ``.c_tap_reactive``,
+  the rows ``.ported_s21_db`` / ``.ported_rel_s21_db``) - into
+  ``model.adex10.port_r`` at the mixer.
+
+Every inductor carries the series loss w0 L / Q_u of ``model.l_q.uhf``.
+Every fixture row's nominal is the exact network response (tol_abs
 ``fe.net_tol``): at these offsets a top-C network is asymmetric, and the
 symmetric narrowband formulas would FAIL a correct network (kr447 design
 §2.7). At the default choices (4.7 nH, 40 / 20 MHz, Q_u 40, 50 ohm) the
-calculators give ``fe_bpf2`` -3.37 dB at f_c and 13.56 dB image rejection,
-``fe_bpf3`` -9.30 dB, 33.57 dB image and 15.42 dB LO1 rejection - the
-numbers of the design's Q-40 decks. The design's one-sided bounds for these
-rows (at_least -4 / -10 dB, image at_most -12.5 / -32.5 dB) are what the
-same model gives less 1 dB; the exact nominal +/- 1 dB judges the same
+calculators give ``fe_bpf2`` -3.529 dB at f_c and 13.565 dB image
+rejection, ``fe_bpf3`` -9.322 dB, 33.597 dB image and 15.426 dB LO1
+rejection (ngspice-42 reads the same to 1e-4 dB; before the divider and the
+choke were members the fixtures gave -3.367 / -9.303 dB for a network the
+board does not have). The design's one-sided bounds for these rows
+(at_least -4 / -10 dB, image at_most -12.5 / -32.5 dB) are what the same
+model gives less about 1 dB; the exact nominal +/- 1 dB judges the same
 network and also catches a netlist that realises another one.
 
 Every filter part is a fixture member only: the design deck leaves it out
@@ -94,9 +122,9 @@ from dataclasses import dataclass, field
 from ai_eda.ir import AnalysisSpec, Expectation, NetKind, Reduce, SpiceBinding, SpiceDevice, Traced
 from ai_eda.ir.rf import LabItem, PlanLine, RFExpectation, RFNetwork, RFPort, RFProbe
 from ai_eda.tools.calc import radio
-from ai_eda.tools.calc.basic import voltage_divider_output
+from ai_eda.tools.calc.basic import parallel_resistance, voltage_divider_output, voltage_divider_ratio
 from ai_eda.tools.calc.part_value import format_part_value
-from ai_eda.tools.calc.rf import friis_nf, lc_c_for_resonance, sensitivity
+from ai_eda.tools.calc.rf import friis_nf, lc_c_for_resonance, power_ratio_to_db, sensitivity
 from ai_eda.tools.spice import SpiceAnalysis
 
 from ai_eda.design.inputs import canonical_key
@@ -130,12 +158,15 @@ BIAS_NOTE = "operating point: the RF transistors' bias (I_C through the 0 ohm li
 
 #: the model values of this module (port resistances of excluded parts, noise / gain numbers of the budget)
 LNA_PORT = ModelValue("model.lna.port_r", 50.0, "ohm",
-                      "input and output resistance the BFR92 LNA presents to the front-end filters (its match is not designed: no S-parameters exist here)",
+                      ("the BFR92 LNA transistor's own input resistance at its base and output resistance at its collector, as the front-end filters see "
+                       "them (its match is not designed: no S-parameters exist here); the base divider and the collector feed choke are not inside it - "
+                       "they are fixture members beside the port"),
                       "NXP BFR92AW S-parameters and a VNA measurement of the built LNA")
 ADEX_PORT = ModelValue("model.adex10.port_r", 50.0, "ohm", "RF / LO / IF port resistance of the ADEX-10 mixer (excluded from every netlist)",
                        "Mini-Circuits ADEX-10 datasheet")
 IFAMP_PORT = ModelValue("model.ifamp.port_r", 50.0, "ohm",
-                        "input resistance of the BFR92 IF1 post-amplifier (the diplexer's load; its match is not designed: no S-parameters exist here)",
+                        ("the BFR92 IF1 post-amplifier transistor's own input resistance at its base (the diplexer's load; its match is not designed: no "
+                         "S-parameters exist here); the base divider is not inside it - it is a fixture member beside the port"),
                         "NXP BFR92AW S-parameters and a VNA measurement of the built post-amplifier")
 LNA_NF = ModelValue("model.lna.nf", 2.0, "dB", "noise figure of the BFR92 LNA (sensitivity budget only)", "NXP BFR92AW datasheet and an NF-meter measurement")
 LNA_GAIN = ModelValue("model.lna.gain", 15.0, "dB", "gain of the BFR92 LNA (sensitivity budget only)", "NXP BFR92AW S-parameters and a VNA measurement")
@@ -611,31 +642,43 @@ class RxFrontendBlock(Block):
             tol = b.choice("fe.net_tol", 1.0, "dB", "tolerance of every exact-network fixture row of the front end (the netlist realises the designed network)")
             image = b.computed("fe.image", radio.superhet_image(p.f_c[1], p.lo1[1], (p.f_c[0], p.lo1[0])))
             half_if = b.computed("fe.half_if", radio.superhet_half_if(p.f_c[1], p.lo1[1], (p.f_c[0], p.lo1[0])))
-            # ---- fe_bpf2: 2-pole, 40 MHz
+            # ---- the LNA's bias values first: its base divider loads fe_bpf2 and its collector choke feeds fe_bpf3 (both are fixture members)
+            common = common_bias(b, "fe")
+            lna_vals = bias_values(b, "fe", "lna", "LNA Q1", r_b1=3300.0, r_b2=2200.0, r_e=220.0, c_e=100e-12, l_choke=100e-9,
+                                   choke_note=("about 280 ohm at 447 MHz, 5.6 times the LNA's 50 ohm port model: it shunts the collector port, so it is a member "
+                                               "of fe_bpf3's fixture and fe_bpf3's input tap absorbs its reactance"),
+                                   common=common, rail_key=rail_key, rail=rail)
+            lna_div = b.computed("fe.lna.r_div", parallel_resistance(lna_vals.r_b1[1], lna_vals.r_b2[1], (lna_vals.r_b1[0], lna_vals.r_b2[0])))
+            r_eff2 = ("fe_bpf2.r_load_eff", b.computed("fe_bpf2.r_load_eff", parallel_resistance(lna_port[1], lna_div, (lna_port[0], "fe.lna.r_div"))))
+            # the power share of fe_bpf2's load that reaches the transistor (the port model) rather than its divider: r_load_eff / R_port = R_div / (R_port + R_div)
+            share2 = b.computed("fe_bpf2.load_share", voltage_divider_ratio(lna_port[1], lna_div, (lna_port[0], "fe.lna.r_div")))
+            share2_db = b.computed("fe_bpf2.load_share_db", power_ratio_to_db(share2, ("fe_bpf2.load_share",)))
+            # ---- fe_bpf2: 2-pole, 40 MHz, into the LNA's base with its divider
             n2 = ("fe.bpf2.n", b.choice("fe.bpf2.n", 2.0, None, "fe_bpf2: resonators of the band-pass before the LNA (2: little loss before the LNA)"))
             bw2 = ("fe.bpf2.bw", b.choice("fe.bpf2.bw", 40e6, "Hz", "fe_bpf2: bandwidth (Butterworth; wide for low loss before the LNA)"))
             l2 = ("fe.bpf2.l", b.choice("fe.bpf2.l", 4.7e-9, "H", "fe_bpf2: resonator inductance (0604HQ; the taps must transform down: R_p = Q_e w0 L above the ports)"))
-            bpf2 = build_top_c(b, "fe_bpf2", what="fe_bpf2 (2-pole band-pass before the LNA)", n=n2, f0=p.f_c, bw=bw2, l=l2, r_source=p.z0, r_load=lna_port, idx=idx,
+            bpf2 = build_top_c(b, "fe_bpf2", what="fe_bpf2 (2-pole band-pass before the LNA)", n=n2, f0=p.f_c, bw=bw2, l=l2, r_source=p.z0, r_load=r_eff2, idx=idx,
                                cap_refs=["C1", "C2", "C3", "C4", "C5"], ind_refs=["L1", "L2"], nodes=["FE2_R1", "FE2_R2"], ind_part="ind_0604hq", netbook=nb)
             # ---- the LNA
-            common = common_bias(b, "fe")
-            lna_vals = bias_values(b, "fe", "lna", "LNA Q1", r_b1=3300.0, r_b2=2200.0, r_e=220.0, c_e=100e-12, l_choke=100e-9,
-                                   choke_note="about 280 ohm at 447 MHz, 5.6 times the LNA's 50 ohm port model", common=common, rail_key=rail_key, rail=rail)
             bias_analysis(b)
             lna = bias_stage(b, lna_vals, q_ref="Q1", refs={"r_b1": "R1", "r_b2": "R2", "r_e": "R3", "c_e": "C6", "link": "R4", "c_dec": "C7", "choke": "L3"},
                              nets={"emitter": "LNA_E", "feed": "LNA_VC"}, what="LNA Q1 (BFR92, class A)", exp_id="ic_lna", npn_text=npn_text,
                              netbook=nb, serves=[*serves_fc, *serves_sens], part_choke="ind_0603")
-            # ---- fe_bpf3: 3-pole, 20 MHz
+            # ---- fe_bpf3: 3-pole, 20 MHz, from the LNA's collector port with its feed choke
             n3 = ("fe.bpf3.n", b.choice("fe.bpf3.n", 3.0, None, "fe_bpf3: resonators of the band-pass after the LNA (image and LO1 rejection)"))
             bw3 = ("fe.bpf3.bw", b.choice("fe.bpf3.bw", 20e6, "Hz", "fe_bpf3: bandwidth (Butterworth; the discrete proposal's 437.8-457.9 MHz)"))
             l3 = ("fe.bpf3.l", b.choice("fe.bpf3.l", 4.7e-9, "H", "fe_bpf3: resonator inductance (0604HQ)"))
+            port3 = PortLoad(l_port=lna_vals.l_choke, q_port=q_uhf, r_load_eff=adex_port)
             bpf3 = build_top_c(b, "fe_bpf3", what="fe_bpf3 (3-pole band-pass after the LNA)", n=n3, f0=p.f_c, bw=bw3, l=l3, r_source=lna_port, r_load=adex_port, idx=idx,
                                cap_refs=["C8", "C9", "C10", "C11", "C12", "C13", "C14"], ind_refs=["L4", "L5", "L6"], nodes=["FE3_R1", "FE3_R2", "FE3_R3"],
-                               ind_part="ind_0604hq", netbook=nb)
+                               ind_part="ind_0604hq", netbook=nb, port=port3)
             # ---- fixture nominals (the exact networks) and the Cohn losses the budget uses
             nom: dict[str, Traced] = {}
+            # fe_bpf2's own S21 is into r_load_eff; the fixture reads it into the port model (the transistor), so its row adds the load share
+            s21_net2 = b.computed("fe_bpf2.s21_net", bpf2.s21(q_uhf[1], q_uhf[0], p.f_c[1], p.f_c[0]))
+            nom["fe_bpf2.s21"] = b.computed("fe_bpf2.s21", radio.db_sum(s21_net2, share2_db, ("fe_bpf2.s21_net", "fe_bpf2.load_share_db")))
+            nom["fe_bpf3.s21"] = b.computed("fe_bpf3.s21", bpf3.s21(q_uhf[1], q_uhf[0], p.f_c[1], p.f_c[0]))
             for top, name in ((bpf2, "fe_bpf2"), (bpf3, "fe_bpf3")):
-                nom[f"{name}.s21"] = b.computed(f"{name}.s21", top.s21(q_uhf[1], q_uhf[0], p.f_c[1], p.f_c[0]))
                 nom[f"{name}.rel_image"] = b.computed(f"{name}.rel_image", top.rel(q_uhf[1], q_uhf[0], image, "fe.image", p.f_c[1], p.f_c[0]))
                 n_t, bw_t = (n2, bw2) if name == "fe_bpf2" else (n3, bw3)
                 b.computed(f"{name}.loss", radio.bpf_dissipation_loss(n_t[1], p.f_c[1], bw_t[1], q_uhf[1], (n_t[0], p.f_c[0], bw_t[0], q_uhf[0])))
@@ -660,8 +703,12 @@ class RxFrontendBlock(Block):
         # ---- fixtures
         # the LO-spur responses are probes (recorded, no verdict) when the LO chain, built first, shared them
         spur_probes = [(pid, ctx.shared[f"lo.{pid}"]) for pid in LO_SPUR_RESPONSES if f"lo.{pid}" in ctx.shared]
-        for top, a, net_a, z_a, c, net_c, z_c in ((bpf2, "rx_rf", "RX_RF", p.z0, "lna_in", "LNA_IN", lna_port),
-                                                  (bpf3, "lna_out", "LNA_OUT", lna_port, "mix_rf", "MIX_RF", adex_port)):
+        # every part on the filters' port nets is a member: fe_bpf2 holds the LNA's base divider R1 / R2 (to RX_5V and GND), fe_bpf3 the LNA's
+        # collector choke L3 with its 0 ohm link R4 and feed decoupling C7 (the link returns the choke to RX_5V: the fixture's rail port, an ac short)
+        rail_port = RFPort(name="rx_5v", net=RAIL_NET, kind="rail", voltage_v=rail, direction="in")
+        for top, a, net_a, z_a, c, net_c, z_c, extra, extra_q in (
+                (bpf2, "rx_rf", "RX_RF", p.z0, "lna_in", "LNA_IN", lna_port, ["R1", "R2"], {}),
+                (bpf3, "lna_out", "LNA_OUT", lna_port, "mix_rf", "MIX_RF", adex_port, ["L3", "R4", "C7"], {"L3": q_uhf[1]})):
             name = top.network
             exps = [row("s21_fc", "s21_db", a, c, p.f_c[1], nom[f"{name}.s21"], tol=tol),
                     row("rel_image", "rel_s21_db", a, c, image, nom[f"{name}.rel_image"], tol=tol, ref_at=p.f_c[1])]
@@ -669,8 +716,9 @@ class RxFrontendBlock(Block):
                 exps.append(row("rel_lo1", "rel_s21_db", a, c, p.lo1[1], nom["fe_bpf3.rel_lo1"], tol=tol, ref_at=p.f_c[1]))
             prb = [probe("half_if", a, c, half_if, p.f_c[1]), *[probe(pid, a, c, f, p.f_c[1]) for pid, f in spur_probes]]
             b.result.networks.append(RFNetwork(
-                id=name, block=self.id, members=top.members, bindings=top.bindings, loss_q={r: q_uhf[1] for r in top.inductors}, q_ref_hz=p.f_c[1],
-                ports=[fixture_port(a, net_a, z_a[1], "in"), fixture_port(c, net_c, z_c[1], "out")], sweep=[sweep], expectations=exps, probes=prb,
+                id=name, block=self.id, members=[*top.members, *extra], bindings=top.bindings, loss_q={**{r: q_uhf[1] for r in top.inductors}, **extra_q},
+                q_ref_hz=p.f_c[1], ports=[fixture_port(a, net_a, z_a[1], "in"), fixture_port(c, net_c, z_c[1], "out"), rail_port], sweep=[sweep],
+                expectations=exps, probes=prb,
             ))
         # ---- block ports, chain, plan, lab
         b.result.ports = [
@@ -792,10 +840,12 @@ class RxMixerBlock(Block):
         nb.add("IF1", NetKind.RF, [("C54", co.pin("2"))], "IF1 output (21.4 MHz, 50 ohm) to the IF back-end", serves=serves_z0)
         nb.add(GROUND_NET, NetKind.GROUND, [*u.at("GND"), ("R50", dr.pin("2"))])
         nb.declare(b)
-        # ---- the diplexer fixture
+        # ---- the diplexer fixture: its load is the post-amp's base with the base divider R51 / R52 beside it (members; R51 returns to RX_5V,
+        # the fixture's rail port - an ac short), so the rows see the divider the board hangs on IFA2_B
         b.result.networks.append(RFNetwork(
-            id="diplexer", block=self.id, members=["L50", "C50", "C51", "R50"], bindings=dip_bind, loss_q={"L50": q_if[1]}, q_ref_hz=p.if1[1],
-            ports=[fixture_port("mix_if", "MIX_IF", adex_port[1], "in"), fixture_port("ifa_in", "IFA2_B", ifamp_port[1], "out")], sweep=[dsweep],
+            id="diplexer", block=self.id, members=["L50", "C50", "C51", "R50", "R51", "R52"], bindings=dip_bind, loss_q={"L50": q_if[1]}, q_ref_hz=p.if1[1],
+            ports=[fixture_port("mix_if", "MIX_IF", adex_port[1], "in"), fixture_port("ifa_in", "IFA2_B", ifamp_port[1], "out"),
+                   RFPort(name="rx_5v", net=RAIL_NET, kind="rail", voltage_v=rail, direction="in")], sweep=[dsweep],
             expectations=[
                 row("s21_if1", "s21_db", "mix_if", "ifa_in", p.if1[1], s21_min, bound="at_least"),
                 row("s11_lo1", "s11_db", "mix_if", "mix_if", p.lo1[1], s11_max, bound="at_most"),
@@ -823,6 +873,13 @@ class RxMixerBlock(Block):
                     reason="the noise figures, gains and the conversion loss are UNVERIFIED model values; only a measurement says what the receiver hears"),
             LabItem(id="lo_radiation", block=self.id, what="LO1 leakage out of the RF input (the receiver's spurious emission at LO1)",
                     instruments=["spectrum analyser"], reason="LO-to-RF isolation of the mixer and the LNA's reverse isolation are not modelled [UNVERIFIED]"),
+            LabItem(id="ifamp_output", block=self.id,
+                    what=("the IF1 post-amplifier's output impedance at IF1 against the system impedance it drives (the bench cable, or the transceiver's "
+                          "IF1 filter input match): the IF1 port declares the system impedance, but the BFR92 collector with its feed choke is not matched "
+                          "to it"),
+                    instruments=["VNA"],
+                    reason=("no output match is designed and no S-parameters of the BFR92 exist here: the IF1 filter's fixture drives its input from the "
+                            "declared system impedance, which the post-amp is only assumed to present [UNVERIFIED]")),
         ]
         return b.done()
 

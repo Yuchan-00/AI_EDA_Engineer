@@ -43,6 +43,19 @@ The block (:class:`PaBlock`, ``pa``, local references re-based to 9xx):
   only for a layout with a via to the plane at each shunt pad (at 447 MHz,
   1 mm of track to ground is about 1 nH; ``routing.maze`` 0.4 gives each GND
   pad of the RF blocks its plane via).
+* The cascade ``pa_lpf`` (:func:`pa_lpf_network`, with the LPF only): the
+  board joins the match's DC block ``C9`` and the low-pass's first shunt
+  capacitor on ``LPF_IN`` with no resistive node between them, and each of
+  the two fixtures assumed the system impedance there. This one holds both
+  networks' parts from the load line to the output (:func:`cascade_network`)
+  and bounds what the chain must give from the two networks' own bounds:
+  s21 at f_c at least ``pa.match.s21_min`` + ``lpf.s21_min``
+  (``pa_lpf.s21_min``, ``calc.rf.db_sum``: -2 dB; ngspice-42 reads
+  -1.231 dB against the two fixtures' -0.146 + -1.045 dB), s11 at the load
+  line at most ``pa.match.s11_max`` (-15 dB; ngspice-42 reads -17.76 dB:
+  the low-pass's own s11 now sits behind the match), s21 at 2 f_c / 3 f_c
+  at most ``lpf.h2_max`` / ``lpf.h3_max`` (-45 / -60 dB; ngspice-42 reads
+  -61.90 / -93.79 dB).
 * ``J1`` U.FL - the **conducted** output into an attenuator or a dummy load
   (``TX_OUT``, the system impedance). This board never gets an antenna.
   ``U1`` and ``J1`` serve the confirmed ``radio_build`` (the transmitter's
@@ -66,8 +79,9 @@ match and LPF parts are fixture members only.
 
 from __future__ import annotations
 
-from ai_eda.ir import NetKind, SpiceBinding, Traced
-from ai_eda.ir.rf import LabItem, RFNetwork, RFPort
+from ai_eda.ir import AnalysisSpec, NetKind, SpiceBinding, Traced
+from ai_eda.ir.provenance import design_data
+from ai_eda.ir.rf import LabItem, RFExpectation, RFNetwork, RFPort, RFState
 from ai_eda.tools.calc import radio
 from ai_eda.tools.calc.rf import chebyshev_g, lmatch_lowpass_c_shunt, lmatch_lowpass_l_series, lpf_series_l, lpf_shunt_c
 
@@ -95,8 +109,8 @@ from ai_eda.design.rf.profile import PROFILE_BY_KEY
 
 #: block id and interface nets
 PA_ID = "pa"
-#: the network ids this block declares (``lpf`` only with the LPF)
-PA_NETWORKS: tuple[str, ...] = ("pa_match", "lpf")
+#: the network ids this block declares (``lpf`` and the cascade ``pa_lpf`` only with the LPF)
+PA_NETWORKS: tuple[str, ...] = ("pa_match", "lpf", "pa_lpf")
 #: the PA's supply draw in the design deck (the PA has no model): powered up, powered down, and the POWER_DOWN level between them
 PA_SUPPLY = ModelValue("model.pa.r_supply", 25.0, "ohm",
                        "the PA's supply draw from VCC1 while powered up, simulated as a resistor in the design deck (about 200 mA at 5 V: 0.5 W out at "
@@ -185,6 +199,75 @@ def add_harmonic_lpf(b: BlockBuilder, nb: NetBook, *, block_id: str, in_net: str
                       row("s21_2fc", "s21_db", "lpf_in", "lpf_out", f2, h2_max, bound="at_most"),
                       row("s21_3fc", "s21_db", "lpf_in", "lpf_out", f3, h3_max, bound="at_most")],
     )
+
+
+def cascade_network(network_id: str, parts: list[RFNetwork], *, block: str | None, ports: list[RFPort], sweep: AnalysisSpec,
+                    expectations: list[RFExpectation], states: list[RFState] | None = None) -> RFNetwork:
+    """One fixture over networks the board joins with no resistive node between them: the union of their members, fixture bindings and
+    inductor losses between the chain's outer ports.
+
+    Each component network's own fixture ran between its port models, so at
+    the net two of them share each one assumed the other's port model there -
+    the system impedance - which the other network presents only near its
+    design frequency. Here the junctions are inside the fixture: every part
+    keeps the binding and the loss its component network gave it, and the
+    ports are the chain's own ends (the same port models the component
+    networks put there). A member bound differently by two component
+    networks, or two different loss reference frequencies, is refused.
+    """
+    members: list[str] = []
+    bindings: dict[str, SpiceBinding] = {}
+    loss_q: dict[str, Traced] = {}
+    q_ref: Traced | None = None
+    for nw in parts:
+        members += [m for m in nw.members if m not in members]
+        for label, have, new in (("binding", bindings, nw.bindings), ("loss Q", loss_q, nw.loss_q)):
+            for ref, value in new.items():
+                if ref in have and design_data(have[ref]) != design_data(value):  # the design view: a provenance's wall-clock is no difference
+                    raise TemplateRefusal(f"cascade {network_id}: {ref} has two different {label}s in its component networks")
+                have[ref] = value
+        if nw.q_ref_hz is not None:
+            if q_ref is not None and float(q_ref.value) != float(nw.q_ref_hz.value):
+                raise TemplateRefusal(f"cascade {network_id}: its component networks take their inductor losses at different frequencies")
+            q_ref = nw.q_ref_hz
+    return RFNetwork(id=network_id, block=block, members=members, bindings=bindings, loss_q=loss_q, q_ref_hz=q_ref if loss_q else None, ports=ports,
+                     states=list(states or []), sweep=[sweep], expectations=expectations)
+
+
+def db_budget(b: BlockBuilder, key: str, terms: list[tuple[str, Traced]]) -> Traced:
+    """The sum of dB terms (``calc.rf.db_sum`` pairwise, intermediate sums as ``<key>.<i>``), the last sum as ``key``."""
+    if len(terms) < 2:
+        raise TemplateRefusal(f"{key}: a budget needs at least two terms")
+    acc_key, acc = terms[0]
+    for i, (k, t) in enumerate(terms[1:], start=1):
+        out_key = key if i == len(terms) - 1 else f"{key}.{i}"
+        acc = calc(b, out_key, lambda acc=acc, acc_key=acc_key, t=t, k=k: radio.db_sum(acc, t, (acc_key, k)))
+        acc_key = out_key
+    return acc
+
+
+def pa_lpf_network(b: BlockBuilder, pa_match: RFNetwork, lpf: RFNetwork, *, block_id: str, f_c: tuple[str, Traced], m_s21: Traced, m_s11: Traced) -> RFNetwork:
+    """``pa_lpf``: the load-line match and the harmonic low-pass as the board joins them at ``LPF_IN`` (the match's DC block into the low-pass's
+    first shunt capacitor), from the PA's load line to the conducted output.
+
+    Rows (one-sided, from the two networks' own bounds): s21 at f_c at least
+    ``pa.match.s21_min`` + ``lpf.s21_min`` (``pa_lpf.s21_min``), s11 at the
+    load line at most ``pa.match.s11_max`` (the PA sees its load line through
+    the whole chain), s21 at 2 f_c / 3 f_c at most ``lpf.h2_max`` /
+    ``lpf.h3_max``.
+    """
+    p = {**b.ctx.shared, **b.result.params}  # the low-pass's rows are this block's own (or a composing block's, when it shared them)
+    s21_min = db_budget(b, "pa_lpf.s21_min", [("pa.match.s21_min", m_s21), ("lpf.s21_min", p["lpf.s21_min"])])
+    pa_out = next(x for x in pa_match.ports if x.name == "pa_out")
+    rails = [x for x in pa_match.ports if x.kind == "rail"]
+    out = next(x for x in lpf.ports if x.name == "lpf_out")
+    sweep = lpf.sweep[0].model_copy(update={"id": "pa_lpf_sweep"})
+    return cascade_network("pa_lpf", [pa_match, lpf], block=block_id, ports=[pa_out, out, *rails], sweep=sweep, expectations=[
+        row("s21_fc", "s21_db", "pa_out", "lpf_out", f_c[1], s21_min, bound="at_least"),
+        row("s11_fc", "s11_db", "pa_out", "pa_out", f_c[1], m_s11, bound="at_most"),
+        row("s21_2fc", "s21_db", "pa_out", "lpf_out", p["lpf.f_2"], p["lpf.h2_max"], bound="at_most"),
+        row("s21_3fc", "s21_db", "pa_out", "lpf_out", p["lpf.f_3"], p["lpf.h3_max"], bound="at_most"),
+    ])
 
 
 class PaBlock(Block):
@@ -313,7 +396,7 @@ class PaBlock(Block):
         dc_out = "LPF_IN" if self.with_lpf else self.out_net
         nb.add(dc_out, NetKind.RF, [pin(c9, "2")], "after the output DC block")
         nb.add(GROUND_NET, NetKind.GROUND, [*u.at("GND"), *(pin(x, "2") for x in (c1, c2, c3, c4, c5, c6, c8))])
-        b.result.networks.append(RFNetwork(
+        pa_match = RFNetwork(
             id="pa_match", block=self.id, members=["L1", "L2", "C8", "C9"], bindings={"L1": l1_bind, "L2": l2_bind, "C8": c8_bind, "C9": c9_bind},
             loss_q={"L1": q_u[1], "L2": q_u[1]}, q_ref_hz=f_c[1],
             ports=[fixture_port("pa_out", "PA_OUT", r_l[1], "in"), fixture_port("match_out", dc_out, z0[1], "out"),
@@ -321,11 +404,14 @@ class PaBlock(Block):
             sweep=[ac_sweep(b, "pa_match_sweep", lin, pts, f_lo, f_hi, "pa_match: 300-600 MHz")],
             expectations=[row("s21_fc", "s21_db", "pa_out", "match_out", f_c[1], m_s21, bound="at_least"),
                           row("s11_fc", "s11_db", "pa_out", "pa_out", f_c[1], m_s11, bound="at_most")],
-        ))
+        )
+        b.result.networks.append(pa_match)
         chain = ["C7", "U1", "L1", "L2", "C8", "C9"]
         if self.with_lpf:
-            b.result.networks.append(add_harmonic_lpf(b, nb, block_id=self.id, in_net="LPF_IN", out_net=self.out_net, cap_refs=("C10", "C11", "C12", "C13"),
-                                                      ind_refs=("L3", "L4", "L5"), nodes=("LPF_N1", "LPF_N2"), f_c=f_c, z0=z0))
+            lpf = add_harmonic_lpf(b, nb, block_id=self.id, in_net="LPF_IN", out_net=self.out_net, cap_refs=("C10", "C11", "C12", "C13"),
+                                   ind_refs=("L3", "L4", "L5"), nodes=("LPF_N1", "LPF_N2"), f_c=f_c, z0=z0)
+            b.result.networks.append(lpf)
+            b.result.networks.append(pa_lpf_network(b, pa_match, lpf, block_id=self.id, f_c=f_c, m_s21=m_s21, m_s11=m_s11))
             chain += ["C10", "L3", "C11", "L4", "C12", "L5", "C13"]
         if self.with_output:
             j = b.part("coax_ufl", "J1", "U.FL", "conducted RF output (U.FL into an attenuator or a dummy load; never an antenna)", [*serves_build, *serves_z, *serves_p])
@@ -361,6 +447,9 @@ class PaBlock(Block):
 
 __all__ = [
     "PA_ID",
+    "cascade_network",
+    "db_budget",
+    "pa_lpf_network",
     "PA_NETWORKS",
     "PA_PD_THRESHOLD",
     "PA_SUPPLY",

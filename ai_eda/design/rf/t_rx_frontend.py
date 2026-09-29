@@ -56,13 +56,13 @@ grounded, ``rf.regulatory_profile`` never PASSes), every block choice and
 NOT_VERIFIED), the floorplan regions (``floor.<block>.x`` / ``.y`` / ``.w`` /
 ``.h`` mm, choices; ``placement.rf_floorplan`` packs each block into its
 region, the cans first, and the outline is their bounding box), the RF
-design ``ir.rf`` (blocks with their interface ports, eight fixture networks,
+design ``ir.rf`` (blocks with their interface ports, seven fixture networks,
 the frequency plan, lab items) and the signal-integrity classes
 (:meth:`si_declarations`).
 
 Expected statuses on this machine (ngspice-42, the packed KiCad 10.0.6
 libraries, no kicad-cli; measured by ``tests/test_kr447_rx_frontend.py``):
-every ``spice.rf.*`` row of the eight networks PASS as "a network verdict
+every ``spice.rf.*`` row of the seven networks PASS as "a network verdict
 under confirmed model values (not a measured part)"; ``spice.ic_*`` (the
 five bias points) PASS under ``model.npn``; ``rf.freq_plan`` NOT_VERIFIED
 (its margin rows PASS; its response rows - image, half-IF, the four LO-spur
@@ -524,6 +524,13 @@ class KR447RxFrontendTemplate(Template):
                 "    C_k = k_ij (BW/f0) C_res,  k_ij = 1/sqrt(g_i g_j),  C_i = C_res − 인접 결합 − 탭의 병렬 등가\n\n"
                 f"포트: RX_RF {quantity(z0, 'ohm')}, LNA {quantity(lna_r, 'ohm')} (model.lna.port_r), 혼합기 {quantity(adex_r, 'ohm')} (model.adex10.port_r), PHA-1 {quantity(pha_r, 'ohm')}; "
                 f"인덕터 손실은 직렬 R = ω0 L / Q_u, Q_u = {number(q_uhf, 3)} (model.l_q.uhf).\n\n"
+                "포트 네트에 보드가 매다는 부품은 모두 픽스처의 구성원입니다. fe_bpf2 의 부하는 LNA 트랜지스터의 포트 모델과 베이스 분압기(R601 / R602)의 병렬 "
+                f"r_load_eff = {quantity(p('fe_bpf2.r_load_eff'), 'ohm')} (`calc.parallel.R`)로 설계하고, 행은 포트 모델(트랜지스터)에 닿는 전력을 읽으므로 회로망 자체의 "
+                f"S21 {number(p('fe_bpf2.s21_net'), 4)} dB 에 분압기 몫 10 log10(R_div / (R_port + R_div)) = {number(p('fe_bpf2.load_share_db'), 4)} dB 를 더합니다"
+                "(`calc.divider.ratio`, `calc.rf.power_ratio_to_db`, `calc.rf.db_sum`). fe_bpf3 의 원천은 LNA 컬렉터의 포트 모델과 급전 초크 L603 의 병렬이며"
+                "(초크는 0 Ω 링크 R604 와 디커플링 C607 을 거쳐 RX_5V 로 돌아가고, 셋 다 구성원), 입력 탭이 초크의 리액턴스를 흡수합니다: "
+                f"R' + jX' = {quantity(p('fe_bpf3.port_r'), 'ohm')} + j{quantity(p('fe_bpf3.port_x'), 'ohm')} "
+                "(`calc.rf.resonator.top_c.port_r` / `.port_x` / `.c_tap_reactive`, 공칭값 `.ported_s21_db` / `.ported_rel_s21_db`).\n\n"
                 "| 회로망 | 공진기 | BW | L | 탭(입력/출력) | 결합 C | 공진 C | S21(f0) | Cohn 손실 |\n|---|---|---|---|---|---|---|---|---|\n"
                 f"{filt('fe_bpf2', 'fe.bpf2')}\n{filt('fe_bpf3', 'fe.bpf3')}\n{filt('lo_bpf', 'lo.bpf')}\n\n"
                 f"거부(f0 기준): fe_bpf2 영상 {number(p('fe_bpf2.rel_image'), 4)} dB; fe_bpf3 영상 {number(p('fe_bpf3.rel_image'), 4)} dB, LO1 {number(p('fe_bpf3.rel_lo1'), 4)} dB; "
@@ -547,7 +554,10 @@ class KR447RxFrontendTemplate(Template):
                 f"- 직렬 L–C 가 IF1 에서 공진: L = {quantity(p('fe.dip.l'), 'H')}, C = 1/(ω_IF1² L) = {quantity(p('fe.dip.c_series'), 'F')} (`calc.rf.lc.c_for_resonance`), "
                 f"인덕터 Q {number(q_if1, 3)} (model.l_q.if1).\n"
                 f"- 흡수 가지: C = {quantity(p('fe.dip.c_hp'), 'F')} + R = {quantity(p('fe.dip.r_term'), 'ohm')} 접지.\n\n"
-                f"판정: IF1 에서 S21 ≥ {number(p('fe.dip.s21_min'), 3)} dB, LO1 과 합성분에서 혼합기 쪽 S11 ≤ {number(p('fe.dip.s11_max'), 3)} dB (단측 한계; 선택값)."
+                f"판정: IF1 에서 S21 ≥ {number(p('fe.dip.s21_min'), 3)} dB, LO1 과 합성분에서 혼합기 쪽 S11 ≤ {number(p('fe.dip.s11_max'), 3)} dB (단측 한계; 선택값). "
+                f"픽스처의 부하는 후치 증폭기 트랜지스터의 포트 모델 {quantity(p('model.ifamp.port_r'), 'ohm')} (model.ifamp.port_r)와 그 옆의 베이스 분압기 "
+                "R651 / R652(픽스처 구성원, R651 은 RX_5V 로)로, 보드가 IFA2_B 에 매다는 그대로입니다. 후치 증폭기의 IF1 출력은 정합되어 있지 않아, IF1 포트가 "
+                "선언하는 시스템 임피던스는 실험실 항목 rf.lab.ifamp_output 만이 확인할 수 있습니다."
             )),
             TheorySection("LO 체인: 체배기 탱크와 버퍼", (
                 f"x3, x2 단 뒤의 탱크는 공진기 2개의 상단 결합 회로망(복동조)이며, 끝단 외부 Q 를 Q_e = {number(p('lo.tank_qe'), 3)} 으로 정해 BW = g_1 f0 / Q_e "
@@ -593,19 +603,22 @@ class KR447RxFrontendTemplate(Template):
         f_c, z0, lna_r, adex_r, q = p("rf.f_c"), p("rf.z0"), p("model.lna.port_r"), p("model.adex10.port_r"), p("model.l_q.uhf")
         f2 = [p(k) for k in ("fe.bpf2.n", "fe.bpf2.bw", "fe.bpf2.l")]
         f3 = [p(k) for k in ("fe.bpf3.n", "fe.bpf3.bw", "fe.bpf3.l")]
+        r_eff2, share2, l_ch = p("fe_bpf2.r_load_eff"), p("fe_bpf2.load_share_db"), p("fe.lna.l_choke")
         image, lo1, half, near = p("fe.image"), p("rf.lo1"), p("fe.half_if"), p("lo.lo_spur_p1m")
-        if None not in (f_c, z0, lna_r, adex_r, q, image, lo1, half, *f2, *f3):
+        if None not in (f_c, z0, lna_r, adex_r, q, image, lo1, half, r_eff2, share2, l_ch, *f2, *f3):
             try:
                 xs = [350e6 + 200e6 * i / 400 for i in range(401)]
-                y2 = [radio.top_c_s21_db_value(f2[0], f_c, f2[1], f2[2], z0, lna_r, q, x) for x in xs]
-                y3 = [radio.top_c_s21_db_value(f3[0], f_c, f3[1], f3[2], lna_r, adex_r, q, x) for x in xs]
+                # the fixtures' networks: fe_bpf2 into its port model beside the LNA's divider, fe_bpf3 from the collector port beside its choke
+                y2 = [radio.top_c_s21_db_value(f2[0], f_c, f2[1], f2[2], z0, r_eff2, q, x) + share2 for x in xs]
+                y3 = [radio.top_c_ported_s21_db_value(f3[0], f_c, f3[1], f3[2], lna_r, l_ch, q, adex_r, adex_r, q, x) for x in xs]
             except ValueError:
                 xs = []
             if xs:
                 bands = [("x", image, image, "영상"), ("x", lo1, lo1, "LO1"), ("x", half, half, "반-IF"), ("x", f_c, f_c, "f_c")]
                 if near is not None:
                     bands.append(("x", near, near, "영상 + f_R"))
-                caption = (f"'프런트엔드·LO 대역통과 필터' 절의 fe_bpf2 · fe_bpf3 정확한 S21 (`calc.rf.resonator.top_c.s21_db`, Q_u {number(q, 3)}, 각자의 포트 저항) 과 "
+                caption = (f"'프런트엔드·LO 대역통과 필터' 절의 fe_bpf2 · fe_bpf3 정확한 S21 (`calc.rf.resonator.top_c.s21_db` / `.ported_s21_db`, Q_u {number(q, 3)}; "
+                           "fe_bpf2 는 LNA 분압기와 병렬인 부하에서 포트 모델에 닿는 몫, fe_bpf3 는 컬렉터 초크와 병렬인 원천에서) 과 "
                            "두 필터의 dB 합(LNA 이득 제외). 안내선 = 영상, LO1, 반-IF, 영상 + f_R, 반송파. " + THEORY_CURVE_NOTE)
                 out.append(_curve_figure("theory_fe_s21", "프런트엔드 필터 S21", caption,
                                          [("fe_bpf2", xs, y2), ("fe_bpf3", xs, y3), ("합", xs, [a + b for a, b in zip(y2, y3)])],

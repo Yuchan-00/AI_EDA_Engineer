@@ -3,7 +3,8 @@
 
 Offline tests run on a synthetic KiCad library written here (``Test_Silk``: an SMD resistor with KiCad-style silk lines and a
 ``Reference`` property, a part whose silk mark sticks out above its courtyard, 1x3 and 2x2 THT headers, footprints whose own silk
-comes 0.09 mm from / touches a pad, one with a ``custom`` pad, a header with a ``custom`` mounting pad, a pad with a drill offset,
+comes 0.09 mm from / touches a pad, one with a ``custom`` pad, one whose custom pad has a primitive the library reader does not read,
+a header with a ``custom`` mounting pad, a pad with a drill offset,
 footprints whose own texts meet their own silk / pad) plus ``Device:R`` and ``Connector_Generic`` symbols. Two tests
 need the installed KiCad libraries (they skip without them: a real header gets its pin labels and every check passes) and one
 needs ``kicad-cli`` too - the silk DRC canary (``silk_over_copper`` / ``silk_overlap`` = 0 on a silk-placed board), NOT measured
@@ -127,11 +128,15 @@ FOOTPRINTS = {
     # the footprint's own silk line across pad 1: silk over copper
     "TOUCH": _fp("TOUCH", REFERENCE.format(y=-1.8) + _line(-1.2, 0.4, -0.8, 0.4) + _rect(-1.8, -1.0, 1.8, 1.0, "F.CrtYd", 0.05)
                  + '  (pad "1" smd rect (at -1 0) (size 1 1) (layers "F.Cu" "F.Mask"))\n  (pad "2" smd rect (at 1 0) (size 1 1) (layers "F.Cu" "F.Mask"))\n'),
-    # a custom pad: its primitives are not read, its copper is unknown
+    # a custom pad: its copper is the boxes of its anchor and its polygon (geometry.custom_pad_parts)
     "CUSTOM": _fp("CUSTOM", REFERENCE.format(y=-1.8) + _rect(-1.8, -1.0, 1.8, 1.0, "F.CrtYd", 0.05)
                   + '  (pad "1" smd custom (at -1 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask") (primitives (gr_poly (pts (xy -0.6 -0.6) (xy 0.6 -0.6) (xy 0.6 0.6)) (width 0))))\n'
                   + '  (pad "2" smd rect (at 1 0) (size 1 1) (layers "F.Cu" "F.Mask"))\n'),
-    # a 1x3 header with a custom mounting pad: the courtyard stands in for that pad's copper
+    # a custom pad with a primitive the library reader does not read: its copper is unknown, the courtyard stands in for it
+    "CUSTOMX": _fp("CUSTOMX", REFERENCE.format(y=-1.8) + _rect(-1.8, -1.0, 1.8, 1.0, "F.CrtYd", 0.05)
+                   + '  (pad "1" smd custom (at -1 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask") (primitives (gr_blob (pts (xy -0.6 -0.6) (xy 0.6 -0.6) (xy 0.6 0.6)) (width 0))))\n'
+                   + '  (pad "2" smd rect (at 1 0) (size 1 1) (layers "F.Cu" "F.Mask"))\n'),
+    # a 1x3 header with a custom mounting pad: the boxes of that pad's anchor and polygon are its copper
     "CONNCUSTOM": _fp("CONNCUSTOM", REFERENCE.format(y=-2.33) + _rect(-1.33, -1.33, 1.33, 6.41, "F.SilkS", 0.12) + _rect(-1.8, -1.8, 1.8, 6.88, "F.CrtYd", 0.05) + _tht(3)
                       + '  (pad "MP" smd custom (at 0 6.2) (size 0.3 0.3) (layers "F.Cu" "F.Mask") (primitives (gr_poly (pts (xy -0.4 -0.2) (xy 0.4 -0.2) (xy 0.4 0.2)) (width 0))))\n',
                       "through_hole"),
@@ -184,6 +189,7 @@ KINDS = {
     "N": ("NEAR", "Device", "R", ("1", "2")),
     "T": ("TOUCH", "Device", "R", ("1", "2")),
     "C": ("CUSTOM", "Device", "R", ("1", "2")),
+    "X": ("CUSTOMX", "Device", "R", ("1", "2")),
     "P": ("CONNCUSTOM", "Connector_Generic", "Conn_01x03", ("1", "2", "3")),
     "D": ("OFFSET", "Device", "R", ("1", "2")),
     "O": ("OWNTEXT", "Device", "R", ("1", "2")),
@@ -307,8 +313,13 @@ def test_pad_copper_is_exact_for_rounded_pads_and_unknown_for_custom(tmp_path: P
     line = next(i for i in silk.items if i.kind == "graphic")
     assert shape_distance(line.shape, pads[1].shape) == 0.24
     assert silk.reference.text == "R1" and (silk.reference.x, silk.reference.y, silk.reference.layer) == (0.0, -1.5, "F.SilkS")
+    # a custom pad: one rectangle per box of its anchor and its primitives (the extent the router reads), all under its label
     custom = pad_copper("C1", lib.load_footprint(LibraryRef(library="Test_Silk", name="CUSTOM")), Placement(component_ref="C1", x_mm=0.0, y_mm=0.0))
-    assert custom[0].shape is None and custom[0].pad_shape == "custom" and custom[1].shape is not None
+    assert [p.label for p in custom] == ["C1.1", "C1.1", "C1.2"] and all(p.pad_shape == "custom" for p in custom[:2])
+    assert [p.shape.bbox() for p in custom[:2]] == [(-1.25, -0.25, -0.75, 0.25), (-1.6, -0.6, -0.4, 0.6)] and all(p.shape.r == 0.0 for p in custom[:2])
+    # one with a primitive the reader does not read: unknown copper
+    unread = pad_copper("X1", lib.load_footprint(LibraryRef(library="Test_Silk", name="CUSTOMX")), Placement(component_ref="X1", x_mm=0.0, y_mm=0.0))
+    assert unread[0].shape is None and unread[0].pad_shape == "custom" and unread[1].shape is not None
     # a through-hole pad is on both silk sides; on the bottom side the silk and the default reference mirror to B.SilkS
     conn = lib.load_footprint(LibraryRef(library="Test_Silk", name="CONN3"))
     assert all(p.sides == {"F", "B"} for p in pad_copper("J1", conn, Placement(component_ref="J1", x_mm=0.0, y_mm=0.0)))
@@ -408,20 +419,29 @@ def test_edge_keep_out_and_the_fab_fallback(tmp_path: Path, lib: KicadLibrary):
 
 
 def test_a_footprint_with_a_custom_pad_gets_its_reference_and_pin_labels_on_an_empty_board(tmp_path: Path, lib: KicadLibrary):
-    """The courtyard stands in for a custom pad's copper (kept ``silk_to_pad`` clear): the box the candidates go around is widened
-    by ``silk_to_pad - text_gap`` too, so the first candidate is free - not the fab layer for every such part."""
+    """A custom pad's copper is the boxes of its anchor and primitives: the reference goes ``text_gap`` outside the courtyard like any
+    part's. A pad whose copper is not read (an unread primitive) has the courtyard stand in for it (kept ``silk_to_pad`` clear): the box
+    the candidates go around is widened by ``silk_to_pad - text_gap`` too, so the first candidate is free - not the fab layer for every
+    such part."""
     ir = silk_ir(tmp_path, lib, [("C1", 50.0, 50.0)], {}, (100.0, 100.0), name="cu")
     res = place_silkscreen(ir, lib)
     c1 = _texts(res, SilkKind.REFERENCE)["C1"]
     assert res.references_on_silk == ["C1"] and res.references_on_fab == [] and c1.layer == "F.SilkS"
     assert "candidate:0:above@0" in c1.provenance.derived_from and c1.size_mm == 1.0
+    # courtyard top 49.0; the box bottom text_gap 0.1 mm above it (the polygon's box, top 49.4, is 0.5 mm away): 49.0 - 0.1 - 1.35 / 2
+    assert (c1.x_mm, c1.y_mm) == (50.0, 48.225) and round(49.0 - ir_text_box(c1).bbox()[3], 6) == 0.1
+    ir = silk_ir(tmp_path, lib, [("X1", 50.0, 50.0)], {}, (100.0, 100.0), name="cx")
+    res = place_silkscreen(ir, lib)
+    x1 = _texts(res, SilkKind.REFERENCE)["X1"]
+    assert res.references_on_silk == ["X1"] and "candidate:0:above@0" in x1.provenance.derived_from
     # courtyard top 49.0; the box bottom 0.15 mm above it: 49.0 - 0.15 - 1.35 / 2
-    assert (c1.x_mm, c1.y_mm) == (50.0, 48.175) and round(49.0 - ir_text_box(c1).bbox()[3], 6) == 0.15
+    assert (x1.x_mm, x1.y_mm) == (50.0, 48.175) and round(49.0 - ir_text_box(x1).bbox()[3], 6) == 0.15
     # a header with a custom mounting pad gets every pin label
     ir = silk_ir(tmp_path, lib, [("P1", 50.0, 50.0)], {"A": [("P1", "1")], "B": [("P1", "2")], "C": [("P1", "3")]}, (100.0, 100.0), name="pc")
     res = place_silkscreen(ir, lib)
     assert res.references_on_silk == ["P1"] and res.labels_placed == ["P1.1 A", "P1.2 B", "P1.3 C"] and res.labels_skipped == []
-    assert {t.x_mm for t in _texts(res, SilkKind.PIN_LABEL).values()} == {round(50.0 + 1.8 + 0.05 + 0.1, 6)}
+    # the mounting pad's copper is its boxes, not the courtyard: the labels go text_gap outside the (unwidened) courtyard
+    assert {t.x_mm for t in _texts(res, SilkKind.PIN_LABEL).values()} == {round(50.0 + 1.8 + 0.1, 6)}
 
 
 def test_a_reference_prefers_a_spot_outside_every_other_footprints_courtyard(tmp_path: Path, lib: KicadLibrary):
@@ -674,11 +694,15 @@ def test_library_silk_is_judged_by_overlap_only_and_references_default_to_the_li
     checks = _checks(ir, tmp_path, lib)
     assert set(checks[SILK_CLEARANCE_CHECK].details["library_default_references"]) == {"R1", "R2", "M1", "J1"}
     # a pad whose copper is not read: the clearance cannot be proven (NOT_VERIFIED naming it); overlap is unaffected
-    ir = silk_ir(tmp_path, lib, [("C1", 5.0, 5.0)], {}, (12.0, 10.0), name="cu")
-    ir.pcb.silkscreen = place_silkscreen(ir, lib).texts  # the courtyard stands in for the custom pad's copper
+    ir = silk_ir(tmp_path, lib, [("X1", 5.0, 5.0)], {}, (12.0, 10.0), name="cx")
+    ir.pcb.silkscreen = place_silkscreen(ir, lib).texts  # the courtyard stands in for the custom pad's unread copper
     checks = _checks(ir, tmp_path, lib)
-    assert checks[SILK_CLEARANCE_CHECK].status is S.NOT_VERIFIED and "pad C1.1 of Test_Silk:CUSTOM has shape 'custom'" in checks[SILK_CLEARANCE_CHECK].message
+    assert checks[SILK_CLEARANCE_CHECK].status is S.NOT_VERIFIED and "pad X1.1 of Test_Silk:CUSTOMX has shape 'custom'" in checks[SILK_CLEARANCE_CHECK].message
     assert checks[SILK_OVERLAP_CHECK].status is S.PASS
+    # a custom pad whose primitives are read is bounded by its boxes: the clearance is judged (PASS)
+    ir = silk_ir(tmp_path, lib, [("C1", 5.0, 5.0)], {}, (12.0, 10.0), name="cu")
+    ir.pcb.silkscreen = place_silkscreen(ir, lib).texts
+    assert _checks(ir, tmp_path, lib)[SILK_CLEARANCE_CHECK].status is S.PASS
     # the edge: a library silk graphic that leaves the outline FAILs; one inside it but within 0.3 mm of it is only listed
     # (M1's mark runs from x - 1.5 to x + 1.5 with a 0.12 mm stroke; the designed reference keeps the library default out of it)
     for x, status, message in (

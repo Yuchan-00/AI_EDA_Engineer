@@ -13,7 +13,7 @@ What runs where:
 * with the packed KiCad 10.0.6 libraries (``needs_libs``,
   ``KICAD10_SYMBOL_DIR``): the confirmation table (every ``kr447.*`` and
   ``model.*`` row says UNVERIFIED), the composition (441 parts, 211 nets,
-  22 fixture networks, 15 blocks with ports and regions), the variant
+  23 fixture networks - the cascade ant_end among them -, 15 blocks with ports and regions), the variant
   difference (``ANT1`` and what goes with the antenna against ``J1001``, in
   the design view), byte-identical rebuilds (design hash, table, compiled
   schematic and board), the RF floorplan on the board's 60 x 243 mm outline
@@ -23,12 +23,13 @@ What runs where:
   PASS; a tx_power above the profile placeholder FAILs the profile row), the
   SI classes, the Korean theory / part notes / figures and the four stage
   reports, every optional input served, the full board's router refusal
-  (the microphone's custom pad first) and a reduced routing case - the
+  (the PA's QFN pad below the 0.2 mm grid; the three custom pads - the
+  microphone's and the two PHA-1s' - are read) and a reduced routing case - the
   antenna end alone (trx + antenna blocks) routed on the real footprints for
   both builds, ``ANT_FEED`` through the antenna band, the GND vias inside
   ``trx_bcu``, ``pcb.keepout`` PASS;
 * with the libraries and ngspice (``needs_ngspice``): every ``spice.rf.*``
-  row of the 22 networks PASS (about 2.2 s on ngspice-42) at pinned trsw /
+  row of the 23 networks PASS (about 2.2 s on ngspice-42) at pinned trsw /
   lpf values, the antenna match's fixture with a confirmed
   ``antenna_impedance``, and the pipeline through the SPICE stage: every
   design-deck row PASS (``pin_bias`` among them), ``block.interface.*``
@@ -269,7 +270,7 @@ def test_the_board_composes_every_block_with_its_ports_regions_and_fixtures(buil
     assert rf is not None and [b.id for b in rf.blocks] == BLOCK_IDS
     assert all(b.region is not None for b in rf.blocks) and {b.id: b.shield_ref for b in rf.blocks if b.shield_ref} == {
         "lo_chain": "SH701", "rx_frontend": "SH601", "tx_mod": "SH802", "tx_chain": "SH801"}
-    assert len(rf.networks) == 22 and {"trsw", "lpf"} <= {n.id for n in rf.networks} and "ant_match" not in {n.id for n in rf.networks}
+    assert len(rf.networks) == 23 and {"trsw", "lpf", "ant_end"} <= {n.id for n in rf.networks} and "ant_match" not in {n.id for n in rf.networks}
     assert rf.profile_keys == profile_keys() and "model.pin.r_on" in rf.model_values and "model.diode" in rf.model_values
     by = {b.id: b for b in rf.blocks}
     assert {p.name for p in by["trx"].ports} == {"TX_RF", "RX_RF", "TX_5V", FEED_NET} and by["antenna"].ports == []  # no antenna impedance: no port
@@ -365,10 +366,9 @@ def test_the_floorplan_places_every_build_on_the_boards_outline(tmp_path: Path, 
     assert box.y1 >= 2.0 - 1e-9 and (box.y2 <= BAND_H_MM if feed == "ANT1" else box.y2 <= 8.0)  # at the top edge, inside the band / its region
     ir.pcb.outline, ir.pcb.placements = fp.outline, fp.placements
     ko = _run("pcb.keepout", ir, tmp_path)["pcb.keepout"]
-    # nothing violates a keep-out, a region or a can fence; the check cannot bound the three custom pads' copper (the microphone's and the
-    # two PHA-1s'), so it says NOT_VERIFIED naming exactly them, never PASS (tests/test_kr447_transceiver.py's reduced case PASSes)
-    assert ko.status is S.NOT_VERIFIED and [r for r in ko.details["rows"] if r["status"] == "FAIL"] == [], ko.message
-    assert sorted(u.split(" of footprint")[0] for u in ko.details["unknown"]) == ["pad MK301.1", "pad U750.2", "pad U850.2"], ko.details["unknown"]
+    # nothing violates a keep-out, a region or a can fence, and every pad's copper is bounded - the three custom pads (the microphone's
+    # and the two PHA-1s') by the boxes of their anchor and primitives
+    assert ko.status is S.PASS and ko.details["unknown"] == [] and [r for r in ko.details["rows"] if r["status"] != "PASS"] == [], ko.message
     assert len(ko.details["regions"]) == len(BLOCK_IDS) + 4  # every region and every can fence was judged
 
 
@@ -497,14 +497,16 @@ def test_the_stage_reports_are_deterministic_views(built) -> None:
 
 
 @needs_libs
-def test_the_full_board_is_placed_but_the_router_refuses_the_custom_pads(built, tmp_path: Path) -> None:
+def test_the_full_board_is_placed_but_the_router_refuses_a_pad_below_its_grid(built, tmp_path: Path) -> None:
     ir, _plan_ = built["transceiver"]
     res = PCBAgent().run(ir.model_copy(deep=True), AgentContext(workdir=tmp_path, tools={"kicad_library": _REAL}))
     board = res.proposals[0].payload
     notes = " | ".join(res.notes)
     assert len(board.placements) == 441 and board.tracks == [] and "keep-outs ant_band honoured" in notes
-    # routing.maze refuses the board before routing: the microphone's custom pad is the first it names (the PHA-1s' SOT-89-3 pads follow)
-    assert "not routed: cannot route: pad MK301.1 of footprint Sensor_Audio:CUI_CMC-4013-SMT has shape 'custom'" in notes, notes
+    # routing.maze 0.5 reads the custom pads (the microphone's ring, the PHA-1s' SOT-89-3 tabs) and refuses the board before routing at
+    # the first pad too small for the 0.2 mm grid: the PA's 0.25 mm-wide QFN pad, whose nearest grid point is outside its inscribed circle
+    assert "not routed: pad U901.1 (0.825 x 0.25 mm) is too small for the 0.2 mm routing grid" in notes, notes
+    assert "shape 'custom'" not in notes
 
 
 @needs_libs
@@ -549,7 +551,7 @@ def test_every_fixture_passes_within_the_budget(built, tmp_path: Path) -> None:
     results = spice_rf_results(ir, {"spice": runner}, tmp_path)
     elapsed = time.perf_counter() - t0
     got = {r.check_id: r for r in results}
-    assert len(results) == 103 and {f"spice.rf.{n}" for n in TRX_NETWORKS if n != "ant_match"} <= set(got)
+    assert len(results) == 112 and "spice.rf.ant_end" in got and {f"spice.rf.{n}" for n in TRX_NETWORKS if n != "ant_match"} <= set(got)
     assert all(r.status is S.PASS for r in results), [(r.check_id, r.message) for r in results if r.status is not S.PASS]
     measured = {k: got[k].details["measured"] for k in got if k.startswith("spice.rf.trsw.") or k.startswith("spice.rf.lpf.")}
     assert measured["spice.rf.trsw.tx.s21_tx_com"] == pytest.approx(-0.335, abs=0.02)

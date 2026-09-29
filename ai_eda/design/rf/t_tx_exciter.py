@@ -61,9 +61,11 @@ IPC-2221 width for 0.6 A).
 
 Expected statuses (measured 2026-09-29 with ngspice-42, the packed KiCad
 10.0.6 libraries, no kicad-cli; ``tests/test_kr447_tx_exciter.py``): every
-``spice.rf.*`` row of the nine fixture networks PASS as "a network verdict
-under confirmed model values (not a measured part)" (36 results in about
-0.8 s); the design deck's five bias rows and three ``pm_couple_*`` rows PASS;
+``spice.rf.*`` row of the ten fixture networks PASS as "a network verdict
+under confirmed model values (not a measured part)" (41 results in about
+0.9 s; the tenth, ``pa_lpf``, is the match and the low-pass as the board
+joins them - the fixture-membership pass, part A1); the design deck's five
+bias rows and three ``pm_couple_*`` rows PASS;
 ``rf.freq_plan``, ``calc.recompute`` and every ``block.interface.*`` PASS;
 ``rf.deviation`` NOT_VERIFIED on the bench stand-in (no integrator: no
 ``spice.pm_drive_peak``, no ``tx.tau_i``) and, with the P9 blocks and a
@@ -630,7 +632,19 @@ class Kr447TxExciterTemplate(Template):
                 f"| K_pm (탱크당, 설계값) | {quantity(k_pm, 'rad/V')} |\n\n"
                 "설계서는 탱크 사이에 이미터 팔로워 하나와 x3 단으로의 '약한 결합(선택값)'을 두었습니다. 등록된 계산기 `calc.rf.pm.tank_phase_loaded` 가 탱크 노드의 "
                 "부하로 모델링할 수 있는 것은 저항 하나뿐이므로, 두 번째 탱크 뒤에도 같은 이미터 팔로워(MMBT3904)를 두어 두 탱크가 같은 설계 회로망"
-                "(소스 50 Ω, 부하 `model.buf.r_in`)이 되게 했습니다. 그래서 픽스처가 측정하는 것이 계산기가 계산하는 회로망과 정확히 같습니다.\n\n"
+                "(소스 50 Ω, 부하 `model.buf.r_in`)이 되게 했습니다. 그래서 픽스처가 측정하는 것이 계산기가 계산하는 회로망과 정확히 같습니다. "
+                "팔로워의 베이스 분압기와 첫 팔로워의 이미터 저항은 픽스처 포트 네트에 있지만 구성원이 아니라 포트 모델 안에 있습니다: `model.buf.r_in` 은 "
+                f"분압기({q('tx.buf1.r_b1', 'ohm')} ∥ {q('tx.buf1.r_b2', 'ohm')})를 포함한 팔로워 입력이라 그 병렬 저항을 넘을 수 없고, `model.buf.r_out` 은 "
+                f"이미터 저항({q('tx.buf1.r_e', 'ohm')})을 포함한 출력입니다. 모델값 설명이 그렇게 말하고, 픽스처의 포트 저항이 그 설명을 출처로 지니며, "
+                "`rf.model_grounding` 이 그 행을 보여 줍니다. 두 탱크의 인덕터는 같은 바이패스 노드 VAR_B 로 돌아가므로, 각 픽스처에는 다른 탱크의 인덕터가 "
+                "빠져 있습니다. 그 인덕터는 다른 탱크의 병렬 커패시턴스와 f_T 에서 공진하므로 VAR_B 에서 본 가지는 리액턴스(142 Ω)가 아니라 약 14–15 Ω 의 "
+                "직렬 공진이고, 바이패스(0.43 Ω)는 그 약 3 % 입니다(기본 선택값). 수동 부하로 달면 각 픽스처의 위상이 최대 0.032° 움직입니다(결합 회로의 "
+                "선형 노드 해석, ngspice-42 도 같은 값). 그러나 기판에서는 첫 팔로워가 탱크 1 의 신호로 탱크 2 를 구동하므로 공유 바이패스에 두 탱크의 인덕터 "
+                "전류가 함께 흐릅니다. 팔로워를 `model.buf.r_out` 뒤의 이득 1 전압원으로 둔 선형 추정으로 탱크 1 의 위상은 +0.70–+1.04°, 탱크 2 의 위상은 "
+                "자기 구동 대비 모든 상태에서 +2.85° 움직입니다. 트리머로 정렬하는 중심 어긋남이며, 두 탱크를 합친 현(φ_hi − φ_lo)은 79.4° 중 약 0.03° 만 "
+                "변합니다. 따라서 픽스처의 절대 `phase21_deg` 행은 탱크 하나에 대한 판정이고 기판에서 결합된 두 탱크의 판정이 아니며, 결합 회로는 실험 항목 "
+                "`tx_pm_coupling` 이 맡습니다. 탱크마다 바이어스·바이패스 노드를 따로 두면 결합이 없어지지만 설계 변경이라 사람이 정해야 하고, "
+                "`pm.c_bypass` 를 키우면 `pm.r_feed` 와의 저역 통과가 음성 대역으로 들어옵니다.\n\n"
                 "**정확한 회로망 위상.** 이상적인 탱크 식 φ = −atan(Q(f/f0 − f0/f)) 는 이 회로망에서 0.8–1.4° 어긋나 허용오차 1° 로는 올바른 탱크를 FAIL 시킵니다"
                 "(critic2). 그래서 각 상태의 공칭값은 포트 R, DC 차단, R_s, 직렬 손실이 있는 L, 바이패스와 급전 저항, 부하를 모두 포함한 정확한 위상입니다:\n\n"
                 f"| 상태 | 바이어스 | 위상 (공칭, 탱크 1 = 탱크 2) |\n|---|---|---|\n| bias_lo | {quantity(v_lo, 'V')} | {number(phases[(1, 'lo')], 5)} ° |\n"
@@ -690,6 +704,10 @@ class Kr447TxExciterTemplate(Template):
                 f"(`calc.rf.lpf.shunt_c` / `.series_l`). 무손실 감쇠 (`calc.rf.lpf.chebyshev.attenuation`): 2 f_c 에서 {number(att2, 4)} dB, 3 f_c 에서 "
                 f"{number(att3, 4)} dB. 픽스처(Q_u 40): f_c 에서 S21 ≥ −1.5 dB, S11 ≤ −15 dB, 2 f_c 에서 ≤ −45 dB, 3 f_c 에서 ≤ −60 dB. 저지대역 판정은 각 병렬 "
                 "소자의 패드에 접지면 비아가 있는 레이아웃에서만 성립합니다(447 MHz 에서 트랙 1 mm ≈ 1 nH).\n\n"
+                "기판은 정합의 DC 차단과 저역통과 필터의 첫 병렬 C 를 LPF_IN 에서 저항성 노드 없이 바로 잇습니다. 두 픽스처는 각각 그곳을 시스템 임피던스로 "
+                "가정했으므로, 캐스케이드 픽스처 `pa_lpf` 가 두 회로망의 부품 전체를 부하선(R_L)에서 출력까지 한 번에 판정합니다: f_c 에서 S21 ≥ "
+                f"{q('pa_lpf.s21_min', 'dB')} (두 한계의 합, `calc.rf.db_sum`), 부하선에서 S11 ≤ {q('pa.match.s11_max', 'dB')}, 2 f_c / 3 f_c 에서 ≤ "
+                f"{q('lpf.h2_max', 'dB')} / {q('lpf.h3_max', 'dB')}.\n\n"
                 "PA(MMZ09332BT1)는 모델이 없어 설계 덱에서 공급 전류만 모사합니다(`model.pa.supply`): POWER_DOWN 이 문턱(`model.pa.v_pd`) 아래이면 VCC1 → GND "
                 "저항 `model.pa.r_supply`, 위이면 `model.pa.r_off` 만. 그래서 P9 블록과 조합한 기판에서 PTT 해제 때 PA_5V 를 비우는 것은 PA 가 아니라 PTT 블록의 능동 방전(Q205)입니다(벤치 기판에서는 벤치 전원이 "
                 "PA_5V 를 공급). "
@@ -799,7 +817,9 @@ class Kr447TxExciterTemplate(Template):
                                       [f"값 {c.value}", "커패시터 NP0/C0G", "인덕터 Q ≥ 40 @ 37 MHz (모델값)"] + (["트리머 범위가 중간 위치를 포함"] if c.symbol is not None and c.symbol.name == "C_Trim" else []),
                                       [unverified("0402 NP0 / 0603 권선형 인덕터 / Murata TZB4 트리머")])
             elif "PM buffer" in d:
-                out[c.ref] = PartNote("위상 변조 탱크 뒤의 버퍼(이미터 팔로워) 부품", "탱크의 부하를 `model.buf.r_in` 으로 고정", [f"값 {c.value}"], [unverified("BC847 / 0402 저항")])
+                out[c.ref] = PartNote("위상 변조 탱크 뒤의 버퍼(이미터 팔로워) 부품",
+                                      "탱크의 부하를 `model.buf.r_in` 으로 고정 - 분압기와 이미터 저항은 `model.buf.r_in` / `.r_out` 포트 모델 안에 있음",
+                                      [f"값 {c.value}"], [unverified("BC847 / 0402 저항")])
             elif "multiplier stage" in d:
                 out[c.ref] = PartNote("체배기 단 부품 (BFR92 와 바이어스)", "분압 바이어스, 에미터 R // C, 0 Ω 링크(전류 측정), 콜렉터 초크 - 초크와 분압기는 탱크·필터 설계에 흡수됨",
                                       [f"값 {c.value}", "BFR92: f_T ≥ 5 GHz (라이브러리 설명)", "초크: 값과 Q 가 설계값에 맞을 것(탱크 탭이 그것을 흡수), 자기공진이 단 출력 주파수보다 높을 것"],

@@ -15,9 +15,12 @@ Keep-outs (board frame, mm, per silk side):
 * every pad's copper (library geometry, transformed: exact rectangles /
   rounded rectangles / discs / capsules) grown by ``silk_to_pad_mm``
   (0.15) - a pad counts on the side of its copper / mask layers, a through
-  hole on both. A ``custom`` / ``trapezoid`` pad's copper is not read by the
-  library reader: its footprint's courtyard stands in for it (a footprint
-  with such a pad and no courtyard is refused, :class:`CompileError`);
+  hole on both. A ``custom`` pad counts with the boxes of its anchor and each
+  copper primitive (:func:`ai_eda.tools.kicad.geometry.custom_pad_parts`, the
+  extent the router reads). A ``trapezoid``'s copper (``rect_delta``) and a
+  custom pad with a primitive the library reader does not read are unknown:
+  the footprint's courtyard stands in for them (a footprint with such a pad
+  and no courtyard is refused, :class:`CompileError`);
 * the board edge: every text lies inside the outline inset by
   ``silk_to_edge_mm`` (0.3);
 * every footprint's own silkscreen graphics and visible silk texts (library
@@ -33,8 +36,9 @@ Placement, in this order (each text is a keep-out for the next):
 1. **References**, natural ref order: ten candidates around the footprint's
    courtyard (widened to the pads' box grown by ``silk_to_pad - text_gap``
    where the pads reach beyond it, and itself grown by ``silk_to_pad -
-   text_gap`` when it stands in for a ``custom`` / ``trapezoid`` pad's
-   copper; the pads' box alone without a courtyard) - above, below, left at 0 then
+   text_gap`` when it stands in for a pad's unknown copper - a trapezoid, a
+   custom pad with an unread primitive; the pads' box alone without a
+   courtyard) - above, below, left at 0 then
    90 degrees, right at 0 then 90 degrees, then the four corners (the box
    diagonally outside each courtyard corner) - at 1.0 mm (0.15 mm stroke,
    KiCad's default silk text), then the same ten at 0.8 mm; the first
@@ -222,14 +226,15 @@ def _body(placement: Placement, fp: FootprintDef, params: SilkParams) -> BBox | 
     """What texts are placed beside: the courtyard, widened where the pads' keep-out reaches beyond it (a courtyard flush with its
     pads), so a candidate ``text_gap`` outside it is also ``silk_to_pad`` clear of those pads; the pads alone without a courtyard.
 
-    A footprint with a ``custom`` / ``trapezoid`` pad has its courtyard as that pad's keep-out (:class:`_Board`), so the courtyard is
+    A footprint with a pad whose copper is unknown (a trapezoid, a custom pad with an unread primitive) has its courtyard as that pad's
+    keep-out (:class:`_Board`), so the courtyard is
     widened the same way - otherwise every candidate ``text_gap`` outside it would sit ``text_gap`` < ``silk_to_pad`` from that
     keep-out and the reference would go to the fab layer even alone on an empty board."""
     boxes = []
     grow = max(params.silk_to_pad_mm - params.text_gap_mm, 0.0)
     court = courtyard_bbox(placement, fp)
     if court is not None:
-        if any(pad.shape not in CONVEX_PAD_SHAPES for pad in fp.pads):
+        if any(pad.shape not in CONVEX_PAD_SHAPES and (pad.shape != "custom" or pad.unread_primitives) for pad in fp.pads):
             court = BBox(court.x1 - grow, court.y1 - grow, court.x2 + grow, court.y2 + grow)
         boxes.append(court)
     pads = pads_bbox(placement, fp)
@@ -289,7 +294,7 @@ class _Board:
                     cy = courtyard_bbox(placement, fp)
                     if cy is None:
                         raise CompileError(
-                            f"pad {pad.label} of footprint {fp.lib_id} has shape {pad.pad_shape!r} (custom primitives / trapezoid rect_delta are not read) "
+                            f"pad {pad.label} of footprint {fp.lib_id} has shape {pad.pad_shape!r} (a trapezoid's rect_delta / a custom pad's unread primitive) "
                             "and the footprint has no courtyard to bound it"
                         )
                     shape = Shape(((cy.x1, cy.y1), (cy.x2, cy.y1), (cy.x2, cy.y2), (cy.x1, cy.y2)))
@@ -635,8 +640,9 @@ def place_silkscreen(ir: CircuitIR, library: KicadLibrary, params: SilkParams | 
 
     Raises :class:`CompileError` when the board cannot be read: no
     placements or outline, a component without a placement / footprint, a
-    footprint not on disk or malformed, a non-convex pad in a footprint
-    without a courtyard, a silk construct the geometry module does not read.
+    footprint not on disk or malformed, a pad whose copper is unknown (a
+    trapezoid, a custom pad with an unread primitive) in a footprint without
+    a courtyard, a silk construct the geometry module does not read.
     ``ir`` is never modified.
     """
     params = params or SilkParams()

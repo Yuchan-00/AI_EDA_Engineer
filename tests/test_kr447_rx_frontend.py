@@ -238,7 +238,7 @@ def test_the_table_shows_every_profile_and_model_row_as_unverified(tmp_path: Pat
     for line in (
         "rf.lo1 = 426162500 Hz [calc.rf.superhet.lo from rf.f_c, rf.if1, rf.lo1_side]",
         "lo.f_ref = 35513541.6667 Hz [calc.clock.divided from rf.lo1, rf.n_mult]",
-        "fe_bpf2.s21 = -3.3670672", "fe_bpf3.rel_image = -33.567324", "lo_tank1.rel_p = -26.3066456", "lo_bpf.rel_p1 = -19.217476", "lo_pad.s21 = -6 dB",
+        "fe_bpf2.s21 = -3.5285336", "fe_bpf3.rel_image = -33.597149", "lo_tank1.rel_p = -26.3066456", "lo_bpf.rel_p1 = -19.217476", "lo_pad.s21 = -6 dB",
         "fe.sensitivity = -114.14321","Y701 Oscillator:KT2520K-T / Oscillator:Oscillator_SMD_Kyocera_2520-6Pin_2.5x2.0mm, value 35.514M (LO1 reference TCXO: 35.5135417 MHz",
         "U650 RF_Mixer:ADEX-10", "U750 RF_Amplifier:PHA-1", "U750 pin 1 has no name in the library; identified as RF_IN by its library electrical type 'input'",
         "SH601 Device:RFShield_OnePiece / RF_Shielding:Laird_Technologies_BMI-S-103_26.21x26.21mm",
@@ -246,8 +246,11 @@ def test_the_table_shows_every_profile_and_model_row_as_unverified(tmp_path: Pat
         "design deck op_bias: ic_lna i(R604) = 0.00545455 +/- 15% under model.npn",
         "RF50: nets RX_RF, LNA_IN, LNA_OUT, MIX_RF, LO1_RAW, LO1_BUF_OUT, LO_PAD_IN, LO1_MIX; Z0 50 ohm +/- 10%",
         "RF_TANK_HI: nets LO_X12_C, LO_B_R1, LO_B_R2, LO_B_R3, LO_B_R4, FE2_R1,",
-        "fixture lo_tank1: 11 member(s) between coll (port), next (port), rx_5v (rail)",
-        "fixture lo_bpf: 15 member(s) between coll (port), buf_in (port), rx_5v (rail)",
+        "fixture lo_tank1: 12 member(s) between coll (port), next (port), rx_5v (rail)",
+        "fixture lo_bpf: 16 member(s) between coll (port), buf_in (port), rx_5v (rail)",
+        "fixture fe_bpf2: 9 member(s) between rx_rf (port), lna_in (port), rx_5v (rail)",
+        "fixture fe_bpf3: 13 member(s) between lna_out (port), mix_rf (port), rx_5v (rail)",
+        "fixture diplexer: 6 member(s) between mix_if (port), ifa_in (port), rx_5v (rail)",
     ):
         assert line in table, line
 
@@ -280,7 +283,7 @@ def test_a_confirmation_applies_the_board(tmp_path: Path, registered) -> None:
     assert rf.block("rx_frontend").shield_ref == "SH601" and rf.block("lo_chain").shield_ref == "SH701"
     assert [p.id for p in rf.frequency_plan] == ["lo_spur_p1m", "lo_spur_p2m", "lo_spur_m1p", "lo_spur_p1p", "birdie_fr_harmonic", "birdie_fr_if1", "image", "half_if"]
     assert sorted(x.id for x in rf.lab_items) == sorted(["lo_spur_response", "lo_frequency", "tank_alignment", "procurement_rx_tcxo", "lo_level", "lna",
-                                                        "image_rejection", "half_if", "mixer", "sensitivity", "lo_radiation"])
+                                                        "image_rejection", "half_if", "mixer", "sensitivity", "lo_radiation", "ifamp_output"])
     assert len(rf.profile_keys) == 13 and all(k.startswith("kr447.") for k in rf.profile_keys)
     assert all(k.startswith("model.") for k in rf.model_values) and "model.npn" in rf.model_values and len(rf.model_values) == 16
     # every choice is the user's now, never grounded; every calculator output derived
@@ -388,7 +391,8 @@ def test_theory_figures_and_part_notes(tmp_path: Path, registered) -> None:
     sections = tpl.theory(ir)
     assert [s.title for s in sections][:2] == ["개요: 수신 프런트엔드 시험 보드(3단계)", "주파수 계획"]
     text = "\n".join(s.body for s in sections)
-    for needle in ("426.16 MHz", "35.5135417 MHz", "440.28 MHz", "-3.367 dB", "UNVERIFIED", "KC 적합성평가", "−114.1".replace("−", "-")):
+    for needle in ("426.16 MHz", "35.5135417 MHz", "440.28 MHz", "-3.529 dB", "-0.1615 dB", "R601 / R602", "L603", "R651 / R652", "UNVERIFIED", "KC 적합성평가",
+                   "−114.1".replace("−", "-")):
         assert needle in text, needle
     assert "기록 없음" not in text
     figures = tpl.theory_figures(ir)
@@ -423,8 +427,8 @@ def test_every_fixture_row_and_bias_point_passes_on_the_default_models_within_th
     # the measured networks are the calculators' (within 0.01 dB), and the design's decided Q-40 numbers where the networks are the design's
     measured = {f"{nid}.{rid}": latest[f"spice.rf.{nid}.{rid}"].details["measured"] for nid, rows in NETWORK_ROWS.items() for rid in rows
                 if latest[f"spice.rf.{nid}.{rid}"].details.get("measured") is not None}
-    for key, value in (("fe_bpf2.s21_fc", -3.37), ("fe_bpf2.rel_image", -13.56), ("fe_bpf3.s21_fc", -9.30), ("fe_bpf3.rel_image", -33.57),
-                       ("fe_bpf3.rel_lo1", -15.42), ("lo_bpf.s21_lo1", -8.01), ("lo_bpf.rel_m1", -27.94), ("lo_bpf.rel_p1", -19.22),
+    for key, value in (("fe_bpf2.s21_fc", -3.5285), ("fe_bpf2.rel_image", -13.5652), ("fe_bpf3.s21_fc", -9.3220), ("fe_bpf3.rel_image", -33.5971),
+                       ("fe_bpf3.rel_lo1", -15.4259), ("lo_bpf.s21_lo1", -8.01), ("lo_bpf.rel_m1", -27.94), ("lo_bpf.rel_p1", -19.22),
                        ("lo_bpf.rel_m2", -56.15), ("lo_bpf.rel_p2", -37.72), ("lo_tank1.s21", -5.50), ("lo_tank2.s21", -5.55),
                        ("lo_tank1.rel_m", -47.79), ("lo_tank1.rel_p", -26.31), ("lo_tank2.rel_m", -29.05), ("lo_tank2.rel_p", -17.65),
                        ("lo_pad.s21_lo1", -6.0)):

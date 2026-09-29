@@ -18,7 +18,7 @@ What runs where:
   ``rf.regulatory_profile``), the blocks re-based with a net prefix (the
   transceiver's use), the Korean theory / part notes / figures;
 * with the libraries and ngspice (``needs_ngspice``): every ``spice.rf.*`` row
-  of the nine fixture networks PASS inside the kr447 design's §3.3 budget
+  of the ten fixture networks (the cascade pa_lpf among them) PASS inside the kr447 design's §3.3 budget
   (tx_exciter fixtures < 4 s; about 0.8 s on ngspice-42) at pinned values,
   and the whole pipeline on the bench-header board: the design deck (five
   bias rows, three pm_couple rows) PASS, the RF checks, and the stand-in's
@@ -259,8 +259,10 @@ def test_the_table_shows_every_kr447_and_model_row_unverified(tmp_path: Path) ->
                  "U901 RF_Amplifier:MMZ09332BT1", "fixture pm_mod1: 9 member(s) between src (port), tank (probe), buf (port), bias (control), states bias_lo, bias_nom, bias_hi",
                  "tx.obw99_1k = 8000 Hz [calc.rf.fm.obw99 from kr447.max_deviation, tx.obw.f_1k]",
                  "RF50: nets TX_RAW, DRV_IN, DRV_RFIN, DRV_OUT, PA_PAD_IN, PA_IN, PA_RFIN; Z0 50 ohm +/- 10%",
-                 "fixture tx_tank2: 11 member(s) between coll (port), next (port), tx_5v (rail)",
-                 "fixture tx_bpf: 18 member(s) between coll (port), pad (port), tx_5v (rail)", "RF50_H: nets PA_MATCH, LPF_IN",
+                 "fixture tx_tank2: 12 member(s) between coll (port), next (port), tx_5v (rail)",
+                 "fixture tx_bpf: 19 member(s) between coll (port), pad (port), tx_5v (rail)", "RF50_H: nets PA_MATCH, LPF_IN",
+                 "fixture pa_lpf: 11 member(s) between pa_out (port), lpf_out (port), pa_5v (rail)",
+                 "pa_lpf.s21_min = -2 dB [calc.rf.db_sum from pa.match.s21_min, lpf.s21_min]",
                  "POWER_PA: nets TX_5V, PA_5V", "stimulus VPMD (dc) on PM_DRIVE", "expectation tx_ic_x3: i(R817) value 0.00240668 +/- 15% A"):
         assert line in table, line
     assert table.count("[UNVERIFIED:") >= len(profile.PROFILE) + 16
@@ -452,7 +454,7 @@ def test_every_fixture_row_passes_on_the_default_models_within_the_budget(tmp_pa
     results = spice_rf_results(ir, {"spice": runner}, tmp_path)
     elapsed = time.perf_counter() - t0
     got = {r.check_id: r for r in results}
-    assert {f"spice.rf.{n}" for n in NETWORKS} <= set(got) and len(results) == 36
+    assert {f"spice.rf.{n}" for n in NETWORKS} <= set(got) and len(results) == 41
     assert all(r.status is S.PASS for r in results), [(r.check_id, r.message) for r in results if r.status is not S.PASS]
     assert all("network verdict under the confirmed model values" in r.message for r in results)
     measured = {cid.removeprefix("spice.rf."): r.details["measured"] for cid, r in got.items() if "measured" in r.details}
@@ -507,15 +509,15 @@ def test_the_pipeline_on_the_bench_header_board(tmp_path: Path, monkeypatch: pyt
         assert status[check] is S.NOT_VERIFIED, (check, latest[check].message)
     # no integrator on the bench board: the deviation chain has no V_max / tau_i
     assert status["rf.deviation"] is S.NOT_VERIFIED and "spice.pm_drive_peak: no result recorded" in latest["rf.deviation"].message
-    # the router cannot read the PHA-1's SOT-89-3 custom pad: placement only, the RF copper does not exist
+    # routing.maze 0.5 reads the PHA-1's SOT-89-3 custom pad and routes most nets, but not all (the PA's 0.5 mm-pitch QFN pads are closer
+    # together than the fine rules' 0.2 mm clearance): a half-routed board is never proposed - placement only, the RF copper does not exist
     placement = state.outcome(Stage.PLACEMENT).message
-    assert "131 component(s) on a 106.0 x 42.0 mm" in placement and "2 shield can(s)" in placement and "cannot route: pad U850.2" in placement
+    assert "131 component(s) on a 106.0 x 42.0 mm" in placement and "2 shield can(s)" in placement
+    assert "not applied: routing.maze 0.5 connected" in placement and "U901." in placement and "shape 'custom'" not in placement, placement
     assert ir.pcb is not None and ir.pcb.tracks == []
-    # placement only: the nets whose pads are all known are a measured open (FAIL); the nets holding U850.2 are not judged
+    # placement only: every net is judged (U850.2 is bounded by its anchor and tab boxes) and the nets are a measured open (FAIL)
     conn = latest["pcb.routing.connectivity"]
-    assert conn.status is S.FAIL and any("U850.2" in u for u in conn.details["unknown"])
-    rows = {r["net"]: r for r in conn.details["nets"]}
-    assert all(r["status"] == "NOT_VERIFIED" for r in rows.values() if any(p.startswith("U850.") and p == "U850.2" for p in r.get("unknown_pads", [])))
+    assert conn.status is S.FAIL and conn.details["unknown"] == [] and conn.details["custom_pads"] == ["U850.2"]
     assert status["pcb.routing.clearance"] is S.NOT_APPLICABLE  # no IR copper to compare
     # the stand-in's honest FAIL: input_voltage is the P9 power block's, not the bench headers'
     assert status["review.requirements_vs_ir"] is S.FAIL and latest["review.requirements_vs_ir"].details["unserved"] == ["req.input_voltage"]

@@ -73,6 +73,19 @@ Fixtures (``ir.rf.networks``):
   antenna resistance). Without it ``rf.lab.antenna_match`` says the antenna
   impedance is not stated and the match is a design change after a VNA
   measurement.
+* ``ant_end`` (composition level, :func:`ant_end_result`, no block): the
+  PA's load-line match, the switch, the low-pass (and ``ant_match``) and the
+  front end's ``fe_bpf2`` as one fixture, because the board joins them
+  with no resistive node between them (DC block to DC block on ``TX_RF``,
+  DC block to the low-pass's shunt capacitor on ``LPF_IN``, DC block to
+  ``fe_bpf2``'s input tap on ``RX_RF``, low-pass to match on
+  ``ANT_PORT``) and each component fixture assumed the system impedance at
+  those nets. States ``tx`` / ``rx`` are the switch's; the rows are bounded
+  by the component networks' own bounds and nominals (the function's
+  docstring). On ngspice-42 at the default choices: TX s21 -1.637 dB
+  (bound -2.5), s11 at the load line -15.86 dB (bound -15), 2 f_c / 3 f_c
+  -65.80 / -97.82 dB, TX -> LNA -37.95 dB; RX s21 -4.833 dB (bound -5.529),
+  image -13.88 dB relative (bound -12.57), RX -> PA -28.88 dB.
 
 The design deck (``op_bias``, the RF transistors' analysis): ``pin_bias`` -
 the current through ``R2`` (the diodes on the generic ``model.diode`` card,
@@ -100,7 +113,7 @@ from ai_eda.tools.calc.rf import lmatch_lowpass_c_shunt, lmatch_lowpass_l_series
 
 from ai_eda.design.library_parts import TemplateRefusal
 from ai_eda.design.rf.blocks.base import GROUND_NET, Block, BlockBuilder, BlockContext, BlockResult
-from ai_eda.design.rf.blocks.pa import add_harmonic_lpf
+from ai_eda.design.rf.blocks.pa import add_harmonic_lpf, cascade_network, db_budget
 from ai_eda.design.rf.blocks.tx_chain import (
     BIAS_ANALYSIS,
     NetBook,
@@ -337,6 +350,85 @@ class TrxBlock(Block):
         return b.done()
 
 
+#: the composition-level fixture over the antenna end (its own id and the pseudo-block that carries its computed bounds)
+ANT_END_ID = "ant_end"
+
+
+def ant_end_result(ctx: BlockContext, results: list[BlockResult], *, with_match: bool) -> BlockResult:
+    """The cascade fixture ``ant_end`` of the transceiver's antenna end: the load-line match, the T/R switch, the harmonic low-pass (with the
+    antenna L-match when the build has one) and the front end's first band-pass, as the board joins them.
+
+    The board joins these networks with no resistive node between them: the
+    match's DC block and the switch's TX DC block on ``TX_RF``, the switch's
+    common DC block and the low-pass's first shunt capacitor on ``LPF_IN``,
+    the switch's RX DC block and ``fe_bpf2``'s input tap on ``RX_RF``, the
+    low-pass's last shunt capacitor and the antenna match on ``ANT_PORT``.
+    Each component fixture assumed the system impedance there; this one holds
+    every part of the four (five) networks between the chain's own ends - the
+    PA's load line ``pa_out``, the antenna feed ``feed`` and the LNA's base
+    ``lna_in`` - with the switch's ``tx`` / ``rx`` states (its PIN bindings).
+
+    Rows (one-sided, from the component networks' own bounds and nominals;
+    ``calc.rf.db_sum`` adds dB terms): TX - s21 ``pa_out`` -> ``feed`` at
+    f_c at least ``pa.match.s21_min`` + ``trx.tx_il_min`` + ``lpf.s21_min``
+    (+ ``trx.match.s21_min``), s11 at the load line at most
+    ``pa.match.s11_max``, s21 at 2 f_c / 3 f_c at most ``lpf.h2_max`` /
+    ``lpf.h3_max``, s21 ``pa_out`` -> ``lna_in`` at f_c at most
+    ``trx.tx_iso_max``; RX - s21 ``feed`` -> ``lna_in`` at f_c at least
+    ``lpf.s21_min`` + ``trx.rx_il_min`` (+ ``trx.match.s21_min``) + the exact
+    ``fe_bpf2.s21``, the image relative to f_c at most ``fe_bpf2.rel_image``
+    + ``fe.net_tol``, s21 ``feed`` -> ``pa_out`` at f_c at most
+    ``trx.rx_iso_max``.
+
+    The result is a composition-level pseudo-block: no part of its own (its
+    network's members are the other blocks'), only the computed bounds and
+    the network, so it is merged after the blocks and never checked as a
+    block (:meth:`BlockResult.check` would call every member unknown); the
+    RF design and the fixture runner check the network.
+    """
+    by_id = {nw.id: nw for r in results for nw in r.networks}
+    need = ["pa_match", "trsw", "lpf", "fe_bpf2", *(["ant_match"] if with_match else [])]
+    missing = [n for n in need if n not in by_id]
+    if missing:
+        raise TemplateRefusal(f"{ANT_END_ID}: the composition has no {', '.join(missing)} network(s) to join")
+    b = BlockBuilder(ctx, ANT_END_ID, "antenna-end cascade fixture")
+    p = ctx.shared
+    keys = ("rf.f_c", "pa.match.s21_min", "pa.match.s11_max", "trx.tx_il_min", "trx.tx_iso_max", "trx.rx_il_min", "trx.rx_iso_max", "lpf.s21_min",
+            "lpf.h2_max", "lpf.h3_max", "lpf.f_2", "lpf.f_3", "fe_bpf2.s21", "fe_bpf2.rel_image", "fe.net_tol", "fe.image",
+            *(["trx.match.s21_min"] if with_match else []))
+    absent = [k for k in keys if k not in p]
+    if absent:
+        raise TemplateRefusal(f"{ANT_END_ID}: the blocks did not share {', '.join(absent)} (BlockContext.shared)")
+    match_term = [("trx.match.s21_min", p["trx.match.s21_min"])] if with_match else []
+    try:
+        tx_min = db_budget(b, f"{ANT_END_ID}.tx_s21_min", [("pa.match.s21_min", p["pa.match.s21_min"]), ("trx.tx_il_min", p["trx.tx_il_min"]),
+                                                          ("lpf.s21_min", p["lpf.s21_min"]), *match_term])
+        rx_min = db_budget(b, f"{ANT_END_ID}.rx_s21_min", [("lpf.s21_min", p["lpf.s21_min"]), ("trx.rx_il_min", p["trx.rx_il_min"]), *match_term,
+                                                          ("fe_bpf2.s21", p["fe_bpf2.s21"])])
+        image_max = db_budget(b, f"{ANT_END_ID}.rx_image_max", [("fe_bpf2.rel_image", p["fe_bpf2.rel_image"]), ("fe.net_tol", p["fe.net_tol"])])
+    except ValueError as e:
+        raise TemplateRefusal(f"{ANT_END_ID}: {e}") from e
+    nets = [by_id[n] for n in need]
+    port = lambda nw, name: next(x for x in by_id[nw].ports if x.name == name)  # noqa: E731
+    feed = port("ant_match", "ant_feed") if with_match else port("lpf", "lpf_out")
+    ports = [port("pa_match", "pa_out"), feed.model_copy(update={"name": "feed"}), port("fe_bpf2", "lna_in"),
+             *[x for nw in nets for x in nw.ports if x.kind == "rail"]]
+    f_c = p["rf.f_c"]
+    rows = [
+        row("tx_s21_fc", "s21_db", "pa_out", "feed", f_c, tx_min, bound="at_least", state="tx"),
+        row("tx_s11_fc", "s11_db", "pa_out", "pa_out", f_c, p["pa.match.s11_max"], bound="at_most", state="tx"),
+        row("tx_s21_2fc", "s21_db", "pa_out", "feed", p["lpf.f_2"], p["lpf.h2_max"], bound="at_most", state="tx"),
+        row("tx_s21_3fc", "s21_db", "pa_out", "feed", p["lpf.f_3"], p["lpf.h3_max"], bound="at_most", state="tx"),
+        row("tx_iso_lna", "s21_db", "pa_out", "lna_in", f_c, p["trx.tx_iso_max"], bound="at_most", state="tx"),
+        row("rx_s21_fc", "s21_db", "feed", "lna_in", f_c, rx_min, bound="at_least", state="rx"),
+        row("rx_rel_image", "rel_s21_db", "feed", "lna_in", p["fe.image"], image_max, bound="at_most", ref_at=f_c, state="rx"),
+        row("rx_iso_pa", "s21_db", "feed", "pa_out", f_c, p["trx.rx_iso_max"], bound="at_most", state="rx"),
+    ]
+    sweep = by_id["lpf"].sweep[0].model_copy(update={"id": f"{ANT_END_ID}_sweep"})
+    b.result.networks.append(cascade_network(ANT_END_ID, nets, block=None, ports=ports, sweep=sweep, expectations=rows, states=list(by_id["trsw"].states)))
+    return b.result
+
+
 class AntennaBlock(Block):
     """The part at the antenna feed: ``ANT1`` (the quarter-wave wire) or ``J1001`` (the conducted variant's U.FL) - see the module docstring."""
 
@@ -413,6 +505,7 @@ class AntennaBlock(Block):
 
 __all__ = [
     "ANTENNA_ID",
+    "ANT_END_ID",
     "ANTENNA_KEYS",
     "ANT_R_RANGE",
     "FEED_NET",
@@ -428,6 +521,7 @@ __all__ = [
     "VARIANT_CONDUCTED",
     "AntennaBlock",
     "TrxBlock",
+    "ant_end_result",
     "antenna_resistance",
     "trx_net_classes",
 ]

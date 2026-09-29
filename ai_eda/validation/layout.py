@@ -69,18 +69,40 @@ inscribed radius ``min(w, h)/2``; a through-hole pad or one listing
 ``*.Cu`` is on every copper layer of the board, an SMD pad on the copper
 layers it lists (mirrored on the bottom side). Only the convex shapes
 (``circle`` / ``rect`` / ``oval`` / ``roundrect``) lie inside their
-``(size)`` box: a ``custom`` pad's primitives and a ``trapezoid``'s
-``rect_delta`` reach beyond it and the library reader keeps neither, so such
-a pad's copper is unknown, like every pad of a component without a placement
-or footprint, or whose footprint is not on disk. Neither result is then ever
+``(size)`` box. A ``custom`` pad is read as the boxes of
+:func:`ai_eda.tools.kicad.geometry.custom_pad_parts` - its anchor and one box
+around each copper primitive, the extent the router and every other user
+reads -, one item per box under the pad's label (one logical pad): clearance
+and ``pcb.keepout`` compare every box (an outer bound, like a round pad's
+box); a part with a bounding disc (``PadPart.disc``: a circle anchor, a
+``gr_circle`` grown by half its stroke - a ring's disc covers its hole) is
+measured clear by copper at least the limit from that disc, however close it
+comes to the box (a ring's box corner); copper closer than the limit only to
+the box / disc that merely bounds its part's copper (a ring, a line's box -
+the part's known copper, the disc of radius ``r_in`` around its centre,
+keeping the limit) is a NOT_VERIFIED pair under
+``details["custom_pad_bounds"]``, never a FAIL, and ``pcb.keepout`` FAILs
+only on a part's known copper (an exact box, the disc of ``r_in``);
+connectivity joins copper to the pad only through a part known to be copper
+around its centre (the anchor's inscribed circle, an exact filled rectangle,
+a filled disc), and a net whose pads are left apart while its copper meets a
+custom pad inside a merely bounding box (and its bounding disc, when the
+part has one: a ring, a line's box) is a NOT_VERIFIED row naming the pad
+(``bounded_pads``), never a FAIL: that contact is neither measured nor
+excluded. A ``trapezoid``'s
+``rect_delta`` reaches beyond the box and the library reader does not keep
+it, and a custom pad with a primitive the reader did not read is not bounded
+either: such a pad's copper is unknown, like every pad of a component
+without a placement or footprint, or whose footprint is not on disk.
+Neither result is then ever
 PASS (a check that skipped that copper would claim more than it measured):
 connectivity makes each net holding an unknown pad a NOT_VERIFIED row naming
 it (never the "no such pad" FAIL), still judges every other net - its union
 joins only the net's own copper, so copper of another net cannot join its
 pads, and an open between known pads is a measured FAIL - and is FAIL when
 such a net is, NOT_VERIFIED naming the unknown pads otherwise (a placement-only
-board whose router refused a custom pad FAILs on its open nets, like any
-other unrouted board); clearance stays NOT_APPLICABLE without IR copper
+board whose router refused a pad FAILs on its open nets, like any other
+unrouted board); clearance stays NOT_APPLICABLE without IR copper
 (pad-to-pad is DRC's anyway), FAILs on a malformed item, an outline row or a
 violation between known items, and is NOT_VERIFIED naming the unknown pads
 otherwise. Only a missing KiCad library makes both NOT_VERIFIED for the whole
@@ -112,9 +134,17 @@ conservative text-box *estimate*, not KiCad's font metrics). References on
   copper or leaves the outline is not a violation either way (the estimate
   is conservative by design; a real glyph is narrower): it is listed under
   ``details["library_text_estimates"]`` and makes the result NOT_VERIFIED -
-  KiCad's ``silk_over_copper`` decides. FAIL on a violation; PASS only when
-  every item was checked (a footprint that cannot be read, a ``custom`` /
-  ``trapezoid`` pad whose copper is unknown, or a missing outline make it
+  KiCad's ``silk_over_copper`` decides. So does a silk item that meets a
+  custom pad's shape that only *bounds* its copper (a ring's disc, a line's
+  box: ``PadCopper.bound``), or a designed / default text within its margin
+  of one - listed under ``details["custom_pad_bounds"]``, never a FAIL: the
+  copper inside that bound is not known. A bound is an outer limit of the
+  copper, so a library silk graphic clear of it touches no copper of that
+  part (judged; at least that far away, listed under ``below_margin`` when
+  closer than the text margin). FAIL on a violation; PASS only when
+  every item was checked (a footprint that cannot be read, a ``trapezoid``
+  pad or a custom pad with an unread primitive - copper unknown -, or a
+  missing outline make it
   NOT_VERIFIED). Tracks are not compared (silk over mask-covered copper is
   normal) and neither are vias (the compiled board tents them).
 * ``pcb.silk.overlap`` - silk texts pairwise, and silk texts against the
@@ -156,7 +186,7 @@ from typing import Any
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import BoardSide, CircuitIR, PCBDesign, Track, ValidationResult, ValidationStatus, Via
-from ai_eda.tools.kicad.geometry import _q, pad_angle, pad_center, pad_layers
+from ai_eda.tools.kicad.geometry import _q, custom_pad_parts, pad_angle, pad_center, pad_layers
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError
 from ai_eda.tools.silkscreen.geometry import (
     FAB_LAYERS,
@@ -230,6 +260,14 @@ class _PadItem:
     layers: frozenset[str]
     #: the box is the pad's copper exactly (a ``rect`` pad at a multiple of 90 degrees)
     exact: bool = False
+    #: copper reaching the disc of radius ``r_in`` around the centre reaches the pad; ``False`` for a part of a ``custom`` pad whose
+    #: box only bounds its copper (a ring, a line, an arc ...): nothing inside that box is known to be copper
+    joins: bool = True
+    #: the part of a ``custom`` pad this item is (``"anchor rect"``, ``"gr_poly[0]"`` ...); ``None`` for every other pad
+    part: str | None = None
+    #: ``(x, y, r)`` of a disc that bounds the part's copper more tightly than its box (``PadPart.disc``: a circle anchor, a
+    #: ``gr_circle`` grown by half its stroke - a ring's disc covers its hole); ``None`` otherwise
+    disc: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +386,8 @@ def _connected(a: _Item, b: _Item) -> bool:
         a, b = b, a
     if isinstance(a, _PadItem):
         return False  # pad-to-pad: not IR copper
+    if isinstance(b, _PadItem) and not b.joins:
+        return False  # a custom pad's bounding part: nothing inside its box is known to be copper
     shared = _item_layers(a) & _item_layers(b)
     if not shared:
         return False
@@ -382,9 +422,12 @@ class _Board:
         self.pad_labels: set[str] = set()
         self.unknown: list[str] = []
         #: the components none of whose pads is known (no placement / footprint, or a footprint that cannot be read) and the
-        #: ``REF.NUMBER`` labels of single pads whose copper is unknown (custom / trapezoid): a net holding one is never judged
+        #: ``REF.NUMBER`` labels of single pads whose copper is unknown (a trapezoid, a custom pad with an unread primitive): a net holding
+        #: one is never judged
         self.unknown_refs: set[str] = set()
         self.unknown_pads: set[str] = set()
+        #: the ``REF.NUMBER`` labels of the custom pads read as parts (module docstring)
+        self.custom_labels: set[str] = set()
         for comp in sorted(ir.components, key=lambda c: natural_ref_key(c.ref)):
             placement = pcb.placement(comp.ref)
             if placement is None:
@@ -406,10 +449,13 @@ class _Board:
                 self.unknown_refs.add(comp.ref)
                 continue
             for pad in fp.pads:
+                if pad.shape == "custom":
+                    self._custom(comp.ref, f"{comp.footprint.library}:{comp.footprint.name}", placement, pad)
+                    continue
                 if pad.shape not in CONVEX_PAD_SHAPES:
                     self.unknown.append(
                         f"pad {comp.ref}.{pad.number or '(unnumbered)'} of footprint {comp.footprint.library}:{comp.footprint.name} has shape "
-                        f"{pad.shape!r}, whose copper is not bounded by its (size) box (custom primitives / trapezoid rect_delta are not read)"
+                        f"{pad.shape!r}, whose copper is not bounded by its (size) box (a trapezoid's rect_delta is not read)"
                     )
                     if pad.number:
                         self.unknown_pads.add(f"{comp.ref}.{pad.number}")
@@ -454,8 +500,34 @@ class _Board:
                 self.malformed.append({"item": item.label, "status": str(ValidationStatus.FAIL), "message": f"{item.label} {why}"})
         self.zones = [(f"zone[{i}:{z.net}]", z.net, z.layer) for i, z in enumerate(pcb.zones)]
 
+    def _custom(self, ref: str, lib_id: str, placement: Any, pad: Any) -> None:
+        """A ``custom`` pad as one item per :func:`~ai_eda.tools.kicad.geometry.custom_pad_parts` box (module docstring); unknown when
+        a primitive was not read."""
+        label = f"{ref}.{pad.number}" if pad.number else f"{ref}.(unnumbered)"
+        try:
+            parts = custom_pad_parts(placement, pad)
+        except CompileError as e:
+            self.unknown.append(f"pad {label} of footprint {lib_id}: {e}")
+            if pad.number:
+                self.unknown_pads.add(label)
+            return
+        layers = pad_layers(placement, pad)
+        if pad.pad_type in ("thru_hole", "np_thru_hole") or "*.Cu" in layers:
+            copper = frozenset(self.copper_layers)
+        else:
+            copper = frozenset(name for name in layers if name.endswith(".Cu"))
+        net = self.pin_net.get((ref, pad.number)) if pad.number else None
+        if pad.number:
+            self.pad_labels.add(label)
+        self.custom_labels.add(label)
+        for part in parts:
+            cx, cy = part.center
+            self.pads.append(_PadItem(label, net, cx, cy, part.box.width / 2.0, part.box.height / 2.0, part.inscribed_r, copper, part.exact,
+                                      part.inscribed_r > 0.0, part.what, part.disc))
+
     def is_unknown(self, ref: str, pin: str) -> bool:
-        """Whether the copper of pin ``ref.pin`` is unknown (its component unread, or the pad itself a custom / trapezoid shape)."""
+        """Whether the copper of pin ``ref.pin`` is unknown (its component unread, or the pad itself a trapezoid or a custom pad with a
+        primitive the library reader did not read)."""
         return ref in self.unknown_refs or f"{ref}.{pin}" in self.unknown_pads
 
 
@@ -562,8 +634,16 @@ def connectivity_rows(ir: CircuitIR, board: _Board) -> tuple[list[dict[str, Any]
                     uf.union(i, j)
         root = uf.find(0)
         left_out = list(dict.fromkeys(p.label for k, p in enumerate(pads) if uf.find(k) != root))
+        maybe = _maybe_joined(pads, items, uf) if left_out else []
         cut_off = _unreachable_by_pour(items, uf, len(pads), [layer for _, zone_net, layer in board.zones if zone_net == net.name]) if left_out and zones else []
-        if cut_off:
+        if maybe:  # copper meets a custom pad's bound where its copper is not known: the open is neither measured nor excluded
+            row.update(
+                status=str(ValidationStatus.NOT_VERIFIED), unconnected=left_out, bounded_pads=maybe,
+                message=(f"{', '.join(left_out)} not joined to {labels[0]} through known copper; copper of the net reaches the bounding box of "
+                         f"custom pad(s) {', '.join(maybe)} where the pad's copper is not known (a ring, a line, an arc ... is bounded by its box): "
+                         "whether it touches the pad is not measured here"),
+            )
+        elif cut_off:
             row.update(
                 status=str(ValidationStatus.FAIL), unconnected=cut_off,
                 message=(f"{', '.join(cut_off)} not connected: no track / via of the net reaches them and their copper is on no layer of "
@@ -592,6 +672,35 @@ def connectivity_rows(ir: CircuitIR, board: _Board) -> tuple[list[dict[str, Any]
 _INNER_RE = re.compile(r"^In[1-9][0-9]*\.Cu$")
 
 
+def _disc_distance(a: _Item, pad: _PadItem) -> float | None:
+    """Distance from the copper of a track / via ``a`` to the disc that bounds ``pad``'s copper (``None``: the part has no disc)."""
+    if pad.disc is None or isinstance(a, _PadItem):
+        return None
+    x, y, r = pad.disc
+    if isinstance(a, _TrackItem):
+        return _seg_point_distance(a.a, a.b, (x, y)) - a.w / 2.0 - r
+    return math.hypot(a.x - x, a.y - y) - a.d / 2.0 - r
+
+
+def _maybe_joined(pads: list[_PadItem], items: list[_Item], uf: _UnionFind) -> list[str]:
+    """The custom pads a track / via of the net meets only inside a bounding part (``joins`` False) while not joined to that pad through
+    known copper: the contact is neither measured nor excluded (module docstring). Copper that meets the part's box but not its bounding
+    disc (a ring's box corner) cannot meet its copper: no contact."""
+    out: list[str] = []
+    for k, p in enumerate(pads):
+        if p.joins or p.label in out:
+            continue
+        for j in range(len(pads), len(items)):
+            c = items[j]
+            if uf.find(j) == uf.find(k) or not (_item_layers(c) & p.layers):
+                continue
+            disc = _disc_distance(c, p)
+            if _q(_copper_distance(c, p)) <= 0.0 and (disc is None or _q(disc) <= 0.0):
+                out.append(p.label)
+                break
+    return out
+
+
 def _unreachable_by_pour(items: list[_Item], uf: _UnionFind, n_pads: int, zone_layers: list[str]) -> list[str]:
     """The pads of every copper set that no pour of the net can reach: none of its items is a via, a pad or a track on a pour layer."""
     layers = set(zone_layers)
@@ -608,8 +717,28 @@ def _unreachable_by_pour(items: list[_Item], uf: _UnionFind, n_pads: int, zone_l
 # --------------------------------------------------------------------------- clearance
 
 
+def _bound_only(a: _Item, pad: _PadItem, limit: float) -> bool:
+    """Whether ``a`` comes within ``limit`` of ``pad`` only through a custom pad's box (or bounding disc) that merely bounds its copper:
+    the part's known copper (the disc of radius ``r_in`` around its centre; none when ``r_in`` is 0) keeps the limit, so the violation is
+    not measured."""
+    if pad.part is None or pad.exact:
+        return False
+    if pad.r_in <= 0.0:
+        return True
+    if isinstance(a, _TrackItem):
+        known = _seg_point_distance(a.a, a.b, (pad.cx, pad.cy)) - a.w / 2.0 - pad.r_in
+    else:
+        known = math.hypot(a.x - pad.cx, a.y - pad.cy) - a.d / 2.0 - pad.r_in
+    return _q(known) >= limit
+
+
 def clearance_rows(board: _Board, limit: float) -> tuple[int, list[dict[str, Any]]]:
-    """``(pairs compared, violation rows)``: every IR copper item against every item of another net on a shared layer."""
+    """``(pairs compared, violation rows)``: every IR copper item against every item of another net on a shared layer.
+
+    A custom pad part with a bounding disc (``_PadItem.disc``) is measured to that disc, which bounds its copper more tightly than its
+    box: a pair at least ``limit`` from it is clear, however close it comes to the part's box (a ring's box corner). A pair closer than
+    ``limit`` only to the box / disc that merely bounds the part's copper (:func:`_bound_only`) is a NOT_VERIFIED row (``bound`` True),
+    never a FAIL: the copper inside that bound is not known."""
     copper: list[_Item] = [*board.tracks, *board.vias]
     others: list[_Item] = [*board.tracks, *board.vias, *board.pads]
     boxes = {id(item): _item_box(item) for item in others}
@@ -633,9 +762,19 @@ def clearance_rows(board: _Board, limit: float) -> tuple[int, list[dict[str, Any
             if box_a[0] - limit > box_b[2] or box_b[0] - limit > box_a[2] or box_a[1] - limit > box_b[3] or box_b[1] - limit > box_a[3]:
                 continue
             raw = _q(_copper_distance(a, b))
+            disc = _disc_distance(a, b) if isinstance(b, _PadItem) else None
+            if disc is not None:  # the disc bounds the part's copper more tightly than its box (a ring's box corner is not copper)
+                raw = max(raw, _q(disc))
             d = max(raw, 0.0)
             if d < limit or raw <= 0.0:  # overlapping or touching copper of two nets is a short whatever the limit
                 where = ",".join(sorted(shared))
+                if isinstance(b, _PadItem) and _bound_only(a, b, limit):
+                    bound = "disc" if disc is not None else "box"
+                    rows.append({"a": a.label, "b": b.label, "layer": where, "distance_mm": d, "limit_mm": limit, "bound": True,
+                                 "status": str(ValidationStatus.NOT_VERIFIED),
+                                 "message": (f"{a.label} vs {b.label} on {where}: {d:g} mm from the {bound} that bounds the copper of custom pad "
+                                             f"{b.label} ({b.part}; its copper inside that {bound} is not known)")})
+                    continue
                 message = f"{a.label} vs {b.label} on {where}: {d:g} mm < {limit:g} mm" if d < limit else f"{a.label} vs {b.label} on {where}: copper overlaps (a short, whatever the {limit:g} mm limit)"
                 rows.append({"a": a.label, "b": b.label, "layer": where, "distance_mm": d, "limit_mm": limit, "status": str(ValidationStatus.FAIL), "message": message})
     return compared, rows
@@ -703,9 +842,12 @@ class RoutingValidator(Validator):
         rows, item_rows = connectivity_rows(ir, board)
         failed = [r["net"] for r in rows if r["status"] == str(ValidationStatus.FAIL)]
         unread = [r["net"] for r in rows if r.get("unknown_pads")]
-        pour = [r["net"] for r in rows if r["status"] == str(ValidationStatus.NOT_VERIFIED) and not r.get("unknown_pads")]
+        bounded = [r["net"] for r in rows if r.get("bounded_pads")]
+        pour = [r["net"] for r in rows if r["status"] == str(ValidationStatus.NOT_VERIFIED) and not r.get("unknown_pads") and not r.get("bounded_pads")]
         connected = [r["net"] for r in rows if r["status"] == str(ValidationStatus.PASS)]
         details = {"nets": rows, "items": item_rows, "tracks": board.track_total, "vias": board.via_total, "zones": len(board.zones), "unknown": board.unknown}
+        if board.custom_labels:  # read as the boxes of their anchor and primitives (module docstring)
+            details["custom_pads"] = sorted(board.custom_labels, key=natural_ref_key)
         # a FAIL row is a net whose every pad is known and whose own copper leaves a pad out: copper this check cannot read belongs to
         # other nets (a union joins only the net's own items), so it cannot join these pads - a measured open, whatever else is unknown
         if failed or item_rows:
@@ -719,10 +861,18 @@ class RoutingValidator(Validator):
                 parts.append(self._malformed_part(board))
             if board.unknown:
                 parts.append(f"{len(unread)} net(s) not judged because of pads whose geometry is unknown ({'; '.join(board.unknown)})")
+            if bounded:
+                parts.append(f"{len(bounded)} net(s) not judged where copper meets a custom pad's bounding box only ({', '.join(bounded)})")
             return self._result(CONNECTIVITY_CHECK, ValidationStatus.FAIL, "; ".join(parts) + f" ({NOT_DRC})", **details)
         if board.unknown:  # never a PASS while a pad's copper is unknown: it may join or cut what the check measured
             tail = f"; {len(unread)} net(s) holding such a pad not judged" + (f", {len(connected)} other net(s) connected through IR copper" if connected else "")
             return self._result(CONNECTIVITY_CHECK, ValidationStatus.NOT_VERIFIED, self._unknown_part(board) + tail + f" ({NOT_DRC})", **details)
+        if bounded:
+            return self._result(
+                CONNECTIVITY_CHECK, ValidationStatus.NOT_VERIFIED,
+                f"{len(bounded)} net(s) whose copper meets a custom pad only inside the box that bounds its copper, where the copper itself is not "
+                "known: " + "; ".join(f"{r['net']}: {r['message']}" for r in rows if r["net"] in bounded) + f" ({NOT_DRC})", **details,
+            )
         if pour:
             return self._result(
                 CONNECTIVITY_CHECK, ValidationStatus.NOT_VERIFIED,
@@ -751,6 +901,8 @@ class RoutingValidator(Validator):
         }
         if board.unknown:
             details["unknown"] = board.unknown
+        if board.custom_labels:
+            details["custom_pads"] = sorted(board.custom_labels, key=natural_ref_key)
         if board.malformed:  # copper the compiler refuses: FAIL whatever the limit, nothing else is claimed about the board
             return self._result(CLEARANCE_CHECK, ValidationStatus.FAIL, self._malformed_part(board) + f" ({NOT_DRC})", pairs_compared=0, violations=[], **details)
         if not board.tracks and not board.vias:  # pad-to-pad is DRC's even when every pad is known: nothing here to compare
@@ -767,8 +919,12 @@ class RoutingValidator(Validator):
                 pairs_compared=0, violations=[], **details,
             )
         lim = float(limit.value)
-        compared, violations = clearance_rows(board, lim)
+        compared, rows = clearance_rows(board, lim)
+        violations = [r for r in rows if r["status"] == str(ValidationStatus.FAIL)]
+        bounded = [r for r in rows if r.get("bound")]
         details.update(pairs_compared=compared, violations=violations)
+        if bounded:
+            details["custom_pad_bounds"] = bounded[:_MAX_ROWS]
         if violations or outline_rows:
             parts = []
             if violations:
@@ -779,6 +935,12 @@ class RoutingValidator(Validator):
         if board.unknown:  # the copper nobody read may be closer than the limit (or a short): no PASS
             return self._result(CLEARANCE_CHECK, ValidationStatus.NOT_VERIFIED,
                                 self._unknown_part(board) + f"; {compared} copper pair(s) of known items keep >= {lim:g} mm ({NOT_DRC})", **details)
+        if bounded:  # closer than the limit only to a box that merely bounds a custom pad's copper: not measured, no PASS, no FAIL
+            return self._result(
+                CLEARANCE_CHECK, ValidationStatus.NOT_VERIFIED,
+                f"{len(bounded)} copper pair(s) closer than {lim:g} mm only to the box / disc that bounds a custom pad's copper, where the copper is not "
+                "known: " + "; ".join(r["message"] for r in bounded[:5]) + (" ..." if len(bounded) > 5 else "") + f" ({NOT_DRC})", **details,
+            )
         edge = "" if pcb.outline is None else f", {len(board.tracks)} track(s) / {len(board.vias)} via(s) inside the outline"
         if pcb.outline is None:
             return self._result(
@@ -874,7 +1036,7 @@ class _SilkBoard:
                 continue
             for pad in pad_copper(comp.ref, fp, placement):
                 if pad.shape is None:
-                    self.unknown_copper.append(f"pad {pad.label} of {fp.lib_id} has shape {pad.pad_shape!r}, whose copper is not read (custom primitives / trapezoid rect_delta)")
+                    self.unknown_copper.append(f"pad {pad.label} of {fp.lib_id} has shape {pad.pad_shape!r}, whose copper is not read (a trapezoid's rect_delta, or a custom pad's unread primitive)")
                 else:
                     self.pads.append(pad)
             values = {"Value": comp.value, "Datasheet": (comp.datasheet.url or "") if comp.datasheet is not None else ""}
@@ -949,6 +1111,7 @@ class SilkscreenValidator(Validator):
         rows: list[dict[str, Any]] = []
         below: list[dict[str, Any]] = []
         estimated: list[str] = []  # library texts whose over-estimated box meets copper / leaves the outline: not a proof either way
+        bounded: list[str] = []  # items meeting a custom pad's box that only bounds its copper (a ring's square ...): not a proof either way
         compared = 0
         for e in board.entries:
             margined = e.kind == "text" and e.source != "library"  # designed / default-position texts: the placer's margins
@@ -961,14 +1124,20 @@ class SilkscreenValidator(Validator):
                 if not _near(e.box, pad.shape.bbox(), SILK_TO_PAD_MM):
                     continue
                 d = shape_distance(e.shape, pad.shape)
-                if library_text and d <= 0.0:
+                # a bound (a ring's disc, a line's box) is an outer limit of the copper: an item clear of it is clear of the copper, so only an
+                # item meeting it - or a margined text within its margin of it - is not measured
+                if pad.bound and (d <= 0.0 or (margined and d < _q(limit))):
+                    bounded.append(f"{e.label} is {max(d, 0.0):g} mm from the shape that bounds the copper of custom pad {pad.label} (its copper inside "
+                                   "that bound is not known: KiCad's silk_over_copper decides)")
+                elif library_text and d <= 0.0:
                     estimated.append(f"the estimated box of library text {e.label} meets pad {pad.label} copper (the estimate is conservative; KiCad's silk_over_copper decides)")
                 elif d <= 0.0 or (margined and d < _q(limit)):
                     what = "overlaps" if d <= 0.0 else f"is {d:g} mm from"
                     rows.append({"a": e.label, "b": f"pad {pad.label}", "distance_mm": d, "limit_mm": limit, "status": str(ValidationStatus.FAIL),
                                  "message": f"{e.label} {what} pad {pad.label} copper" + ("" if d <= 0.0 else f" (< {limit:g} mm)")})
                 elif d < _q(SILK_TO_PAD_MM):
-                    below.append({"a": e.label, "b": f"pad {pad.label}", "distance_mm": d, "message": f"library silk {e.label} is {d:g} mm from pad {pad.label} (the footprint's own design; below the {SILK_TO_PAD_MM:g} mm text margin)"})
+                    at = f"at least {d:g} mm from pad {pad.label} (measured to the shape that bounds its copper)" if pad.bound else f"{d:g} mm from pad {pad.label}"
+                    below.append({"a": e.label, "b": f"pad {pad.label}", "distance_mm": d, "message": f"library silk {e.label} is {at} (the footprint's own design; below the {SILK_TO_PAD_MM:g} mm text margin)"})
             if board.outline is not None:
                 inset = (board.outline[0] + SILK_TO_EDGE_MM, board.outline[1] + SILK_TO_EDGE_MM, board.outline[2] - SILK_TO_EDGE_MM, board.outline[3] - SILK_TO_EDGE_MM)
                 if margined and not inside_box(e.shape, inset):
@@ -979,7 +1148,7 @@ class SilkscreenValidator(Validator):
                     rows.append({"a": e.label, "b": "board edge", "status": str(ValidationStatus.FAIL), "message": f"{e.label} leaves the outline"})
                 elif not margined and not inside_box(e.shape, inset):
                     below.append({"a": e.label, "b": "board edge", "message": f"library silk {e.label} is within {SILK_TO_EDGE_MM:g} mm of the outline (the footprint's own design)"})
-        unknown = [*board.unknown, *board.unknown_copper, *estimated] + ([] if board.outline is not None else ["ir.pcb has no outline: edge distances not judged"])
+        unknown = [*board.unknown, *board.unknown_copper, *estimated, *bounded] + ([] if board.outline is not None else ["ir.pcb has no outline: edge distances not judged"])
         passed = (
             f"{sum(1 for e in board.entries if e.kind == 'text' and e.source != 'library')} silk text(s) keep >= {SILK_TO_PAD_MM:g} mm from pad copper and >= {SILK_TO_EDGE_MM:g} mm inside the outline "
             f"(the silkscreen placer's margins, not a fab rule), {sum(1 for e in board.entries if e.source == 'library')} footprint silk graphic(s) / library text(s) touch no pad copper and stay inside the outline"
@@ -988,7 +1157,8 @@ class SilkscreenValidator(Validator):
         return self._verdict(SILK_CLEARANCE_CHECK, board, rows, "silk item(s) too close to pad copper or the board edge", passed, unknown,
                              pairs_compared=compared, silk_to_pad_mm=SILK_TO_PAD_MM, silk_to_edge_mm=SILK_TO_EDGE_MM, below_margin=below[:_MAX_ROWS],
                              library_text_estimates=estimated[:_MAX_ROWS],
-                             not_compared=["tracks (silk over mask-covered copper is normal)", "vias (tented by the compiled board)"])
+                             not_compared=["tracks (silk over mask-covered copper is normal)", "vias (tented by the compiled board)"],
+                             **({"custom_pad_bounds": bounded[:_MAX_ROWS]} if bounded else {}))
 
     def _overlap(self, board: _SilkBoard) -> ValidationResult:
         rows: list[dict[str, Any]] = []
