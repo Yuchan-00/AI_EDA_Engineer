@@ -545,6 +545,9 @@ class PCBAgent(Agent):
             text += "; plane net(s) " + ", ".join(
                 f"{n} ({r['vias']} pad via(s), {len(r['through_hole'])} through-hole pad(s)) to {'+'.join(r['planes'])}" for n, r in joined.items()
             ) + " - joined through the plane fill, not by tracks"
+        if s.get("escapes"):  # routing.maze 0.6: fine-pitch / off-grid pads joined to the grid by escape stubs
+            text += (f"; {len(s['escapes'])} pad(s) reach the grid by an escape stub or cell ({', '.join(e['pad'] for e in s['escapes'])})"
+                     + (f", none reaches {', '.join(s['escape_refused'])}" if s.get("escape_refused") else ""))
         return text
 
     @staticmethod

@@ -410,10 +410,13 @@ def test_an_unroutable_board_gets_the_placement_only_and_never_half_a_route(tmp_
     [proposal] = res.proposals
     assert len(proposal.payload.placements) == 5 and proposal.payload.tracks == [] and proposal.payload.vias == []
     assert res.notes[0].startswith("placement.grid 0.1: 5 component(s)") and res.notes[0].endswith(f"; {UNROUTED_NOTE}")
-    # every terminal cell lies inside a foreign pad's 3 mm keep-out: the reason names the cell, never copper through the keep-out
+    # every terminal cell lies inside a foreign pad's 3 mm keep-out: the reason names the cell and the pads that fence it, never copper through
+    # the keep-out, and no escape stub (routing.maze 0.6) reaches a cell outside every one of them
     board_notes = _board_notes(res.notes)
     assert [n[: n.index(" terminal cell")] for n in board_notes[1:]] == ["not routed: N0: R1.2", "not routed: N1: R2.1", "not routed: N2: R2.2", "not routed: N3: R3.2"]
-    assert all(n.endswith("is inside a keep-out on every copper layer of the pad (a foreign pad, a pad without a net or the board edge is within clearance 3 + width/2 of it)") for n in board_notes[1:])
+    assert all("is inside a keep-out on every copper layer of the pad (" in n and " within clearance 3 + width/2 of it); no escape stub: every grid cell" in n
+               for n in board_notes[1:])
+    assert "(R1.1, R2.1, R2.2, R10.2 within clearance 3" in board_notes[1]
     Orchestrator.apply_proposals(ir, res.proposals)
     checks = _routing_checks(ir, tmp_path, lib)
     assert checks[CONNECTIVITY_CHECK].status is S.FAIL and "4 net(s) not connected through IR copper" in checks[CONNECTIVITY_CHECK].message
@@ -814,21 +817,29 @@ def test_core_ring_refusals_and_unrouted_fine_boards_are_notes(tmp_path: Path):
         "(raised to ir.pcb.manufacturing minimums: clearance_mm 0.2 -> 3.0)"
     )
     assert len(_board_notes(res.notes)) > 2 and all(n.startswith("not routed: ") for n in _board_notes(res.notes)[2:])
-    # parameters the agent was built with are used as given: at the default rules the QFP's terminals sit in their neighbours' keep-out
+    # parameters the agent was built with are used as given: at the default rules the QFP's terminals sit in their neighbours' keep-out -
+    # routing.maze 0.6 joins them to the grid by escape stubs and the board routes; with no escape allowed (a stub may not be narrower than
+    # 1 mm, wider than the 0.45 mm pads) they stay fenced, each net's reason noted
     ir, mlib = _mcu_board(tmp_path)
     res = PCBAgent(routing=RoutingParams()).run(ir, _ctx(tmp_path, mlib))
     [proposal] = res.proposals
-    assert proposal.payload.tracks == [] and not any("fine rules" in n for n in res.notes)
-    assert any(n.startswith("not routed: PA") and "terminal cell" in n and "inside a keep-out" in n for n in res.notes), res.notes
+    assert proposal.payload.tracks and not any("fine rules" in n for n in res.notes)
+    assert any(n.startswith("routing.maze 0.6: 10 net(s) routed") and "reach the grid by an escape stub or cell (U1." in n for n in res.notes), res.notes
+    res = PCBAgent(routing=RoutingParams(escape_min_width_mm=1.0)).run(ir, _ctx(tmp_path, mlib))
+    [proposal] = res.proposals
+    assert proposal.payload.tracks == []
+    assert any(n.startswith("not routed: PA") and "terminal cell" in n and "inside a keep-out" in n and "no escape stub" in n for n in res.notes), res.notes
 
 
 def test_a_partial_route_is_reported_as_not_applied_and_never_proposed(tmp_path: Path):
-    """At the default rules the cut-down MCU board routes some nets and fences the QFP terminals of the rest: the proposal carries the
-    placement only, and one ``not applied:`` note (before the per-net reasons) says what the router did connect - its own numbers."""
+    """At the default rules with no escape stub allowed (none may be narrower than 1 mm, wider than the QFP's 0.45 mm pads) the cut-down MCU
+    board routes some nets and fences the QFP terminals of the rest: the proposal carries the placement only, and one ``not applied:``
+    note (before the per-net reasons) says what the router did connect - its own numbers."""
     from ai_eda.tools.routing.maze import RoutingParams, route_board
 
+    params = RoutingParams(escape_min_width_mm=1.0)
     ir, mlib = _mcu_board(tmp_path)
-    res = PCBAgent(routing=RoutingParams()).run(ir, _ctx(tmp_path, mlib))
+    res = PCBAgent(routing=params).run(ir, _ctx(tmp_path, mlib))
     [proposal] = res.proposals
     assert proposal.payload.tracks == [] and proposal.payload.vias == []
     reasons = [n for n in res.notes if n.startswith("not routed: ")]
@@ -843,7 +854,7 @@ def test_a_partial_route_is_reported_as_not_applied_and_never_proposed(tmp_path:
     assert m is not None, dropped[0]
     routed, total, tracks, vias, length, iterations, unrouted = int(m[1]), int(m[2]), int(m[3]), int(m[4]), float(m[5]), int(m[6]), int(m[7])
     assert routed > 0 and tracks > 0 and unrouted == len(reasons) and routed + unrouted == total
-    again = route_board(ir.model_copy(update={"pcb": proposal.payload}), mlib, RoutingParams())
+    again = route_board(ir.model_copy(update={"pcb": proposal.payload}), mlib, params)
     assert (routed, tracks, vias, length, iterations) == (again.stats["routed_nets"], len(again.tracks), len(again.vias), again.stats["total_length_mm"], again.stats["iterations"])
     # a board where nothing routes gets no such note (nothing was connected)
     ir.pcb = PCBDesign(manufacturing=ManufacturingConstraints(min_clearance_mm=assumption(3.0, note="absurd, to fence every pad")))

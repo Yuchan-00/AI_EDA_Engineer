@@ -360,10 +360,11 @@ def test_refusals_instead_of_guesses(tmp_path: Path, lib: KicadLibrary):
     x.pcb.layers = [Layer(name="F.Cu", kind="signal")]
     with pytest.raises(CompileError, match=r"lacks \['B.Cu'\]"):
         route_board(x, lib)
-    # a pad too small for the grid: the nearest grid point (3.0, 3.0) is 0.12 mm from the 0.2 mm pad's centre
+    # a pad too small for the grid (the nearest grid point is 0.12 mm from the 0.2 mm pad's centre) is no longer a refusal: routing.maze
+    # 0.6 joins it to the grid by an escape stub (tests/test_routing_fine_pitch.py); a pad no escape reaches is refused per net there
     x = board_ir(tmp_path, lib, [("R1", "PAD1", 3.0, 3.0), ("T1", "TINY", 9.12, 3.0)], {"N": [("R1", "1"), ("T1", "1")]}, (12.0, 6.0))
-    with pytest.raises(CompileError, match=r"pad T1.1 \(0.2 x 0.2 mm\) is too small for the 0.25 mm routing grid: the nearest grid point is 0.1200 mm"):
-        route_board(x, lib)
+    escaped = route_board(x, lib)
+    assert escaped.unrouted == {} and escaped.version == "0.6" and [e["pad"] for e in escaped.stats["escapes"]] == ["T1.1"]
     assert route_board(board_ir(tmp_path, lib, [("R1", "PAD1", 3.0, 3.0), ("T1", "TINY", 9.0, 3.0)], {"N": [("R1", "1"), ("T1", "1")]}, (12.0, 6.0)), lib).unrouted == {}
     # a net naming an unplaced / unknown component, or a pin the footprint does not have
     x = board_ir(tmp_path, lib, [("R1", "PAD1", 3.0, 3.0), ("R2", "PAD1", 9.0, 3.0)], {"N": [("R1", "1"), ("R2", "1"), ("R3", "1")]}, (12.0, 6.0))
@@ -407,40 +408,44 @@ def test_a_pad_inside_the_outline_but_past_the_last_grid_cell_is_refused_with_th
         route_board(ir, lib)
 
 
-def test_a_terminal_cell_inside_a_foreign_keep_out_leaves_the_net_unrouted_never_copper_through_it(tmp_path: Path, lib: KicadLibrary):
+def test_a_terminal_cell_inside_a_foreign_keep_out_is_escaped_never_copper_through_it(tmp_path: Path, lib: KicadLibrary):
     """R1 (0.54 x 0.64 mm, net A) and R3 (1.0 mm, net B) sit exactly 0.25 mm apart - legal at the router's clearance - but R1's terminal cell
-    (5.0, 3.0) is 0.395 mm from R3's box, inside the ``clearance + width/2 + grid/2`` keep-out: BLOCKED on the owner map. The router must not
-    enter it (a track cap there would be 0.195 mm from R3), so A is unrouted with that reason and B still routes with its clearance kept."""
+    (5.0, 3.0) is 0.395 mm from R3's box, inside the ``clearance + width/2 + grid/2`` keep-out: BLOCKED on the owner map. The router never
+    enters it (a track cap there would be 0.195 mm from R3): routing.maze 0.5 left A unrouted with that reason; 0.6 (module docstring:
+    escape stubs) lands A's track on another grid point inside R1's inscribed circle, (4.75, 3.0), whose stub to the pad centre keeps
+    the clearance exactly, and B still routes with its clearance kept. A pad whose stub cannot keep the edge clearance stays unrouted."""
     ir = board_ir(
         tmp_path, lib, [("R1", "SMD054", 4.875, 3.0), ("R2", "PAD1", 1.0, 3.0), ("R3", "SMD1", 5.895, 3.0), ("R4", "PAD1", 9.0, 3.0)],
         {"A": [("R1", "1"), ("R2", "1")], "B": [("R3", "1"), ("R4", "1")]}, (10.0, 6.0),
     )
     board = _Board(ir, lib, P)
     t = board.terminals["A"][0]
-    assert t.label == "R1.1" and board.pos(t.cell) == (5.0, 3.0) and board.owner[0][t.cell] == BLOCKED and board.usable_layers(t, board.net_index["A"]) == ()
+    assert t.label == "R1.1" and board.pos(t.cell) == (4.75, 3.0) and t.escape is not None and t.escape.kind == "cell" and t.escape.why == "fenced"
+    assert board.owner[0][board._nearest_cell(5.0, 3.0)[1] * board.nx + board._nearest_cell(5.0, 3.0)[0]] == BLOCKED  # the cell 0.2 would take
+    assert board.usable_layers(t, board.net_index["A"]) == (0,)
     r = route_board(ir, lib)
-    assert r.unrouted == {
-        "A": "R1.1 terminal cell (5, 3) is inside a keep-out on every copper layer of the pad "
-        "(a foreign pad, a pad without a net or the board edge is within clearance 0.25 + width/2 of it)"
-    }
-    assert r.tracks and all(t.net == "B" for t in r.tracks) and r.stats["routed_nets"] == 1 and r.stats["unrouted_nets"] == 1
+    assert r.unrouted == {} and r.version == "0.6" and r.stats["escapes"] == [
+        {"pad": "R1.1", "net": "A", "kind": "cell", "why": "fenced", "layer": "F.Cu", "cell": [4.75, 3.0]}]
     r3_box = (5.895 - 0.5, 3.0 - 0.5, 5.895 + 0.5, 3.0 + 0.5)
     r1_box = (4.875 - 0.27, 3.0 - 0.32, 4.875 + 0.27, 3.0 + 0.32)
-    for t in r.tracks:  # B's copper keeps the router's clearance from A's pad (its own pad it may touch)
-        assert _segment_box_distance(t.start, t.end, r1_box) >= PAD_KEEPOUT - 1e-9, t
-    assert any(_segment_box_distance(t.start, t.end, r3_box) == 0.0 for t in r.tracks)
+    for t in r.tracks:  # each net's copper keeps the router's clearance from the other net's pad (its own pad it may touch)
+        assert _segment_box_distance(t.start, t.end, r1_box if t.net == "B" else r3_box) >= PAD_KEEPOUT - 1e-9, t
+    assert any(_segment_box_distance(t.start, t.end, r3_box) == 0.0 for t in r.tracks if t.net == "B")
     # the same at the outline: a 0.5 x 1.0 mm pad whose edge is 0.1 mm inside the board has its terminal cell (0.25, 3.0) in the edge
-    # keep-out (edge_clearance + width/2 = 0.5): BLOCKED on both layers, so no track cap 0.05 mm from the outline is ever emitted
+    # keep-out (edge_clearance + width/2 = 0.5): BLOCKED on both layers, so no track cap 0.05 mm from the outline is ever emitted - 0.6
+    # leaves along the pad's long axis by a 0.1 mm stub whose copper keeps the 0.3 mm edge clearance exactly
     ir = board_ir(tmp_path, lib, [("R1", "SMD0510", 0.35, 3.0), ("R2", "PAD1", 6.0, 3.0)], {"N": [("R1", "1"), ("R2", "1")]}, (10.0, 6.0))
     board = _Board(ir, lib, P)
-    t = board.terminals["N"][0]
-    assert board.pos(t.cell) == (0.25, 3.0) and board.owner[0][t.cell] == BLOCKED and board.owner[1][t.cell] == BLOCKED
+    assert board.owner[0][board._nearest_cell(0.25, 3.0)[1] * board.nx + 1] == BLOCKED
     r = route_board(ir, lib)
-    assert r.tracks == [] and r.vias == [] and list(r.unrouted) == ["N"] and r.unrouted["N"].startswith("R1.1 terminal cell (0.25, 3) is inside a keep-out")
-    # a THT pad whose centre lies in the edge keep-out likewise (its copper would even leave the board): unrouted, not routed past the edge
+    assert r.unrouted == {} and [(e["kind"], e["width_mm"], e["points"]) for e in r.stats["escapes"]] == [("stub", 0.1, [[0.35, 3.0], [0.35, 3.5], [0.5, 3.5]])]
+    assert min(min(t.start[0], t.end[0]) - t.width_mm / 2 for t in r.tracks) >= P.edge_clearance_mm - 1e-9
+    # a THT pad whose centre lies in the edge keep-out (its copper would even leave the board): unrouted, not routed past the edge, and
+    # no escape either (its stub's copper at the pad centre is inside the edge clearance)
     ir = board_ir(tmp_path, lib, [("R1", "PAD1", 4.0, 4.0), ("R2", "PAD1", 13.85, 4.0)], {"N": [("R1", "1"), ("R2", "1")]}, (14.0, 8.0))
     r = route_board(ir, lib)
-    assert r.tracks == [] and r.unrouted["N"].startswith("R2.1 terminal cell (13.75, 4) is inside a keep-out")
+    assert r.tracks == [] and r.version == "0.2" and r.unrouted["N"].startswith("R2.1 terminal cell (13.75, 4) is inside a keep-out")
+    assert "(the board edge within clearance 0.25 + width/2 of it); no escape stub" in r.unrouted["N"]
     # a target cell is never entered against the owner map: the terminal test above also guards the seed side (R1.1 is the first terminal of A)
 
 
@@ -682,8 +687,10 @@ def test_the_qfp_terminal_rule_holds_at_the_fine_rules_and_fails_at_the_defaults
             assert math.hypot(x - t.pad.cx, y - t.pad.cy) <= fine.grid_mm * math.sqrt(2) / 2 + 1e-9 < t.pad.inscribed_r == 0.225
             assert board.usable_layers(t, board.net_index[next(n for n, ts in board.terminals.items() if t in ts)]) == (0,), (t.label, shift)
         default = _Board(ir, mlib, RoutingParams())
-        fenced = [t for net, ts in default.terminals.items() for t in ts if t.pad.ref == "U1" and not default.usable_layers(t, default.net_index[net])]
+        # at the defaults most U1 terminal cells are fenced: routing.maze 0.6 escapes them (module docstring: escape stubs) or names them
+        fenced = [row["pad"] for row in default.escapes if row["pad"].startswith("U1.")] + [lab for lab in default.escape_refused if lab.startswith("U1.")]
         assert len(fenced) >= 14, len(fenced)  # 21 of 28 at the core on the grid
+        assert not board.escapes and not board.escape_refused  # at the fine rules none needs one
     # the pad geometry the numbers above rely on
     assert qfp_pad(1)[2:] == (1.5, 0.45) and QFP_PITCH - 0.45 == pytest.approx(0.35)
     assert fine.clearance_mm + fine.track_width_mm / 2 + fine.grid_mm / 2 < QFP_PITCH - 0.45 / 2 - fine.grid_mm / 2  # 0.425 < 0.475: the neighbour never fences a terminal

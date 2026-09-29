@@ -505,23 +505,33 @@ def test_the_pipeline_on_the_bench_header_board(tmp_path: Path, monkeypatch: pyt
                   *(f"spice.{e}" for e in (*BIAS_IDS, *PM_COUPLE_IDS)), *(f"spice.rf.{n}" for n in NETWORKS)):
         assert status[check] is S.PASS, (check, latest[check].message)
     assert latest["spice"].details["analyses"].keys() == {"op_bias", "pm_ac_low", "pm_ac_ref", "pm_ac_high"}
-    for check in ("rf.model_grounding", "rf.regulatory_profile", "rf.lab.tx_deviation", "rf.lab.pa_harmonics", "domain.rf.impedance"):
+    for check in ("rf.model_grounding", "rf.regulatory_profile", "rf.lab.tx_deviation", "rf.lab.pa_harmonics"):
         assert status[check] is S.NOT_VERIFIED, (check, latest[check].message)
     # no integrator on the bench board: the deviation chain has no V_max / tau_i
     assert status["rf.deviation"] is S.NOT_VERIFIED and "spice.pm_drive_peak: no result recorded" in latest["rf.deviation"].message
-    # routing.maze 0.5 reads the PHA-1's SOT-89-3 custom pad and routes most nets, but not all (the PA's 0.5 mm-pitch QFN pads are closer
-    # together than the fine rules' 0.2 mm clearance): a half-routed board is never proposed - placement only, the RF copper does not exist
+    # routing.maze 0.5 routed 53 of the 57 nets here and so proposed the placement only (three of the PA's 0.5 mm-pitch QFN pins fenced by
+    # their neighbours, GND without a via site for R806.2); 0.6 joins them to the grid by escapes (the router's module docstring: escape
+    # stubs) and the whole board routes - every track and via stamped 0.6
     placement = state.outcome(Stage.PLACEMENT).message
     assert "131 component(s) on a 106.0 x 42.0 mm" in placement and "2 shield can(s)" in placement
-    assert "not applied: routing.maze 0.5 connected" in placement and "U901." in placement and "shape 'custom'" not in placement, placement
-    assert ir.pcb is not None and ir.pcb.tracks == []
-    # placement only: every net is judged (U850.2 is bounded by its anchor and tab boxes) and the nets are a measured open (FAIL)
+    assert "routing.maze 0.6: 57 net(s) routed" in placement and "not applied" not in placement and "shape 'custom'" not in placement, placement
+    assert "4 pad(s) reach the grid by an escape stub or cell (U901.11, U901.12, U901.2, R806.2)" in placement, placement
+    assert ir.pcb is not None and ir.pcb.tracks and {t.provenance.tool_version for t in ir.pcb.tracks} == {"0.6"}
+    # every net is judged (U850.2 is bounded by its anchor and tab boxes); GND is joined only through the plane fill, which the check cannot see
     conn = latest["pcb.routing.connectivity"]
-    assert conn.status is S.FAIL and conn.details["unknown"] == [] and conn.details["custom_pads"] == ["U850.2"]
-    assert status["pcb.routing.clearance"] is S.NOT_APPLICABLE  # no IR copper to compare
+    assert conn.status is S.NOT_VERIFIED and conn.details["unknown"] == [] and conn.details["custom_pads"] == ["U850.2"]
+    assert "GND:" in conn.message and "joined only by a copper pour" in conn.message
+    assert status["pcb.routing.clearance"] is S.NOT_VERIFIED  # the IR states no clearance limit: the router's own is a parameter
+    # the routed RF nets are judged: every RF segment within 50 ohm over its plane (escape stubs are named, not judged)
+    assert status["domain.rf.impedance"] is S.PASS and all(status[f"si.impedance.{c}"] is S.PASS for c in ("RF50", "RF50_H", "RF_OUT", "Z50"))
+    # PA_PD (the PA's POWER_DOWN line, here from the bench header J2.2, 101.8 mm to U901.10) is electrically long over the plane: spice.si
+    # drives its one line (Z0 49.7 ohm) through the class's confirmed 25 ohm / 1 ns into 5 pF and it rings - an honest verdict on the new
+    # copper, left to a human (the router never re-routes for it; the full board drives PA_PD from the PTT block beside the PA)
+    si_pd = latest["spice.si.PA_PD"]
+    assert si_pd.status is S.FAIL and "J2.2-U901.10" in si_pd.message and "overshoot 32.2% > 15%" in si_pd.message
     # the stand-in's honest FAIL: input_voltage is the P9 power block's, not the bench headers'
     assert status["review.requirements_vs_ir"] is S.FAIL and latest["review.requirements_vs_ir"].details["unserved"] == ["req.input_voltage"]
-    assert sorted(k for k, s in status.items() if s is S.FAIL) == ["pcb.routing.connectivity", "repair.loop", "review.requirements_vs_ir"]
+    assert sorted(k for k, s in status.items() if s is S.FAIL) == ["repair.loop", "review.requirements_vs_ir", "spice.si.PA_PD"]
 
 
 @needs_libs

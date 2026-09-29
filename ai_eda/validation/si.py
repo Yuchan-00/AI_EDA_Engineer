@@ -51,9 +51,12 @@ their verdicts. Results (tool :data:`~ai_eda.tools.si.measure.SI_TOOL`):
   judged - only when the router necked it down: its provenance records the
   net's rule with that ``neckdown_width`` and (with the KiCad library, which
   gives the pad boxes) it lies within the rule's ``neckdown_radius`` plus one
-  grid step of one of the net's pads. Every other narrower track is judged
-  at its own width (a promoted net the router left at the board width
-  FAILs). A track whose copper lies in a keep-out that forbids the zone of
+  grid step of one of the net's pads - or it is a segment of an escape stub
+  the router recorded (routing.maze 0.6: a fine-pitch pad joined to the grid
+  by a stub no wider than the pad, whose provenance names the pad, the width
+  and the stub's points, and the track is one of its segments). Every other
+  narrower track is judged at its own width (a promoted net the router left
+  at the board width FAILs). A track whose copper lies in a keep-out that forbids the zone of
   its plane layer (:func:`ai_eda.tools.si.measure.plane_keepout`) has no
   reference plane there: its row is NOT_VERIFIED with that keep-out named,
   never judged as a microstrip. NOT_APPLICABLE for a class without a target
@@ -99,6 +102,7 @@ from ai_eda.ir.si import FACT_REF_RE, TIMING_TERMS
 from ai_eda.tools.calc.tline import NO_STACKUP, TLineRangeError, edge_coupled_microstrip, line_geometry
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.routing.coupling import COUPLED_GAP_FACTOR, coupled_pieces, uncoupled_lengths
+from ai_eda.tools.routing.maze import ROUTER_ESCAPE_VERSION, escape_entry
 from ai_eda.tools.si.measure import (
     NOT_DRC,
     NO_PLANE_ADVICE,
@@ -286,8 +290,27 @@ def _box_distance(x: float, y: float, box: PadBox) -> float:
     return math.hypot(max(abs(x - box.cx) - box.hw, 0.0), max(abs(y - box.cy) - box.hh, 0.0))
 
 
+def _escape_segment(track: Track) -> str | None:
+    """The words for a track that is one segment of an escape stub the router recorded (module docstring), else ``None``."""
+    esc = escape_entry(track)
+    if esc is None:
+        return None
+    label, width, pts = esc
+    if abs(width - float(track.width_mm)) > _TOL:
+        return None
+    ends = {(round(track.start[0], 6), round(track.start[1], 6)), (round(track.end[0], 6), round(track.end[1], 6))}
+    if not any(ends == {(round(a[0], 6), round(a[1], 6)), (round(b[0], 6), round(b[1], 6))} for a, b in zip(pts, pts[1:])):
+        return None
+    return (f"escape stub of pad {label} recorded by the router (routing.maze {ROUTER_ESCAPE_VERSION}: from the pad to the grid, no wider "
+            "than the pad and its neighbours' clearance allow)")
+
+
 def _neckdown(track: Track, pads: dict[str, list[PadBox]] | None) -> tuple[bool, str]:
-    """Whether ``track`` is a neck-down the router recorded (module docstring), and the words for the row."""
+    """Whether ``track`` is a neck-down the router recorded - a rule's neck-down or an escape stub (module docstring) -, and the words for
+    the row."""
+    escape = _escape_segment(track)
+    if escape is not None:
+        return True, escape
     rule = _entry(track, "rule:")
     neck, radius = _float(rule.get("neckdown_width")), _float(rule.get("neckdown_radius"))
     if neck is None or radius is None or abs(neck - float(track.width_mm)) > _TOL:

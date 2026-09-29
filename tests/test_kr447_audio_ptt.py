@@ -65,7 +65,7 @@ from ai_eda.design.rf.t_audio_ptt import KR447_AUDIO_PTT, REGIONS, TEMPLATE_ID, 
 from ai_eda.ir import CircuitIR, ProjectMeta, ValidationStatus as S
 from ai_eda.tools.calc import recompute_parameters
 from ai_eda.tools.kicad.library import KicadLibrary
-from ai_eda.tools.routing.maze import ROUTER_CUSTOM_PAD_VERSION, RoutingParams, route_board
+from ai_eda.tools.routing.maze import ROUTER_ESCAPE_VERSION, RoutingParams, route_board
 from ai_eda.tools.spice import NgspiceShared
 from ai_eda.workflow import Orchestrator, Stage
 
@@ -275,23 +275,68 @@ def test_two_builds_are_one_design_and_compile_byte_identical(registered: None, 
 
 
 @needs_libs
-def test_the_router_cannot_route_this_board_so_the_deliverable_is_placement_only(registered: None, tmp_path: Path):
-    """A known limit, named. routing.maze 0.5 reads the microphone footprint's custom pad 1 (a ring, its circle anchor on it) as the
-    boxes of its anchor and its ring, but no net of the microphone or its preamp has a route: MK301.2, the capsule's centre contact, lies
-    inside the ring's box (on the real copper too the closed ring leaves it no way out on F.Cu), and the MAX9814's 0.4 mm-pitch DFN pads
-    are 0.15 mm apart, below the fine rules' 0.2 mm clearance, so each of its terminal cells is inside a neighbour's keep-out. The router
-    is run here on those nets alone (GND left out - a plane net; about 0.2 s): by the all-or-nothing rule the agent's proposal for the
-    whole board (about 45 s of routing) is the placement only, never half the nets - the real routing is left to KiCad."""
+def test_the_router_cannot_route_this_board_so_the_deliverable_is_placement_only(registered: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A known limit, named. The router reads the microphone footprint's custom pad 1 (a ring, its circle anchor on it) as the boxes of
+    its anchor and its ring: MK301.2, the capsule's centre contact, lies inside the ring's box - and on the real copper the closed ring
+    leaves it no way out on F.Cu (a via would have to sit in the pad) - so MIC_P has no route and, by the all-or-nothing rule, the
+    agent's proposal for the whole board is the placement only, never half the nets. The MAX9814's 0.4 mm-pitch DFN pads are 0.15 mm
+    apart, below the fine rules' 0.2 mm clearance, so each terminal cell is inside a neighbour's keep-out: routing.maze 0.6 joins them to
+    the grid by escape stubs (0.1-0.15 mm wide).
+
+    First the MK301 / U301 nets alone (GND, a plane net, left out: its pads are net-less here; about 10 s): eight of the ten signal pads
+    escape and two are refused, each for its own cause (measured by moving one part at a time). U301.6 (MICOUT, west row): the
+    microphone's ring, whose box ends about 1.7 mm west of the pad row, blocks the straight westward ways out, so U301.5's way out turns
+    south along the row through the one cell in front of U301.6 (with MK301 1 mm further west, U301.6 escapes there). U301.13 (MIC_BIAS,
+    east row), wherever the microphone is: U302's SOT-23-5 pads, about 1.4 mm east of the pad row, bound that row, and U301.12's escape
+    and its way out take the cells in front of it (with U302 moved away, it escapes). A refusal names only its nearest candidate cell's
+    problem, not the whole cause. Then the whole board's static phase (the plane vias and the escape pass, about 15 s): GND's pads
+    escape to vias first, TX_3V3 is doomed (U301.5 and U301.10 have no escape), so the pass runs again without it and U301.2's escape
+    is withdrawn - and U301.3 (MIC_CG), which that escape's way out had fenced, escapes. tests/test_routing_fine_pitch.py routes the
+    same package on an open board."""
     ir = _confirmed(AUDIO, tmp_path)
     _placed(ir, tmp_path)
+    whole = ir.model_copy(deep=True)
     mic = {"MK301", "U301"}
     ir.nets = [n for n in ir.nets if any(p.component_ref in mic for p in n.pins) and n.name != "GND"]
     r = route_board(ir, LIB, RoutingParams.for_board(ir, LIB), inner_layers=True)
-    assert r.version == ROUTER_CUSTOM_PAD_VERSION and r.tracks == [] and r.stats["routed_nets"] == 0
-    assert set(r.unrouted) == {n.name for n in ir.nets} and len(r.unrouted) == 9
-    assert r.unrouted["MIC_P"].startswith("MK301.2 terminal cell") and "is inside a keep-out on every copper layer" in r.unrouted["MIC_P"]
-    assert all(why.startswith("U301.") and "is inside a keep-out" in why for net, why in r.unrouted.items() if net != "MIC_P")
+    assert r.version == ROUTER_ESCAPE_VERSION and len(ir.nets) == 9 and r.stats["routed_nets"] == 6
+    assert sorted(r.unrouted) == ["MICOUT", "MIC_BIAS", "MIC_P"]
+    assert r.unrouted["MIC_P"].startswith("MK301.2 terminal cell") and "is inside a keep-out on every copper layer of the pad" in r.unrouted["MIC_P"]
+    assert "(MK301.1 within clearance 0.2 + width/2 of it); no escape stub" in r.unrouted["MIC_P"]
+    assert r.unrouted["MICOUT"].startswith("U301.6 terminal cell") and r.unrouted["MIC_BIAS"].startswith("U301.13 terminal cell")
+    assert all("; no escape stub within 1.5 mm in front of its edge" in r.unrouted[n] for n in ("MICOUT", "MIC_BIAS"))
+    assert r.unrouted["MICOUT"].endswith("the nearest candidate cell (47.6, 4.8): it is on the way out reserved for an escape of net TX_3V3")
+    assert r.unrouted["MIC_BIAS"].endswith("(52.4, 2.8): its clearance would take a cell on the way out reserved for an escape of net MIC_VB")
+    escaped = sorted((e["pad"] for e in r.stats["escapes"]), key=lambda pad: int(pad.split(".")[1]))
+    assert escaped == ["U301.1", "U301.2", "U301.3", "U301.5", "U301.8", "U301.10", "U301.12", "U301.14"]
+    assert all(e["kind"] == "stub" and 0.1 <= e["width_mm"] <= 0.15 for e in r.stats["escapes"])
     assert [(c["pad"], [p["part"] for p in c["parts"]]) for c in r.stats["custom_pads"]] == [("MK301.1", ["anchor circle", "gr_circle[0]"])]
+    # the whole board's static phase, with the agent's router arguments (stopped before the negotiation)
+    from ai_eda.agents.pcb import _routes_around_planes
+    from ai_eda.tools.routing import maze
+    from ai_eda.tools.si.rules import net_rules
+
+    boards: list = []
+
+    class _Stop(Exception):
+        pass
+
+    def stop(self, board, *args, **kwargs):
+        boards.append(board)
+        raise _Stop
+
+    monkeypatch.setattr(maze._Negotiation, "__init__", stop)
+    params = RoutingParams.for_board(whole, LIB)
+    with pytest.raises(_Stop):
+        route_board(whole, LIB, params, rules=net_rules(whole, params).rules or None, inner_layers=_routes_around_planes(whole.pcb),
+                    **PCBAgent._router_extras(whole, whole.pcb))
+    (board,) = boards
+    assert board.static_passes == 2 and list(board.doomed) == ["TX_3V3"]
+    escaped = {e["pad"]: e["net"] for e in board.escapes}
+    assert escaped["U301.3"] == "MIC_CG" and "U301.2" not in escaped and all(escaped[f"U301.{n}"] == "GND" for n in (4, 7, 9, 11))
+    assert sorted(board.escape_refused) == ["MK301.2", "U301.10", "U301.12", "U301.2", "U301.5"]
+    assert board.escape_refused["U301.2"].endswith("; its escape is withdrawn: net TX_3V3 stays unrouted, since no escape reaches U301.5")
+    assert board.escape_refused["U301.12"].endswith("it is on the way out reserved for an escape of net MIC_BIAS")
 
 
 @needs_libs

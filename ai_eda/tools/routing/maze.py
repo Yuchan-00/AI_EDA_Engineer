@@ -7,9 +7,10 @@ layers - never model memory), the :class:`RoutingParams` and the caller's
 :class:`NetRule` s. Nothing is estimated, nothing is guessed: a component
 without a placement or footprint, a footprint that is not on disk, a net pin
 without a pad, a copper layer other than ``F.Cu`` / ``B.Cu`` (inner
-``In<k>.Cu`` layers only when the caller opts in), a pad too small for the
-grid or a rule that makes no sense raises :class:`~ai_eda.errors.CompileError`
-instead of getting a default.
+``In<k>.Cu`` layers only when the caller opts in) or a rule that makes no
+sense raises :class:`~ai_eda.errors.CompileError` instead of getting a
+default; a pad too small for the grid that no escape stub reaches (below:
+routing.maze 0.6) leaves its net unrouted with that reason.
 
 What this is: a Lee / A* maze router on a square grid over the board
 outline, ``F.Cu`` and ``B.Cu`` only, with through vias between them, inside a
@@ -89,7 +90,9 @@ with :func:`ai_eda.tools.kicad.geometry._q`). The static part is 0.1's:
   (no via-in-pad).
 * a pad's terminal is the grid cell nearest to its centre; it must lie inside
   the pad's inscribed circle, so the track ending there overlaps the pad
-  copper, and one stub segment joins it to the exact centre. The terminal
+  copper, and one stub segment joins it to the exact centre (a pad whose
+  nearest cell is outside that circle, or fenced as below, gets an escape
+  instead: routing.maze 0.6, below). The terminal
   cell obeys the owner map like every other cell: on a layer where it is
   BLOCKED (a foreign pad's keep-out or the board edge reaches it) or owned by
   another net it is neither a seed nor a target, and a terminal with no
@@ -275,6 +278,136 @@ the pads (``custom_pads:...;model=anchor+primitive_boxes``) and
 before, so no saved copper changes; a board without a custom pad is exactly
 0.2's / 0.3's / 0.4's.
 
+**Escape stubs (routing.maze 0.6).** Two pad situations used to end a net
+before it was searched, and neither is a fact about the copper: a pad whose
+nearest grid point lies outside its inscribed circle (a 0.25 mm-wide pad
+0.125 mm off the 0.2 mm grid: 0.5 refused the whole board), and a pad whose
+grid cell lies inside its *neighbours'* keep-out on every layer of the pad.
+The second is the fine-pitch case, and its cause is a rule applied where it
+does not belong: the owner map keeps a cell ``clearance + width/2 + grid/2``
+from every foreign pad box because a full-width *track* centred there must
+keep the clearance (and its unit steps too), and at a 0.4 mm pitch (a
+0.25 mm pad, a 0.15 mm gap) or a 0.5 mm one (0.25 mm pads) every cell of the
+pad's own centreline is within that radius of the pads beside it - so the
+rule for a track was fencing the pad's own copper, where no full-width track
+has to lie and the clearance of a narrower one can be measured exactly. The
+rule is now: such a pad (and a plane pad whose 0.4 via walk finds no site)
+is joined to the grid by an *escape*, and only when none exists is it
+refused. Nothing changes for a pad whose grid cell is usable: every board
+without such a pad routes exactly as 0.2 / 0.3 / 0.4 / 0.5 did (byte for
+byte, stamps included).
+
+* **The stub** runs from the pad's centre along the axis of its larger half
+  extent (a square or round pad: the axis nearer the direction from its
+  footprint's copper centroid to the pad; all four directions, east, south,
+  west, north, when that is undecided), pointing away from the centroid, to
+  the pad's outer edge ``O``; from there straight on for ``a`` (a multiple
+  of ``grid/2``, 0 first) and then one straight segment to a grid cell ``E``
+  in front of the edge (``(E - O) . d >= 0``, both offsets at most
+  :attr:`RoutingParams.escape_reach_mm`). Its width is the smaller of the
+  pad's narrow side and the net's track width (a plane pad's: its stubs'
+  width) when that keeps every clearance, else the widest multiple of
+  :attr:`RoutingParams.escape_width_step_mm` that does, and at least
+  :attr:`RoutingParams.escape_min_width_mm` (raised to the fab's
+  ``min_track_width_mm``: recorded in ``stats["raised"]`` and the params
+  entry) - or that candidate is illegal. A signal pad whose
+  grid cell is only fenced first tries another grid point inside its
+  inscribed circle (``kind="cell"``) from which the ordinary stub to the
+  centre, at the net's width, keeps every clearance below exactly.
+* **Legality, exact**: every segment keeps ``max(c_net, c_other)`` from
+  every foreign pad box, every other net's escape, plane stub and plane via
+  and every other net's ordinary stub (terminal cell to pad centre, at that
+  net's width) on its layer (exact segment / box / disc distances - the part
+  inside its own pad included, which is why a 0.4 mm-pitch stub is narrower
+  than its pad), no copper inside a track keep-out that does not let the net
+  through, ``edge_clearance + width/2`` from the outline; ``E`` is free or
+  the net's own on the static owner map and outside the net rule's fence (a
+  track of the net may start there); the stub's claim - every cell within
+  ``clearance + track_width/2 + grid/2`` of its copper, owned by the net
+  like a pad's - takes no cell reserved for another net: a usable ordinary
+  terminal cell, an earlier escape's ``E`` or its *way out*, a cell a fan
+  holds (a refusal names which); and ``E`` has a
+  way out - the shortest 4-neighbour chain of cells free or the net's own
+  (and reserved for no other net) from ``E`` to the first cell outside the
+  footprint's escape area (its pads' box grown by the reach and a grid
+  step), which is then reserved for the net so no later escape closes it.
+* **Plane nets**: an SMD pad of a plane net whose grid cell is fenced or off
+  the grid, or whose axis walk (0.4's rule, unchanged when it succeeds)
+  finds no via site, waits - its net pending, its other vias claimed - for
+  an escape stub to a *via* at a grid cell in front of its edge: the via
+  obeys the plane-via rules exactly (its disc keeps ``max(c_net, c_other)``
+  from every foreign pad, stub and via, overlaps no pad box - its own
+  included -, keeps ``via_diameter + clearance`` from every other plane via,
+  lies wholly inside one of the net's plane zones, outside every via
+  keep-out that does not allow the net, ``edge_clearance + via_diameter/2``
+  from the outline) and both claims keep every other net's reserved cells.
+  A pending net one of whose pads gets none is unrouted with that pad's
+  reason and no copper - and since its other vias were claimed while it
+  waited, it is doomed (below).
+* **The choice**: one footprint at a time (natural ref order, each seeing
+  the escapes before it), its waiting pads - signal and plane - escaped
+  greedily in each order of ``_ESCAPE_TRIALS`` in turn (every claim undone
+  after each), and the first order with the fewest plane pads left without
+  an escape (one leaves its whole plane net unrouted), then the fewest
+  signal pads, then the shortest total stub, is applied. An order is the
+  pads' sequence - ``fan`` (below, then the rest nearest the centroid
+  first), nearest the footprint's copper centroid first (a row fans out from
+  its middle), farthest first, pad order - and the candidates - by distance
+  from ``O`` to ``E``, then the smaller lateral offset, then the side away
+  from the centroid, then the cell index (``near``), or straight ones first
+  (``straight``); ``a`` from 0 up, the first legal one taken - and whether
+  the plane pads' vias or the signal pads go first. A *fan* gives the pads
+  of one row (one escape direction, one edge line) cells on one line in
+  front of it, as far apart as their claims need (the next cell outside a
+  signal stub's claim, ``via_diameter + clearance`` between two vias),
+  centred on the row, at the shallowest depth where the most of them are
+  legal, the straightest pads first: a QFN's side leaves as a fan the
+  nearest-first greedy cannot find. All of it is deterministic; none of it
+  is optimal.
+* **Doomed nets**: a pass - the plane vias, then the escape pass - can doom
+  a net: a plane net one of whose pads no escape reaches (its other vias
+  were claimed while it waited), or a signal net with such a pad that holds
+  an escape (a stub, a reserved way out, that the unrouted net will never
+  use). Then the pass is thrown away and run again from the maps as the
+  pads and the keep-outs left them, without that net - no via, stub, claim
+  or reservation of it -, so the other nets' via walks, escape choices and
+  claims are made as on a board where it is never routed (as 0.4 undid a
+  failing plane net before the next one walked), and a net that failed only
+  beside the doomed net's claims is tried again. One net per pass: the
+  first such plane net in name order (the order they walk in), else the
+  signal net whose pad was refused first. A doomed net is never taken back
+  (a greedy pass is not monotone), so there is at most one more pass per
+  net, and a board where no pass dooms a net runs once. A doomed net keeps
+  the refusals of the pass that doomed it, and each of its pads that pass
+  escaped is listed as withdrawn (``stats["escape_refused"]``).
+* The pad's terminal becomes ``E`` on the stub's layer (the search starts
+  and ends there) and the stub replaces the one-segment stub to the pad
+  centre; its segments are ordinary tracks of the net in the IR at the stub
+  width (so ``pcb.routing.*`` and the SI paths see them), each naming the
+  stub in its ``derived_from`` (``escape:<pad>:<stub|via>:width=<w>:points=
+  x,y;...``, read back by :func:`escape_entry`: ``si.impedance`` names such
+  a segment of a controlled net like a neck-down) and its geometry in the
+  note, and their length counts toward a length budget.
+* A pad no escape reaches keeps its refusal, naming it, with why no escape
+  exists appended (the nearest candidate's problem): its net is unrouted
+  with no copper at all (an off-grid pad no longer refuses the whole board -
+  the refusal is the net's, like a fenced terminal's - except a pad of a
+  coupled pair, which keeps 0.3's board refusal). Pads of nets that are
+  never routed (fewer than two pads) get no escape.
+
+A board with a pad off the grid (0.5 refused such a board), or with an
+escape or a plane pad that waited for one in the last pass, is stamped
+:data:`ROUTER_ESCAPE_VERSION` ``"0.6"`` on every track and via (in place of
+0.2 - 0.5); its params entry records the three escape parameters,
+``derived_from`` names the escaped and the refused pads
+(``escapes:...;refused=...;model=centre+edge+cell``) and ``stats["escapes"]``
+/ ``["escape_refused"]`` list every escape (pad, net, kind, why, layer,
+cell, width, points, length) and every pad none reached. A board whose only
+escape news is pads none reached - a fenced signal pad, a fenced plane pad
+or one without a via site, and with them the doomed nets' withdrawn
+escapes - keeps its 0.2 - 0.5 copper and stamp: those nets were unrouted
+before too, now with the reason extended.
+
 What this is not: a DRC. The clearances above are the router's own
 parameters; whether the board is valid is decided by ``kicad-cli pcb drc``
 on the compiled board (:meth:`ai_eda.tools.kicad.cli.KicadCli.run_drc`), and
@@ -288,8 +421,8 @@ only honours the widths, spacings and lengths it is given.
 
 Traceability: every :class:`~ai_eda.ir.Track` / :class:`~ai_eda.ir.Via`
 carries ``derived`` provenance naming this router (:data:`ROUTER_ID` /
-:data:`ROUTER_VERSION`, :data:`ROUTER_RULES_VERSION`, :data:`ROUTER_KEEPOUT_VERSION`
-or :data:`ROUTER_CUSTOM_PAD_VERSION`), the net, the
+:data:`ROUTER_VERSION`, :data:`ROUTER_RULES_VERSION`, :data:`ROUTER_KEEPOUT_VERSION`,
+:data:`ROUTER_CUSTOM_PAD_VERSION` or :data:`ROUTER_ESCAPE_VERSION`), the net, the
 placements of the net's components and every parameter in
 ``derived_from``; the note names the iteration count and how the net's route
 was obtained. ``Provenance.inputs`` stays empty: it is the calculator role
@@ -300,6 +433,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from collections import deque
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -320,6 +454,8 @@ __all__ = [
     "ROUTER_RULES_VERSION",
     "ROUTER_KEEPOUT_VERSION",
     "ROUTER_CUSTOM_PAD_VERSION",
+    "ROUTER_ESCAPE_VERSION",
+    "ESCAPE_ENTRY_PREFIX",
     "PLANE_VIA_REACH_MM",
     "LAYERS",
     "BLOCKED",
@@ -330,6 +466,7 @@ __all__ = [
     "RoutingParams",
     "Routing",
     "effective_params",
+    "escape_entry",
     "finest_pad_pitch",
     "route_board",
 ]
@@ -346,6 +483,9 @@ ROUTER_KEEPOUT_VERSION = "0.4"
 #: the version stamped on every track and via of a board with at least one ``custom`` pad (module docstring: custom pads); it takes
 #: the place of 0.2 / 0.3 / 0.4 on such a board, whose copper was refused before
 ROUTER_CUSTOM_PAD_VERSION = "0.5"
+#: the version stamped on every track and via of a board with at least one escape stub (module docstring: escape stubs); it takes the
+#: place of 0.2 - 0.5 on such a board, whose escaped pads were refused before
+ROUTER_ESCAPE_VERSION = "0.6"
 #: how far (mm, along one axis from the terminal cell) a plane net's SMD pad looks for the site of its via
 PLANE_VIA_REACH_MM = 3.0
 #: the only copper layers this router routes (index 0 / 1 in the owner maps)
@@ -358,6 +498,22 @@ BLOCKED = -1
 _FREE = -2
 #: net index of a coupled pair's virtual net (it owns no pad and never reads the owner map)
 _VIRTUAL = -3
+#: an escape candidate that is not one at all (a cell another net's pad claims, a via site off the zone): skipped without a reason
+_SKIP = "skip"
+#: the orders one footprint's escapes are tried in (routing.maze 0.6, module docstring: escape stubs): (pad order, candidate order,
+#: which pads go first - the plane pads' vias or the signal pads' stubs)
+_ESCAPE_TRIALS: tuple[tuple[str, str, str], ...] = (
+    ("fan", "near", "plane"), ("fan", "near", "signal"), ("middle", "near", "plane"), ("middle", "near", "signal"), ("middle", "straight", "plane"), ("middle", "straight", "signal"),
+    ("ends", "near", "plane"), ("ends", "near", "signal"), ("natural", "near", "plane"), ("natural", "near", "signal"),
+)
+
+#: what a reserved cell of the escape pass is (routing.maze 0.6), as a refusal names it - after "it is" and after "would take": an
+#: ordinary or escape terminal cell, a cell on the way out reserved for an escape, a cell a fan holds for one of its pads while it is tried
+_RESERVED_WORDS: dict[str, tuple[str, str]] = {
+    "terminal": ("the terminal cell of", "the terminal cell of"),
+    "exit": ("on the way out reserved for an escape of", "a cell on the way out reserved for an escape of"),
+    "fan": ("the cell a fan holds for", "the cell a fan holds for"),
+}
 
 #: ``(track parameter, ir.pcb.manufacturing limit)`` pairs a fab minimum can raise
 _FAB_MINIMUMS: tuple[tuple[str, str], ...] = (
@@ -412,6 +568,17 @@ class RoutingParams:
     bump height and the leg spacing of a length-matching meander, rounded to
     whole grid steps) and ``pair_bump_amplitude_mm`` / ``pair_bump_length_mm``
     (the largest height and the length of one intra-pair compensation bump).
+
+    The escape knobs (0.6; used only for a pad whose grid cell is off its
+    copper or fenced, module docstring: escape stubs, and recorded in the
+    provenance only when a board has an escape stub):
+    ``escape_reach_mm`` (how far in front of the pad's edge, along and
+    across its axis, an escape cell is looked for), ``escape_min_width_mm``
+    (the narrowest stub; the fab's ``min_track_width_mm`` raises it, and
+    :func:`route_board` records the raise on a board with escapes) and
+    ``escape_width_step_mm`` (a stub narrower than the pad's narrow side and
+    the net's width is a whole multiple of it: the widest that keeps every
+    clearance).
     """
 
     grid_mm: float = 0.25
@@ -436,12 +603,16 @@ class RoutingParams:
     meander_pitch_mm: float = 1.0
     pair_bump_amplitude_mm: float = 0.25
     pair_bump_length_mm: float = 0.5
+    escape_reach_mm: float = 1.5
+    escape_min_width_mm: float = 0.1
+    escape_width_step_mm: float = 0.01
 
     def check(self) -> None:
         """Refuse parameters that make no sense (:class:`CompileError`)."""
         for name in (
             "grid_mm", "track_width_mm", "via_drill_mm", "via_diameter_mm", "base_cost", "window_mm",
             "neckdown_radius_mm", "meander_amplitude_mm", "meander_pitch_mm", "pair_bump_amplitude_mm", "pair_bump_length_mm",
+            "escape_reach_mm", "escape_min_width_mm", "escape_width_step_mm",
         ):
             value = getattr(self, name)
             if not (isinstance(value, (int, float)) and math.isfinite(value) and value > 0):
@@ -459,11 +630,12 @@ class RoutingParams:
         if self.pad_pitch_mm is not None and not (math.isfinite(self.pad_pitch_mm) and self.pad_pitch_mm > 0):
             raise CompileError(f"routing parameter pad_pitch_mm must be a finite number > 0 (got {self.pad_pitch_mm!r})")
 
-    def derived_from_entry(self, rules: bool = False) -> str:
+    def derived_from_entry(self, rules: bool = False, escapes: bool = False) -> str:
         """The ``derived_from`` entry that records every parameter (and, when set, the rule set and the pitch that chose it).
 
-        ``rules=True`` (a board routed with net rules) appends the 0.3 knobs;
-        without rules the entry is 0.2's, character for character.
+        ``rules=True`` (a board routed with net rules) appends the 0.3 knobs,
+        ``escapes=True`` (a board with an escape stub) the 0.6 knobs; without
+        either the entry is 0.2's, character for character.
         """
         entry = (
             f"params:grid={self.grid_mm},width={self.track_width_mm},clearance={self.clearance_mm},"
@@ -479,6 +651,11 @@ class RoutingParams:
                 f",neckdown_radius={self.neckdown_radius_mm},meander_amplitude={self.meander_amplitude_mm},"
                 f"meander_pitch={self.meander_pitch_mm},pair_bump_amplitude={self.pair_bump_amplitude_mm},"
                 f"pair_bump_length={self.pair_bump_length_mm}"
+            )
+        if escapes:
+            entry += (
+                f",escape_reach={self.escape_reach_mm},escape_min_width={self.escape_min_width_mm},"
+                f"escape_width_step={self.escape_width_step_mm}"
             )
         return entry
 
@@ -621,8 +798,10 @@ class Routing:
     """What :func:`route_board` produced. ``unrouted`` maps a net name to why it has no copper.
 
     ``version`` is the ``tool_version`` stamped on the copper (:data:`ROUTER_VERSION`
-    without net rules, :data:`ROUTER_RULES_VERSION` with), ``rules`` the
-    effective rules (after the fab / board raises and the defaults).
+    without net rules, :data:`ROUTER_RULES_VERSION` with; :data:`ROUTER_KEEPOUT_VERSION`,
+    :data:`ROUTER_CUSTOM_PAD_VERSION` or :data:`ROUTER_ESCAPE_VERSION` on the
+    boards the module docstring names), ``rules`` the effective rules (after
+    the fab / board raises and the defaults).
     """
 
     tracks: list[Track] = field(default_factory=list)
@@ -880,6 +1059,12 @@ class _PadGeom:
     layers: tuple[int, ...]  # indices into LAYERS
     net: int  # net index or BLOCKED
     reach: tuple[float, float, float, float] | None = None
+    #: what the entry is: a footprint ``"pad"`` (or part of one), a plane net's ``"plane-via"`` / ``"plane-stub"`` (0.4) or an
+    #: ``"escape"`` segment / ``"escape-via"`` (0.6); every consumer before 0.6 reads only :attr:`box`
+    kind: str = "pad"
+    #: the exact copper of a via or stub entry, which the 0.6 escape checks measure instead of the box: ``("seg", a, b, half width)``
+    #: or ``("disc", centre, radius)``; ``None`` for a pad (its box is its bound)
+    shape: tuple | None = None
 
     @property
     def box(self) -> tuple[float, float, float, float]:
@@ -887,10 +1072,75 @@ class _PadGeom:
 
 
 @dataclass(frozen=True, slots=True)
+class _Escape:
+    """How a pad whose grid cell is off its copper or fenced reaches the grid (module docstring: escape stubs, routing.maze 0.6).
+
+    ``kind``: ``"cell"`` - another grid point inside the pad's inscribed circle is usable, so the ordinary one-segment stub to the pad
+    centre is kept and only the terminal cell moves; ``"stub"`` - a stub (``points``, from the pad centre, at ``width``) to the grid cell
+    ``cell`` where the net's track starts; ``"via"`` - a plane net's stub to its via at ``cell``. ``why``: ``"off-grid"``, ``"fenced"``
+    or ``"no via site"`` (a plane pad whose axis walk found none)."""
+
+    kind: str
+    why: str
+    layer: int
+    cell: int
+    width: float | None = None
+    points: tuple[tuple[float, float], ...] = ()
+    #: a signal stub's way out: the grid cells (on its layer) from ``cell`` to the first one outside the footprint's escape area,
+    #: every one free or the net's own - reserved for the net, so no later escape closes it
+    exit: tuple[int, ...] = ()
+
+    def length_mm(self) -> float:
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(self.points, self.points[1:]))
+
+
+@dataclass(frozen=True, slots=True)
 class _Terminal:
     pad: _PadGeom
     cell: int  # cell index k = j * nx + i
     label: str
+    #: routing.maze 0.6: how the pad reaches the grid when its own cell does not (``cell`` is then the escape's cell), else ``None``
+    escape: _Escape | None = None
+    #: the refusal of a pad whose nearest grid point lies outside its inscribed circle (0.5 refused the board with it)
+    offgrid: str | None = None
+    #: why the pad cannot be reached when it needed an escape and none exists: its net is unrouted with this reason
+    refusal: str | None = None
+
+
+#: one pad waiting for an escape (routing.maze 0.6): (``"signal"`` / ``"plane"``, net, index in the net's terminals or slot in the
+#: plane net's links, terminal, pad layer of a plane pad, why - ``"off-grid"`` / ``"fenced"`` / ``"no via site"`` -, the plane walk's reason)
+_Need = tuple[str, str, int, "_Terminal", int, str, "str | None"]
+
+
+@dataclass(slots=True)
+class _PendingPlane:
+    """A plane net one of whose SMD pads waits for an escape (routing.maze 0.6): its walk links so far (``None`` where a pad waits),
+    its claimed entries, its through-hole / footprint-joined pads, the waiting pads ``(slot, terminal, layer, why, walk reason)`` and,
+    once the escape pass is done, the reason of the first pad none reached."""
+
+    idx: int
+    width: float
+    areas: list[list[tuple[float, float]]]
+    links: list[tuple[_Terminal, int, int] | None]
+    geoms: list[_PadGeom]
+    tht: list[str]
+    joined: list[str]
+    deferred: list[tuple[int, _Terminal, int, str, str]]
+    failed: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _Doomed:
+    """A net a pass of the static phase doomed (routing.maze 0.6, :meth:`_Board._static_phase`): a plane net one of whose pads no escape
+    reaches, or a signal net with such a pad that held an escape. ``reason`` is the net's (its first refused pad's refusal), ``refused``
+    the refused pads (terminal index - ``None`` for a plane pad -, label, refusal) as the dooming pass left them, ``withdrawn`` the pads
+    whose escape that pass made and the later passes do not (the net gets no copper): terminal index, label and, for a plane pad, why it
+    waited (a signal pad's is its off-grid sentence or what fences it in the last pass)."""
+
+    kind: str
+    reason: str
+    refused: list[tuple[int | None, str, str]]
+    withdrawn: list[tuple[int | None, str, str | None]]
 
 
 def _pad_copper_layers(placement, pad: Pad) -> tuple[int, ...]:
@@ -943,12 +1193,27 @@ class _Board:
     clearance exceeds ``p.clearance_mm``) grows the owner map around those
     nets' pads and keeps every other net's via ``via_diameter/2 + c`` from
     them (:attr:`via_keep`); without it the maps are 0.2's.
+
+    Escapes (routing.maze 0.6, module docstring: escape stubs) are found
+    here, after the pads, the keep-outs and the plane vias: for every pad of
+    a routed signal net (two or more pads, not a plane net, not in
+    ``no_escape`` - the coupled pairs, whose off-grid pads keep 0.3's board
+    refusal) whose grid cell is off its copper or fenced on every layer of
+    the pad, and for every plane pad the plane via walk could not serve
+    (:meth:`_static_phase`: :meth:`_plane_vias` and :meth:`_escape_all`,
+    repeated without each net a pass dooms, then :meth:`_finish_planes`;
+    :attr:`doomed` / :attr:`static_passes` say what happened). ``net_rules`` (net
+    index -> width, clearance, neck-down width and radius) keeps an escape
+    cell out of a rule net's fence. :attr:`escapes` lists the escapes,
+    :attr:`escape_refused` the pads none reached, :attr:`escape_ran` says
+    whether the board is routing.maze 0.6's.
     """
 
     def __init__(
         self, ir: CircuitIR, library: KicadLibrary, p: RoutingParams, pad_clearance: Mapping[int, float] | None = None, inner_layers: bool = False,
         *, keepouts: Sequence[Any] | None = None, ko_width: float | None = None, plane: Mapping[str, float] | None = None,
-        plane_areas: Mapping[str, list[list[tuple[float, float]]]] | None = None,
+        plane_areas: Mapping[str, list[list[tuple[float, float]]]] | None = None, no_escape: Sequence[str] | None = None,
+        net_rules: Mapping[int, tuple[float, float, float | None, float | None]] | None = None,
     ) -> None:
         if ir.pcb is None:
             raise CompileError("cannot route: ir.pcb is None")
@@ -1009,7 +1274,46 @@ class _Board:
         #: the custom pads of the board (``REF.NUMBER``, natural ref order) and their parts (routing.maze 0.5, module docstring)
         self.custom_pads: list[str] = []
         self.custom_pad_stats: list[dict[str, Any]] = []
+        #: each placed component's copper-pad centroid (the "footprint body" an escape stub points away from, routing.maze 0.6)
+        self.fp_centroid: dict[str, tuple[float, float]] = {}
+        #: routing.maze 0.6 (module docstring): the escape stubs made (one row each), the pads none reached, the cells no other net's claim
+        #: may take (``layer * n + k`` -> net) and what each of them is (a key of :data:`_RESERVED_WORDS`)
+        self.escapes: list[dict[str, Any]] = []
+        self.escape_refused: dict[str, str] = {}
+        self._reserved: dict[int, int] | None = None
+        self._reserved_why: dict[int, str] = {}
+        #: the ordinary one-segment stubs (terminal cell -> pad centre) of the usable terminals, as copper an escape keeps clear of
+        self._bands: list[_PadGeom] = []
+        #: plane nets waiting for an escape of one of their pads (routing.maze 0.6) and every plane via so far
+        self._pending: dict[str, _PendingPlane] = {}
+        self._plane_placed: list[tuple[float, float]] = []
+        #: the nets the static phase doomed (:meth:`_static_phase`): net -> what it left behind, in the order they were doomed
+        self.doomed: dict[str, _Doomed] = {}
+        #: how many times the static phase ran (1 unless a pass doomed a net)
+        self.static_passes = 0
+        #: each footprint's escape area (its pads' box grown by the escape reach): an escape's way out ends outside it
+        self._escape_area: dict[str, tuple[float, float, float, float]] = {}
+        #: routing.maze 0.6 ran on this board: an escape was made, or a plane net waited for one (its copper may differ from 0.5's)
+        self.escape_ran = False
+        #: net index -> (width, clearance, neck-down width, neck-down radius) of the nets a rule names (an escape cell obeys the rule)
+        self.net_rules: dict[int, tuple[float, float, float | None, float | None]] = dict(net_rules or {})
+        mfg = ir.pcb.manufacturing
+        min_track = float(mfg.min_track_width_mm.value) if mfg is not None and mfg.min_track_width_mm is not None else 0.0
+        #: the narrowest escape stub: ``escape_min_width_mm``, raised to the fab's ``min_track_width_mm`` (:func:`route_board` records the
+        #: raise in ``stats["raised"]`` and the params entry of a 0.6 board)
+        self.escape_min_width = max(p.escape_min_width_mm, min_track)
         self._load_pads(ir, library)
+        blocked_escape = set(no_escape or ())
+        for name in sorted(blocked_escape):  # a coupled pair's pads keep 0.3's refusal of a pad off the grid
+            for t in self.terminals.get(name, []):
+                if t.offgrid is not None:
+                    raise CompileError(t.offgrid)
+        if any(t.offgrid is not None for terms in self.terminals.values() for t in terms):
+            self.escape_ran = True  # 0.5 refused a board with a pad off the grid: whatever routes it is 0.6
+        self._eligible: list[str] = [
+            net.name for net in ir.nets
+            if len(self.terminals[net.name]) >= 2 and net.name not in blocked_escape and net.name not in (plane or {})
+        ]
         #: routing.maze 0.4 (module docstring): what each keep-out blocked, the via keep-outs (cell -> the nets allowed a via
         #: there), the track keep-outs as areas (the pair breakouts check them), and each plane net's pad vias or why not
         self.keepout_stats: list[dict[str, Any]] = []
@@ -1022,8 +1326,7 @@ class _Board:
         self.plane_problems: dict[str, str] = {}
         if keepouts:
             self._apply_keepouts(keepouts, p.track_width_mm if ko_width is None else max(p.track_width_mm, ko_width))
-        if plane:
-            self._plane_vias(plane, plane_areas or {})
+        self._static_phase(plane or {}, plane_areas or {})
         #: the static owner maps as one flat list over ``layer * n + k`` with :data:`_FREE` for free cells (the search reads this)
         self.stat: list[int] = [_FREE if v is None else v for v in self.owner[0]] + [_FREE if v is None else v for v in self.owner[1]]
         #: per cell, lazily: BLOCKED / _FREE / the one net whose pads the via's keep-out touches (see :meth:`via_static_at`)
@@ -1111,6 +1414,9 @@ class _Board:
                 )
             fp = library.load_footprint(comp.footprint)
             self._check_net_pads(ir, comp.ref, fp)
+            centres = [pad_center(placement, pad) for pad in fp.pads if _copper(pad)]
+            if centres:
+                self.fp_centroid[comp.ref] = (sum(x for x, _ in centres) / len(centres), sum(y for _, y in centres) / len(centres))
             for pad in fp.pads:
                 parts: list[PadPart] | None = None
                 if pad.shape == "custom":
@@ -1165,16 +1471,22 @@ class _Board:
 
     def _custom_terminal(self, geoms: list[_PadGeom]) -> _Terminal:
         """The terminal of a ``custom`` pad: on its anchor when the nearest grid point lies inside the anchor's inscribed circle, else on
-        the first part whose inscribed circle (copper for sure: an exact rectangle, a filled disc) holds its nearest grid point; the
-        anchor's refusal when none does."""
-        first: CompileError | None = None
+        the first part whose inscribed circle (copper for sure: an exact rectangle, a filled disc) holds its nearest grid point; else the
+        first part's failure - raised when it is an error, the off-grid terminal (whose escape routing.maze 0.6 looks for) otherwise."""
+        first: CompileError | _Terminal | None = None
         for geom in geoms:
             if geom.inscribed_r <= 0.0:
                 continue
             try:
-                return self._terminal(geom)
+                t = self._terminal(geom)
             except CompileError as e:
                 first = first or e
+                continue
+            if t.offgrid is None:
+                return t
+            first = first or t
+        if isinstance(first, _Terminal):
+            return first
         raise first or CompileError(f"cannot route: custom pad {geoms[0].ref}.{geoms[0].number} has no part a track can land on")
 
     @staticmethod
@@ -1198,10 +1510,11 @@ class _Board:
         x, y = self.pos(j * self.nx + i)
         d = math.hypot(x - geom.cx, y - geom.cy)
         if d > geom.inscribed_r - 1e-6:
-            raise CompileError(
+            # 0.5 refused the board here; 0.6 looks for an escape stub for a pad of a routed net and refuses only that net
+            return _Terminal(pad=geom, cell=j * self.nx + i, label=label, offgrid=(
                 f"pad {label} ({2 * geom.hw:g} x {2 * geom.hh:g} mm) is too small for the {self.p.grid_mm} mm routing grid: "
                 f"the nearest grid point is {d:.4f} mm from its centre, outside its inscribed circle (r={geom.inscribed_r:g} mm)"
-            )
+            ))
         return _Terminal(pad=geom, cell=j * self.nx + i, label=label)
 
     def _mark_box(self, layer: int, geom: _PadGeom) -> None:
@@ -1312,9 +1625,10 @@ class _Board:
                         owner[k] = new
         rv = self.p.via_diameter_mm / 2.0
         for k, dist in self.cells_near_box(geom, rv):
-            if dist < rv - _EPS and self.via_pad_ok[k]:
-                log.append(("via", 0, k, True))
-                self.via_pad_ok[k] = False
+            if dist < rv - _EPS:
+                if self.via_pad_ok[k]:
+                    log.append(("via", 0, k, True))
+                    self.via_pad_ok[k] = False
 
     def _wide_run_ok(self, k: int, layer: int, net: int, width: float) -> bool:
         """For a plane stub wider than the board's tracks: the cell keeps ``clearance + width/2 + grid/2`` from every foreign pad box."""
@@ -1355,21 +1669,25 @@ class _Board:
         return all(math.hypot(x - vx, y - vy) >= spacing - _EPS for vx, vy in placed)
 
     def _plane_vias(self, plane: Mapping[str, float], areas: Mapping[str, list[list[tuple[float, float]]]]) -> None:
-        """Each plane net's SMD pads get a via beside them, claimed on the static maps (module docstring); a net that cannot is undone."""
+        """Each plane net's SMD pads get a via beside them, claimed on the static maps (module docstring); a net that cannot is undone.
+
+        routing.maze 0.6: a pad whose terminal cell is off its copper or fenced, or whose walk finds no via site, is not a failure here:
+        it waits for its escape (:meth:`_escape_all`), its net pending - its other vias claimed and seen by the nets after it while the
+        net may still succeed: a pending net one of whose pads gets no escape is left out of the next pass of :meth:`_static_phase`, so
+        no decision that stands was made beside its vias - until :meth:`_finish_planes`."""
         g = self.p.grid_mm
         reach = max(1, int(PLANE_VIA_REACH_MM / g + _EPS))
-        rv = self.p.via_diameter_mm / 2.0
-        placed: list[tuple[float, float]] = []
+        placed = self._plane_placed
         for name in sorted(plane):
             idx = self.net_index[name]
             width = float(plane[name])
             log: list[tuple[str, int, int, Any]] = []
-            links: list[tuple[_Terminal, int, int]] = []
+            links: list[tuple[_Terminal, int, int] | None] = []
             geoms: list[_PadGeom] = []
             tht: list[str] = []
             joined: list[str] = []
             mine: list[tuple[float, float]] = []
-            problem: str | None = None
+            deferred: list[tuple[int, _Terminal, int, str, str]] = []  # (slot in links, terminal, layer, why, the walk's reason)
             barrels = [t.pad for t in self.terminals[name] if len(t.pad.layers) != 1]
             for t in self.terminals[name]:
                 if len(t.pad.layers) != 1:
@@ -1381,57 +1699,38 @@ class _Board:
                         joined.append(t.label)  # the footprint's own thermal vias (same pad number, on this pad's copper) reach the plane
                     continue
                 layer = t.pad.layers[0]
-                if self.owner[layer][t.cell] not in (None, idx):
-                    problem = f"pad {t.label}: its terminal cell is inside a keep-out on {LAYERS[layer]} (a foreign pad, a keep-out area or the edge)"
-                    break
-                j0, i0 = divmod(t.cell, self.nx)
-                # the walk crosses the pad's own copper first: the reach counts from where a via disc clears the pad box on that axis
-                # (a custom pad's whole copper, every part, in each direction)
-                if t.pad.reach is None:
-                    clear = (math.ceil((t.pad.hw + rv) / g - _EPS) + 1, math.ceil((t.pad.hh + rv) / g - _EPS) + 1)
-                    limits = [reach + (clear[0] if di else clear[1]) for di, _dj in _DIRS]
-                else:
-                    limits = [reach + math.ceil((t.pad.reach[d] + rv) / g - _EPS) + 1 for d in range(4)]
-                open_dirs = [True, True, True, True]
                 site: tuple[int, int] | None = None
-                for step in range(1, max(limits) + 1):
-                    for d, (di, dj) in enumerate(_DIRS):
-                        if not open_dirs[d]:
-                            continue
-                        if step > limits[d]:
-                            open_dirs[d] = False
-                            continue
-                        i, j = i0 + di * step, j0 + dj * step
-                        if not (0 <= i < self.nx and 0 <= j < self.ny):
-                            open_dirs[d] = False
-                            continue
-                        k = j * self.nx + i
-                        if self.owner[layer][k] not in (None, idx) or not self._wide_run_ok(k, layer, idx, width):
-                            open_dirs[d] = False
-                            continue
-                        if self._plane_via_ok(k, idx, placed + mine, areas.get(name, [])):
-                            site = (k, d)
-                            break
-                    if site is not None or not any(open_dirs):
-                        break
-                if site is None:
+                if t.offgrid is not None:
+                    why, problem = "off-grid", t.offgrid
+                elif self.owner[layer][t.cell] not in (None, idx):
+                    why = "fenced"
+                    problem = f"pad {t.label}: its terminal cell is inside a keep-out on {LAYERS[layer]} (a foreign pad, a keep-out area or the edge)"
+                else:
+                    site = self._plane_walk(t, idx, layer, width, reach, placed + mine, areas.get(name, []))
+                    why = "no via site"
                     problem = (f"pad {t.label}: no legal via site within {PLANE_VIA_REACH_MM:g} mm beyond its copper along the grid axes from its "
                                f"terminal cell (pads, keep-outs, the edge, the other plane vias and the extent of its plane zone leave none)")
-                    break
+                if site is None:  # routing.maze 0.6 (module docstring: escape stubs): the escape pass looks for a stub to a via
+                    deferred.append((len(links), t, layer, why, problem))
+                    links.append(None)
+                    continue
                 k, d = site
                 (x0, y0), (x1, y1) = self.xy(t.cell), self.xy(k)
                 hv = self.p.via_diameter_mm / 2.0
-                via = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-via", x1, y1, hv, hv, hv, (0, 1), idx)
+                via = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-via", x1, y1, hv, hv, hv, (0, 1), idx, kind="plane-via", shape=("disc", (x1, y1), hv))
                 run = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-stub", (x0 + x1) / 2.0, (y0 + y1) / 2.0,
-                               abs(x1 - x0) / 2.0 + width / 2.0, abs(y1 - y0) / 2.0 + width / 2.0, width / 2.0, (layer,), idx)
+                               abs(x1 - x0) / 2.0 + width / 2.0, abs(y1 - y0) / 2.0 + width / 2.0, width / 2.0, (layer,), idx,
+                               kind="plane-stub", shape=("seg", (x0, y0), (x1, y1), width / 2.0))
                 self._claim((0, 1), via, log)
                 self._claim((layer,), run, log)
                 geoms += [via, run]
                 links.append((t, layer, k))
                 mine.append((x1, y1))
-            if problem is not None:
-                self._undo(log)
-                self.plane_problems[name] = problem
+            if deferred:
+                self.pads.extend(geoms)
+                placed.extend(mine)
+                self._pending[name] = _PendingPlane(idx, width, list(areas.get(name, [])), links, geoms, tht, joined, deferred)
+                self.escape_ran = True
                 continue
             self.pads.extend(geoms)
             placed.extend(mine)
@@ -1439,9 +1738,816 @@ class _Board:
             self.plane_tht[name] = tht
             self.plane_joined[name] = joined
 
+    def _static_phase(self, plane: Mapping[str, float], areas: Mapping[str, list[list[tuple[float, float]]]]) -> None:
+        """The plane vias and the escape pass (module docstring: escape stubs), repeated while a pass dooms a net.
+
+        A pass dooms a plane net one of whose pads no escape reaches (its other vias were claimed while it waited), and a signal net with
+        a pad no escape reaches that holds an escape (a stub, or a cell reserved for it, that the unrouted net will never use). Each such
+        pass dooms one net - the first such plane net in name order (the order they walk in: their vias come before every escape), else
+        the signal net whose pad was refused first (footprints in natural ref order) - and the next pass starts again from the maps as
+        the pads and the keep-outs left them, every doomed net left out: no via, stub, claim or reservation of it, so the others' via
+        walks, escape choices and claims are made as on a board where it is never routed (as 0.4 undid a failing plane net before the
+        next one walked) and a net that failed only beside a doomed net's claims is tried again. A doomed net is never taken back (a
+        greedy pass is not monotone), so the passes end - at most one more per net -, and a board where no pass dooms a net runs once,
+        exactly as before. The doomed nets are refused with the reasons of the pass that doomed them (:attr:`doomed`): a plane net in
+        :attr:`plane_problems`, a signal net on its refused terminals, and every pad of theirs that pass escaped is listed in
+        :attr:`escape_refused` as withdrawn. :attr:`escape_ran` is the last pass's (a board whose only escape news is pads none reached
+        keeps its 0.2 - 0.5 maps and stamp)."""
+        owner0 = [list(layer) for layer in self.owner]
+        via0 = list(self.via_pad_ok)
+        pads0 = len(self.pads)
+        terms0 = {name: list(terms) for name, terms in self.terminals.items()}
+        ran0 = self.escape_ran
+        eligible0 = list(self._eligible)
+        while True:
+            self.static_passes += 1
+            if plane:
+                self._plane_vias({name: width for name, width in plane.items() if name not in self.doomed}, areas)
+            self._escape_all()
+            new = self._next_doomed()
+            if new is None:
+                break
+            self.doomed[new[0]] = new[1]
+            self.owner = [list(layer) for layer in owner0]
+            self.via_pad_ok = list(via0)
+            del self.pads[pads0:]
+            self.terminals = {name: list(terms) for name, terms in terms0.items()}
+            self.escape_ran = ran0
+            self._eligible = [name for name in eligible0 if name not in self.doomed]
+            self.escapes, self.escape_refused = [], {}
+            self._reserved, self._reserved_why, self._bands = None, {}, []
+            self._pending, self._plane_placed = {}, []
+            self.plane_links, self.plane_tht, self.plane_joined, self.plane_problems = {}, {}, {}, {}
+        self._finish_planes()
+        for name, d in self.doomed.items():
+            for q, label, why in d.refused:
+                self.escape_refused[label] = why
+                if q is not None:
+                    self.terminals[name][q] = replace(self.terminals[name][q], refusal=why)
+            first = d.refused[0][1]
+            for q, label, head in d.withdrawn:
+                if head is None:
+                    t = self.terminals[name][q]
+                    head = t.offgrid if t.offgrid is not None else self._fenced_words(t, self.net_index[name])
+                self.escape_refused.setdefault(label, f"{head}; its escape is withdrawn: net {name} stays unrouted, since no escape reaches {first}")
+            if d.kind == "plane":
+                self.plane_problems[name] = d.reason
+
+    def _next_doomed(self) -> tuple[str, _Doomed] | None:
+        """The net this pass of the static phase dooms (:meth:`_static_phase`), or ``None``: the first pending plane net (name order) with
+        a pad none reached, else the signal net with a refused pad and an escape whose first refused pad was refused first."""
+        for name in sorted(self._pending):
+            pend = self._pending[name]
+            if pend.failed:
+                refused = [(None, t.label, self.escape_refused[t.label]) for _slot, t, _l, _w, _pr in pend.deferred if t.label in self.escape_refused]
+                problems = {slot: problem for slot, _t, _l, _w, problem in pend.deferred}
+                withdrawn = [(None, link[0].label, problems[slot]) for slot, link in enumerate(pend.links)
+                             if link is not None and link[0].escape is not None]
+                return name, _Doomed("plane", pend.failed[0], refused, withdrawn)
+        order = {label: i for i, label in enumerate(self.escape_refused)}
+        best: tuple[int, str, _Doomed] | None = None
+        for name in self._eligible:
+            terms = self.terminals[name]
+            refused = [(q, t.label, t.refusal) for q, t in enumerate(terms) if t.refusal is not None]
+            withdrawn = [(q, t.label, None) for q, t in enumerate(terms) if t.escape is not None]
+            if refused and withdrawn:
+                when = min(order[label] for _q, label, _why in refused)
+                if best is None or when < best[0]:
+                    best = (when, name, _Doomed("signal", refused[0][2], refused, withdrawn))
+        return None if best is None else (best[1], best[2])
+
+    def _finish_planes(self) -> None:
+        """Close the pending plane nets of the last pass of :meth:`_static_phase` (routing.maze 0.6): every deferred pad of each has its
+        escape (a net with a pad none reached was doomed and left out of this pass), so each gets its links and its escapes are recorded."""
+        for name in sorted(self._pending):
+            pend = self._pending[name]
+            self.plane_links[name] = [link for link in pend.links if link is not None]
+            self.plane_tht[name] = pend.tht
+            self.plane_joined[name] = pend.joined
+            for link in pend.links:
+                if link is not None and link[0].escape is not None:
+                    self._record_escape(name, link[0])
+
+    def _plane_walk(
+        self, t: _Terminal, idx: int, layer: int, width: float, reach: int, placed: list[tuple[float, float]], areas: list[list[tuple[float, float]]],
+    ) -> tuple[int, int] | None:
+        """0.4's via site walk for one plane pad along the grid axes from its terminal cell: ``(cell, direction)`` or ``None``."""
+        g = self.p.grid_mm
+        rv = self.p.via_diameter_mm / 2.0
+        j0, i0 = divmod(t.cell, self.nx)
+        # the walk crosses the pad's own copper first: the reach counts from where a via disc clears the pad box on that axis
+        # (a custom pad's whole copper, every part, in each direction)
+        if t.pad.reach is None:
+            clear = (math.ceil((t.pad.hw + rv) / g - _EPS) + 1, math.ceil((t.pad.hh + rv) / g - _EPS) + 1)
+            limits = [reach + (clear[0] if di else clear[1]) for di, _dj in _DIRS]
+        else:
+            limits = [reach + math.ceil((t.pad.reach[d] + rv) / g - _EPS) + 1 for d in range(4)]
+        open_dirs = [True, True, True, True]
+        for step in range(1, max(limits) + 1):
+            for d, (di, dj) in enumerate(_DIRS):
+                if not open_dirs[d]:
+                    continue
+                if step > limits[d]:
+                    open_dirs[d] = False
+                    continue
+                i, j = i0 + di * step, j0 + dj * step
+                if not (0 <= i < self.nx and 0 <= j < self.ny):
+                    open_dirs[d] = False
+                    continue
+                k = j * self.nx + i
+                if self.owner[layer][k] not in (None, idx) or not self._wide_run_ok(k, layer, idx, width):
+                    open_dirs[d] = False
+                    continue
+                if self._plane_via_ok(k, idx, placed, areas):
+                    return (k, d)
+            if not any(open_dirs):
+                break
+        return None
+
+    # --- escape stubs (routing.maze 0.6) ---------------------------------------
+
+    def _clear_of(self, net: int) -> float:
+        return self.pad_clear.get(net, self.p.clearance_mm)
+
+    def _net_width(self, idx: int) -> float:
+        """The net's track width: its rule's, else the board's."""
+        rule = self.net_rules.get(idx)
+        return self.p.track_width_mm if rule is None else float(rule[0])
+
+    def _reserve(self) -> dict[int, int]:
+        """The cells no escape claim of another net may take (``layer * n + k`` -> net), built on first use with every usable terminal
+        cell of a routed net (the escapes add theirs and their ways out, a fan the cells it holds; :attr:`_reserved_why` says which),
+        together with those terminals' one-segment stubs to the pad centre (:attr:`_bands`, copper an escape keeps its clearance from)."""
+        if self._reserved is None:
+            self._reserved = {}
+            for name in self._eligible:
+                idx = self.net_index[name]
+                for t in self.terminals[name]:
+                    if t.offgrid is not None:
+                        continue
+                    layers = tuple(layer for layer in t.pad.layers if self.owner[layer][t.cell] in (None, idx))
+                    for layer in layers:
+                        c = layer * self.n + t.cell
+                        if c not in self._reserved:
+                            self._reserved[c] = idx
+                            self._reserved_why[c] = "terminal"
+                    a, b = self.pos(t.cell), (_q(t.pad.cx), _q(t.pad.cy))
+                    if layers and a != b:
+                        half = self._net_width(idx) / 2.0
+                        self._bands.append(_PadGeom(
+                            t.pad.ref, f"{t.pad.number}:stub", (a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, abs(b[0] - a[0]) / 2.0 + half,
+                            abs(b[1] - a[1]) / 2.0 + half, half, layers, idx, kind="stub", shape=("seg", a, b, half),
+                        ))
+        return self._reserved
+
+    def _centroid_distance(self, geom: _PadGeom) -> float:
+        fx, fy = self.fp_centroid.get(geom.ref, (geom.cx, geom.cy))
+        return round(math.hypot(geom.cx - fx, geom.cy - fy), 6)
+
+    def _escape_all(self) -> None:
+        """The escape pass (module docstring: escape stubs): every pad of a routed signal net (not a doomed one, :meth:`_static_phase`)
+        whose grid cell is off its copper or fenced on every pad layer, and every waiting plane pad, gets an escape or a refusal.
+        Footprints in natural ref order, each seeing the escapes before it; one footprint's pads are escaped greedily in each order of
+        :data:`_ESCAPE_TRIALS` in turn (undone after each) and the first order with the fewest pads left without one - plane pads first,
+        since one such pad leaves its whole plane net unrouted -, then the shortest total stub, is applied."""
+        need: list[_Need] = []
+        for name in self._eligible:
+            idx = self.net_index[name]
+            for q, t in enumerate(self.terminals[name]):
+                if t.offgrid is not None or not any(self.owner[layer][t.cell] in (None, idx) for layer in t.pad.layers):
+                    need.append(("signal", name, q, t, -1, "off-grid" if t.offgrid is not None else "fenced", None))
+        for name, pend in self._pending.items():
+            for slot, t, layer, why, problem in pend.deferred:
+                need.append(("plane", name, slot, t, layer, why, problem))
+        if not need:
+            return
+        self._reserve()
+        groups: dict[str, list[_Need]] = {}
+        for row in need:
+            groups.setdefault(row[3].pad.ref, []).append(row)
+        for ref in sorted(groups, key=natural_ref_key):
+            rows = groups[ref]
+            best: tuple[tuple[int, int, float, int], tuple[str, str, str]] | None = None
+            trials = _ESCAPE_TRIALS if len(rows) > 1 else tuple(tr for tr in _ESCAPE_TRIALS if tr[0] == "middle" and tr[2] == "plane")
+            # one pad: its candidate orders only (no row to fan, nothing to go first)
+            for n_trial, trial in enumerate(trials):
+                left_plane, left_signal, total = self._escape_group(rows, trial, commit=False)
+                key = (left_plane, left_signal, round(total, 6), n_trial)
+                if best is None or key < best[0]:
+                    best = (key, trial)
+                if left_plane == 0 and left_signal == 0:
+                    break
+            self._escape_group(rows, best[1], commit=True)
+
+    def _escape_group(self, rows: list[_Need], trial: tuple[str, str, str], *, commit: bool) -> tuple[int, int, float]:
+        """Escape one footprint's pads by the trial - pad order ``"middle"`` (nearest its copper centroid first: a row fans out from its
+        middle), ``"ends"`` (farthest first), ``"natural"`` (pad order) or ``"fan"`` (:meth:`_fan` for each row of pads first, the rest
+        in the middle order); candidates ``"near"`` or ``"straight"`` (:meth:`_find_escape`); the plane pads (vias) or the signal pads
+        first - and return ``(plane pads left, signal pads left, total stub length)``. ``commit=False`` undoes every claim afterwards;
+        ``commit=True`` applies them and records each escape or refusal."""
+        order, cands, first_kind = trial
+
+        def key(i: int) -> tuple:
+            row = rows[i]
+            d = self._centroid_distance(row[3].pad)
+            where = -d if order == "ends" else 0.0 if order == "natural" else d
+            return (0 if row[0] == first_kind else 1, where, natural_ref_key(row[3].pad.number), row[1], row[2])
+
+        log: list[tuple[str, int, int, Any]] | None = None if commit else []
+        snap = self._snapshot()
+        left_plane = left_signal = 0
+        total = 0.0
+        fanned = self._fan(rows, cands, log, snap[2]) if order == "fan" else {}
+        for i, got in sorted(fanned.items()):
+            total += got.length_mm()
+            if commit:
+                self._keep(rows[i], got)
+        for i in sorted((i for i in range(len(rows)) if i not in fanned), key=key):
+            row = rows[i]
+            got = self._find_row_escape(row, cands)
+            if isinstance(got, str):
+                kind, name, q, t, _layer, _why, problem = row
+                if kind == "plane":
+                    left_plane += 1
+                    if commit:
+                        reason = f"{problem}; {got}"
+                        self._pending[name].failed.append(reason)
+                        self.escape_refused[t.label] = reason
+                else:
+                    left_signal += 1
+                    if commit:
+                        head = t.offgrid if t.offgrid is not None else self._fenced_words(t, self.net_index[name])
+                        refusal = f"{head}; {got}"
+                        self.terminals[name][q] = replace(t, refusal=refusal)
+                        self.escape_refused[t.label] = refusal
+                continue
+            total += got.length_mm()
+            self._take(row, got, log, snap[2])
+            if commit:
+                self._keep(row, got)
+        if log is not None:
+            self._rollback(snap, log)
+        return left_plane, left_signal, total
+
+    def _snapshot(self) -> tuple[int, int, list[int]]:
+        """What :meth:`_rollback` restores: the lengths of :attr:`pads` and of the plane vias, and a list for the reserved cells added
+        after it."""
+        return (len(self.pads), len(self._plane_placed), [])
+
+    def _rollback(self, snap: tuple[int, int, list[int]], log: list[tuple[str, int, int, Any]]) -> None:
+        self._undo(log)
+        del self.pads[snap[0]:]
+        del self._plane_placed[snap[1]:]
+        for c in snap[2]:
+            self._reserved.pop(c, None)
+            self._reserved_why.pop(c, None)
+        snap[2].clear()
+
+    def _find_row_escape(self, row: _Need, cands: str, only: int | None = None) -> _Escape | str:
+        kind, name, _q, t, _layer, why, _problem = row
+        idx = self.net_index[name]
+        if kind == "plane":
+            pend = self._pending[name]
+            return self._find_escape(t, idx, why, via=True, w_cap=pend.width, areas=pend.areas, placed=self._plane_placed, cands=cands, only=only)
+        return self._find_escape(t, idx, why, cands=cands, only=only)
+
+    def _take(self, row: _Need, got: _Escape, log: list[tuple[str, int, int, Any]] | None, added: list[int]) -> None:
+        """Claim one escape (its stub and via), reserve a signal escape's cell for its net (``added`` collects the new reservations)."""
+        kind, name, _q, t, _layer, _why, _problem = row
+        idx = self.net_index[name]
+        if got.kind != "cell":
+            self._claim_escape(got, t, idx, log)
+        if kind == "plane":
+            self._plane_placed.append(self.xy(got.cell))
+            return
+        for k in (got.cell, *got.exit):
+            c = got.layer * self.n + k
+            if c not in self._reserved:
+                added.append(c)
+                self._reserved[c] = idx
+                self._reserved_why[c] = "terminal" if k == got.cell else "exit"
+            elif k == got.cell and c in added:  # a fan's held cell, now the escape's terminal cell (rolled back with it)
+                self._reserved_why[c] = "terminal"
+
+    def _keep(self, row: _Need, got: _Escape) -> None:
+        """Record a committed escape: the signal pad's terminal moves to the escape's cell, a plane pad's link waits in its net."""
+        kind, name, q, t, layer, _why, _problem = row
+        self.escape_ran = True
+        t2 = replace(t, cell=got.cell, escape=got)
+        if kind == "plane":
+            self._pending[name].links[q] = (t2, layer, got.cell)
+            return
+        self.terminals[name][q] = t2
+        self._record_escape(name, t2)
+
+    def _fan(self, rows: list[_Need], cands: str, log: list[tuple[str, int, int, Any]] | None, added: list[int]) -> dict[int, _Escape]:
+        """Fan each row of the footprint's waiting pads out (module docstring: escape stubs): pads that leave in one direction from one
+        edge line get escape cells in one line in front of it, as far apart as their claims need (a signal stub's cell keeps
+        ``c + width/2 + grid/2`` plus its neighbour's half copper from it, a via's cell ``via_diameter + c`` from another via), centred
+        on the row and at the shallowest depth where the most of them are legal; the straightest pads go first. Returns the escapes
+        made (row index -> escape), claimed through ``log``."""
+        p, g = self.p, self.p.grid_mm
+        lines: dict[tuple[int, int, float], list[int]] = {}
+        for i, row in enumerate(rows):
+            geom = row[3].pad
+            dirs = self._escape_dirs(geom)
+            if len(dirs) != 1 or len(geom.layers) != 1:
+                continue
+            dx, dy = _DIRS[dirs[0]]
+            ext = geom.hw if dx else geom.hh
+            lines.setdefault((dirs[0], geom.layers[0], round((geom.cx + dx * ext) * dx + (geom.cy + dy * ext) * dy, 4)), []).append(i)
+        out: dict[int, _Escape] = {}
+        for line_key in sorted(lines):
+            members = lines[line_key]
+            if len(members) < 2:
+                continue
+            d, _layer, edge = line_key
+            dx, dy = _DIRS[d]
+            along_x = dx != 0
+
+            def lateral(i: int) -> float:
+                geom = rows[i][3].pad
+                return ((geom.cy - self.oy) if along_x else (geom.cx - self.ox)) / g
+
+            members.sort(key=lambda i: (lateral(i), i))
+            halves: list[float] = []
+            clears: list[float] = []
+            for i in members:
+                kind, name, _q, t, _l, _w, _pr = rows[i]
+                idx = self.net_index[name]
+                halves.append(p.via_diameter_mm / 2.0 if kind == "plane" else min(2.0 * t.pad.inscribed_r, self._net_width(idx)) / 2.0)
+                clears.append(self._clear_of(idx))
+            gaps: list[int] = []
+            for k in range(len(members) - 1):
+                c = max(clears[k], clears[k + 1])
+                need = c + p.track_width_mm / 2.0 + g / 2.0 + max(halves[k], halves[k + 1])
+                if rows[members[k]][0] == "plane" and rows[members[k + 1]][0] == "plane":
+                    need = max(need, p.via_diameter_mm + c)
+                gaps.append(math.ceil(need / g - 1e-9))
+            span = sum(gaps)
+            j0 = math.floor((lateral(members[0]) + lateral(members[-1])) / 2.0 - span / 2.0 + 0.5)
+            lanes = [j0 + sum(gaps[:k]) for k in range(len(members))]
+            n_axis, n_lat = (self.nx, self.ny) if along_x else (self.ny, self.nx)
+            origin = self.ox if along_x else self.oy
+            sign = dx if along_x else dy
+            depths = sorted((f, a) for a in range(n_axis) for f in [(origin + a * g) * sign - edge] if -_EPS <= f <= p.escape_reach_mm + _EPS)
+            best: tuple[int, int] | None = None
+            for _f, a in depths:
+                trial_snap = self._snapshot()
+                sub: list[tuple[str, int, int, Any]] = []
+                got = self._fan_line(rows, members, lanes, a, along_x, n_lat, cands, sub, trial_snap[2], lateral)
+                self._rollback(trial_snap, sub)
+                if best is None or len(got) > best[0]:
+                    best = (len(got), a)
+                if len(got) == len(members):
+                    break
+            if best is not None and best[0] > 0:
+                out.update(self._fan_line(rows, members, lanes, best[1], along_x, n_lat, cands, log, added, lateral))
+        return out
+
+    def _fan_line(
+        self, rows: list[_Need], members: list[int], lanes: list[int], depth: int, along_x: bool, n_lat: int, cands: str,
+        log: list[tuple[str, int, int, Any]] | None, added: list[int], lateral: Callable[[int], float],
+    ) -> dict[int, _Escape]:
+        """One row's fan at one depth: every signal cell reserved for its net first, then each pad (the straightest first) takes the
+        stub to its own cell if one is legal; a pad that gets none gives its reservation back."""
+        cells: dict[int, int] = {}
+        for k, i in enumerate(members):
+            if 0 <= lanes[k] < n_lat:
+                cells[i] = lanes[k] * self.nx + depth if along_x else depth * self.nx + lanes[k]
+        pre: dict[int, int] = {}
+        for i, cell in cells.items():
+            kind, name, _q, t, _l, _w, _pr = rows[i]
+            if kind == "plane":
+                continue
+            for layer in t.pad.layers:
+                c = layer * self.n + cell
+                if c not in self._reserved:
+                    self._reserved[c] = self.net_index[name]
+                    self._reserved_why[c] = "fan"
+                    pre[i] = c
+                    added.append(c)
+        got_map: dict[int, _Escape] = {}
+        order = sorted(cells, key=lambda i: (round(abs(lanes[members.index(i)] - lateral(i)), 6), lateral(i)))
+        for i in order:
+            got = self._find_row_escape(rows[i], cands, only=cells[i])
+            if isinstance(got, str):
+                continue
+            self._take(rows[i], got, log, added)
+            got_map[i] = got
+        for i, c in pre.items():
+            if i not in got_map:
+                self._reserved.pop(c, None)
+                self._reserved_why.pop(c, None)
+                if c in added:
+                    added.remove(c)
+        return got_map
+
+    def _fenced_words(self, t: _Terminal, idx: int) -> str:
+        """Why the terminal cell of ``t`` is no seed on any layer of its pad (0.2's sentence, naming what reaches it)."""
+        x, y = self.pos(t.cell)
+        xr, yr = self.xy(t.cell)
+        g, w = self.p.grid_mm, self.p.track_width_mm
+        names: list[str] = []
+        for geom in self.pads:
+            if geom.net == idx or not set(geom.layers) & set(t.pad.layers):
+                continue
+            c = self.pad_clear.get(geom.net)
+            r = self.pad_radius if c is None else c + w / 2.0 + g / 2.0
+            if _pt_box(xr, yr, geom.box) < r - _EPS:
+                number = geom.number.split(":", 1)[0] or "(unnumbered)"
+                label = f"{geom.ref}.{number}" if geom.kind == "pad" else f"the {geom.kind} of {geom.ref}.{number}"
+                if label not in names:
+                    names.append(label)
+        if self._edge_distance(t.cell) < self.p.edge_clearance_mm + w / 2.0 - _EPS:
+            names.append("the board edge")
+        what = ", ".join(names) if names else "a keep-out area"
+        return (f"{t.label} terminal cell ({x:g}, {y:g}) is inside a keep-out on every copper layer of the pad ({what} within clearance "
+                f"{self.p.clearance_mm:g} + width/2 of it)")
+
+    def _record_escape(self, name: str, t: _Terminal) -> None:
+        esc = t.escape
+        row: dict[str, Any] = {"pad": t.label, "net": name, "kind": esc.kind, "why": esc.why, "layer": LAYERS[esc.layer], "cell": list(self.pos(esc.cell))}
+        if esc.kind != "cell":
+            row.update(width_mm=esc.width, points=[list(pt) for pt in esc.points], length_mm=_q(esc.length_mm()))
+        self.escapes.append(row)
+
+    def _escape_dirs(self, geom: _PadGeom) -> list[int]:
+        """The directions (indices into :data:`_DIRS`) a stub may leave ``geom`` in: its long axis, pointing away from its footprint's
+        copper centroid; a square or round pad takes the axis nearer that direction; both senses, or all four, when it is undecided."""
+        fx, fy = self.fp_centroid.get(geom.ref, (geom.cx, geom.cy))
+        vx, vy = geom.cx - fx, geom.cy - fy
+        tol = 1e-6
+        if geom.hw > geom.hh + tol:
+            axis = "x"
+        elif geom.hh > geom.hw + tol:
+            axis = "y"
+        elif abs(vx) > abs(vy) + tol:
+            axis = "x"
+        elif abs(vy) > abs(vx) + tol:
+            axis = "y"
+        else:
+            return [0, 1, 2, 3]
+        if axis == "x":
+            return [0] if vx > tol else [2] if vx < -tol else [0, 2]
+        return [1] if vy > tol else [3] if vy < -tol else [1, 3]
+
+    def _in_pad_cell(self, t: _Terminal, idx: int, local: list[_PadGeom]) -> tuple[int, int] | None:
+        """``(cell, layer)``: another grid point strictly inside the pad's inscribed circle that is free or the net's own on a layer of the
+        pad, obeys the net's rule, is no other net's reserved cell, and from which the ordinary stub to the pad centre at the net's width
+        keeps every clearance exactly (nearest to the centre first, then cell order, then layer); ``None`` when there is none."""
+        geom, g = t.pad, self.p.grid_mm
+        centre = (_q(geom.cx), _q(geom.cy))
+        half = self._net_width(idx) / 2.0
+        r = geom.inscribed_r
+        i0, j0 = self._nearest_cell(geom.cx, geom.cy)
+        span = int(r / g) + 1
+        reserved = self._reserve()
+        best: tuple[float, int] | None = None
+        for j in range(max(0, j0 - span), min(self.ny - 1, j0 + span) + 1):
+            for i in range(max(0, i0 - span), min(self.nx - 1, i0 + span) + 1):
+                k = j * self.nx + i
+                if k == t.cell:
+                    continue
+                x, y = self.pos(k)
+                d = math.hypot(x - geom.cx, y - geom.cy)
+                if d > r - 1e-6:
+                    continue
+                for layer in geom.layers:
+                    if (self.owner[layer][k] in (None, idx) and reserved.get(layer * self.n + k, idx) == idx and not self._rule_fenced(k, layer, idx, geom)
+                            and self._stub_room([(x, y), centre], layer, idx, local)[0] >= half - _EPS):
+                        key = (round(d, 9), k, layer)
+                        if best is None or key < best:
+                            best = key
+                        break
+        return None if best is None else (best[1], best[2])
+
+    def _rule_fenced(self, k: int, layer: int, idx: int, geom: _PadGeom) -> bool:
+        """Whether a net rule's wider track or larger clearance keeps the net's own track off cell ``k`` (its fence, module docstring:
+        net rules; the neck-down width within its radius of the pad) - an escape cell must not be one."""
+        rule = self.net_rules.get(idx)
+        if rule is None:
+            return False
+        w, c, neck, radius = rule
+        if w <= self.p.track_width_mm + _EPS and c <= self.p.clearance_mm + _EPS:
+            return False  # the owner map is the net's fence
+        x, y = self.xy(k)
+        if neck is not None and radius is not None and _pt_box(x, y, geom.box) <= radius + _EPS:
+            w, c = neck, self.p.clearance_mm
+        return self.rule_blocked(k, layer, idx, w, c, self._clear_of)
+
+    def _near(self, x1: float, y1: float, x2: float, y2: float) -> list[_PadGeom]:
+        """The entries of :attr:`pads` and of the ordinary stubs (:attr:`_bands`) whose box meets the given window."""
+        return [geom for geom in (*self.pads, *self._bands)
+                if geom.cx + geom.hw >= x1 and geom.cx - geom.hw <= x2 and geom.cy + geom.hh >= y1 and geom.cy - geom.hh <= y2]
+
+    @staticmethod
+    def _seg_gap(a: tuple[float, float], b: tuple[float, float], geom: _PadGeom) -> float:
+        """Distance from the segment a-b to the copper of ``geom`` (its exact shape when it has one, else its box)."""
+        shape = geom.shape
+        if shape is None:
+            return _seg_box(a, b, geom.box)
+        if shape[0] == "seg":
+            return _seg_seg(a, b, shape[1], shape[2]) - shape[3]
+        return _pt_seg(shape[1][0], shape[1][1], a, b) - shape[2]
+
+    @staticmethod
+    def _pt_gap(x: float, y: float, geom: _PadGeom) -> float:
+        """Distance from the point to the copper of ``geom`` (exact shape or box)."""
+        shape = geom.shape
+        if shape is None:
+            return _pt_box(x, y, geom.box)
+        if shape[0] == "seg":
+            return _pt_seg(x, y, shape[1], shape[2]) - shape[3]
+        return math.hypot(x - shape[1][0], y - shape[1][1]) - shape[2]
+
+    @staticmethod
+    def _label(geom: _PadGeom) -> str:
+        number = geom.number.split(":", 1)[0] or "(unnumbered)"
+        if geom.kind == "pad":
+            return f"pad {geom.ref}.{number}"
+        return {"stub": "the stub of pad", "escape": "the escape stub of pad", "escape-via": "the escape via of pad",
+                "plane-stub": "the plane stub of pad", "plane-via": "the plane via of pad"}.get(geom.kind, geom.kind) + f" {geom.ref}.{number}"
+
+    def _stub_room(self, pts: list[tuple[float, float]], layer: int, idx: int, local: list[_PadGeom]) -> tuple[float, str]:
+        """The largest half width a stub along ``pts`` may have on ``layer`` (exact geometry) and what limits it."""
+        c_net = self._clear_of(idx)
+        room, what = _INF, ""
+        segs = list(zip(pts, pts[1:]))
+        for geom in local:
+            if geom.net == idx or layer not in geom.layers:
+                continue
+            req = max(c_net, self._clear_of(geom.net) if geom.net >= 0 else self.p.clearance_mm)
+            for a, b in segs:
+                h = self._seg_gap(a, b, geom) - req
+                if h < room:
+                    room, what = h, f"{self._label(geom)} (needs {req:g} mm)"
+        for ko, area, layers, allowed in self.track_keepouts:
+            if layer not in layers or (len(allowed) == 1 and idx in allowed):
+                continue
+            for a, b in segs:
+                h = segment_area_distance(a, b, area)
+                if h < room:
+                    room, what = h, f"keep-out {ko}"
+        for pt in pts:  # the outline is a rectangle: a segment is nearest the edge at an end
+            h = self.edge_distance_xy(*pt) - self.p.edge_clearance_mm
+            if h < room:
+                room, what = h, "the board edge"
+        return room, what
+
+    def _claim_cells(self, pts: list[tuple[float, float]], width: float, layers: tuple[int, ...], idx: int, via: tuple[float, float] | None) -> list[int]:
+        """The cells (``layer * n + k``) a stub along ``pts`` of ``width`` on ``layers`` (and a via at ``via``, on both layers) claims for
+        ``idx``: within ``c + track_width/2 + grid/2`` of their copper, as :meth:`_mark_box` claims around a pad."""
+        g = self.p.grid_mm
+        r = self._clear_of(idx) + self.p.track_width_mm / 2.0 + g / 2.0
+        out: set[int] = set()
+        shapes: list[tuple[tuple[float, float], tuple[float, float], float, tuple[int, ...]]] = [(a, b, width / 2.0, layers) for a, b in zip(pts, pts[1:])]
+        if via is not None:
+            shapes.append((via, via, self.p.via_diameter_mm / 2.0, (0, 1)))
+        for a, b, half, lays in shapes:
+            reach = r + half
+            i0, j0 = self._nearest_cell(min(a[0], b[0]) - reach, min(a[1], b[1]) - reach)
+            i1, j1 = self._nearest_cell(max(a[0], b[0]) + reach, max(a[1], b[1]) + reach)
+            for j in range(max(0, j0 - 1), min(self.ny - 1, j1 + 1) + 1):
+                for i in range(max(0, i0 - 1), min(self.nx - 1, i1 + 1) + 1):
+                    k = j * self.nx + i
+                    x, y = self.xy(k)
+                    if _pt_seg(x, y, a, b) < reach - _EPS:
+                        for layer in lays:
+                            out.add(layer * self.n + k)
+        return sorted(out)
+
+    def _find_escape(
+        self, t: _Terminal, idx: int, why: str, *, via: bool = False, w_cap: float | None = None,
+        areas: Sequence[list[tuple[float, float]]] = (), placed: Sequence[tuple[float, float]] = (), cands: str = "near",
+        only: int | None = None,
+    ) -> _Escape | str:
+        """The escape of one pad (module docstring: escape stubs), or why none exists (a sentence naming the nearest candidate's problem).
+
+        A signal pad first tries another grid point inside its inscribed circle (``kind="cell"``), then a stub to a free grid cell with a
+        way out; a plane pad (``via=True``) a stub to a via obeying the plane-via rules exactly (``areas``: the net's plane zones,
+        ``placed``: the plane vias so far, ``w_cap``: the plane stubs' width). ``cands`` orders the candidates (``"near"`` /
+        ``"straight"``), ``only`` restricts them to one cell (a fan's)."""
+        p, g, n = self.p, self.p.grid_mm, self.n
+        geom = t.pad
+        w_net = (p.track_width_mm if w_cap is None else w_cap) if via else self._net_width(idx)
+        w_top = min(2.0 * geom.inscribed_r, w_net)
+        w_min = self.escape_min_width
+        step = p.escape_width_step_mm
+        reach = p.escape_reach_mm
+        if w_top < w_min - _EPS:
+            return f"no escape stub: its narrow side ({2.0 * geom.inscribed_r:g} mm) is below the narrowest stub {w_min:g} mm"
+        rv = p.via_diameter_mm / 2.0
+        reserved = self._reserve()
+        c_max = max(p.clearance_mm, *self.pad_clear.values()) if self.pad_clear else p.clearance_mm
+        margin = max(geom.hw, geom.hh) + 1.5 * reach + max(w_top, w_net) + 2.0 * c_max + 2.0 * rv + g
+        local = self._near(geom.cx - margin, geom.cy - margin, geom.cx + margin, geom.cy + margin)
+        if not via and t.offgrid is None and only is None:
+            inside = self._in_pad_cell(t, idx, local)
+            if inside is not None:
+                return _Escape("cell", why, inside[1], inside[0])
+        centre = (_q(geom.cx), _q(geom.cy))
+        noun = "via site" if via else "cell"
+        first: str | None = None
+        free_seen = False
+        for layer in geom.layers:
+            for d in self._escape_dirs(geom):
+                dx, dy = _DIRS[d]
+                lx, ly = -dy, dx
+                ext = geom.hw if dx else geom.hh
+                ox, oy = geom.cx + dx * ext, geom.cy + dy * ext
+                fx, fy = self.fp_centroid.get(geom.ref, (geom.cx, geom.cy))
+                side = (geom.cx - fx) * lx + (geom.cy - fy) * ly
+                i0, j0 = self._nearest_cell(ox - reach, oy - reach)
+                i1, j1 = self._nearest_cell(ox + reach, oy + reach)
+                found: list[tuple[tuple, int, float, float]] = []
+                for j in range(max(0, j0 - 1), min(self.ny - 1, j1 + 1) + 1):
+                    for i in range(max(0, i0 - 1), min(self.nx - 1, i1 + 1) + 1):
+                        k = j * self.nx + i
+                        if only is not None and k != only:
+                            continue
+                        x, y = self.xy(k)
+                        f = (x - ox) * dx + (y - oy) * dy
+                        lat = (x - ox) * lx + (y - oy) * ly
+                        if f < -_EPS or f > reach + _EPS or abs(lat) > reach + _EPS:
+                            continue
+                        away = 0 if abs(lat) < _EPS or lat * side > 0 else 1
+                        near = (round(math.hypot(f, lat), 9), round(abs(lat), 9), away, k)
+                        found.append(((0 if abs(lat) < _EPS else 1, *near) if cands == "straight" else near, k, f, lat))
+                found.sort()
+                for _key, k, f, lat in found:
+                    ex, ey = self.pos(k)
+                    if via:
+                        problem = self._via_site_problem(k, idx, areas, placed, local)
+                    else:
+                        problem = None if self.owner[layer][k] in (None, idx) else _SKIP
+                        if problem is None and reserved.get(layer * n + k, idx) != idx:
+                            problem = f"it is {self._reserved_words(layer * n + k, False)}"
+                        if problem is None and self._rule_fenced(k, layer, idx, geom):
+                            problem = "the net rule's wider track or larger clearance keeps its track off it"
+                    if problem == _SKIP:
+                        continue
+                    free_seen = True
+                    if problem is not None:
+                        first = first or f"the nearest candidate {noun} ({ex:g}, {ey:g}): {problem}"
+                        continue
+                    a_steps = [0] if abs(lat) < _EPS else list(range(0, int(f / (g / 2.0) + _EPS) + 1))
+                    for a_i in a_steps:
+                        a = a_i * g / 2.0
+                        if abs(lat) < _EPS:
+                            pts = [centre, (ex, ey)]
+                        else:
+                            bend = (_q(ox + dx * a), _q(oy + dy * a))
+                            pts = [centre, bend, (ex, ey)] if bend != (ex, ey) else [centre, (ex, ey)]
+                        room, what = self._stub_room(pts, layer, idx, local)
+                        width = _q(min(w_top, math.floor((2.0 * room + 1e-9) / step) * step))
+                        if width < w_min - _EPS:
+                            first = first or (f"the nearest candidate {noun} ({ex:g}, {ey:g}): a stub keeping its clearance from {what} could be at "
+                                              f"most {max(2.0 * room, 0.0):.3f} mm wide, below the narrowest stub {w_min:g} mm")
+                            continue
+                        cells = self._claim_cells(pts, width, (layer,), idx, (ex, ey) if via else None)
+                        taken = next((c for c in cells if reserved.get(c, idx) != idx), None)
+                        if taken is not None:
+                            first = first or (f"the nearest candidate {noun} ({ex:g}, {ey:g}): its clearance would take "
+                                              f"{self._reserved_words(taken, True)}")
+                            continue
+                        if via:
+                            return _Escape("via", why, layer, k, width, tuple(pts))
+                        way = self._exit_path(k, layer, idx, geom.ref)
+                        if way is None:
+                            first = first or (f"the nearest candidate cell ({ex:g}, {ey:g}): no way out of the footprint's escape area from it on "
+                                              f"{LAYERS[layer]} (every path meets another net's pad, stub or edge clearance)")
+                            break  # another bend does not open a way out of this cell
+                        return _Escape("stub", why, layer, k, width, tuple(pts), tuple(way))
+        where = f"within {reach:g} mm in front of its edge"
+        if not free_seen:
+            if via:
+                return (f"no escape stub: no via site {where} lies inside the net's plane zone clear of the edge, every pad and the via "
+                        "keep-outs")
+            return (f"no escape stub: every grid cell {where} is inside a foreign pad's, the edge's or a keep-out's clearance, or another "
+                    "escape's")
+        return f"no escape stub {where}: {first or 'no candidate is legal'}"
+
+    def _exit_path(self, start: int, layer: int, idx: int, ref: str) -> list[int] | None:
+        """The shortest 4-neighbour way (cells on ``layer``; ties in the order east, south, west, north) from ``start`` to the first cell
+        outside the escape area of footprint ``ref`` (its pads' box grown by ``escape_reach_mm`` + a grid step) through cells free or the
+        net's own and reserved for no other net (the candidate's own claim takes only free cells, so it closes none); ``None`` when there
+        is none."""
+        box = self._escape_area.get(ref)
+        if box is None:
+            geoms = [geom for geom in self.pads if geom.ref == ref and geom.kind == "pad"]
+            grow = self.p.escape_reach_mm + self.p.grid_mm
+            box = (min(g.cx - g.hw for g in geoms) - grow, min(g.cy - g.hh for g in geoms) - grow,
+                   max(g.cx + g.hw for g in geoms) + grow, max(g.cy + g.hh for g in geoms) + grow)
+            self._escape_area[ref] = box
+        x1, y1, x2, y2 = box
+        owner, reserved, base, nx, ny = self.owner[layer], self._reserved, layer * self.n, self.nx, self.ny
+
+        def ok(k: int) -> bool:
+            return owner[k] in (None, idx) and reserved.get(base + k, idx) == idx
+
+        prev: dict[int, int] = {start: -1}
+        queue = deque([start])
+        while queue:
+            k = queue.popleft()
+            x, y = self.xy(k)
+            if not (x1 <= x <= x2 and y1 <= y <= y2):
+                path = [k]
+                while prev[path[-1]] != -1:
+                    path.append(prev[path[-1]])
+                return path[::-1]
+            j, i = divmod(k, nx)
+            for di, dj in _DIRS:
+                ii, jj = i + di, j + dj
+                if 0 <= ii < nx and 0 <= jj < ny:
+                    kk = jj * nx + ii
+                    if kk not in prev and ok(kk):
+                        prev[kk] = k
+                        queue.append(kk)
+        return None
+
+    def _reserved_words(self, c: int, taken: bool) -> str:
+        """What the reserved cell ``c`` (``layer * n + k``) is, as a refusal names it (:data:`_RESERVED_WORDS`; ``taken``: the form after
+        "would take")."""
+        return f"{_RESERVED_WORDS[self._reserved_why[c]][taken]} net {self._net_name(self._reserved[c])}"
+
+    def _net_name(self, idx: int) -> str:
+        for name, k in self.net_index.items():
+            if k == idx:
+                return name
+        return "?"
+
+    def _via_site_problem(
+        self, k: int, idx: int, areas: Sequence[list[tuple[float, float]]], placed: Sequence[tuple[float, float]], local: list[_PadGeom],
+    ) -> str | None:
+        """Why a plane escape's via may not sit at cell ``k`` (exact rules, module docstring), :data:`_SKIP` when the cell is not even a
+        candidate (the edge, a pad under its disc, a via keep-out, outside the plane zones), ``None`` when it may."""
+        p = self.p
+        rv = p.via_diameter_mm / 2.0
+        if not self.via_edge_ok[k] or not self.via_pad_ok[k]:
+            return _SKIP
+        x, y = self.xy(k)
+        if not any(point_area_distance((x, y), poly) == 0.0 and _edge_gap((x, y), poly) >= rv - _EPS for poly in areas):
+            return _SKIP
+        if self.via_ko is not None and k in self.via_ko and idx not in self.via_ko[k]:
+            return _SKIP
+        c_net = self._clear_of(idx)
+        for other in local:
+            if other.net == idx:
+                continue
+            req = max(c_net, self._clear_of(other.net) if other.net >= 0 else p.clearance_mm)
+            gap = self._pt_gap(x, y, other) - rv
+            if gap < req - _EPS:
+                return f"the via would come {max(gap, 0.0):.3f} mm from {self._label(other)} (needs {req:g} mm)"
+        spacing = p.via_diameter_mm + p.clearance_mm
+        if any(math.hypot(x - vx, y - vy) < spacing - _EPS for vx, vy in placed):
+            return f"the via would come nearer than {spacing:g} mm to another plane via"
+        return None
+
+    def _claim_escape(self, esc: _Escape, t: _Terminal, idx: int, log: list[tuple[str, int, int, Any]] | None) -> list[_PadGeom]:
+        """Claim the escape's cells on the owner maps (and, for a via, keep other vias off it), add its entries to :attr:`pads` and
+        return them; ``log`` (a trial) records every change for the undo."""
+        pts = list(esc.points)
+        via_xy = self.xy(esc.cell) if esc.kind == "via" else None
+        for c in self._claim_cells(pts, esc.width, (esc.layer,), idx, via_xy):
+            layer, k = divmod(c, self.n)
+            cur = self.owner[layer][k]
+            new = idx if cur in (None, idx) else BLOCKED
+            if new != cur:
+                if log is not None:
+                    log.append(("owner", layer, k, cur))
+                self.owner[layer][k] = new
+        geoms: list[_PadGeom] = []
+        half = esc.width / 2.0
+        for a, b in zip(pts, pts[1:]):
+            geoms.append(_PadGeom(
+                t.pad.ref, f"{t.pad.number}:escape", (a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, abs(b[0] - a[0]) / 2.0 + half, abs(b[1] - a[1]) / 2.0 + half,
+                half, (esc.layer,), idx, kind="escape", shape=("seg", a, b, half),
+            ))
+        if via_xy is not None:
+            rv = self.p.via_diameter_mm / 2.0
+            geoms.append(_PadGeom(t.pad.ref, f"{t.pad.number}:escape-via", via_xy[0], via_xy[1], rv, rv, rv, (0, 1), idx, kind="escape-via",
+                                  shape=("disc", via_xy, rv)))
+            i0, j0 = self._nearest_cell(via_xy[0] - 2 * rv, via_xy[1] - 2 * rv)
+            i1, j1 = self._nearest_cell(via_xy[0] + 2 * rv, via_xy[1] + 2 * rv)
+            for j in range(max(0, j0 - 1), min(self.ny - 1, j1 + 1) + 1):
+                for i in range(max(0, i0 - 1), min(self.nx - 1, i1 + 1) + 1):
+                    k = j * self.nx + i
+                    x, y = self.xy(k)
+                    if math.hypot(x - via_xy[0], y - via_xy[1]) < 2 * rv - _EPS:
+                        if self.via_pad_ok[k]:
+                            if log is not None:
+                                log.append(("via", 0, k, True))
+                            self.via_pad_ok[k] = False
+        self.pads.extend(geoms)
+        return geoms
+
     def usable_layers(self, terminal: _Terminal, net: int) -> tuple[int, ...]:
-        """The pad's copper layers on which the terminal cell is free or the net's own (never BLOCKED / another net's)."""
-        return tuple(layer for layer in terminal.pad.layers if self.owner[layer][terminal.cell] in (None, net))
+        """The pad's copper layers on which the terminal cell is free or the net's own (never BLOCKED / another net's); an escape stub's
+        own layer only (routing.maze 0.6)."""
+        esc = terminal.escape
+        layers = terminal.pad.layers if esc is None or esc.kind == "cell" else (esc.layer,)
+        return tuple(layer for layer in layers if self.owner[layer][terminal.cell] in (None, net))
 
     def via_static_at(self, k: int) -> int:
         """:data:`BLOCKED`, :data:`_FREE` or the one net that may drill a via at cell ``k`` given the pads and the edge (memoised).
@@ -2018,7 +3124,9 @@ def _path_length(board: _Board, path: list[int], via_len: float) -> float:
 
 
 def _stub_length(board: _Board, t: _Terminal) -> float:
-    """Length of the stub from the terminal cell to the pad centre, as :class:`_NetCopper` emits it."""
+    """Length of the stub from the terminal cell to the pad centre, as :class:`_NetCopper` emits it (an escape stub's polyline, 0.6)."""
+    if t.escape is not None and t.escape.kind != "cell":
+        return t.escape.length_mm()
     x, y = board.pos(t.cell)
     return math.hypot(_q(t.pad.cx) - x, _q(t.pad.cy) - y)
 
@@ -2040,6 +3148,9 @@ def _route_net(
     """
     board = neg.board
     n, nx = board.n, board.nx
+    refused = [t for t in terms if t.refusal is not None]
+    if refused:  # routing.maze 0.6: a pad that needed an escape stub and has none (its refusal names it and why)
+        return refused[0].refusal
     usable = [board.usable_layers(t, idx) for t in terms]
     # a terminal cell inside a keep-out (a foreign pad, a net-less pad, the board edge) is no seed and no target on that
     # layer; a terminal with no usable layer cannot be connected without breaking the router's own clearance
@@ -2552,7 +3663,14 @@ class _World:
         self.cmax = board.p.clearance_mm
         for geom in board.pads:
             c = clear_of(geom.net)
-            self._add(("box", geom.net, frozenset(geom.layers), geom.box, 0.0, c, f"pad {geom.ref}.{geom.number or '(unnumbered)'}"), geom.box)
+            label = f"pad {geom.ref}.{geom.number or '(unnumbered)'}"
+            if geom.kind in ("escape", "escape-via"):  # routing.maze 0.6: an escape stub / via is audited as its exact copper
+                if geom.shape[0] == "seg":
+                    self._add(("seg", geom.net, frozenset(geom.layers), (geom.shape[1], geom.shape[2]), geom.shape[3], c, f"escape stub of {label}"), geom.box)
+                else:
+                    self._add(("disc", geom.net, frozenset(geom.layers), geom.shape[1], geom.shape[2], c, f"escape via of {label}"), geom.box)
+                continue
+            self._add(("box", geom.net, frozenset(geom.layers), geom.box, 0.0, c, label), geom.box)
 
     def _add(self, item: tuple, bbox: tuple[float, float, float, float]) -> None:
         self.cmax = max(self.cmax, item[5])
@@ -2609,6 +3727,8 @@ class _Plan:
     version: str
     derived: tuple[str, ...]
     note: str
+    #: routing.maze 0.6: the board has an escape stub, so the params entry records the escape knobs
+    escape: bool = False
 
 
 def _provenance(
@@ -2622,7 +3742,7 @@ def _provenance(
             story = f"routed against the legal copper as an obstacle after {iterations} negotiation iteration(s) left it in conflict"
         else:
             story = f"negotiated-congestion route, {iterations} iteration(s)" + ("" if legal else ", kept after the conflicting nets were ripped up")
-    derived = [f"net:{net.name}", *(f"placement:{r}" for r in refs), p.derived_from_entry(rules=rules_active)]
+    derived = [f"net:{net.name}", *(f"placement:{r}" for r in refs), p.derived_from_entry(rules=rules_active, escapes=plan is not None and plan.escape)]
     if rule is not None:
         derived.append(rule.derived_from_entry())
     rule_text = f"; {rule_note}" if rule_note else ""
@@ -2689,7 +3809,16 @@ class _NetCopper:
             self._track(path[-1] // n, run_start, path[-1] % n, run_w)
 
     def add_stub(self, terminal: _Terminal, layer: int) -> None:
-        """One segment from the terminal cell to the exact pad centre (nothing when the cell is the centre)."""
+        """One segment from the terminal cell to the exact pad centre (nothing when the cell is the centre); an escape stub's segments
+        (routing.maze 0.6) from its cell back to the pad centre, at its own width, each naming the escape in its provenance."""
+        esc = terminal.escape
+        if esc is not None and esc.kind != "cell":
+            prov = _escape_provenance(self.prov, terminal, self.board.p)
+            pts = list(reversed(esc.points))
+            for a, b in zip(pts, pts[1:]):
+                if a != b:
+                    self.tracks.append(Track(net=self.net.name, layer=LAYERS[esc.layer], start=a, end=b, width_mm=esc.width, provenance=prov))
+            return
         start = self.board.pos(terminal.cell)
         end = (_q(terminal.pad.cx), _q(terminal.pad.cy))
         width = self.neck if self.zone is not None and self.zone[terminal.cell] else self.width
@@ -2698,6 +3827,42 @@ class _NetCopper:
 
     def length_mm(self) -> float:
         return sum(math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1]) for t in self.tracks)
+
+
+#: the ``derived_from`` prefix of an escape stub's segments (routing.maze 0.6): ``escape:<pad>:<stub|via>:width=<w>:points=x,y;x,y;...``
+ESCAPE_ENTRY_PREFIX = "escape:"
+
+
+def escape_entry(track: Track) -> tuple[str, float, list[tuple[float, float]]] | None:
+    """``(pad label, width, points)`` of the escape stub a track is a segment of (its provenance's :data:`ESCAPE_ENTRY_PREFIX` entry),
+    or ``None`` for any other track."""
+    for entry in track.provenance.derived_from:
+        if not entry.startswith(ESCAPE_ENTRY_PREFIX):
+            continue
+        try:
+            label, _kind, width, points = entry[len(ESCAPE_ENTRY_PREFIX):].rsplit(":", 3)
+            pts = [(float(x), float(y)) for x, y in (pt.split(",") for pt in points.removeprefix("points=").split(";"))]
+            return label, float(width.removeprefix("width=")), pts
+        except ValueError:
+            return None
+    return None
+
+
+def _escape_provenance(prov: Provenance, t: _Terminal, p: RoutingParams) -> Provenance:
+    """The net's provenance for the segments of ``t``'s escape stub: an ``escape:<pad>:...`` entry in ``derived_from`` (its kind, width and
+    points, :func:`escape_entry`), the stub's geometry in the note."""
+    esc = t.escape
+    why = {"off-grid": "no grid point lies inside its inscribed circle", "fenced": "its grid cell is inside its neighbours' keep-out on every layer",
+           "no via site": "the axis walk found no via site"}.get(esc.why, esc.why)
+    path = " -> ".join(f"({x:g}, {y:g})" for x, y in esc.points)
+    target = "its via" if esc.kind == "via" else "the grid cell the track starts from"
+    points = ";".join(f"{x!r},{y!r}" for x, y in esc.points)
+    return prov.model_copy(update={
+        "derived_from": [*prov.derived_from, f"{ESCAPE_ENTRY_PREFIX}{t.label}:{esc.kind}:width={esc.width}:points={points}"],
+        "note": (f"{prov.note}; escape stub of pad {t.label} (routing.maze {ROUTER_ESCAPE_VERSION}: {why}): {path} on {LAYERS[esc.layer]} at "
+                 f"{esc.width:g} mm, from the pad centre out of its edge to {target} (every clearance checked exactly; "
+                 f"escape_reach {p.escape_reach_mm:g} mm)"),
+    })
 
 
 def _emit(board: _Board, net: Net, route: _NetRoute, prov: Provenance, rn: _RuleNet | None) -> _NetCopper:
@@ -2919,10 +4084,18 @@ def route_board(
         plan = _Plan(ROUTER_KEEPOUT_VERSION, tuple(derived), f"routing.maze {ROUTER_KEEPOUT_VERSION}: " + "; ".join(words))
     widths = [p.track_width_mm, *(float(r.width_mm) for r in eff.values()), *plane_width.values()]
     widths += [2.0 * float(r.width_mm) + float(r.pair_spacing_mm) for r in eff.values() if r.pair_partner is not None]
+    pair_nets = sorted({name for name, r in eff.items() if r.pair_partner is not None})
     board = _Board(
         ir, library, p, {index[name]: r.clearance_mm for name, r in eff.items()}, inner_layers,
         keepouts=list(keepouts or ()) or None, ko_width=max(widths), plane=plane_width or None, plane_areas=plane_areas or None,
+        no_escape=pair_nets,
+        net_rules={index[name]: (float(r.width_mm), float(r.clearance_mm), r.neckdown_width_mm, r.neckdown_radius_mm) for name, r in eff.items()},
     )
+    if board.escape_ran and board.escape_min_width > p.escape_min_width_mm + _EPS:
+        # routing.maze 0.6: the fab's min_track_width_mm raised the narrowest escape stub - recorded like every other raise, and only on a
+        # board with escapes (the knob is in no other board's provenance)
+        raised["escape_min_width_mm"] = (p.escape_min_width_mm, board.escape_min_width)
+        p = replace(p, escape_min_width_mm=board.escape_min_width)
     if board.custom_pads:  # routing.maze 0.5 (module docstring: custom pads): its own stamp and the pads it modelled, on every item
         entry = "custom_pads:" + ",".join(board.custom_pads) + ";model=anchor+primitive_boxes"
         words = (f"custom pad(s) {', '.join(board.custom_pads)} are obstacles as the box of their anchor plus one box around each copper "
@@ -2932,6 +4105,19 @@ def route_board(
             plan = _Plan(ROUTER_CUSTOM_PAD_VERSION, (entry,), head + words)
         else:
             plan = _Plan(ROUTER_CUSTOM_PAD_VERSION, (*plan.derived, entry), head + plan.note.removeprefix(f"routing.maze {ROUTER_KEEPOUT_VERSION}: ") + "; " + words)
+    planes_or_pads = plan is not None  # a 0.4 / 0.5 board: its plane copper and stats are added after the nets (_add_planes)
+    if board.escape_ran:  # routing.maze 0.6 (module docstring: escape stubs): its own stamp, the escape knobs and the escaped pads, on every item
+        labels = [row["pad"] for row in board.escapes]
+        refused = sorted(board.escape_refused, key=lambda label: [natural_ref_key(part) for part in label.split(".", 1)])
+        entry = "escapes:" + ",".join(labels) + (";refused=" + ",".join(refused) if refused else "") + ";model=centre+edge+cell"
+        words = (f"pad(s) {', '.join(labels) or 'none'} reach the grid by an escape (another grid point inside the pad, or a stub from the "
+                 "pad centre out of its edge to a grid cell or a plane via, every clearance checked exactly) because their own grid cell is "
+                 "off their copper or inside their neighbours' keep-out" + (f"; no escape reaches {', '.join(refused)}" if refused else ""))
+        head = f"routing.maze {ROUTER_ESCAPE_VERSION}: "
+        if plan is None:
+            plan = _Plan(ROUTER_ESCAPE_VERSION, (entry,), head + words, escape=True)
+        else:
+            plan = _Plan(ROUTER_ESCAPE_VERSION, (*plan.derived, entry), head + plan.note.removeprefix(f"routing.maze {plan.version}: ") + "; " + words, escape=True)
     clearance = {index[name]: r.clearance_mm for name, r in eff.items()}
 
     def clear_of(idx: int) -> float:
@@ -3062,21 +4248,27 @@ def route_board(
         recovered = _recover(neg, order, routes, dropped, unrouted, route_one)
     if plan is None:
         if not eff:
-            return _result_0_2(board, p, raised, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered)
-        return _result_rules(
-            ir, board, neg, p, raised, eff, rule_raised, rule_nets, pairs, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered,
-            clear_of,
-        )
-    if not eff:
-        result = _result_0_2(board, p, raised, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered, plan)
+            result = _result_0_2(board, p, raised, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered)
+        else:
+            result = _result_rules(
+                ir, board, neg, p, raised, eff, rule_raised, rule_nets, pairs, order, routes, unrouted, skipped, iterations, legal, history, dropped,
+                recovered, clear_of,
+            )
     else:
-        result = _result_rules(
-            ir, board, neg, p, raised, eff, rule_raised, rule_nets, pairs, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered,
-            clear_of, plan,
-        )
-    _add_planes(ir, board, p, result, plan, plane_width, plane_rules, plane_layers, iterations, legal)
-    if board.custom_pads:
-        result.stats["custom_pads"] = list(board.custom_pad_stats)
+        if not eff:
+            result = _result_0_2(board, p, raised, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered, plan)
+        else:
+            result = _result_rules(
+                ir, board, neg, p, raised, eff, rule_raised, rule_nets, pairs, order, routes, unrouted, skipped, iterations, legal, history, dropped,
+                recovered, clear_of, plan,
+            )
+        if planes_or_pads:
+            _add_planes(ir, board, p, result, plan, plane_width, plane_rules, plane_layers, iterations, legal)
+        if board.custom_pads:
+            result.stats["custom_pads"] = list(board.custom_pad_stats)
+    if board.escapes or board.escape_refused:  # routing.maze 0.6: every stub and every pad none reached
+        result.stats["escapes"] = list(board.escapes)
+        result.stats["escape_refused"] = dict(board.escape_refused)
     return result
 
 
@@ -3112,6 +4304,9 @@ def _add_planes(
         copper = _NetCopper(board, net, prov, widths[name])
         for t, layer, k in links:
             copper.add_stub(t, layer)
+            if t.escape is not None:  # routing.maze 0.6: the escape stub ends on its via
+                copper.add_path([layer * board.n + k, (1 - layer) * board.n + k])
+                continue
             copper.add_path([layer * board.n + t.cell, layer * board.n + k, (1 - layer) * board.n + k])
         result.tracks.extend(copper.tracks)
         result.vias.extend(copper.vias)

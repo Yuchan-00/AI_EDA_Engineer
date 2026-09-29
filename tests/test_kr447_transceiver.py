@@ -497,16 +497,36 @@ def test_the_stage_reports_are_deterministic_views(built) -> None:
 
 
 @needs_libs
-def test_the_full_board_is_placed_but_the_router_refuses_a_pad_below_its_grid(built, tmp_path: Path) -> None:
+def test_the_full_board_is_placed_and_the_pas_qfn_pads_off_the_grid_escape_it(built, tmp_path: Path) -> None:
+    """routing.maze 0.5 refused this board before routing at U901.1 (the PA's 0.825 x 0.25 mm QFN pad, 0.1296 mm from the nearest 0.2 mm
+    grid point, outside its inscribed circle). 0.6 joins every U901 pad to the grid by an escape stub no wider than the pad (the router's
+    module docstring: escape stubs). Routing the whole board takes minutes here, so the PA's nets are routed alone on the placed board,
+    every other part and the plane nets in place."""
+    from ai_eda.agents.pcb import ROUTING_KEY, _routes_around_planes
+    from ai_eda.tools.routing.maze import RoutingParams, route_board
+    from ai_eda.tools.si.rules import net_rules
+
     ir, _plan_ = built["transceiver"]
-    res = PCBAgent().run(ir.model_copy(deep=True), AgentContext(workdir=tmp_path, tools={"kicad_library": _REAL}))
+    res = PCBAgent().run(ir.model_copy(deep=True), AgentContext(workdir=tmp_path, tools={"kicad_library": _REAL}, answers={ROUTING_KEY: "skip"}))
     board = res.proposals[0].payload
-    notes = " | ".join(res.notes)
-    assert len(board.placements) == 441 and board.tracks == [] and "keep-outs ant_band honoured" in notes
-    # routing.maze 0.5 reads the custom pads (the microphone's ring, the PHA-1s' SOT-89-3 tabs) and refuses the board before routing at
-    # the first pad too small for the 0.2 mm grid: the PA's 0.25 mm-wide QFN pad, whose nearest grid point is outside its inscribed circle
-    assert "not routed: pad U901.1 (0.825 x 0.25 mm) is too small for the 0.2 mm routing grid" in notes, notes
-    assert "shape 'custom'" not in notes
+    assert len(board.placements) == 441 and board.tracks == [] and "keep-outs ant_band honoured" in " | ".join(res.notes)
+    placed = ir.model_copy(deep=True)
+    placed.pcb = board
+    extra = PCBAgent._router_extras(placed, board)
+    placed.nets = [n for n in placed.nets if n.name in extra["plane_nets"] or any(p.component_ref == "U901" for p in n.pins)]
+    params = RoutingParams.for_board(placed, _REAL)
+    r = route_board(placed, _REAL, params, rules=net_rules(placed, params).rules or None, inner_layers=_routes_around_planes(board), **extra)
+    rows = {e["pad"]: e for e in r.stats["escapes"] if e["pad"].startswith("U901.")}
+    assert rows["U901.1"]["why"] == rows["U901.3"]["why"] == "off-grid" and all(row["width_mm"] <= 0.25 for row in rows.values())
+    assert not [k for k in r.stats["escape_refused"] if k.startswith("U901.")] and r.version == "0.6"
+    pa = {n.name for n in placed.nets if n.name not in extra["plane_nets"]}
+    assert pa and not pa & set(r.unrouted), {k: r.unrouted[k] for k in pa & set(r.unrouted)}
+    placed.pcb.tracks, placed.pcb.vias = list(r.tracks), list(r.vias)
+    from ai_eda.ir import ManufacturingConstraints
+
+    mfg = placed.pcb.manufacturing or ManufacturingConstraints()
+    placed.pcb.manufacturing = mfg.model_copy(update={"min_clearance_mm": assumption(r.params.clearance_mm, note="the router's own clearance as the limit")})
+    assert _run("pcb.routing", placed, tmp_path)["pcb.routing.clearance"].status is S.PASS
 
 
 @needs_libs

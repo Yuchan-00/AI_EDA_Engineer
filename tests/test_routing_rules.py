@@ -35,6 +35,7 @@ from ai_eda.tools.routing.coupling import uncoupled_lengths
 from ai_eda.tools.routing.maze import (
     FINE_RULES,
     ROUTER_RULES_VERSION,
+    ROUTER_ESCAPE_VERSION,
     ROUTER_VERSION,
     NetRule,
     Routing,
@@ -227,6 +228,14 @@ GOLDEN_0_2: dict[str, str] = {
 }
 
 
+#: the fixtures routing.maze 0.6 routes differently from 0.2 because a pad needs an escape (module docstring: escape stubs): "keepout"'s
+#: R1.1 was fenced by R3's keep-out, so 0.2 left net A unrouted (its canonical digest above); 0.6 lands A on another grid point inside
+#: R1.1 (tests/test_routing.py) - B's copper is 0.2's
+GOLDEN_0_6: dict[str, str] = {
+    "keepout": "28e021009cc9505abd610905f9a97e70cf7bf64b1c8ca3b912e09cd02c7ebf54",
+}
+
+
 # --------------------------------------------------------------------------- helpers
 
 
@@ -262,13 +271,14 @@ def test_without_rules_every_fixture_is_routing_maze_0_2_byte_for_byte(tmp_path:
     ir, lib, params = FIXTURES[name](tmp_path)
     before = ir.content_hash()
     plain = route_board(ir, lib, params)
-    assert ir.content_hash() == before and plain.version == ROUTER_VERSION == "0.2" and plain.rules == {}
-    assert digest(plain) == GOLDEN_0_2[name], name
+    version = ROUTER_ESCAPE_VERSION if name in GOLDEN_0_6 else ROUTER_VERSION
+    assert ir.content_hash() == before and plain.version == version and plain.rules == {}
+    assert digest(plain) == GOLDEN_0_6.get(name, GOLDEN_0_2[name]), name
     # an empty mapping and rules that constrain nothing (a class name only) are no rules either
     nothing = {net.name: NetRule(net_class="DEFAULT") for net in ir.nets}
     for rules in ({}, nothing, {ir.nets[0].name: NetRule()}):
         again = route_board(copy.deepcopy(ir), lib, params, rules=rules)
-        assert canonical(again) == canonical(plain) and again.version == ROUTER_VERSION, (name, rules)
+        assert canonical(again) == canonical(plain) and again.version == version, (name, rules)
 
 
 def test_inner_layers_are_refused_as_in_0_2_unless_the_caller_opts_in(tmp_path: Path):
