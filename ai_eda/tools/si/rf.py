@@ -35,7 +35,7 @@ from dataclasses import dataclass
 
 from ai_eda.ir import CircuitDomain, CircuitIR, NetKind, Traced
 from ai_eda.tools.calc.tline import guided_wavelength_mm, rf_critical_length_mm
-from ai_eda.tools.si.measure import NetMeasure
+from ai_eda.tools.si.measure import NetMeasure, no_plane_reason
 
 #: the check ids this module's rows and nets feed
 RF_LENGTH_CHECK = "si.rf_length"
@@ -199,11 +199,11 @@ def rf_length_rows(ir: CircuitIR, measures: dict[str, NetMeasure]) -> list[RfLen
             row.reason = (f"possibly long {at}: the whole copper of its {m.pads} pads ({row.length_mm:.3f} mm, an upper bound of every path) exceeds "
                           f"l_crit {row.l_crit_mm:.3f} mm, but no pad-to-pad path was extracted ({m.path_problem or 'not tried'})")
             if row.bound:
-                row.reason += "; impedance is undefined without a reference plane - use pcb_layers=4 or add a plane"
+                row.reason += f"; {no_plane_reason(m)}"
         elif row.bound:
             row.status = "possibly_long"
             row.reason = (f"possibly long {at}: {row.measure} {row.length_mm:.3f} mm > l_crit {row.l_crit_mm:.3f} mm by the no-plane upper bound of t_pd; "
-                          "impedance is undefined without a reference plane - use pcb_layers=4 or add a plane")
+                          f"{no_plane_reason(m)}")
         else:
             row.status = "long"
             row.reason = f"electrically long {at}: {row.measure} {row.length_mm:.3f} mm > l_crit {row.l_crit_mm:.3f} mm over the reference plane"

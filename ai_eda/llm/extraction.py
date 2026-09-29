@@ -111,8 +111,9 @@ from ai_eda.llm.prompts import JSON_ONLY_INSTRUCTION, REQUIREMENT_EXTRACTION_SYS
 from ai_eda.tools.calc.quantity import QUANTITY_VERSION, Quantity, QuantityRange, find_quantities, format_quantity, parse_quantity
 
 #: bumped whenever grounding rules, the prompt or the schema change in a way that makes a cached model reply stale
-#: (0.3: the RF requirement keys and the level units dBm / dBW / dB / dBc / dBi / dBuV/m / ppm in the prompt and the schema)
-EXTRACTION_VERSION = "0.3"
+#: (0.3: the RF requirement keys and the level units dBm / dBW / dB / dBc / dBi / dBuV/m / ppm in the prompt and the schema;
+#: 0.4: tx_timeout, radio_build with its six values and "a band is not a carrier_frequency" in the prompt)
+EXTRACTION_VERSION = "0.4"
 
 #: the one question the agent always asks after an extraction; the user's answer decides the upgrade
 CONFIRM_KEY = "confirm_requirements"

@@ -43,7 +43,12 @@ Invariants this module enforces:
   (measured), so such a binding is a ``CompileError`` and the runner's deck
   check refuses such a line too.
 * **A tolerance must be a tolerance.** An expectation whose ``nominal`` is 0
-  needs ``tol_abs``: ``tol_rel`` alone would be a zero tolerance.
+  needs ``tol_abs``: ``tol_rel`` alone would be a zero tolerance. A one-sided
+  ``bound`` (``at_least`` / ``at_most``: PASS on the passing side of
+  ``nominal``) replaces the tolerance: it takes no ``tol_abs`` / ``tol_rel``
+  (so it also waives the dB rule below) and cannot claim a requirement yet
+  (``requirement_id``: the reviewer's nominal-vs-requirement rule and the
+  tolerance chart know only tolerances).
 * **A reduction must fit its analysis.** ``reduce=value`` only on ``op``,
   ``at`` / ``final`` / ``max`` / ``min`` only on a sweep, and
   ``reduce=frequency`` (rising mid-level crossings over time) only on a
@@ -58,7 +63,7 @@ Invariants this module enforces:
   kind, or ``params["ref"]`` > 0); ``harmonic_dbc`` takes an integer ``k >= 2``
   and a window of whole periods of ``f0``; ``am_depth`` needs
   ``f_carrier >= 20 f_mod`` and a window of at least one modulation period;
-  a dB level needs ``tol_abs`` and no ``tol_rel``; a stated nominal unit must
+  a dB level needs ``tol_abs`` and no ``tol_rel`` (or a one-sided ``bound``); a stated nominal unit must
   be the reduction's (``dB``, ``dBc``, ``percent``, the vector's for ``rms``).
   Every param is a finite traced number through the same llm_generated
   refusal; the other reductions take none. None of it reaches the deck: the
@@ -635,6 +640,17 @@ def _check_expectation(exp: Expectation, ir: CircuitIR, setup: SimulationSetup, 
                 raise CompileError(f"{what} {label} must be a finite number")
     if float(exp.nominal.value) == 0.0 and exp.tol_abs is None and exp.tol_rel is not None:
         raise CompileError(f"{what}: nominal is 0 and only tol_rel is given - a relative tolerance on zero is no tolerance; give tol_abs")
+    if exp.bound is not None:
+        if exp.tol_abs is not None or exp.tol_rel is not None:
+            raise CompileError(
+                f"{what}: a one-sided bound ({exp.bound}) takes no tolerance - PASS is the measured value on the passing side of nominal; "
+                "give either tol_abs / tol_rel or the bound"
+            )
+        if exp.requirement_id is not None:
+            raise CompileError(
+                f"{what}: a one-sided bound cannot claim a requirement yet (requirement_id {exp.requirement_id!r}): "
+                "the reviewer's nominal-vs-requirement rule and the tolerance chart know only tolerances"
+            )
     _check_reduction(exp, ir, analysis, what, ledger)
     return vector
 
@@ -656,7 +672,8 @@ def _check_reduction(exp: Expectation, ir: CircuitIR, analysis: AnalysisSpec, wh
     ``f0``; an AM depth needs ``f_carrier >= 20 f_mod``
     and a window of at least one modulation period; a dB level needs
     ``tol_abs`` and no ``tol_rel`` (a relative tolerance on a logarithm is no
-    tolerance), and a stated ``nominal.unit`` must be the reduction's unit.
+    tolerance) unless it is a one-sided ``bound``, and a stated
+    ``nominal.unit`` must be the reduction's unit.
     """
     kind = exp.reduce
     required, optional = REDUCE_PARAMS[kind]
@@ -740,9 +757,9 @@ def _check_reduction(exp: Expectation, ir: CircuitIR, analysis: AnalysisSpec, wh
                 )
             if (t1 - t0) * fm < 1.0 - PERIOD_REL_TOL:
                 raise CompileError(f"{what}: window shorter than one modulation period ({t1 - t0:g} s < 1 / f_mod = {1.0 / fm:g} s)")
-    if kind in DB_REDUCES:
+    if kind in DB_REDUCES and exp.bound is None:  # a one-sided bound replaces the tolerance (checked in _check_expectation)
         if exp.tol_abs is None or exp.tol_rel is not None:
-            raise CompileError(f"{what}: a level in dB needs tol_abs (and no tol_rel): a relative tolerance on a logarithm is no tolerance")
+            raise CompileError(f"{what}: a level in dB needs tol_abs (and no tol_rel) or a one-sided bound: a relative tolerance on a logarithm is no tolerance")
     unit = REDUCE_UNITS.get(kind) or (_vector_unit(exp.vector) if kind == Reduce.RMS else None)
     if unit is not None and exp.nominal.unit is not None:
         same = {_unit_key(unit)} | ({"%"} if unit == "percent" else set())

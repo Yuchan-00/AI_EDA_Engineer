@@ -27,6 +27,17 @@ significant digits (``100n``, ``1.5915k``, :mod:`ai_eda.tools.calc.part_value`);
 the SPICE binding and the netlist keep the calculator's exact number, and no
 E-series rounding is applied to either.
 
+The selection considers :data:`TEMPLATES` and then the radio template family
+(``RF_TEMPLATES`` of :data:`RF_REGISTRY_MODULE`, imported lazily; absent or
+empty means no radio template, and nothing below changes for the five). A
+radio template is selected by the categorical requirement ``radio_build``
+(:func:`~ai_eda.design.inputs.read_radio_build`, through its own
+``triggered_by``); a confirmed ``carrier_frequency`` or ``modulation`` without
+``radio_build`` is the family's required question (which board to build),
+never a guess. Every template's layer policy decides the board layer counts
+it builds (:mod:`ai_eda.design.board`); a stated count outside it refuses the
+template before a missing input is asked for.
+
 Templates:
 
 * ``divider`` - unloaded resistive divider from ``input_voltage`` and
@@ -67,6 +78,7 @@ Templates:
 
 from __future__ import annotations
 
+import importlib
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -135,7 +147,18 @@ from ai_eda.design.base import (
     unserved_requirements,
     unverified,
 )
-from ai_eda.design.inputs import KEY_ALIASES, UNIT_OF, DesignInput, read_inputs, read_value
+from ai_eda.design.inputs import (
+    KEY_ALIASES,
+    RADIO_BUILD_KEY,
+    RADIO_BUILDS,
+    UNIT_OF,
+    DesignInput,
+    present_keys,
+    read_inputs,
+    read_modulation,
+    read_radio_build,
+    read_value,
+)
 from ai_eda.design.library_parts import TemplateRefusal, library_component, pin_by_name, require_pins, two_terminals
 
 if TYPE_CHECKING:  # imported lazily in _curve_figure: the report package imports this one
@@ -1481,9 +1504,53 @@ from ai_eda.design.atmega128 import Atmega128DevboardTemplate  # noqa: E402
 
 TEMPLATES: list[Template] = [DividerTemplate(), LedTemplate(), RcLowpassTemplate(), AstableTemplate(), Atmega128DevboardTemplate()]
 
+#: the module whose ``RF_TEMPLATES`` list holds the radio template family; imported lazily (the RF design package is
+#: optional here: absent means no radio template) and never at import time (it imports this module's helpers)
+RF_REGISTRY_MODULE = "ai_eda.design.rf.registry"
+#: the module whose ``selector_question(ir)`` asks which board of the radio family to build
+RF_FAMILY_MODULE = "ai_eda.design.rf.family"
+
+
+def rf_templates(module: str = RF_REGISTRY_MODULE) -> list[Template]:
+    """The radio templates ``module`` registers (``RF_TEMPLATES``), in its order; ``[]`` when that module is not installed.
+
+    Only the absence of ``module`` itself or of one of its parent packages
+    counts as "no radio template": any other import error inside it (a module
+    it needs, a syntax error) propagates, so a broken RF package is never
+    silently treated as an empty one. A registry without ``RF_TEMPLATES`` or
+    with an entry that is not a :class:`~ai_eda.design.base.Template` raises.
+    """
+    try:
+        mod = importlib.import_module(module)
+    except ModuleNotFoundError as e:
+        if e.name is not None and (module == e.name or module.startswith(e.name + ".")):
+            return []
+        raise
+    if not hasattr(mod, "RF_TEMPLATES"):
+        raise AttributeError(f"{module} defines no RF_TEMPLATES")
+    found = list(mod.RF_TEMPLATES)
+    bad = [t for t in found if not isinstance(t, Template)]
+    if bad:
+        raise TypeError(f"{module}.RF_TEMPLATES holds non-templates: {bad!r}")
+    return found
+
+
+def all_templates() -> list[Template]:
+    """:data:`TEMPLATES` followed by :func:`rf_templates` - every template the selection considers; ``ValueError`` on a repeated id."""
+    return _with_rf(rf_templates())
+
+
+def _with_rf(rf: list[Template]) -> list[Template]:
+    out = [*TEMPLATES, *rf]
+    ids = [t.id for t in out]
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        raise ValueError(f"template id(s) {repeated} registered twice")
+    return out
+
 
 def template_keys_text() -> str:
-    return "; ".join(f"{t.id} needs {' + '.join(t.needs)}" for t in TEMPLATES)
+    return "; ".join(f"{t.id} needs {' + '.join(t.needs)}" for t in all_templates())
 
 
 @dataclass
@@ -1543,23 +1610,38 @@ def design_from_requirements(
 ) -> Plan | None:
     """The plan of the one template the confirmed requirements select, or ``None`` when none is triggered.
 
-    Two or more triggered templates give a plan that refuses (ambiguous); a
-    template that does not serve every confirmed design requirement gives a
+    Every template of :func:`all_templates` (the five of :data:`TEMPLATES`, then
+    the radio family's, imported lazily) is asked
+    :meth:`~ai_eda.design.base.Template.triggered_by`. Two or more triggered
+    templates give a plan that refuses (ambiguous). A stated layer count the
+    selected template's layer policy does not build refuses it before
+    anything else is asked (:func:`~ai_eda.design.board.layer_policy_refusal`);
+    a template that does not serve every confirmed design requirement gives a
     plan that refuses with a non-required question under each such
-    requirement's own key.
+    requirement's own key. When nothing triggers, the radio selection may
+    still answer (:func:`_radio_build_plan`); otherwise ``None``.
     """
     if inputs is None or unusable is None:
         inputs, unusable = read_inputs(ir)
-    triggered = [t for t in TEMPLATES if t.triggered(inputs)]
+    rf = rf_templates()
+    templates = _with_rf(rf)
+    triggered = [t for t in templates if t.triggered_by(ir, inputs)]
     if not triggered:
-        return None
+        return _radio_build_plan(ir, inputs, rf)
     if len(triggered) > 1:
         ids = [t.id for t in triggered]
         plan = Plan(template="+".join(ids), title="ambiguous")
         plan.notes.append(f"ambiguous: templates {ids} all match the confirmed requirements ({', '.join(sorted(inputs))}); refusing to guess - state the requirements of one circuit")
         return plan
     template = triggered[0]
-    missing = [k for k in template.needs if k not in inputs]
+    from ai_eda.design.board import add_board, layer_policy_refusal  # the board module imports the shared helpers of this one
+
+    layer_refusal = layer_policy_refusal(template, ir)
+    if layer_refusal is not None:
+        plan = Plan(template=template.id, title=template.title, questions=[layer_refusal])
+        return _refused(plan, layer_refusal.rationale)
+    present = present_keys(ir, inputs)  # a categorical need (modulation, radio_build) counts once its reader reads it
+    missing = [k for k in template.needs if k not in present]
     if not missing:
         refusals = template.refusals(ir, inputs, unusable)
         if refusals:
@@ -1567,12 +1649,70 @@ def design_from_requirements(
             return _refused(plan, "; ".join(q.rationale for q in refusals))
     plan = template.build(ir, inputs, unusable, library, confirmed=confirmed)
     if plan.buildable:
-        from ai_eda.design.board import add_board  # the board module imports the shared helpers of this one
-
         why = add_board(template, ir, plan, confirmed=confirmed)
         if why is not None:
             plan.changes = []
             return _refused(plan, why)
+    return plan
+
+
+#: the ``Plan.template`` of what the radio selection says when no template triggered (it names the key, not a template)
+RADIO_SELECTION = RADIO_BUILD_KEY
+
+
+def _radio_build_plan(ir: CircuitIR, inputs: dict[str, DesignInput], rf: list[Template]) -> Plan | None:
+    """What the radio selection says when no template triggered: ``None`` without radio templates or radio requirements.
+
+    With radio templates registered (``rf`` non-empty; the family module is
+    imported only then):
+
+    * a stated ``radio_build`` that :func:`~ai_eda.design.inputs.read_radio_build`
+      cannot read (unconfirmed, not exactly one build name, ambiguous) is a
+      note and a non-required question under ``radio_build`` with the reason;
+    * a readable one that no registered template accepted (not registered, or
+      its template declined the other requirements) is a note and a
+      non-required question naming the registered radio templates;
+    * no ``radio_build`` but a confirmed ``carrier_frequency`` or
+      ``modulation`` is the family's required question
+      (``selector_question(ir)`` of :data:`RF_FAMILY_MODULE`, key
+      ``radio_build``): which board of the family to build - a radio request
+      without it is never guessed into one.
+
+    Anything else is ``None`` (no template matches, as before).
+    """
+    if not rf:
+        return None
+    build, why = read_radio_build(ir)
+    plan = Plan(template=RADIO_SELECTION, title="radio build selection")
+    if why is not None:
+        plan.notes.append(f"{RADIO_BUILD_KEY} not usable: {why}")
+        plan.questions.append(MissingInformation(
+            key=RADIO_BUILD_KEY, required=False, rationale=f"{RADIO_BUILD_KEY} not usable: {why}",
+            question=f"{why}; no radio template was proposed (a radio board is chosen by {RADIO_BUILD_KEY} = exactly one of {', '.join(RADIO_BUILDS)}).",
+        ))
+        return plan
+    if build is not None:
+        why = f"{RADIO_BUILD_KEY} = {build}: no registered radio template builds it from the confirmed requirements (radio templates: {', '.join(t.id for t in rf)})"
+        plan.notes.append(f"template not proposed: {why}")
+        plan.questions.append(MissingInformation(
+            key=RADIO_BUILD_KEY, required=False, rationale=why,
+            question=f"{why}; nothing was proposed. Provide the circuit in the IR yourself, or state a {RADIO_BUILD_KEY} a registered template builds.",
+        ))
+        return plan
+    evidence: list[str] = []
+    if "carrier_frequency" in inputs:
+        evidence.append(f"carrier_frequency ({inputs['carrier_frequency'].requirement.id})")
+    modulation, _ = read_modulation(ir)
+    if modulation is not None:
+        evidence.append(f"modulation {modulation}")
+    if not evidence:
+        return None
+    question = importlib.import_module(RF_FAMILY_MODULE).selector_question(ir)
+    if not isinstance(question, MissingInformation) or question.key != RADIO_BUILD_KEY:
+        raise TypeError(f"{RF_FAMILY_MODULE}.selector_question must return a MissingInformation under {RADIO_BUILD_KEY!r}, got {question!r}")
+    plan.questions.append(question)
+    plan.notes.append(f"radio requirement(s) confirmed ({', '.join(evidence)}) but no {RADIO_BUILD_KEY}: asked which board of the radio family to build "
+                      f"(one of {', '.join(RADIO_BUILDS)})")
     return plan
 
 
@@ -1586,6 +1726,9 @@ __all__ = [
     "NPN",
     "RESISTOR",
     "RESISTOR_THT",
+    "RADIO_SELECTION",
+    "RF_FAMILY_MODULE",
+    "RF_REGISTRY_MODULE",
     "TEMPLATES",
     "VALUE_SPELLING_NOTE",
     "display_spelled",
@@ -1595,9 +1738,11 @@ __all__ = [
     "LedTemplate",
     "RcLowpassTemplate",
     "LateLoad",
+    "all_templates",
     "astable_drawing",
     "design_from_requirements",
     "late_load_changes",
     "nearest_e12",
+    "rf_templates",
     "template_keys_text",
 ]

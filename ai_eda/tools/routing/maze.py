@@ -205,6 +205,48 @@ and ``stats["rules"]`` / ``["match_groups"]`` / ``["pairs"]`` say what each rule
   net gets copper. The launch points, directions, breakout, coupled and
   uncoupled lengths and the skew before / after are in ``stats["pairs"]``.
 
+**Keep-outs and plane nets (routing.maze 0.4).** :func:`route_board` takes
+``keepouts`` (the IR's :class:`~ai_eda.ir.pcb.Keepout` s, read through
+:mod:`ai_eda.tools.keepout`) and ``plane_nets`` (net name -> the layer and
+polygon of each plane zone the caller gives the net), both supplied by the
+caller - the PCB agent passes them only for a board with keep-outs or RF
+blocks. Without both the
+result is exactly 0.2's / 0.3's (no line of the paths above changes); with
+either, every track and via is stamped :data:`ROUTER_KEEPOUT_VERSION`
+``"0.4"`` and names the keep-outs / plane nets in ``derived_from``.
+
+* A keep-out that forbids **tracks** on ``F.Cu`` / ``B.Cu`` joins the static
+  owner map: every cell closer than ``w_max/2 + grid/2`` to its area (the
+  widest copper any net of the board may draw - the board width, the rule
+  widths, a pair's envelope, the plane stubs - so no net's copper reaches
+  into the area from a cell outside it) is BLOCKED, or owned by the
+  keep-out's one allowed net (a cell holds one net: a keep-out allowing two
+  or more nets lets none of them through, and ``stats["keepouts"]`` says
+  so). A pair's fence and its breakouts keep out of such areas too.
+* A keep-out that forbids **vias** on any copper layer (a through via is on
+  all of them) forbids a via whose disc (``via_diameter/2``) would reach its
+  area, except for its allowed nets.
+* A **plane net**'s pads are never joined by tracks: each SMD pad gets its
+  own via beside it - the nearest grid cell (along one axis from the pad's
+  terminal cell, steps east / south / west / north in that order, up to
+  :data:`PLANE_VIA_REACH_MM` beyond the point where a via disc first clears
+  the pad's own copper box on that axis: a 6.4 x 5.8 mm TO-252 tab is
+  crossed first) where a via is legal (the via rules above - never inside a
+  pad box, its own included: a tab's paste apertures would wick the solder -,
+  the keep-outs, ``via_diameter + clearance`` between the centres of any two
+  plane vias, and its whole disc inside one of the net's plane zones, so the
+  fill can surround it) and the straight run to it is free on the pad's
+  layer - joined by one stub; a through-hole pad needs none (its barrel
+  reaches the inner planes), and neither does an SMD pad on which a
+  through-hole pad of the same footprint, pad number and net sits (a
+  ``..._ThermalVias`` exposed pad: the footprint's own vias join it to the
+  plane; listed as ``joined_by_footprint_vias``). The pad vias and stubs are
+  claimed on the static maps like pads (every other net keeps its clearance
+  from them) before any net is negotiated. A plane net one of whose SMD pads
+  has no via site is unrouted with that reason and gets no copper at all.
+  Whether the plane's fill really joins the vias is KiCad's fill and DRC;
+  ``pcb.routing.connectivity`` reports such a net NOT_VERIFIED.
+
 What this is not: a DRC. The clearances above are the router's own
 parameters; whether the board is valid is decided by ``kicad-cli pcb drc``
 on the compiled board (:meth:`ai_eda.tools.kicad.cli.KicadCli.run_drc`), and
@@ -230,7 +272,7 @@ from __future__ import annotations
 import heapq
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
@@ -239,12 +281,16 @@ from ai_eda.errors import CompileError
 from ai_eda.ir import CircuitIR, Net, Provenance, ProvenanceKind, Track, Via
 from ai_eda.tools.kicad.geometry import _q, pad_angle, pad_center, pad_layers
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary, Pad
+from ai_eda.tools.keepout import allowed_nets as keepout_allowed_nets
+from ai_eda.tools.keepout import area_bbox, area_points, covers_layer, forbids, keepout_id, point_area_distance, segment_area_distance
 from ai_eda.tools.routing.coupling import uncoupled_lengths
 
 __all__ = [
     "ROUTER_ID",
     "ROUTER_VERSION",
     "ROUTER_RULES_VERSION",
+    "ROUTER_KEEPOUT_VERSION",
+    "PLANE_VIA_REACH_MM",
     "LAYERS",
     "BLOCKED",
     "CONVEX_PAD_SHAPES",
@@ -265,6 +311,10 @@ ROUTER_ID = "routing.maze"
 ROUTER_VERSION = "0.2"
 #: ``tool_version`` of every track and via of a board routed with at least one :class:`NetRule`
 ROUTER_RULES_VERSION = "0.3"
+#: the version stamped on every track and via of a board routed with keep-outs or plane nets (module docstring)
+ROUTER_KEEPOUT_VERSION = "0.4"
+#: how far (mm, along one axis from the terminal cell) a plane net's SMD pad looks for the site of its via
+PLANE_VIA_REACH_MM = 3.0
 #: the only copper layers this router routes (index 0 / 1 in the owner maps)
 LAYERS: tuple[str, str] = ("F.Cu", "B.Cu")
 #: inner copper layers a board may list: accepted, never routed (planes / zones live there)
@@ -758,6 +808,12 @@ def _pt_box(px: float, py: float, box: tuple[float, float, float, float]) -> flo
     return math.hypot(max(x1 - px, 0.0, px - x2), max(y1 - py, 0.0, py - y2))
 
 
+def _edge_gap(p: tuple[float, float], poly: list[tuple[float, float]]) -> float:
+    """Distance from ``p`` to the polygon's boundary."""
+    n = len(poly)
+    return min(_pt_seg(p[0], p[1], poly[i], poly[(i + 1) % n]) for i in range(n))
+
+
 def _seg_box(a: tuple[float, float], b: tuple[float, float], box: tuple[float, float, float, float]) -> float:
     """Distance from the segment a-b to the axis-aligned box (0 when it touches or enters it); both convex, so a vertex of one is nearest."""
     x1, y1, x2, y2 = box
@@ -853,6 +909,8 @@ class _Board:
 
     def __init__(
         self, ir: CircuitIR, library: KicadLibrary, p: RoutingParams, pad_clearance: Mapping[int, float] | None = None, inner_layers: bool = False,
+        *, keepouts: Sequence[Any] | None = None, ko_width: float | None = None, plane: Mapping[str, float] | None = None,
+        plane_areas: Mapping[str, list[list[tuple[float, float]]]] | None = None,
     ) -> None:
         if ir.pcb is None:
             raise CompileError("cannot route: ir.pcb is None")
@@ -911,6 +969,20 @@ class _Board:
         #: every placed pad (the rule fences and the exact audits read them)
         self.pads: list[_PadGeom] = []
         self._load_pads(ir, library)
+        #: routing.maze 0.4 (module docstring): what each keep-out blocked, the via keep-outs (cell -> the nets allowed a via
+        #: there), the track keep-outs as areas (the pair breakouts check them), and each plane net's pad vias or why not
+        self.keepout_stats: list[dict[str, Any]] = []
+        self.via_ko: dict[int, frozenset[int]] | None = None
+        self.track_keepouts: list[tuple[str, list[tuple[float, float]], frozenset[int], frozenset[int]]] = []
+        self.plane_links: dict[str, list[tuple[_Terminal, int, int]]] = {}
+        self.plane_tht: dict[str, list[str]] = {}
+        #: SMD pads of a plane net joined to it by their own footprint's same-numbered through-hole pads (no stub, no via of ours)
+        self.plane_joined: dict[str, list[str]] = {}
+        self.plane_problems: dict[str, str] = {}
+        if keepouts:
+            self._apply_keepouts(keepouts, p.track_width_mm if ko_width is None else max(p.track_width_mm, ko_width))
+        if plane:
+            self._plane_vias(plane, plane_areas or {})
         #: the static owner maps as one flat list over ``layer * n + k`` with :data:`_FREE` for free cells (the search reads this)
         self.stat: list[int] = [_FREE if v is None else v for v in self.owner[0]] + [_FREE if v is None else v for v in self.owner[1]]
         #: per cell, lazily: BLOCKED / _FREE / the one net whose pads the via's keep-out touches (see :meth:`via_static_at`)
@@ -1089,6 +1161,196 @@ class _Board:
                 if math.hypot(dx, dy) < r - _EPS:
                     self.via_pad_ok[j * self.nx + i] = False
 
+    # --- keep-outs and plane nets (routing.maze 0.4) -----------------------------
+
+    def _cells_near_area(self, pts: list[tuple[float, float]], r: float) -> list[int]:
+        """Every cell closer than ``r`` to the area ``pts`` (inside it included), in cell order."""
+        x1, y1, x2, y2 = area_bbox(pts)
+        i0, j0 = self._nearest_cell(x1 - r, y1 - r)
+        i1, j1 = self._nearest_cell(x2 + r, y2 + r)
+        out: list[int] = []
+        g = self.p.grid_mm
+        for j in range(max(0, j0 - 1), min(self.ny - 1, j1 + 1) + 1):
+            for i in range(max(0, i0 - 1), min(self.nx - 1, i1 + 1) + 1):
+                if point_area_distance((self.ox + i * g, self.oy + j * g), pts) < r - _EPS:
+                    out.append(j * self.nx + i)
+        return out
+
+    def _apply_keepouts(self, keepouts: Sequence[Any], width: float) -> None:
+        """Fold the track / via keep-outs into the static maps (module docstring); ``width`` is the widest copper of the board."""
+        r_track = width / 2.0 + self.p.grid_mm / 2.0
+        r_via = self.p.via_diameter_mm / 2.0
+        layers_all = [*LAYERS, *self.inner_layers]
+        for ko in keepouts:
+            pts = area_points(ko)
+            names = keepout_allowed_nets(ko)
+            allowed = frozenset(self.net_index[n] for n in names if n in self.net_index)
+            row: dict[str, Any] = {"id": keepout_id(ko), "allowed_nets": list(names), "track_cells": {}, "via_cells": 0}
+            if forbids(ko, "tracks"):
+                layers = [layer for layer, name in enumerate(LAYERS) if covers_layer(ko, name)]
+                if layers:
+                    self.track_keepouts.append((keepout_id(ko), pts, frozenset(layers), allowed))
+                cells = self._cells_near_area(pts, r_track) if layers else []
+                for layer in layers:
+                    owner = self.owner[layer]
+                    for k in cells:
+                        cur = owner[k]
+                        if len(allowed) == 1:
+                            (only,) = allowed
+                            owner[k] = only if cur in (None, only) else BLOCKED
+                        else:
+                            owner[k] = BLOCKED
+                    row["track_cells"][LAYERS[layer]] = len(cells)
+                if len(allowed) > 1 and layers:
+                    row["note"] = (f"allows {len(allowed)} nets ({', '.join(names)}); a grid cell holds one net, so none of them is routed "
+                                   "through the area")
+            if forbids(ko, "vias") and any(covers_layer(ko, name) for name in layers_all):
+                if self.via_ko is None:
+                    self.via_ko = {}
+                cells = self._cells_near_area(pts, r_via)
+                for k in cells:
+                    prev = self.via_ko.get(k)
+                    self.via_ko[k] = allowed if prev is None else prev & allowed
+                row["via_cells"] = len(cells)
+            self.keepout_stats.append(row)
+
+    def _claim(self, layer_set: tuple[int, ...], geom: _PadGeom, log: list[tuple[str, int, int, Any]]) -> None:
+        """:meth:`_mark_box` + :meth:`_forbid_vias_in` for a plane net's own via / stub, recording every change in ``log`` (undo)."""
+        r = self.pad_radius
+        for layer in layer_set:
+            owner = self.owner[layer]
+            for k, dist in self.cells_near_box(geom, r):
+                if dist < r - _EPS:
+                    cur = owner[k]
+                    new = geom.net if cur in (None, geom.net) else BLOCKED
+                    if new != cur:
+                        log.append(("owner", layer, k, cur))
+                        owner[k] = new
+        rv = self.p.via_diameter_mm / 2.0
+        for k, dist in self.cells_near_box(geom, rv):
+            if dist < rv - _EPS and self.via_pad_ok[k]:
+                log.append(("via", 0, k, True))
+                self.via_pad_ok[k] = False
+
+    def _wide_run_ok(self, k: int, layer: int, net: int, width: float) -> bool:
+        """For a plane stub wider than the board's tracks: the cell keeps ``clearance + width/2 + grid/2`` from every foreign pad box."""
+        if width <= self.p.track_width_mm + _EPS:
+            return True
+        x, y = self.xy(k)
+        r = self.p.clearance_mm + width / 2.0 + self.p.grid_mm / 2.0
+        return all(_pt_box(x, y, geom.box) >= r - _EPS for geom in self.pads if geom.net != net and layer in geom.layers)
+
+    def _undo(self, log: list[tuple[str, int, int, Any]]) -> None:
+        for kind, layer, k, old in reversed(log):
+            if kind == "owner":
+                self.owner[layer][k] = old
+            else:
+                self.via_pad_ok[k] = old
+
+    def _plane_via_ok(self, k: int, net: int, placed: list[tuple[float, float]], areas: list[list[tuple[float, float]]]) -> bool:
+        """Whether a via of plane net ``net`` may sit at cell ``k``: edge, pads, keep-outs, both layers' owners, plane-via spacing, and its
+        whole disc inside one of the net's plane zones (``areas``), so the fill can surround it."""
+        if not self.via_edge_ok[k] or not self.via_pad_ok[k]:
+            return False
+        x, y = self.xy(k)
+        r = self.p.via_diameter_mm / 2.0
+        if not any(point_area_distance((x, y), poly) == 0.0 and _edge_gap((x, y), poly) >= r - _EPS for poly in areas):
+            return False
+        if self.via_ko is not None and k in self.via_ko and net not in self.via_ko[k]:
+            return False
+        j, i = divmod(k, self.nx)
+        for a, b in self.via_disc:
+            ii, jj = i + a, j + b
+            if not (0 <= ii < self.nx and 0 <= jj < self.ny):
+                return False
+            kk = jj * self.nx + ii
+            for layer in (0, 1):
+                if self.owner[layer][kk] not in (None, net):
+                    return False
+        spacing = self.p.via_diameter_mm + self.p.clearance_mm
+        return all(math.hypot(x - vx, y - vy) >= spacing - _EPS for vx, vy in placed)
+
+    def _plane_vias(self, plane: Mapping[str, float], areas: Mapping[str, list[list[tuple[float, float]]]]) -> None:
+        """Each plane net's SMD pads get a via beside them, claimed on the static maps (module docstring); a net that cannot is undone."""
+        g = self.p.grid_mm
+        reach = max(1, int(PLANE_VIA_REACH_MM / g + _EPS))
+        rv = self.p.via_diameter_mm / 2.0
+        placed: list[tuple[float, float]] = []
+        for name in sorted(plane):
+            idx = self.net_index[name]
+            width = float(plane[name])
+            log: list[tuple[str, int, int, Any]] = []
+            links: list[tuple[_Terminal, int, int]] = []
+            geoms: list[_PadGeom] = []
+            tht: list[str] = []
+            joined: list[str] = []
+            mine: list[tuple[float, float]] = []
+            problem: str | None = None
+            barrels = [t.pad for t in self.terminals[name] if len(t.pad.layers) != 1]
+            for t in self.terminals[name]:
+                if len(t.pad.layers) != 1:
+                    tht.append(t.label)  # on both outer layers: a through-hole pad, whose barrel reaches the inner planes
+                    continue
+                if any(b.ref == t.pad.ref and b.number == t.pad.number and abs(b.cx - t.pad.cx) <= t.pad.hw + _EPS
+                       and abs(b.cy - t.pad.cy) <= t.pad.hh + _EPS for b in barrels):
+                    if t.label not in joined:  # the F.Cu and B.Cu copies of one exposed pad are one logical pad
+                        joined.append(t.label)  # the footprint's own thermal vias (same pad number, on this pad's copper) reach the plane
+                    continue
+                layer = t.pad.layers[0]
+                if self.owner[layer][t.cell] not in (None, idx):
+                    problem = f"pad {t.label}: its terminal cell is inside a keep-out on {LAYERS[layer]} (a foreign pad, a keep-out area or the edge)"
+                    break
+                j0, i0 = divmod(t.cell, self.nx)
+                # the walk crosses the pad's own copper first: the reach counts from where a via disc clears the pad box on that axis
+                clear = (math.ceil((t.pad.hw + rv) / g - _EPS) + 1, math.ceil((t.pad.hh + rv) / g - _EPS) + 1)
+                limits = [reach + (clear[0] if di else clear[1]) for di, _dj in _DIRS]
+                open_dirs = [True, True, True, True]
+                site: tuple[int, int] | None = None
+                for step in range(1, max(limits) + 1):
+                    for d, (di, dj) in enumerate(_DIRS):
+                        if not open_dirs[d]:
+                            continue
+                        if step > limits[d]:
+                            open_dirs[d] = False
+                            continue
+                        i, j = i0 + di * step, j0 + dj * step
+                        if not (0 <= i < self.nx and 0 <= j < self.ny):
+                            open_dirs[d] = False
+                            continue
+                        k = j * self.nx + i
+                        if self.owner[layer][k] not in (None, idx) or not self._wide_run_ok(k, layer, idx, width):
+                            open_dirs[d] = False
+                            continue
+                        if self._plane_via_ok(k, idx, placed + mine, areas.get(name, [])):
+                            site = (k, d)
+                            break
+                    if site is not None or not any(open_dirs):
+                        break
+                if site is None:
+                    problem = (f"pad {t.label}: no legal via site within {PLANE_VIA_REACH_MM:g} mm beyond its copper along the grid axes from its "
+                               f"terminal cell (pads, keep-outs, the edge, the other plane vias and the extent of its plane zone leave none)")
+                    break
+                k, d = site
+                (x0, y0), (x1, y1) = self.xy(t.cell), self.xy(k)
+                hv = self.p.via_diameter_mm / 2.0
+                via = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-via", x1, y1, hv, hv, hv, (0, 1), idx)
+                run = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-stub", (x0 + x1) / 2.0, (y0 + y1) / 2.0,
+                               abs(x1 - x0) / 2.0 + width / 2.0, abs(y1 - y0) / 2.0 + width / 2.0, width / 2.0, (layer,), idx)
+                self._claim((0, 1), via, log)
+                self._claim((layer,), run, log)
+                geoms += [via, run]
+                links.append((t, layer, k))
+                mine.append((x1, y1))
+            if problem is not None:
+                self._undo(log)
+                self.plane_problems[name] = problem
+                continue
+            self.pads.extend(geoms)
+            placed.extend(mine)
+            self.plane_links[name] = links
+            self.plane_tht[name] = tht
+            self.plane_joined[name] = joined
+
     def usable_layers(self, terminal: _Terminal, net: int) -> tuple[int, ...]:
         """The pad's copper layers on which the terminal cell is free or the net's own (never BLOCKED / another net's)."""
         return tuple(layer for layer in terminal.pad.layers if self.owner[layer][terminal.cell] in (None, net))
@@ -1112,6 +1374,12 @@ class _Board:
                 value = BLOCKED
             elif keep != _FREE:
                 value = keep
+        if self.via_ko is not None and value != BLOCKED and k in self.via_ko:
+            allowed = self.via_ko[k]  # a via keep-out: only its allowed nets, and a free cell only when exactly one is allowed
+            if value == _FREE:
+                value = next(iter(allowed)) if len(allowed) == 1 else BLOCKED
+            elif value not in allowed:
+                value = BLOCKED
         self.via_static[k] = value
         return value
 
@@ -1921,6 +2189,10 @@ def _setup_pair(board: _Board, pr: _Pair, clear_of: Callable[[int], float], trac
             if dist < r - _EPS:
                 for layer in geom.layers:
                     fence[layer * n + k] = 1
+    for _ko, pts, layers, _allowed in board.track_keepouts:  # routing.maze 0.4: the envelope never enters a track keep-out
+        for k in board._cells_near_area(pts, W / 2.0 + g / 2.0):
+            for layer in layers:
+                fence[layer * n + k] = 1
     pr.rn.fence = fence
     ta, tb = board.terminals[pr.a], board.terminals[pr.b]
 
@@ -1996,6 +2268,9 @@ def _breakout_problem(
             gap = _seg_box(seg[0], seg[1], geom.box) - w / 2.0
             if gap < req - _EPS:
                 return f"the breakout of {name} passes {geom.ref}.{geom.number or '(unnumbered)'} at {max(gap, 0.0):.3f} mm < {req:g} mm"
+        for ko, pts, layers, allowed in board.track_keepouts:  # routing.maze 0.4
+            if layer in layers and own not in allowed and segment_area_distance(seg[0], seg[1], pts) < w / 2.0 - _EPS:
+                return f"the breakout of {name} enters keep-out {ko}"
         for idx, t in foreign_terms:
             if layer not in t.pad.layers:
                 continue
@@ -2239,9 +2514,19 @@ class _World:
 # --------------------------------------------------------------------------- emission
 
 
+@dataclass(frozen=True, slots=True)
+class _Plan:
+    """routing.maze 0.4 (module docstring): the stamp, the extra ``derived_from`` entries and the note words of a board with keep-outs / plane nets."""
+
+    version: str
+    derived: tuple[str, ...]
+    note: str
+
+
 def _provenance(
     net: Net, p: RoutingParams, how: str, iterations: int, legal: bool, *, version: str = ROUTER_VERSION, rules_active: bool = False,
     rule: NetRule | None = None, extra_refs: list[str] | None = None, story: str | None = None, rule_note: str | None = None,
+    plan: _Plan | None = None,
 ) -> Provenance:
     refs = sorted({pin.component_ref for pin in net.pins} | set(extra_refs or []))
     if story is None:
@@ -2253,6 +2538,10 @@ def _provenance(
     if rule is not None:
         derived.append(rule.derived_from_entry())
     rule_text = f"; {rule_note}" if rule_note else ""
+    if plan is not None:
+        version = plan.version
+        derived.extend(plan.derived)
+        rule_text += f"; {plan.note}"
     return Provenance(
         kind=ProvenanceKind.DERIVED,
         tool=ROUTER_ID,
@@ -2474,8 +2763,9 @@ def _meander(neg: _Negotiation, rn: _RuleNet, route: _NetRoute, cells_needed: in
 def route_board(
     ir: CircuitIR, library: KicadLibrary, params: RoutingParams | None = None, *,
     rules: Mapping[str, NetRule] | None = None, inner_layers: bool = False, progress: Callable[[dict[str, Any]], None] | None = None,
+    keepouts: Sequence[Any] | None = None, plane_nets: Mapping[str, Sequence[tuple[str, Sequence[tuple[float, float]]]]] | None = None,
 ) -> Routing:
-    """Route every net of the placed board on ``F.Cu`` / ``B.Cu``; pure (same IR + library + params + rules -> same result).
+    """Route every net of the placed board on ``F.Cu`` / ``B.Cu``; pure (same IR + library + params + rules + keep-outs -> same result).
 
     ``ir`` is not mutated and its existing copper (``ir.pcb.tracks`` / ``vias``
     / ``zones``) is neither an obstacle nor reused: the caller decides what to
@@ -2492,14 +2782,59 @@ def route_board(
     default such a board is refused, as 0.2 refused it.
     ``progress``, when given, is called after every negotiation iteration
     with that iteration's row of ``stats["history"]`` (for a caller that
-    reports progress; it never changes the result). Raises
+    reports progress; it never changes the result). ``keepouts`` (keep-out
+    areas, read through :mod:`ai_eda.tools.keepout`) and ``plane_nets`` (net
+    name -> ``(layer, polygon)`` of each plane zone the caller gives the net;
+    a pad via must lie wholly inside one of them) make it
+    routing.maze 0.4 (module docstring: keep-outs and plane nets); a plane
+    net's rule width becomes its pad stubs' width and the rest of its rule
+    does not apply (no track joins its pads; ``stats["plane_nets"]`` says
+    so), and a plane net in a coupled pair is refused. Raises
     :class:`CompileError` for anything that would need a guess (module
     docstring).
     """
     p, raised = effective_params(ir, params)
     eff, rule_raised = _effective_rules(ir, p, rules)
     index = {net.name: k for k, net in enumerate(ir.nets)}
-    board = _Board(ir, library, p, {index[name]: r.clearance_mm for name, r in eff.items()}, inner_layers)
+    plan: _Plan | None = None
+    plane_width: dict[str, float] = {}
+    plane_rules: dict[str, NetRule] = {}
+    plane_layers: dict[str, list[str]] = {}
+    plane_areas: dict[str, list[list[tuple[float, float]]]] = {}
+    if keepouts or plane_nets:
+        for name in sorted(plane_nets or {}):
+            if name not in index:
+                raise CompileError(f"plane net {name!r}: the IR has no such net")
+            partner = eff[name].pair_partner if name in eff else None
+            if partner is not None or any(r.pair_partner == name for r in eff.values()):
+                raise CompileError(f"plane net {name!r} is in a coupled pair: a plane net's pads are joined by vias, never by a coupled track")
+            entries = list(plane_nets[name])
+            if not entries:
+                raise CompileError(f"plane net {name!r}: no plane zone given (a pad via must land inside one)")
+            plane_layers[name] = list(dict.fromkeys(str(layer) for layer, _ in entries))
+            plane_areas[name] = [[(float(x), float(y)) for x, y in poly] for _, poly in entries]
+            rule = eff.pop(name, None)
+            if rule is not None:
+                plane_rules[name] = rule
+            plane_width[name] = p.track_width_mm if rule is None else max(p.track_width_mm, float(rule.width_mm))
+        ids = [keepout_id(k) for k in keepouts or ()]
+        derived = []
+        if ids:
+            derived.append("keepouts:" + ",".join(ids))
+        if plane_width:
+            derived.append("plane_nets:" + ",".join(f"{n}={'+'.join(plane_layers[n])}" for n in sorted(plane_width)) + f";reach={PLANE_VIA_REACH_MM}")
+        words = []
+        if ids:
+            words.append(f"keep-outs {', '.join(ids)} are obstacles")
+        if plane_width:
+            words.append(f"plane net(s) {', '.join(sorted(plane_width))} join their pads by vias to the plane, never by tracks")
+        plan = _Plan(ROUTER_KEEPOUT_VERSION, tuple(derived), f"routing.maze {ROUTER_KEEPOUT_VERSION}: " + "; ".join(words))
+    widths = [p.track_width_mm, *(float(r.width_mm) for r in eff.values()), *plane_width.values()]
+    widths += [2.0 * float(r.width_mm) + float(r.pair_spacing_mm) for r in eff.values() if r.pair_partner is not None]
+    board = _Board(
+        ir, library, p, {index[name]: r.clearance_mm for name, r in eff.items()}, inner_layers,
+        keepouts=list(keepouts or ()) or None, ko_width=max(widths), plane=plane_width or None, plane_areas=plane_areas or None,
+    )
     clearance = {index[name]: r.clearance_mm for name, r in eff.items()}
 
     def clear_of(idx: int) -> float:
@@ -2509,7 +2844,8 @@ def route_board(
         r = eff.get(ir.nets[idx].name) if idx >= 0 else None
         return (r.width_mm, r.clearance_mm) if r is not None else (p.track_width_mm, p.clearance_mm)
 
-    ordered = sorted(ir.nets, key=lambda net: (len(board.terminals[net.name]), net.name))
+    nets = [net for net in ir.nets if net.name not in plane_width] if plane_width else ir.nets
+    ordered = sorted(nets, key=lambda net: (len(board.terminals[net.name]), net.name))
     skipped = [net.name for net in ordered if len(board.terminals[net.name]) < 2]
     order = [net for net in ordered if len(board.terminals[net.name]) >= 2]
     # --- the rule nets, the pairs and the profiles
@@ -2627,11 +2963,77 @@ def route_board(
     if not legal:
         dropped = _drop_conflicts(neg, order, routes, iterations, unrouted)
         recovered = _recover(neg, order, routes, dropped, unrouted, route_one)
+    if plan is None:
+        if not eff:
+            return _result_0_2(board, p, raised, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered)
+        return _result_rules(
+            ir, board, neg, p, raised, eff, rule_raised, rule_nets, pairs, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered,
+            clear_of,
+        )
     if not eff:
-        return _result_0_2(board, p, raised, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered)
-    return _result_rules(
-        ir, board, neg, p, raised, eff, rule_raised, rule_nets, pairs, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered, clear_of,
-    )
+        result = _result_0_2(board, p, raised, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered, plan)
+    else:
+        result = _result_rules(
+            ir, board, neg, p, raised, eff, rule_raised, rule_nets, pairs, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered,
+            clear_of, plan,
+        )
+    _add_planes(ir, board, p, result, plan, plane_width, plane_rules, plane_layers, iterations, legal)
+    return result
+
+
+def _add_planes(
+    ir: CircuitIR, board: _Board, p: RoutingParams, result: Routing, plan: _Plan, widths: Mapping[str, float], rules: Mapping[str, NetRule],
+    plane_nets: Mapping[str, Sequence[str]], iterations: int, legal: bool,
+) -> None:
+    """Append each plane net's pad stubs and vias (IR net order) and the 0.4 stats: ``keepouts`` and ``plane_nets`` (module docstring)."""
+    lengths: dict[str, float] = result.stats.setdefault("net_length_mm", {})
+    rows: dict[str, dict[str, Any]] = {}
+    for net in ir.nets:
+        name = net.name
+        if name not in widths:
+            continue
+        row: dict[str, Any] = {"planes": list(plane_nets.get(name, ())), "width_mm": widths[name]}
+        if name in rules:
+            row["rule"] = rules[name].derived_from_entry()
+            row["rule_note"] = "the rule's width is the pad stubs' width; nothing else of it applies (no track joins a plane net's pads)"
+        rows[name] = row
+        problem = board.plane_problems.get(name)
+        if problem is not None:
+            row["reason"] = problem
+            result.unrouted[name] = f"plane net: {problem}"
+            continue
+        links = board.plane_links.get(name, [])
+        planes = "+".join(plane_nets.get(name, ())) or "the plane"
+        joined = list(board.plane_joined.get(name, []))
+        story = (f"plane net: {len(links)} SMD pad(s) each joined by one stub to its own via to the {planes} plane, "
+                 f"{len(board.plane_tht.get(name, []))} through-hole pad(s) reach it by their barrel"
+                 + (f", {len(joined)} SMD pad(s) by their footprint's own same-numbered through-hole pads" if joined else "")
+                 + "; no track joins two pads")
+        prov = _provenance(net, p, "plane", iterations, legal, story=story, plan=plan)
+        copper = _NetCopper(board, net, prov, widths[name])
+        for t, layer, k in links:
+            copper.add_stub(t, layer)
+            copper.add_path([layer * board.n + t.cell, layer * board.n + k, (1 - layer) * board.n + k])
+        result.tracks.extend(copper.tracks)
+        result.vias.extend(copper.vias)
+        length = _q(copper.length_mm())
+        lengths[name] = length
+        row.update(vias=len(copper.vias), pads=[t.label for t, _, _ in links], through_hole=list(board.plane_tht.get(name, [])), length_mm=length)
+        if joined:
+            row["joined_by_footprint_vias"] = joined
+    ids = [k["id"] for k in board.keepout_stats]
+    if ids:  # say that the keep-outs were obstacles wherever a net found no route
+        for name, why in list(result.unrouted.items()):
+            if name not in widths:
+                result.unrouted[name] = f"{why} (keep-out(s) {', '.join(ids)} are obstacles on this board)"
+    s = result.stats
+    s["routed_nets"] = len(lengths)
+    s["unrouted_nets"] = len(result.unrouted)
+    s["total_length_mm"] = _q(sum(lengths.values()))
+    s["track_count"] = len(result.tracks)
+    s["via_count"] = len(result.vias)
+    s["keepouts"] = list(board.keepout_stats)
+    s["plane_nets"] = rows
 
 
 def _setup_rule_net(board: _Board, name: str, rule: NetRule, clear_of: Callable[[int], float]) -> _RuleNet:
@@ -2665,16 +3067,18 @@ def _setup_rule_net(board: _Board, name: str, rule: NetRule, clear_of: Callable[
 
 def _result_0_2(
     board: _Board, p: RoutingParams, raised: dict, order: list[Net], routes: dict[str, _NetRoute], unrouted: dict[str, str], skipped: list[str],
-    iterations: int, legal: bool, history: list, dropped: list[str], recovered: list[str],
+    iterations: int, legal: bool, history: list, dropped: list[str], recovered: list[str], plan: _Plan | None = None,
 ) -> Routing:
-    """The result of a board without rules: 0.2's emission and stats (plus ``inner_layers`` when the board has them)."""
+    """The result of a board without rules: 0.2's emission and stats (plus ``inner_layers`` when the board has them); ``plan`` stamps 0.4."""
     result = Routing(params=p, unrouted={net.name: unrouted[net.name] for net in order if net.name in unrouted})
+    if plan is not None:
+        result.version = plan.version
     lengths: dict[str, float] = {}
     for net in order:
         route = routes.get(net.name)
         if route is None:
             continue
-        copper = _emit(board, net, route, _provenance(net, p, route.how, iterations, legal), None)
+        copper = _emit(board, net, route, _provenance(net, p, route.how, iterations, legal, plan=plan), None)
         result.tracks.extend(copper.tracks)
         result.vias.extend(copper.vias)
         lengths[net.name] = _q(copper.length_mm())
@@ -2727,9 +3131,10 @@ def _result_rules(
     ir: CircuitIR, board: _Board, neg: _Negotiation, p: RoutingParams, raised: dict, eff: dict[str, NetRule], rule_raised: dict,
     rule_nets: dict[str, _RuleNet], pairs: dict[str, _Pair], order: list[Net], routes: dict[str, _NetRoute], unrouted: dict[str, str],
     skipped: list[str], iterations: int, legal: bool, history: list, dropped: list[str], recovered: list[str], clear_of: Callable[[int], float],
+    plan: _Plan | None = None,
 ) -> Routing:
-    """Match groups, emission, pairs, the audits and the stats of a board routed with rules (stamped :data:`ROUTER_RULES_VERSION`)."""
-    version = ROUTER_RULES_VERSION
+    """Match groups, emission, pairs, the audits and the stats of a board routed with rules (stamped :data:`ROUTER_RULES_VERSION`, 0.4 with ``plan``)."""
+    version = ROUTER_RULES_VERSION if plan is None else plan.version
     # --- length matching on the grid (before emission: the meanders are checked against every other net's halo)
     meanders: dict[str, dict[str, Any]] = {}
     pre_meander: dict[str, _NetRoute] = {}
@@ -2809,7 +3214,7 @@ def _result_rules(
         rn = rule_nets.get(net.name)
         prov = _provenance(
             net, p, route.how, iterations, legal, version=version, rules_active=True, rule=None if rn is None else rn.rule,
-            rule_note=None if rn is None else _rule_note(rn, meanders.get(net.name), p.grid_mm),
+            rule_note=None if rn is None else _rule_note(rn, meanders.get(net.name), p.grid_mm), plan=plan,
         )
         return _emit(board, net, route, prov, rn)
 
@@ -2887,7 +3292,7 @@ def _result_rules(
         if route is None:
             st["reason"] = unrouted.get(pr.name, pr.reason)
             continue
-        problem, tracks = _emit_pair(board, p, pr, route, world, st, iterations, legal, net_of, eff)
+        problem, tracks = _emit_pair(board, p, pr, route, world, st, iterations, legal, net_of, eff, plan)
         if problem is not None:
             unrouted[pr.name] = problem
             st["reason"] = problem
@@ -2959,7 +3364,7 @@ def _pair_names(pairs: Mapping[str, _Pair]) -> set[str]:
 
 def _emit_pair(
     board: _Board, p: RoutingParams, pr: _Pair, route: _NetRoute, world: _World, st: dict[str, Any], iterations: int, legal: bool,
-    net_of: Mapping[str, Net], eff: Mapping[str, NetRule],
+    net_of: Mapping[str, Net], eff: Mapping[str, NetRule], plan: _Plan | None = None,
 ) -> tuple[str | None, list[Track]]:
     """The pair's two tracks (breakouts + offset centreline + compensation), audited exactly; ``(problem, tracks)``."""
     data = route.steps[0][1]
@@ -3047,7 +3452,7 @@ def _emit_pair(
             note += f", {comp['bumps']} compensation bump(s) of {comp['amplitude_mm']:g} mm"
         prov = _provenance(
             net_of[x], p, route.how, iterations, legal, version=ROUTER_RULES_VERSION, rules_active=True, rule=eff[x],
-            extra_refs=refs, story=story, rule_note=note,
+            extra_refs=refs, story=story, rule_note=note, plan=plan,
         )
         for a, b in zip(polys[x], polys[x][1:]):
             if a != b:

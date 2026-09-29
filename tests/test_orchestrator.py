@@ -115,3 +115,23 @@ def test_compile_error_classes_map_to_statuses(divider_ir: CircuitIR, tmp_path: 
         ctx.tools["compilers"][ArtifactKind.PCB] = Refuses()
         status, message = orch._compile(divider_ir, ctx, ArtifactKind.PCB)
         assert (status, "why" in message) == (expected, True), exc
+
+
+def test_a_dotted_parameter_key_is_one_key_of_the_dict():
+    """``parameters.rf.n_mult`` sets the parameter ``rf.n_mult`` (the radio templates' ``rf.*`` / ``model.*`` / ``kr447.*`` keys)."""
+    from ai_eda.agents.base import IRProposal
+    from ai_eda.ir import user_requirement
+
+    ir = CircuitIR(project=ProjectMeta(id="p", name="p"))
+    Orchestrator.apply_proposals(ir, [
+        IRProposal(description="n", target="parameters.rf.n_mult", operation="set", payload=user_requirement(12.0)),
+        IRProposal(description="q", target="parameters.model.l_q.uhf", operation="set", payload=user_requirement(40.0)),
+        IRProposal(description="r", target="parameters.r_top", operation="set", payload=user_requirement(1000.0, "ohm")),
+    ])
+    assert sorted(ir.parameters) == ["model.l_q.uhf", "r_top", "rf.n_mult"] and ir.parameters["rf.n_mult"].value == 12.0
+    with pytest.raises(ValueError, match="parameters.kr447.max_power"):  # the dict's value type is still enforced, and nothing is applied
+        Orchestrator.apply_proposals(ir, [
+            IRProposal(description="p", target="parameters.kr447.max_power", operation="set", payload=user_requirement(0.5, "W")),
+            IRProposal(description="bad", target="parameters.kr447.max_power", operation="set", payload="half a watt"),
+        ])
+    assert "kr447.max_power" not in ir.parameters

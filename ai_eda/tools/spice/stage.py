@@ -66,7 +66,16 @@ Invariants:
   engine's resolution is measured but never PASS (NOT_VERIFIED, "not
   resolved", ``details["unresolved"]``). No tolerance
   at all is UNRESOLVED; so is ``tol_rel`` alone on a nominal of 0 (a relative
-  tolerance on zero is no tolerance). A vector the plot does not contain is
+  tolerance on zero is no tolerance). A one-sided expectation
+  (``Expectation.bound`` ``at_least`` / ``at_most``, no tolerance) is PASS
+  when the measured value is on the passing side of ``nominal`` and FAIL on
+  the failing side; an interpolated or biased value is judged on its whole
+  bracket - PASS only when all of it passes, FAIL only when all of it fails,
+  UNRESOLVED when it straddles ``nominal`` - and the result records
+  ``details["bound"]``, ``details["tolerance"]`` ``None`` and the signed
+  ``details["deviation"]`` (measured - nominal). :func:`judge` reads only
+  ``nominal`` / ``tol_abs`` / ``tol_rel`` / ``bound``, so the RF fixture
+  runner judges an :class:`~ai_eda.ir.RFExpectation` with it too. A vector the plot does not contain is
   FAIL ("vector not produced"; a plot without its own scale vector is
   "scale vector not produced", naming the scale, never the expectation's
   vector); an
@@ -90,7 +99,10 @@ Invariants:
 * **Retired expectations do not haunt the release.** Every ``spice.<id>``
   recorded earlier for an expectation that is no longer in the setup gets a
   superseding NOT_APPLICABLE result (:func:`retire_expectation_results`), so
-  ``ir.validation.overall()`` reflects the current setup.
+  ``ir.validation.overall()`` reflects the current setup. The SI transients
+  (``spice.si.*``, :data:`SI_CHECK_PREFIX`) and the RF fixture networks
+  (``spice.rf.*``, :data:`RF_CHECK_PREFIX`) are not design-deck
+  expectations: their own runners retire them, never this stage.
 """
 
 from __future__ import annotations
@@ -112,10 +124,12 @@ from ai_eda.ir import (
     Evidence,
     Expectation,
     Reduce,
+    RFExpectation,
     ValidationResult,
     ValidationStatus,
     worst_status,
 )
+from ai_eda.ir.simulation import EXPECTATION_BOUNDS
 from ai_eda.tools.kicad.cli import fresh_artifact
 from ai_eda.tools.spice.measure import ABSTOL, VNTOL, am_depth, harmonic_level, rising_edge_frequency, window_rms
 from ai_eda.tools.spice.runner import Interpolation, SpiceAnalysis, SpiceResult, SpiceRunner
@@ -123,6 +137,9 @@ from ai_eda.tools.spice.runner import Interpolation, SpiceAnalysis, SpiceResult,
 CHECK_ID = "spice"
 #: the SI transients' check ids (``spice.si.<net>``): not expectations, never retired here
 SI_CHECK_PREFIX = "spice.si"
+#: the RF fixture networks' check ids (``spice.rf.<network>`` summaries and ``spice.rf.<network>[.<state>].<expectation>``):
+#: not design-deck expectations, never retired here (the fixture runner retires its own)
+RF_CHECK_PREFIX = "spice.rf"
 #: subdirectory of the workdir that holds ``results.json`` and one rawfile directory per analysis id
 RESULTS_DIR = "spice"
 RESULTS_FILE = "results.json"
@@ -392,9 +409,48 @@ def reduce_result(res: SpiceResult, exp: Expectation, vector: str, reference: st
     return r.measured, r.problem
 
 
-def judge(measured: float, exp: Expectation, interpolation: Interpolation | None = None,
+def _bracket(measured: float, interpolation: Interpolation | None, bias: tuple[float | None, float | None] | None) -> tuple[float, float] | None:
+    """``(low, high)`` the true value may lie in: the bias bracket (``None`` edges unbounded), else the interpolation's samples; ``None`` for an exact value."""
+    if bias is not None:
+        lo = min(measured, bias[0]) if bias[0] is not None else -math.inf
+        hi = max(measured, bias[1]) if bias[1] is not None else math.inf
+        return lo, hi
+    if interpolation is None or interpolation.exact:
+        return None
+    return interpolation.low, interpolation.high
+
+
+def _judge_bound(measured: float, exp: Expectation | RFExpectation, interpolation: Interpolation | None,
+                 bias: tuple[float | None, float | None] | None) -> tuple[ValidationStatus, None, float]:
+    """The one-sided branch of :func:`judge` (``exp.bound`` is set): ``(status, None, measured - nominal)``."""
+    nominal = float(exp.nominal.value)
+    signed = measured - nominal
+    if exp.tol_abs is not None or exp.tol_rel is not None or exp.bound not in EXPECTATION_BOUNDS or not math.isfinite(nominal):
+        # a bound and a tolerance say two different things (the compiler and RFExpectation refuse it); an unknown bound
+        # or a nominal that is not a number is nothing to judge against
+        return ValidationStatus.UNRESOLVED, None, signed
+    bracket = _bracket(measured, interpolation, bias)
+    lo, hi = bracket if bracket is not None else (measured, measured)
+    if exp.bound == "at_least":
+        if lo >= nominal:
+            return ValidationStatus.PASS, None, signed
+        if hi < nominal:
+            return ValidationStatus.FAIL, None, signed
+    else:
+        if hi <= nominal:
+            return ValidationStatus.PASS, None, signed
+        if lo > nominal:
+            return ValidationStatus.FAIL, None, signed
+    return ValidationStatus.UNRESOLVED, None, signed
+
+
+def judge(measured: float, exp: Expectation | RFExpectation, interpolation: Interpolation | None = None,
           bias: tuple[float | None, float | None] | None = None) -> tuple[ValidationStatus, float | None, float]:
     """``(status, tolerance limit, deviation)`` for ``measured`` against ``exp.nominal``.
+
+    Reads only ``exp.nominal``, ``exp.tol_abs``, ``exp.tol_rel`` and
+    ``exp.bound``, so it judges a design-deck :class:`~ai_eda.ir.Expectation`
+    and an RF fixture :class:`~ai_eda.ir.RFExpectation` alike.
 
     UNRESOLVED without a usable tolerance (none given, or only ``tol_rel``
     on a nominal of 0). With an ``interpolation`` between two samples, the
@@ -404,7 +460,17 @@ def judge(measured: float, exp: Expectation, interpolation: Interpolation | None
     bracket ``(low, high)`` (a window measurement's documented bias bounds;
     ``None`` is an unbounded edge) is judged the same way: a measurement
     error is never reported as a design deviation, nor a biased number as a PASS.
+
+    A one-sided ``bound`` (``at_least`` / ``at_most``) replaces the
+    tolerance: PASS when the value - the whole bracket, if interpolated or
+    biased - is on the passing side of ``nominal`` (equal passes), FAIL when
+    all of it is on the failing side, UNRESOLVED when the bracket straddles
+    ``nominal``; the result is ``(status, None, measured - nominal)`` (a
+    signed deviation, no tolerance limit). A bound together with a tolerance
+    is UNRESOLVED (two different claims; the compiler refuses it).
     """
+    if getattr(exp, "bound", None) is not None:
+        return _judge_bound(measured, exp, interpolation, bias)
     nominal = float(exp.nominal.value)
     deviation = abs(measured - nominal)
     limits = []
@@ -416,18 +482,45 @@ def judge(measured: float, exp: Expectation, interpolation: Interpolation | None
         # a tolerance that is not a number is no tolerance (inf would pass anything, nan nothing)
         return ValidationStatus.UNRESOLVED, None, deviation
     limit = max(limits)
-    if bias is not None:
-        lo = min(measured, bias[0]) if bias[0] is not None else -math.inf
-        hi = max(measured, bias[1]) if bias[1] is not None else math.inf
-    elif interpolation is None or interpolation.exact:
+    bracket = _bracket(measured, interpolation, bias)
+    if bracket is None:
         return (ValidationStatus.PASS if deviation <= limit else ValidationStatus.FAIL), limit, deviation
-    else:
-        lo, hi = interpolation.low, interpolation.high
+    lo, hi = bracket
     if hi - nominal <= limit and nominal - lo <= limit:
         return ValidationStatus.PASS, limit, deviation
     if lo - nominal > limit or nominal - hi > limit:
         return ValidationStatus.FAIL, limit, deviation
     return ValidationStatus.UNRESOLVED, limit, deviation
+
+
+def bound_message(label: str, measured: float, exp: Expectation | RFExpectation, status: ValidationStatus, unit: str = "",
+                  interpolation: Interpolation | None = None, bias: tuple[float | None, float | None] | None = None,
+                  bias_note: str | None = None) -> str:
+    """The result message of a one-sided expectation (``exp.bound`` set) that :func:`judge` gave ``status``.
+
+    ``label`` names what was measured, ``unit`` is ``" <unit>"`` or ``""``.
+    PASS / FAIL state the value, the bound and ``measured - nominal``; an
+    UNRESOLVED one says why nothing was judged - a tolerance given beside
+    the bound, a bias bracket or an interpolation bracket that straddles
+    ``nominal`` (with the remedy).
+    """
+    nominal = float(exp.nominal.value)
+    side = str(exp.bound).replace("_", " ")
+    limit = f"the one-sided bound {side} {nominal:.6g}{unit}"
+    if exp.tol_abs is not None or exp.tol_rel is not None:
+        return f"{label} = {measured:.6g}{unit}: a one-sided bound and a tolerance (tol_abs / tol_rel) say two different things - nothing judged against {limit}"
+    if exp.bound not in EXPECTATION_BOUNDS or not math.isfinite(nominal):
+        return f"{label} = {measured:.6g}{unit}: nothing to judge against (bound {exp.bound!r}, nominal {nominal!r})"
+    if status is ValidationStatus.UNRESOLVED and bias is not None:
+        lo_b, hi_b = bias
+        span = f"[{'-inf' if lo_b is None else f'{lo_b:.6g}'}, {'+inf' if hi_b is None else f'{hi_b:.6g}'}]{unit}"
+        return (f"{label} = {measured:.6g}{unit}, but the true value lies anywhere in {span} given the measurement's bias bounds, "
+                f"which straddles {limit}: not judged - {bias_note}")
+    if status is ValidationStatus.UNRESOLVED and interpolation is not None:
+        return (f"{label} = {measured:.6g}{unit} interpolated ({interpolation.method}) between ({interpolation.x0:g}, {interpolation.y0:.6g}) and "
+                f"({interpolation.x1:g}, {interpolation.y1:.6g}), which lie on both sides of {limit}: the sweep grid is too coarse to judge this; "
+                "put 'at' on a sweep point or refine the sweep")
+    return f"{label} = {measured:.6g}{unit}, {limit} (measured - nominal {measured - nominal:+.3g}{unit})"
 
 
 def retire_expectation_results(ir: CircuitIR, keep: set[str], status: ValidationStatus, why: str, **stamp: Any) -> list[ValidationResult]:
@@ -437,7 +530,11 @@ def retire_expectation_results(ir: CircuitIR, keep: set[str], status: Validation
     removed or renamed would otherwise keep its last verdict in
     ``overall()`` forever. Returns the results (the caller appends them).
     ``spice.si.<net>`` (:data:`SI_CHECK_PREFIX`, the SI transients) is not an
-    expectation and is left to :func:`ai_eda.tools.spice.si_check.spice_si_results`.
+    expectation and is left to :func:`ai_eda.tools.spice.si_check.spice_si_results`;
+    nor is ``spice.rf.<network>[.<state>].<expectation>`` (:data:`RF_CHECK_PREFIX`,
+    the RF fixture networks of ``ir.rf``), which the fixture runner retires
+    itself. An expectation id is a plain identifier without a dot, so a
+    design expectation named ``rf`` (``spice.rf``) is still retired here.
     """
     out: list[ValidationResult] = []
     prefix = f"{CHECK_ID}."
@@ -446,6 +543,8 @@ def retire_expectation_results(ir: CircuitIR, keep: set[str], status: Validation
             continue
         if check_id == SI_CHECK_PREFIX or check_id.startswith(SI_CHECK_PREFIX + "."):
             continue  # the SI transients (ai_eda.tools.spice.si_check) retire their own results
+        if check_id.startswith(RF_CHECK_PREFIX + "."):
+            continue  # the RF fixture networks (ai_eda.tools.spice.rf_fixture) retire their own results
         if last.status is status or last.status is ValidationStatus.NOT_APPLICABLE:
             continue  # already superseded
         out.append(ValidationResult(check_id=check_id, status=status, message=why, details={"superseded": last.status.value}, **stamp))
@@ -625,7 +724,11 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
                     details["deviation"] = deviation
                     label = f"{exp.vector} {exp.reduce.value}" + _label_suffix(exp, res)
                     unit = f" {exp.nominal.unit}" if exp.nominal.unit else ""
-                    if status is ValidationStatus.UNRESOLVED and limit is None:
+                    judged = status is not ValidationStatus.UNRESOLVED
+                    if exp.bound is not None:
+                        details["bound"] = exp.bound
+                        message = bound_message(label, measured, exp, status, unit, interp, reduction.bias, reduction.bias_note)
+                    elif status is ValidationStatus.UNRESOLVED and limit is None:
                         if exp.tol_rel is not None and float(exp.nominal.value) == 0.0:
                             message = f"no usable tolerance: nominal is 0 and only tol_rel is given (a relative tolerance on zero is no tolerance); {label} = {measured:.6g}{unit}"
                         else:
@@ -648,6 +751,7 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
                             f"{label} = {measured:.6g}{unit}, nominal {details['nominal']:.6g}{unit} "
                             f"+/- {limit:.3g}{unit} (deviation {deviation:.3g}{unit})"
                         )
+                    if judged:
                         if status is ValidationStatus.FAIL:
                             details["repair"] = "human"
                         elif reduction.unresolved is not None and status is ValidationStatus.PASS:
@@ -748,7 +852,10 @@ __all__ = [
     "RESULTS_DIR",
     "RESULTS_FILE",
     "RESULTS_FORMAT",
+    "RF_CHECK_PREFIX",
     "Reduction",
+    "SI_CHECK_PREFIX",
+    "bound_message",
     "judge",
     "read_results",
     "reduce_expectation",

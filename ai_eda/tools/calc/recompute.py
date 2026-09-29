@@ -40,6 +40,11 @@ in ``ir.parameters`` first, then - for an id under :data:`SI_PREFIX` - in
 calculator records ``pcb.stackup.dielectrics[0].thickness_mm`` and the like),
 and, like the reviewer's ``calculations_vs_design`` check, in
 ``ir.requirements`` (a requirement's traced ``value``) as a fallback.
+
+The walk also covers ``ir.rf`` (``rf.networks[lpf].expectations[s21_fc].nominal``,
+``RFDesign.traced_items``); its derived values take their inputs from
+``ir.parameters`` (dotted keys such as ``rf.n_mult`` included), the
+requirements or the stackup, never from an ``ir.rf`` item.
 """
 
 from __future__ import annotations
@@ -83,6 +88,7 @@ from ai_eda.tools.calc.basic import (
     voltage_divider_output,
     voltage_divider_ratio,
 )
+from ai_eda.tools.calc.radio import RADIO_CALCULATORS
 from ai_eda.tools.calc.rf import RF_CALCULATORS
 from ai_eda.tools.calc.tline import (
     critical_length,
@@ -164,6 +170,8 @@ CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     "calc.clock.divided": (clock_divided, ROLES["calc.clock.divided"]),
     # RF (ai_eda.tools.calc.rf): every calc.rf.* calculator and calc.crystal.c_for_load, with the roles basic.ROLES names
     **{tool: (fn, ROLES[tool]) for tool, fn in RF_CALCULATORS.items()},
+    # RADIO (ai_eda.tools.calc.radio): frequency plan, FM / PM, top-C and crystal-ladder networks, pads, audio, power budget
+    **{tool: (fn, ROLES[tool]) for tool, fn in RADIO_CALCULATORS.items()},
 }
 
 #: lower-cased unit spelling -> the key a role's expected unit lower-cases to. A thermal resistance is written
@@ -208,13 +216,22 @@ def derived_values(ir: CircuitIR) -> Iterator[tuple[str, Traced]]:
 
     ``ir.parameters`` entries keep their key as the path; everything else is
     addressed by where it lives (``components[R1].spice.value``,
-    ``simulation.expectations[v_out].nominal`` ...).
+    ``simulation.expectations[v_out].nominal`` ...). ``ir.si`` and ``ir.rf``
+    are walked through their own ``traced_items`` ids
+    (``si.net_classes[POWER].min_width_mm``,
+    ``rf.networks[lpf].expectations[s21_fc].nominal``): a fixture nominal a
+    calculator produced is re-derived like a parameter (its inputs live in
+    ``ir.parameters``, the requirements or the stackup, never in ``ir.rf``).
     """
     for key, t in ir.parameters.items():
         if t.provenance.kind == ProvenanceKind.DERIVED:
             yield key, t
     if ir.si is not None:
         for key, t in ir.si.traced_items(SI_PREFIX):
+            if t.provenance.kind == ProvenanceKind.DERIVED:
+                yield key, t
+    if ir.rf is not None:
+        for key, t in ir.rf.traced_items():
             if t.provenance.kind == ProvenanceKind.DERIVED:
                 yield key, t
     for c in ir.components:
@@ -279,7 +296,7 @@ def recompute_parameters(ir: CircuitIR) -> ValidationResult:
                 if all(v is not None for v in positional):
                     try:
                         entry["positional_recompute"] = fn(*positional, tuple(prov.derived_from)).value
-                    except (ValueError, ZeroDivisionError, TypeError) as e:
+                    except (ValueError, ArithmeticError, TypeError) as e:
                         entry["positional_recompute"] = f"refused: {e}"
             refuse(reason)
             continue
@@ -305,7 +322,7 @@ def recompute_parameters(ir: CircuitIR) -> ValidationResult:
         entry["input_values"] = {k: inputs[role].value for role, k in prov.inputs.items()}
         try:
             result = fn(*(inputs[role] for role in roles), tuple(prov.derived_from))
-        except (ValueError, ZeroDivisionError, TypeError) as e:
+        except (ValueError, ArithmeticError, TypeError) as e:  # ArithmeticError: ZeroDivisionError, and an OverflowError of a float ** / exp
             refuse(f"{prov.tool} refused the inputs: {e}")
             continue
         entry["recomputed"] = result.value

@@ -18,5 +18,6 @@ import ai_eda.validation.domain  # noqa: E402,F401
 import ai_eda.validation.fit  # noqa: E402,F401
 import ai_eda.validation.layout  # noqa: E402,F401
 import ai_eda.validation.si  # noqa: E402,F401
+import ai_eda.validation.rf  # noqa: E402,F401
 
 __all__ = ["ValidationContext", "Validator", "ValidatorRegistry", "default_registry"]

@@ -13,7 +13,9 @@ used would have to be re-routed with it); the plane assignment is always the
 design's decision, never the page's.
 
 Two shapes (``pcb_layers``, :func:`~ai_eda.design.inputs.read_layer_count`;
-the templates default to 2 and say so):
+a template builds the counts of its :class:`~ai_eda.design.base.LayerPolicy`
+and defaults to the policy's count - 2 unless the template states another -
+and says so in the table, :func:`layer_count_choice_text`):
 
 * 2 layers - ``F.Cu`` / core / ``B.Cu``, no plane: every impedance number is
   NOT_VERIFIED "impedance is undefined without a reference plane".
@@ -38,7 +40,7 @@ from dataclasses import dataclass
 from ai_eda.ir import BoardOutline, Layer, Provenance, ProvenanceKind, Stackup, StackupCopper, StackupDielectric, Traced, Zone
 from ai_eda.ir.pcb import DielectricKind
 
-from ai_eda.design.base import Choice, choice_provenance
+from ai_eda.design.base import Choice, LayerPolicy, choice_provenance
 from ai_eda.design.inputs import DEFAULT_LAYER_COUNT, LAYER_COUNT_KEY, LAYER_COUNT_OPTIONS, LayerCountInput
 
 #: provenance ``tool`` of the zones :func:`plane_zones` derives
@@ -99,18 +101,42 @@ def plane_description(ground_net: str, power_net: str) -> str:
             "(every net is still routed with tracks; the planes are zones KiCad fills)")
 
 
+#: what each generic count gives the board, for the row that names the alternatives to a default
+_LAYER_BOARD_TEXT: dict[int, str] = {2: "a 2-layer board without planes", 4: "a 4-layer board with ground / power planes"}
+
+
+def layer_count_choice_text(policy: LayerPolicy | None = None) -> str:
+    """The description of the ``pcb_layers`` row a template shows when no requirement states a count.
+
+    Without a policy, or with the generic one (every generic stack, default
+    :data:`~ai_eda.design.inputs.DEFAULT_LAYER_COUNT`), the text every
+    template showed before policies existed, byte for byte (a confirmed
+    table's hash stays valid). A template's own default names the counts the
+    user may answer instead; a policy with one count says it is the only
+    one; a restricting policy quotes its reason.
+    """
+    if policy is None or policy.is_generic:
+        return f"board layer count: the default {DEFAULT_LAYER_COUNT} layers (answer {LAYER_COUNT_KEY}=4 for a 4-layer board with ground / power planes)"
+    why = f": {policy.reason.strip()}" if policy.reason.strip() else ""
+    others = [n for n in policy.allowed if n != policy.default]
+    if not others:
+        return f"board layer count: {policy.default} layers, the only count this template builds{why}"
+    alternatives = "; ".join(f"answer {LAYER_COUNT_KEY}={n} for {_LAYER_BOARD_TEXT.get(n, f'a {n}-layer board')}" for n in others)
+    return f"board layer count: this template's default {policy.default} layers ({alternatives}){why}"
+
+
 def stackup_choices(layers: LayerCountInput, *, ground_net: str = "GND", power_net: str = "+5V",
-                    edge_clearance_mm: float = PLANE_EDGE_CLEARANCE_MM) -> list[Choice]:
+                    edge_clearance_mm: float = PLANE_EDGE_CLEARANCE_MM, policy: LayerPolicy | None = None) -> list[Choice]:
     """The rows a template adds to its ``confirm_design`` table for the board stack.
 
     The layer count is a row only when no requirement stated it (the default
-    is a choice the user must see); the stack's numbers always are, and a
+    is a choice the user must see; its text follows the template's ``policy``,
+    :func:`layer_count_choice_text`); the stack's numbers always are, and a
     4-layer stack adds the plane assignment and the planes' edge clearance.
     """
     out: list[Choice] = []
     if layers.is_default:
-        out.append(Choice(LAYER_COUNT_KEY, f"board layer count: the default {DEFAULT_LAYER_COUNT} layers "
-                                           f"(answer {LAYER_COUNT_KEY}=4 for a 4-layer board with ground / power planes)", layers.value, None))
+        out.append(Choice(LAYER_COUNT_KEY, layer_count_choice_text(policy), layers.value, None))
     out.append(Choice("stackup", stack_description(layers.value)))
     if layers.value == 4:
         out.append(Choice("stackup.planes", plane_description(ground_net, power_net)))
@@ -206,6 +232,7 @@ __all__ = [
     "GenericStack",
     "board_layers",
     "generic_stackup",
+    "layer_count_choice_text",
     "plane_description",
     "plane_zones",
     "stack_description",

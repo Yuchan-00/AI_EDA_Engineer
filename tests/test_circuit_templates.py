@@ -688,7 +688,7 @@ ASTABLE_C_VALUE = "64.817n"
 
 def test_astable_calculators_refuse_out_of_domain_inputs():
     c = astable_c_for_frequency(user_requirement(1000.0, "Hz"), user_requirement(10_000.0, "ohm"), user_requirement(5.0, "V"), user_requirement(0.7, "V"))
-    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.9"
+    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.10"
     assert c.provenance.inputs == {"f_osc": "f_osc", "r_b": "r_b", "v_cc": "v_cc", "v_be": "v_be"}
     f = astable_frequency(user_requirement(10_000.0, "ohm"), c, user_requirement(5.0, "V"), user_requirement(0.7, "V"))
     assert f.value == pytest.approx(1000.0) and f.unit == "Hz" and f.provenance.tool == "calc.astable.f"

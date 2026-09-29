@@ -313,6 +313,8 @@ REDUCE_PARAMS: dict[Reduce, tuple[tuple[str, ...], tuple[str, ...]]] = {
 }
 #: reductions whose number is a level in dB: a relative tolerance on a logarithm is no tolerance, so they need ``tol_abs``
 DB_REDUCES: frozenset[Reduce] = frozenset({Reduce.DB_AT, Reduce.DB_RMS, Reduce.HARMONIC_DBC})
+#: the one-sided limits an :class:`Expectation` (and an RF fixture expectation) may state instead of a tolerance
+EXPECTATION_BOUNDS: tuple[str, ...] = ("at_least", "at_most")
 #: reductions that read a reference (``reference_vector`` or ``params["ref"]``, exactly one)
 REFERENCE_REDUCES: frozenset[Reduce] = frozenset({Reduce.DB_AT, Reduce.DB_RMS})
 #: reductions over a time window ``[t_start, t_stop]`` of a tran analysis
@@ -341,7 +343,8 @@ class Expectation(BaseModel):
     project from the magnitudes ngspice wrote, with the reference in
     ``reference_vector`` (the same grammar as ``vector``, never a complex
     part) or ``params["ref"]``. A dB expectation needs ``tol_abs`` (a
-    relative tolerance on a logarithm is no tolerance) and, when
+    relative tolerance on a logarithm is no tolerance) unless it is a
+    one-sided ``bound`` (below), and, when
     ``nominal.unit`` is set, the reduction's unit (:data:`REDUCE_UNITS`:
     ``dB``, ``dBc``; ``percent`` for ``am_depth``).
 
@@ -361,6 +364,20 @@ class Expectation(BaseModel):
     zero is no tolerance). Expectations are judged at the components' nominal
     values and one temperature: no tolerance corners are simulated, and every
     result says so (``details["conditions"]``).
+
+    ``bound`` (``"at_least"`` / ``"at_most"``) makes the expectation a
+    one-sided limit instead of a tolerance band: PASS when the measured value
+    is on the passing side of ``nominal`` (equal counts as passing), FAIL when
+    it is on the failing side, and - for a value interpolated between two
+    samples or read with a documented bias - PASS only when the whole bracket
+    is on the passing side, FAIL only when all of it is on the failing side,
+    UNRESOLVED otherwise (:func:`ai_eda.tools.spice.stage.judge`). A bound
+    takes no ``tol_abs`` / ``tol_rel`` (it replaces them, so it also waives
+    the "a level in dB needs tol_abs" rule) and cannot claim a requirement
+    yet (``requirement_id``: the reviewer's nominal-vs-requirement rule and
+    the tolerance chart know only tolerances); the compiler refuses both.
+    ``bound`` is left out of the design view while ``None``, so an IR saved
+    before it existed keeps its hash.
     """
 
     id: str
@@ -377,9 +394,11 @@ class Expectation(BaseModel):
     params: dict[str, Traced] = Field(default_factory=dict)
     #: the reference of a ``db_at`` / ``db_rms`` level (the vector grammar above; a magnitude, never a complex part)
     reference_vector: str | None = None
+    #: a one-sided limit instead of a tolerance: PASS when the measured value is on the passing side of ``nominal``
+    bound: Literal["at_least", "at_most"] | None = None
     provenance: Provenance
 
-    _design = drop_empty_in_design_view("params", "reference_vector")
+    _design = drop_empty_in_design_view("params", "reference_vector", "bound")
 
 
 class SimulationSetup(BaseModel):
@@ -410,6 +429,7 @@ __all__ = [
     "DB_REDUCES",
     "DEVICE_PARAMS",
     "ELECTRICAL_KEYS",
+    "EXPECTATION_BOUNDS",
     "Expectation",
     "MODEL_DEVICES",
     "NODE_COUNTS",

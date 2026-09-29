@@ -356,8 +356,11 @@ def test_r1_an_exclusion_without_evidence_is_not_grounded(every_quote_found):
 
 
 def test_r1_a_kr_radio_decision_names_the_uncited_notice(every_quote_found):
-    """The KR 고시 entry cites no sentence on either branch: every decided KR run is NOT_VERIFIED naming it (intended, not a regression)."""
-    out = _research("KR", {"radio": "yes", "digital_device": "no"})
+    """The KR 고시 entry cites no sentence on either branch: every decided KR run is NOT_VERIFIED naming it (intended, not a regression).
+
+    The KR 447 MHz radio entries (unfetchable, no quotes) cite nothing either; ``kr_licence_free_class`` is answered so that every candidate is
+    decided and the message is the uncited one, not the undecided one (``tests/test_regulatory_kr447.py`` covers the unanswered case)."""
+    out = _research("KR", {"radio": "yes", "digital_device": "no", "kr_licence_free_class": "yes"})
     by = {r.candidate_id: r for r in out.candidates}
     notice = by["reg.KR.RadioWavesAct.ConformityAssessmentNotice"]
     assert notice.evaluation.applicability.value == "applicable" and notice.evaluation.evidence == [] and not notice.evidence_grounded

@@ -21,6 +21,7 @@ from ai_eda.ir.pcb import PCBDesign
 from ai_eda.ir.provenance import DESIGN_VIEW, Traced, design_data, drop_empty_in_design_view, drop_in_design_view
 from ai_eda.ir.regulatory import RegulatoryState
 from ai_eda.ir.requirements import RequirementSet
+from ai_eda.ir.rf import RFDesign
 from ai_eda.ir.si import SIConstraints
 from ai_eda.ir.simulation import SimulationSetup
 from ai_eda.ir.topology import Topology
@@ -190,6 +191,10 @@ class CircuitIR(BaseModel):
     #: signal-integrity constraints (net classes, timing paths): design content, ``None`` when the design states none -
     #: left out of the design view while ``None``, so an IR saved before the field existed keeps its hash
     si: SIConstraints | None = None
+    #: RF design content (blocks, fixture networks, the frequency plan, lab items, rail budgets; :mod:`ai_eda.ir.rf`),
+    #: ``None`` when the design states none - left out of the design view while ``None``, so an IR saved before the
+    #: field existed keeps its hash
+    rf: RFDesign | None = None
     regulatory: RegulatoryState = Field(default_factory=RegulatoryState)
     validation: ValidationState = Field(default_factory=ValidationState)
     artifacts: dict[ArtifactKind, ArtifactRef] = Field(default_factory=dict)
@@ -217,7 +222,7 @@ class CircuitIR(BaseModel):
 
     # --- hashing -------------------------------------------------------------
 
-    _design = drop_empty_in_design_view("si")
+    _design = drop_empty_in_design_view("si", "rf")
 
     #: fields that describe *state about* the design rather than the design itself
     _NON_DESIGN_FIELDS = ("validation", "artifacts")

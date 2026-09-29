@@ -89,7 +89,7 @@ from ai_eda.ir import (
 from ai_eda.tools.calc.tline import NO_REFERENCE_PLANE
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.si.driver import DRIVING_TYPES, driver_value, pins_on_net
-from ai_eda.tools.si.measure import SI_VERSION, measure_nets
+from ai_eda.tools.si.measure import SI_VERSION, measure_nets, no_plane_reason
 from ai_eda.tools.si.promote import critical_rows
 from ai_eda.tools.spice.runner import SpiceAnalysis, SpiceResult, SpiceRunner
 
@@ -252,7 +252,10 @@ def spice_si_results(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) 
         assert line is not None  # a long row has a line
         base.update(line_mm=round(line.length_mm, 6), line=line.describe())
         if line.bound or line.delay_s is None:
-            out.append(nv(f"{r.net} is electrically long but {NO_REFERENCE_PLANE} - use pcb_layers=4 or add a plane: Z0 and t_d are not defined, nothing to simulate"))
+            # a keep-out that cleared the plane is named (never "use pcb_layers=4" on a board that has its planes)
+            why = no_plane_reason(m) if line.bound else f"{NO_REFERENCE_PLANE} - use pcb_layers=4 or add a plane"
+            out.append(nv(f"{r.net} is electrically long but {why}: Z0 and t_d are not defined, nothing to simulate",
+                          **({"keepouts": m.keepout_ids} if m.keepout_ids else {})))
             continue
         main = next((s for s in m.segments if line.main is not None and (s.layer, s.width_mm) == line.main), None)
         if main is None or main.model is None or main.model.z0_ohm is None:

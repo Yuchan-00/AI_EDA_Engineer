@@ -34,8 +34,10 @@ number; beta for FM / PM, m for AM), ``rx_sensitivity`` (dBm),
 ``system_impedance`` (the reference impedance the RF ports and lines are
 designed to) and ``antenna_impedance`` (the antenna's stated feed-point
 resistance) in ohm - different quantities, which is why a match exists -,
-``antenna_gain`` (dBi), ``link_range`` (m), ``frequency_tolerance`` (ppm) and
-``field_strength_limit`` (V/m). ``frequency_tolerance`` and ``frequency_deviation``
+``antenna_gain`` (dBi), ``link_range`` (m), ``frequency_tolerance`` (ppm),
+``field_strength_limit`` (V/m) and ``tx_timeout`` (s: the transmit time-out
+after which a transmission is cut off; ``3 min`` is not read - state seconds).
+``frequency_tolerance`` and ``frequency_deviation``
 are the keys (:data:`SYMMETRIC_TOLERANCE_KEYS`) where a ``±`` answer is a value -
 ``±2.5 ppm`` reads as 2.5 ppm, ``±2.5 kHz`` as a 2.5 kHz peak deviation: a bare
 ``±x`` there has no nominal beside it and means its magnitude; under every other
@@ -48,6 +50,18 @@ refused. ``modulation`` (aliases :data:`MODULATION_ALIASES`) is categorical and
 read by :func:`read_modulation`, never as a quantity. ``battery_voltage`` is the
 one battery alias of ``input_voltage`` (``vbat`` names an MCU's backup-supply
 pin, not the board's supply).
+
+``radio_build`` (:data:`RADIO_BUILD_KEY`) is the other categorical key: which
+board of the radio template family is built, exactly one of
+:data:`RADIO_BUILDS`, read by :func:`read_radio_build`. It is a requirement,
+not a control key - which board is built is the product - so it is typed once
+(``--answer radio_build=rx_backend``), persists as ``user_requirement`` and is
+served (or refused, closed world) like every design requirement. The whole
+value must be one build name (case-insensitive, ``-`` read as ``_``): a
+description of a board is never mapped to one. A categorical value is never
+copied into ``ir.parameters`` with the :data:`PARSED_NOTE_PREFIX` note, which
+:func:`~ai_eda.design.checks.check_inputs_vs_requirements` re-reads as a
+quantity.
 
 No alias is a bare physical word: ``frequency`` (which frequency?), ``power``,
 ``bandwidth``, ``impedance``, ``sensitivity``, ``range``, ``gain``,
@@ -133,6 +147,8 @@ RF_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "link_range": ("link_range", "communication_range", "radio_range"),
     "frequency_tolerance": ("frequency_tolerance", "frequency_stability"),
     "field_strength_limit": ("field_strength_limit", "e_field_limit"),
+    # the transmit time-out: a transmission is cut off after it (a radio template builds its time-out timer only when stated)
+    "tx_timeout": ("tx_timeout", "transmit_timeout"),
 }
 #: canonical RF key -> the unit its value must carry (W keys also read dBm / dBW, V/m keys dBuV/m, through calc.rf)
 RF_UNIT_OF: dict[str, str] = {
@@ -140,7 +156,7 @@ RF_UNIT_OF: dict[str, str] = {
     "modulation_depth": "percent", "modulation_index": RATIO_UNIT, "audio_bandwidth": "Hz", "channel_bandwidth": "Hz",
     "occupied_bandwidth": "Hz", "channel_spacing": "Hz", "rx_sensitivity": "dBm", "system_impedance": "ohm",
     "antenna_impedance": "ohm", "antenna_gain": "dBi", "link_range": "m", "frequency_tolerance": "ppm",
-    "field_strength_limit": "V/m",
+    "field_strength_limit": "V/m", "tx_timeout": "s",
 }
 #: the battery aliases of ``input_voltage`` (not ``vbat`` / ``v_bat``: datasheets use those for an MCU's backup-supply pin)
 BATTERY_ALIASES: tuple[str, ...] = ("battery_voltage",)
@@ -155,6 +171,13 @@ MODULATION_ALIASES: tuple[str, ...] = ("modulation", "modulation_type", "emissio
 MODULATIONS: tuple[str, ...] = ("am", "fm", "pm", "ssb", "dsb", "fsk", "gfsk", "ask", "ook", "psk", "lora")
 #: Korean phrases for a modulation (whitespace inside optional)
 MODULATION_PHRASES: dict[str, str] = {"진폭 변조": "am", "주파수 변조": "fm"}
+#: the categorical radio-build key (read by :func:`read_radio_build`, never as a quantity): which board of the radio
+#: template family is built - a requirement (it names the product), never a control key - and the keys that mean it
+RADIO_BUILD_KEY = "radio_build"
+RADIO_BUILD_ALIASES: tuple[str, ...] = ("radio_build",)
+#: the boards of the radio template family, in build order (``transceiver_conducted``: the transceiver with a coaxial
+#: connector in place of the integral antenna, for conducted bench measurements)
+RADIO_BUILDS: tuple[str, ...] = ("audio_ptt", "rx_backend", "rx_frontend", "tx_exciter", "transceiver", "transceiver_conducted")
 #: (level unit, target unit) -> (calculator, its tool id): the only unit conversions :func:`read_value` makes
 LEVEL_CONVERSIONS = {
     ("dBm", "W"): (rf_calc.dbm_to_w, "calc.rf.dbm_to_w"),
@@ -177,9 +200,10 @@ class DesignInput:
 
 
 def canonical_key(key: str) -> str | None:
-    """The canonical template key a requirement key means (a quantity key, a board key such as ``pcb_layers`` or the
-    categorical ``modulation``), or ``None``."""
-    for canon, aliases in (*KEY_ALIASES.items(), *BOARD_KEY_ALIASES.items(), (MODULATION_KEY, MODULATION_ALIASES)):
+    """The canonical template key a requirement key means (a quantity key, a board key such as ``pcb_layers`` or a
+    categorical key: ``modulation``, ``radio_build``), or ``None``."""
+    for canon, aliases in (*KEY_ALIASES.items(), *BOARD_KEY_ALIASES.items(), (MODULATION_KEY, MODULATION_ALIASES),
+                           (RADIO_BUILD_KEY, RADIO_BUILD_ALIASES)):
         if key in aliases:
             return canon
     return None
@@ -468,6 +492,62 @@ def read_modulation(ir: CircuitIR) -> tuple[str | None, str | None]:
     return next(iter(names.values())), None
 
 
+#: a build name inside a longer text (whole words; ``-`` or ``_`` between its parts) - only to name what a refused text holds
+_RADIO_BUILD_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(" + "|".join(sorted((b.replace("_", "[_-]") for b in RADIO_BUILDS), key=len, reverse=True)) + r")(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+
+
+def read_radio_build(ir: CircuitIR) -> tuple[str | None, str | None]:
+    """``(build, None)`` with the confirmed radio build (one of :data:`RADIO_BUILDS`), or ``(None, why)``.
+
+    ``(None, None)`` when no requirement under :data:`RADIO_BUILD_ALIASES`
+    states one (the radio selector asks for it). A stated build must be
+    confirmed (the user's or authoritative) and its whole value one build name
+    - case-insensitive, surrounding whitespace ignored, ``-`` read as ``_``
+    (``"RX-Backend"`` is ``rx_backend``). A text that holds a build name among
+    other words (``"rx_backend board"``), names several (``"rx_backend,
+    tx_exciter"``), names none (``"IF 백엔드 보드"``: a description is never
+    mapped to a build) or requirements that name different builds are refused
+    with the reason, never picked.
+    """
+    candidates = [r for r in ir.requirements.requirements if r.key in RADIO_BUILD_ALIASES]
+    if not candidates:
+        return None, None
+    choices = ", ".join(RADIO_BUILDS)
+    builds: dict[str, str] = {}
+    reasons: list[str] = []
+    for r in candidates:
+        value = r.value
+        if value is None:
+            reasons.append(f"{r.id}: has no value")
+            continue
+        if not value.provenance.is_authoritative:
+            reasons.append(f"{r.id}: value is {value.provenance.kind.value}, not yet the user's (confirm it, or answer {r.key} directly)")
+            continue
+        raw = value.value
+        if not isinstance(raw, str):
+            reasons.append(f"{r.id}: {raw!r} is not a radio build name (one of {choices})")
+            continue
+        whole = raw.strip().lower().replace("-", "_")
+        if whole in RADIO_BUILDS:
+            builds[r.id] = whole
+            continue
+        named = sorted({m.group(1).lower().replace("-", "_") for m in _RADIO_BUILD_TOKEN_RE.finditer(raw)})
+        if len(named) > 1:
+            reasons.append(f"{r.id}: {raw!r} names several radio builds ({', '.join(named)}); state exactly one")
+        elif named:
+            reasons.append(f"{r.id}: {raw!r} is not exactly one radio build name (it contains {named[0]} among other words); state exactly one of {choices} and nothing else")
+        else:
+            reasons.append(f"{r.id}: {raw!r} names no radio build (state exactly one of {choices})")
+    if reasons:
+        return None, "; ".join(reasons)
+    if len(set(builds.values())) > 1:
+        return None, "ambiguous: " + ", ".join(f"{rid} says {build}" for rid, build in builds.items())
+    return next(iter(builds.values())), None
+
+
 def read_inputs(ir: CircuitIR) -> tuple[dict[str, DesignInput], dict[str, str]]:
     """Confirmed numeric requirement values by canonical key, and the keys that are present but unusable (with why).
 
@@ -504,6 +584,28 @@ def read_inputs(ir: CircuitIR) -> tuple[dict[str, DesignInput], dict[str, str]]:
     return found, unusable
 
 
+def present_keys(ir: CircuitIR, inputs: dict[str, DesignInput]) -> set[str]:
+    """The canonical keys a template may count as present: the numeric ``inputs`` plus each categorical key its reader reads.
+
+    ``modulation`` counts when :func:`read_modulation` returns a name,
+    ``radio_build`` when :func:`read_radio_build` returns a build; a stated
+    but unreadable value (not confirmed, ambiguous, naming several) stays
+    missing. The one rule for a template's ``needs``: the selection gate of
+    :func:`ai_eda.design.templates.design_from_requirements` and a template's
+    own ``build`` ask for the same missing keys.
+    """
+    present = set(inputs)
+    if read_modulation(ir)[0] is not None:
+        present.add(MODULATION_KEY)
+    if read_radio_build(ir)[0] is not None:
+        present.add(RADIO_BUILD_KEY)
+    return present
+
+
+#: the categorical keys a template's ``needs`` may name beside the numeric ones (read by :func:`present_keys`)
+CATEGORICAL_KEYS: tuple[str, ...] = (MODULATION_KEY, RADIO_BUILD_KEY)
+
+
 def is_template_input(t: Traced) -> bool:
     """Whether a traced value is a requirement copied by :func:`read_value` (one requirement id, the parsed-from note)."""
     p = t.provenance
@@ -513,6 +615,7 @@ def is_template_input(t: Traced) -> bool:
 __all__ = [
     "BATTERY_ALIASES",
     "BOARD_KEY_ALIASES",
+    "CATEGORICAL_KEYS",
     "DEFAULT_LAYER_COUNT",
     "KEY_ALIASES",
     "LAYER_COUNT_ALIASES",
@@ -525,6 +628,9 @@ __all__ = [
     "MODULATION_KEY",
     "MODULATION_PHRASES",
     "PARSED_NOTE_PREFIX",
+    "RADIO_BUILDS",
+    "RADIO_BUILD_ALIASES",
+    "RADIO_BUILD_KEY",
     "RATIO_UNIT",
     "RF_KEY_ALIASES",
     "RF_UNIT_OF",
@@ -534,8 +640,10 @@ __all__ = [
     "LayerCountInput",
     "canonical_key",
     "is_template_input",
+    "present_keys",
     "read_inputs",
     "read_layer_count",
     "read_modulation",
+    "read_radio_build",
     "read_value",
 ]

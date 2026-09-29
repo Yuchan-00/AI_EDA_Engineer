@@ -63,6 +63,7 @@ from ai_eda.ir.pcb import (
     Zone,
     SilkKind,
     SilkText,
+    Keepout,
     ManufacturingConstraints,
     PCBDesign,
     unrecorded_origin,
@@ -74,6 +75,19 @@ from ai_eda.ir.pcb import (
     Stackup,
 )
 from ai_eda.ir.si import DiffPair, NetClass, Promotion, SIConstraints, TimingPath
+from ai_eda.ir.rf import (
+    LabItem,
+    PlanLine,
+    RailBudget,
+    RFBlock,
+    RFDesign,
+    RFExpectation,
+    RFNetwork,
+    RFPort,
+    RFProbe,
+    RFRegion,
+    RFState,
+)
 from ai_eda.ir.regulatory import (
     Jurisdiction,
     RegulatoryProvenance,
@@ -94,10 +108,12 @@ __all__ = [
     "Expectation", "SimulationSetup",
     "CircuitDomain", "Block", "Topology",
     "ConstraintKind", "Constraint",
-    "BoardSide", "Layer", "BoardOutline", "Placement", "Track", "Via", "Zone", "SilkKind", "SilkText",
+    "BoardSide", "Layer", "BoardOutline", "Placement", "Track", "Via", "Zone", "SilkKind", "SilkText", "Keepout",
     "ManufacturingConstraints", "PCBDesign", "UNRECORDED_ORIGIN", "unrecorded_origin",
     "CopperRole", "DielectricKind", "StackupCopper", "StackupDielectric", "SolderMask", "Stackup",
     "DiffPair", "NetClass", "Promotion", "SIConstraints", "TimingPath",
+    "LabItem", "PlanLine", "RailBudget", "RFBlock", "RFDesign", "RFExpectation", "RFNetwork", "RFPort", "RFProbe",
+    "RFRegion", "RFState",
     "Jurisdiction", "RegulatoryProvenance", "RegulatoryRequirement", "RegulatoryState",
     "ArtifactKind", "ArtifactRef", "ProjectMeta", "CircuitIR", "hash_file_set",
 ]

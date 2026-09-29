@@ -5,7 +5,7 @@ geometry is *not* stored here - it comes from the verified KiCad footprint at
 compile time.
 
 Traceability (spec 26): every layout item (``Placement``, ``Track``, ``Via``,
-``Zone``, ``SilkText``) carries a :class:`~ai_eda.ir.provenance.Provenance` so
+``Zone``, ``SilkText``, ``Keepout``) carries a :class:`~ai_eda.ir.provenance.Provenance` so
 copper and silkscreen can be traced to the tool run, the user or the model
 that produced it. An item that was constructed without saying where it came
 from gets :data:`UNRECORDED_ORIGIN` - an *assumption* that
@@ -35,10 +35,21 @@ every number ``Traced``. Impedance and propagation delay are only defined
 over a reference plane; :mod:`ai_eda.tools.calc.tline` reads the geometry of
 a routed layer from the stack (``line_geometry``) and says why when it
 cannot.
+
+Keep-outs (:class:`Keepout`, ``PCBDesign.keepouts``) are design content added
+the same way (out of the design view while empty): an area of one or more
+copper layers (a rectangle or a polygon, mm, every number ``Traced``) where
+tracks, vias, pads, zones and / or footprints are forbidden, with the refs /
+nets that are the named exceptions (an antenna's feed pad and its feed
+track in an otherwise empty band) and the reason. A keep-out is a rule for
+the placer, the router, the plane zones and the ``pcb.keepout`` geometry
+check; it carries a provenance like every other layout item.
 """
 
 from __future__ import annotations
 
+import math
+import re
 from enum import StrEnum
 from typing import Literal
 
@@ -381,6 +392,120 @@ class Stackup(BaseModel):
         return None
 
 
+# --------------------------------------------------------------------------- keep-outs
+
+
+#: what a :class:`Keepout` may forbid (a KiCad rule area calls the ``zones`` ban ``copperpour``)
+KEEPOUT_ITEMS: tuple[str, ...] = ("tracks", "vias", "pads", "zones", "footprints")
+#: the items a ref exception applies to, and the items a net exception applies to
+_REF_ITEMS = frozenset({"footprints", "pads"})
+_NET_ITEMS = frozenset({"tracks", "vias", "zones", "pads"})
+#: every copper layer of the board
+ALL_COPPER = "*.Cu"
+_COPPER_LAYER_RE = re.compile(r"^(F\.Cu|B\.Cu|In[1-9][0-9]*\.Cu)$")
+_KEEPOUT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class Keepout(BaseModel):
+    """An area of copper layers where tracks / vias / pads / zones / footprints are forbidden (board frame, mm, Y down).
+
+    ``layers`` names copper layers (``F.Cu``, ``In1.Cu`` .. ``In<n>.Cu``,
+    ``B.Cu``) or is exactly ``["*.Cu"]`` (every copper layer of the board).
+    The area is exactly one of ``rect`` - ``[x, y, w, h]`` in mm, the corner
+    with the smallest coordinates first, ``w`` / ``h`` > 0 - and ``polygon``
+    - at least three ``[x, y]`` points in mm enclosing a non-zero area; the
+    traced value carries unit ``mm``. ``forbids`` lists what may not lie in
+    the area (:data:`KEEPOUT_ITEMS`, no repeats). ``allowed_refs`` names the
+    footprints exempt from a ``footprints`` / ``pads`` ban (the antenna in a
+    no-parts band) and ``allowed_nets`` the nets exempt from a ``tracks`` /
+    ``vias`` / ``zones`` / ``pads`` ban (its feed track); an exception for an
+    item the keep-out does not forbid is refused. ``reason`` says why the
+    area is kept out. ``id`` is a plain identifier (it names the check row
+    and the compiled rule area).
+    """
+
+    id: str
+    layers: list[str]
+    rect: Traced[list[float]] | None = None
+    polygon: Traced[list[list[float]]] | None = None
+    forbids: list[Literal["tracks", "vias", "pads", "zones", "footprints"]]
+    allowed_refs: list[str] = Field(default_factory=list)
+    allowed_nets: list[str] = Field(default_factory=list)
+    reason: str
+    #: the template / user / tool that decided the keep-out; unrecorded = assumption
+    provenance: Provenance = Field(default_factory=unrecorded_origin)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Keepout:
+        what = f"keep-out {self.id}"
+        if not _KEEPOUT_ID_RE.match(self.id):
+            raise ValueError(f"keep-out id {self.id!r} must be a plain identifier (a letter, then letters, digits or _)")
+        if not self.layers:
+            raise ValueError(f"{what}: needs at least one copper layer")
+        if ALL_COPPER in self.layers and self.layers != [ALL_COPPER]:
+            raise ValueError(f"{what}: {ALL_COPPER!r} means every copper layer and stands alone, got {self.layers}")
+        for layer in self.layers:
+            if layer != ALL_COPPER and not _COPPER_LAYER_RE.match(layer):
+                raise ValueError(f"{what}: {layer!r} is not a copper layer (F.Cu, In<n>.Cu, B.Cu or {ALL_COPPER})")
+        if len(set(self.layers)) != len(self.layers):
+            raise ValueError(f"{what}: a layer is listed twice in {self.layers}")
+        if (self.rect is None) == (self.polygon is None):
+            raise ValueError(f"{what}: give exactly one of rect ([x, y, w, h] mm) or polygon ([[x, y], ...] mm)")
+        area = self.rect if self.rect is not None else self.polygon
+        if area.unit != "mm":  # type: ignore[union-attr]
+            raise ValueError(f"{what}: the area must carry unit 'mm', got {area.unit!r}")  # type: ignore[union-attr]
+        if self.rect is not None:
+            r = self.rect.value
+            if len(r) != 4 or any(not math.isfinite(float(v)) for v in r):
+                raise ValueError(f"{what}: rect must be [x, y, w, h] (four finite numbers), got {r!r}")
+            if not (r[2] > 0 and r[3] > 0):
+                raise ValueError(f"{what}: rect width and height must be > 0, got {r[2]!r} x {r[3]!r}")
+        else:
+            pts = self.polygon.value  # type: ignore[union-attr]
+            if len(pts) < 3 or any(len(p) != 2 or any(not math.isfinite(float(v)) for v in p) for p in pts):
+                raise ValueError(f"{what}: polygon needs at least three [x, y] points of finite numbers, got {pts!r}")
+            if _shoelace([(float(p[0]), float(p[1])) for p in pts]) == 0.0:
+                raise ValueError(f"{what}: polygon encloses no area")
+        if not self.forbids:
+            raise ValueError(f"{what}: forbids nothing ({list(KEEPOUT_ITEMS)})")
+        if len(set(self.forbids)) != len(self.forbids):
+            raise ValueError(f"{what}: an item is listed twice in forbids {self.forbids}")
+        for label, names, items in (("allowed_refs", self.allowed_refs, _REF_ITEMS), ("allowed_nets", self.allowed_nets, _NET_ITEMS)):
+            if any(not isinstance(n, str) or not n.strip() for n in names):
+                raise ValueError(f"{what}: {label} entries must name something, got {names!r}")
+            if len(set(names)) != len(names):
+                raise ValueError(f"{what}: a name is listed twice in {label} {names}")
+            if names and not (set(self.forbids) & items):
+                raise ValueError(f"{what}: {label} are exceptions to a {' / '.join(sorted(items))} ban, which this keep-out does not state (forbids {self.forbids})")
+        if not self.reason.strip():
+            raise ValueError(f"{what}: reason must say why the area is kept out")
+        return self
+
+    def outline(self) -> list[tuple[float, float]]:
+        """The area's corner points in mm (a rect as its four corners, from ``(x, y)`` clockwise on screen)."""
+        if self.rect is not None:
+            x, y, w, h = (float(v) for v in self.rect.value)
+            return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        return [(float(p[0]), float(p[1])) for p in self.polygon.value]  # type: ignore[union-attr]
+
+    def bbox(self) -> tuple[float, float, float, float]:
+        """``(x0, y0, x1, y1)`` of the area in mm."""
+        pts = self.outline()
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def covers_layer(self, layer: str) -> bool:
+        """Whether the keep-out applies on copper layer ``layer`` (``*.Cu`` covers every copper layer)."""
+        if self.layers == [ALL_COPPER]:
+            return bool(_COPPER_LAYER_RE.match(layer))
+        return layer in self.layers
+
+
+def _shoelace(pts: list[tuple[float, float]]) -> float:
+    """Twice the signed area of the polygon ``pts``."""
+    return sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]))
+
+
 class PCBDesign(BaseModel):
     layers: list[Layer] = Field(default_factory=lambda: [Layer(name="F.Cu", kind="signal"), Layer(name="B.Cu", kind="signal")])
     outline: BoardOutline | None = None
@@ -394,8 +519,20 @@ class PCBDesign(BaseModel):
     #: the layer stack (thicknesses, permittivities, plane layers); ``None`` = not stated, and every impedance / delay
     #: number is NOT_VERIFIED "no stackup"
     stackup: Stackup | None = None
+    #: areas where tracks / vias / pads / zones / footprints are forbidden (:class:`Keepout`); empty = none
+    keepouts: list[Keepout] = Field(default_factory=list)
 
-    _design = drop_empty_in_design_view("silkscreen", "stackup")
+    _design = drop_empty_in_design_view("silkscreen", "stackup", "keepouts")
+
+    @model_validator(mode="after")
+    def _unique_keepouts(self) -> PCBDesign:
+        ids = [k.id for k in self.keepouts]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"keep-out ids must be unique, got {ids}")
+        return self
+
+    def keepout(self, id: str) -> Keepout | None:
+        return next((k for k in self.keepouts if k.id == id), None)
 
     def placement(self, ref: str) -> Placement | None:
         for p in self.placements:
@@ -404,10 +541,11 @@ class PCBDesign(BaseModel):
         return None
 
     def layout_items(self) -> list[tuple[str, Provenance]]:
-        """``(label, provenance)`` of every placement / track / via / zone / silkscreen text, for traceability review."""
+        """``(label, provenance)`` of every placement / track / via / zone / silkscreen text / keep-out, for traceability review."""
         out: list[tuple[str, Provenance]] = [(f"placement[{p.component_ref}]", p.provenance) for p in self.placements]
         out += [(f"track[{i}:{t.net}]", t.provenance) for i, t in enumerate(self.tracks)]
         out += [(f"via[{i}:{v.net}]", v.provenance) for i, v in enumerate(self.vias)]
         out += [(f"zone[{i}:{z.net}]", z.provenance) for i, z in enumerate(self.zones)]
         out += [(f"silk[{i}:{t.kind}:{t.text}]", t.provenance) for i, t in enumerate(self.silkscreen)]
+        out += [(f"keepout[{i}:{k.id}]", k.provenance) for i, k in enumerate(self.keepouts)]
         return out

@@ -53,7 +53,11 @@ their verdicts. Results (tool :data:`~ai_eda.tools.si.measure.SI_TOOL`):
   gives the pad boxes) it lies within the rule's ``neckdown_radius`` plus one
   grid step of one of the net's pads. Every other narrower track is judged
   at its own width (a promoted net the router left at the board width
-  FAILs). NOT_APPLICABLE for a class without a target or without nets.
+  FAILs). A track whose copper lies in a keep-out that forbids the zone of
+  its plane layer (:func:`ai_eda.tools.si.measure.plane_keepout`) has no
+  reference plane there: its row is NOT_VERIFIED with that keep-out named,
+  never judged as a microstrip. NOT_APPLICABLE for a class without a target
+  or without nets.
 * ``si.width.<class>`` - every track of the class's nets at least
   ``min_width_mm`` (a class with one).
 * ``si.length.<class>`` / ``si.delay.<class>`` - each net the class declares
@@ -92,7 +96,18 @@ from ai_eda.ir.si import FACT_REF_RE, TIMING_TERMS
 from ai_eda.tools.calc.tline import NO_STACKUP, TLineRangeError, edge_coupled_microstrip, line_geometry
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.routing.coupling import COUPLED_GAP_FACTOR, coupled_pieces, uncoupled_lengths
-from ai_eda.tools.si.measure import NOT_DRC, SI_TOOL, SI_VERSION, NetMeasure, line_model, measure_nets, undefined_impedance_reason
+from ai_eda.tools.si.measure import (
+    NOT_DRC,
+    NO_PLANE_ADVICE,
+    SI_TOOL,
+    SI_VERSION,
+    NetMeasure,
+    line_model,
+    measure_nets,
+    no_plane_reason,
+    plane_keepout,
+    undefined_impedance_reason,
+)
 from ai_eda.tools.si.paths import NetPads, PadBox, net_pads
 from ai_eda.tools.si.promote import critical_rows
 from ai_eda.tools.si.rf import RF_IMPEDANCE_CHECK, RF_LENGTH_CHECK, format_hz, rf_length_rows, rf_nets
@@ -139,6 +154,7 @@ def critical_result(ir: CircuitIR, measures: dict[str, NetMeasure]) -> Validatio
     rows: list[dict] = []
     long_spice: list[str] = []
     uncontrolled: list[str] = []
+    cleared: list[str] = []  # long nets whose reference plane a keep-out clears (named, never "use pcb_layers=4")
     possibly: list[str] = []
     for r in critical_rows(ir, measures):
         row = r.as_dict()
@@ -156,10 +172,17 @@ def critical_result(ir: CircuitIR, measures: dict[str, NetMeasure]) -> Validatio
         elif r.status == "short":
             row["status"], row["reason"] = S.PASS.value, SHORT_TEXT + (" (with the no-plane upper bound of t_pd)" if r.bound else "")
         elif r.bound:
+            m = measures.get(r.net)
             row["status"] = S.NOT_VERIFIED.value
             row["reason"] = (f"electrically long ({r.length_mm:.3f} mm > l_crit {r.l_crit_mm:.3f} mm by the upper bound of t_pd{where}): needs impedance control, "
-                             "but impedance is undefined without a reference plane - use pcb_layers=4 or add a plane")
-            uncontrolled.append(r.net)
+                             f"but {NO_PLANE_ADVICE if m is None else no_plane_reason(m)}")
+            if m is not None and m.keepout_ids:
+                row["keepouts"] = m.keepout_ids
+                cleared.append(r.net)
+                if m.plane_less:
+                    uncontrolled.append(r.net)
+            else:
+                uncontrolled.append(r.net)
         else:
             row["status"] = S.NOT_APPLICABLE.value
             row["reason"] = f"electrically long ({r.length_mm:.3f} mm > l_crit {r.l_crit_mm:.3f} mm{where}): over a plane, judged by spice.si.{r.net}, not by this rule"
@@ -167,7 +190,7 @@ def critical_result(ir: CircuitIR, measures: dict[str, NetMeasure]) -> Validatio
         rows.append(row)
     status = _worst(rows)
     short = [r["net"] for r in rows if r["status"] == S.PASS.value]
-    details = {"nets": rows, "long_over_plane": long_spice, "long_without_plane": uncontrolled, "possibly_long": possibly,
+    details = {"nets": rows, "long_over_plane": long_spice, "long_without_plane": uncontrolled, "long_under_keepout": cleared, "possibly_long": possibly,
                "fraction": None if ir.si is None or ir.si.critical_fraction is None else float(ir.si.critical_fraction.value)}
     if status == S.NOT_APPLICABLE:
         if long_spice:
@@ -180,9 +203,13 @@ def critical_result(ir: CircuitIR, measures: dict[str, NetMeasure]) -> Validatio
     if uncontrolled:
         parts.append(f"{len(uncontrolled)} electrically long net(s) need impedance control but impedance is undefined without a reference plane "
                      f"- use pcb_layers=4 or add a plane: {', '.join(uncontrolled)}")
+    if cleared:
+        parts.append(f"{len(cleared)} electrically long net(s) need impedance control but a keep-out clears their reference plane (impedance is "
+                     f"undefined there): " + ", ".join(f"{n} (keep-out {', '.join(measures[n].keepout_ids)})" for n in cleared))
     if possibly:
         parts.append(f"{len(possibly)} net(s) possibly long (the whole copper exceeds l_crit, no pad-to-pad path extracted; not judged): {', '.join(possibly)}")
-    other = [f"{r['net']}: {r['reason']}" for r in rows if r["status"] == S.NOT_VERIFIED.value and r["net"] not in uncontrolled and r["net"] not in possibly]
+    other = [f"{r['net']}: {r['reason']}" for r in rows
+             if r["status"] == S.NOT_VERIFIED.value and r["net"] not in uncontrolled and r["net"] not in cleared and r["net"] not in possibly]
     if other:
         parts.append(f"{len(other)} net(s) not judged: " + "; ".join(other))
     return _result(CRITICAL_CHECK, status, "; ".join(parts), **details)
@@ -303,8 +330,8 @@ def impedance_result(ir: CircuitIR, si: SIConstraints, cls: NetClass, measures: 
             status = S.NOT_APPLICABLE if _pads(ir, net) < 2 else S.NOT_VERIFIED
             rows.append({"net": net, "status": status.value, "reason": "no routed copper" if status is S.NOT_VERIFIED else "fewer than two pads"})
             continue
-        # the net's tracks grouped by (layer, width, neck-down or not), in segment order
-        groups: dict[tuple[str, float, bool], list[float | str]] = {}
+        # the net's tracks grouped by (layer, width, neck-down or not, the keep-out that clears its plane or None), in segment order
+        groups: dict[tuple[str, float, bool, str | None], list[float | str]] = {}
         for seg in m.segments:
             for t in by_net.get(net, []):
                 if t.layer != seg.layer or float(t.width_mm) != seg.width_mm:
@@ -312,12 +339,17 @@ def impedance_result(ir: CircuitIR, si: SIConstraints, cls: NetClass, measures: 
                 neck, words = (False, "")
                 if width is not None and seg.width_mm < width - _TOL:
                     neck, words = _neckdown(t, None if pads is None else pads.pads.get(net, {}))
-                g = groups.setdefault((seg.layer, seg.width_mm, neck), [0.0, words])
+                ko = plane_keepout(ir, t) if seg.keepout_mm > 0.0 else None
+                g = groups.setdefault((seg.layer, seg.width_mm, neck, ko), [0.0, words])
                 g[0] = float(g[0]) + math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1])
                 if not g[1]:
                     g[1] = words
-        for (layer, w, neck), (length, words) in groups.items():
+        for (layer, w, neck, ko), (length, words) in groups.items():
             row: dict[str, Any] = {"net": net, "layer": layer, "width_mm": w, "length_mm": round(float(length), 6)}
+            if ko is not None:  # a keep-out clears the plane under this copper: no microstrip there (tools/si/measure.py)
+                row.update(status=S.NOT_VERIFIED.value, reason=ko)
+                rows.append(row)
+                continue
             if neck:
                 row.update(status=S.NOT_APPLICABLE.value, reason=f"{words} ({w:g} mm < the controlled {width:g} mm): not judged")
                 necks.append(f"{net} {layer} {float(length):.3f} mm at {w:g} mm")

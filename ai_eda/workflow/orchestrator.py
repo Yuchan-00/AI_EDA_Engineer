@@ -277,23 +277,29 @@ class Orchestrator:
         can not leave an IR that hashes today and fails to load tomorrow.
         ``remove`` matches by design content (wall-clock ``created_at`` is not
         content) and raises when nothing matched: a removal that silently did
-        nothing is worse than one that fails.
+        nothing is worse than one that fails. Once the target's path reaches a
+        dict (``parameters``), the whole rest of the path is one key of it, so a
+        dotted parameter key (``parameters.rf.n_mult``, ``parameters.model.l_q.uhf``)
+        is set as that one key, never walked into.
         """
         # two phases: every proposal is resolved and validated first, then all are applied - a set of proposals
         # is one logical change, and a bad one must not leave the first half applied (and the hash moved)
         plan: list[Callable[[], None]] = []
         for p in proposals:
             obj: Any = ir
+            owner: Any = None
+            field_name = ""
             parts = p.target.split(".")
-            for part in parts[:-1]:
-                obj = obj[part] if isinstance(obj, dict) else getattr(obj, part)
-            leaf = parts[-1]
+            i = 0
+            while i < len(parts) - 1 and not isinstance(obj, dict):
+                owner, field_name = obj, parts[i]
+                obj = getattr(obj, parts[i])
+                i += 1
+            # a dict's key is the whole rest of the path: ``parameters.rf.n_mult`` is the parameter ``rf.n_mult``
+            leaf = ".".join(parts[i:]) if isinstance(obj, dict) else parts[i]
             if isinstance(obj, dict):
                 # the parent model's annotation names the value type of this dict (``parameters: dict[str, Traced]``)
-                owner: Any = ir
-                for part in parts[:-2]:
-                    owner = owner[part] if isinstance(owner, dict) else getattr(owner, part)
-                annotation = _field_annotation(owner, parts[-2]) if len(parts) >= 2 and isinstance(owner, BaseModel) else Any
+                annotation = _field_annotation(owner, field_name) if isinstance(owner, BaseModel) else Any
                 value_type = get_args(annotation)[1] if get_origin(annotation) is dict and len(get_args(annotation)) == 2 else Any
             else:
                 annotation = _field_annotation(obj, leaf)

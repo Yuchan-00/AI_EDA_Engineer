@@ -1,6 +1,6 @@
 """Placement tools.
 
-Two deterministic placers, both built from the extents of the verified
+Three deterministic placers, all built from the extents of the verified
 library footprints and guarded against touching extents or a part outside
 the outline:
 
@@ -12,6 +12,12 @@ the outline:
   direction of the pads they connect to, everything else on an outer ring at
   the board edge; the PCB agent uses it when a part has at least
   :data:`~ai_eda.tools.placement.core_ring.CORE_MIN_PADS` pads.
+* :mod:`ai_eda.tools.placement.rf_floorplan` - each RF block's parts packed
+  in shelves inside the block's region (``ir.rf.blocks[*].region``), in
+  chain order, the shield can first and its parts inside the can's fence,
+  keep-outs that forbid footprints avoided; a part or can that does not fit
+  is refused, never overlapped; the PCB agent uses it for every IR with
+  ``ir.rf.blocks``.
 
 Whether the resulting board is valid is decided exclusively by real
 ``kicad-cli`` DRC (:meth:`ai_eda.tools.kicad.cli.KicadCli.run_drc`), never

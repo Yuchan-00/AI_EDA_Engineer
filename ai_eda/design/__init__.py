@@ -12,6 +12,7 @@ from ai_eda.design.base import (
     AMBIGUOUS_KEYS,
     CHOICE_NOTE_PREFIX,
     CONFIRM_DESIGN_KEY,
+    DEFAULT_LAYER_POLICY,
     DESIGN_CATEGORIES,
     IGNORED_KEYS,
     NO_RECORD,
@@ -20,6 +21,7 @@ from ai_eda.design.base import (
     UNVERIFIED_SUBSTITUTE,
     Choice,
     DesignChange,
+    LayerPolicy,
     PartNote,
     Plan,
     Template,
@@ -43,6 +45,9 @@ from ai_eda.design.inputs import (
     MODULATION_KEY,
     MODULATIONS,
     PARSED_NOTE_PREFIX,
+    RADIO_BUILD_ALIASES,
+    RADIO_BUILD_KEY,
+    RADIO_BUILDS,
     RATIO_UNIT,
     RF_KEY_ALIASES,
     RF_UNIT_OF,
@@ -55,11 +60,27 @@ from ai_eda.design.inputs import (
     read_inputs,
     read_layer_count,
     read_modulation,
+    read_radio_build,
     read_value,
 )
-from ai_eda.design.stackup import GENERIC_STACKS, board_layers, generic_stackup, plane_zones, stackup_choices, with_planes
+from ai_eda.design.stackup import GENERIC_STACKS, board_layers, generic_stackup, layer_count_choice_text, plane_zones, stackup_choices, with_planes
 from ai_eda.design.library_parts import TemplateRefusal, library_component, pin_by_name
-from ai_eda.design.templates import TEMPLATES, Atmega128DevboardTemplate, AstableTemplate, DividerTemplate, LateLoad, LedTemplate, RcLowpassTemplate, design_from_requirements, late_load_changes, template_keys_text
+from ai_eda.design.templates import (
+    RF_FAMILY_MODULE,
+    RF_REGISTRY_MODULE,
+    TEMPLATES,
+    Atmega128DevboardTemplate,
+    AstableTemplate,
+    DividerTemplate,
+    LateLoad,
+    LedTemplate,
+    RcLowpassTemplate,
+    all_templates,
+    design_from_requirements,
+    late_load_changes,
+    rf_templates,
+    template_keys_text,
+)
 
 __all__ = [
     "AMBIGUOUS_KEYS",
@@ -71,6 +92,17 @@ __all__ = [
     "RF_KEY_ALIASES",
     "RF_UNIT_OF",
     "SYMMETRIC_TOLERANCE_KEYS",
+    "RADIO_BUILDS",
+    "RADIO_BUILD_ALIASES",
+    "RADIO_BUILD_KEY",
+    "RF_FAMILY_MODULE",
+    "RF_REGISTRY_MODULE",
+    "DEFAULT_LAYER_POLICY",
+    "LayerPolicy",
+    "all_templates",
+    "layer_count_choice_text",
+    "read_radio_build",
+    "rf_templates",
     "read_modulation",
     "DEFAULT_LAYER_COUNT",
     "GENERIC_STACKS",

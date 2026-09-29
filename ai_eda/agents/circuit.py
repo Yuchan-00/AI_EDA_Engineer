@@ -87,8 +87,8 @@ from ai_eda.design import (
     CONFIRM_DESIGN_KEY,
     DESIGN_CATEGORIES,
     IGNORED_KEYS,
-    TEMPLATES,
     Plan,
+    all_templates,
     canonical_key,
     check_inputs_vs_requirements,
     design_from_requirements,
@@ -263,7 +263,7 @@ def _trace_ambiguous(ir: CircuitIR, plan: Plan, notes: list[str]) -> None:
     same thing the template decided. Nothing changes for a plan without such
     a requirement.
     """
-    template = next((t for t in TEMPLATES if t.id == plan.template), None)
+    template = next((t for t in all_templates() if t.id == plan.template), None)
     if template is None:
         return
     extra: dict[str, list[str]] = {}

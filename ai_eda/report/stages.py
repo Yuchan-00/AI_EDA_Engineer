@@ -73,7 +73,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ai_eda.design import TEMPLATES
+from ai_eda.design import all_templates
 from ai_eda.design.base import CHOICE_NOTE_PREFIX, NO_RECORD, TOOL_ID, PartNote, Template, TheorySection, parameter_value, quantity
 from ai_eda.design.templates import display_spelled
 from ai_eda.errors import CompileError
@@ -254,7 +254,7 @@ def template_for(ir: CircuitIR) -> Template | None:
     found = template_of(ir)
     if found is None:
         return None
-    for t in TEMPLATES:
+    for t in all_templates():  # the radio family's templates too
         if t.id == found[0]:
             return t
     return None

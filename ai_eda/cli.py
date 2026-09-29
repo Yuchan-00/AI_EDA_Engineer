@@ -212,7 +212,7 @@ RUN_OPTIONS: tuple[RunOption, ...] = (
     RunOption(
         "--answer", "answer", "append", "KEY=VALUE",
         "answer an open question; confirm_requirements=yes, accept_implicit=k1,k2, reject_implicit=k3 steer the LLM extraction; "
-        "mains_powered=yes|no, radio=yes|no, finished_apparatus=yes|no, evaluation_kit=yes|no, digital_device=yes|no, "
+        "mains_powered=yes|no, radio=yes|no, finished_apparatus=yes|no, evaluation_kit=yes|no, digital_device=yes|no, kr_licence_free_class=yes|no, "
         "highest_rated_voltage='12 V DC', intended_use=... are the regulatory scope answers; "
         "confirm_parts=yes|no decides the candidate-parts table; datasheet_facts_file=<json> grounds your datasheet facts "
         "(layouts: ai_eda.parts.datasheet_facts.load_facts_file); extract_datasheet_facts=yes and propose_regulations=yes ask the model (billed); "

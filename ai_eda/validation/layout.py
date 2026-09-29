@@ -31,6 +31,12 @@ Both checks are conservative, so a claim is real:
   copper reaching any of them reaches the pad. A net whose pads a copper
   pour (``ir.pcb.zones``) may join is NOT_VERIFIED, never FAIL: whether the
   fill reaches a pad is decided by KiCad's fill and DRC, not by the polygon.
+  A net whose pours all lie on inner layers - a plane, whose pads the router
+  joins by a via each (routing.maze 0.4, a board with keep-outs or RF
+  blocks) - says so: connected only through a plane fill the IR does not
+  measure. A copper set of such a net that no pour can reach at all (no via
+  in it, no pad or track on a pour layer: an SMD pad on ``F.Cu`` without a
+  via can never meet an ``In1.Cu`` plane) is a FAIL row naming its pads.
   Nets with fewer than two pads have nothing to connect (NOT_APPLICABLE
   rows).
 * **clearance** - judged only against ``ir.pcb.manufacturing.min_clearance_mm``
@@ -114,6 +120,14 @@ conservative text-box *estimate*, not KiCad's font metrics). References on
   message names the provenance). A key without a limit in the IR is a
   NOT_VERIFIED row naming it; the result is the worst row.
 
+Keep-outs (:class:`KeepoutValidator`, tool ``pcb.keepout``, only for a
+board with ``ir.pcb.keepouts`` or RF blocks with a region or a shield can):
+nothing a keep-out forbids lies in it (footprints, pads, tracks, vias,
+zones - each with its named exceptions), every block part lies inside its
+region and every part under a can inside the can's fence. The compiled
+KiCad rule areas cannot carry the exceptions (they are cut out of the rule
+area's polygon), so only this check knows them.
+
 An IR silk text the compiler refuses
 (:func:`~ai_eda.tools.silkscreen.geometry.silk_text_problems`: a layer the
 board lacks, a non-finite number, a reference to no component ...) FAILs all
@@ -124,12 +138,13 @@ three. KiCad's DRC ``silk_over_copper`` / ``silk_overlap`` /
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
-from ai_eda.ir import CircuitIR, PCBDesign, Track, ValidationResult, ValidationStatus, Via
+from ai_eda.ir import BoardSide, CircuitIR, PCBDesign, Track, ValidationResult, ValidationStatus, Via
 from ai_eda.tools.kicad.geometry import _q, pad_angle, pad_center, pad_layers
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError
 from ai_eda.tools.silkscreen.geometry import (
@@ -165,6 +180,10 @@ __all__ = [
     "SILK_TO_PAD_MM",
     "SILK_TO_EDGE_MM",
     "SilkscreenValidator",
+    "KEEPOUT_CHECK",
+    "KEEPOUT_TOOL_ID",
+    "KEEPOUT_TOOL_VERSION",
+    "KeepoutValidator",
 ]
 
 TOOL_ID = "pcb.routing"
@@ -198,6 +217,8 @@ class _PadItem:
     hh: float
     r_in: float  # radius of the inscribed circle
     layers: frozenset[str]
+    #: the box is the pad's copper exactly (a ``rect`` pad at a multiple of 90 degrees)
+    exact: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,7 +409,8 @@ class _Board:
                 label = f"{comp.ref}.{pad.number}" if pad.number else f"{comp.ref}.(unnumbered)"
                 if pad.number:
                     self.pad_labels.add(label)
-                self.pads.append(_PadItem(label, net, cx, cy, hw, hh, min(pad.size_w, pad.size_h) / 2.0, copper))
+                exact = pad.shape == "rect" and math.isclose(angle % 90.0, 0.0, abs_tol=1e-9)
+                self.pads.append(_PadItem(label, net, cx, cy, hw, hh, min(pad.size_w, pad.size_h) / 2.0, copper, exact))
         self.track_total, self.via_total = len(pcb.tracks), len(pcb.vias)
         #: FAIL rows for tracks / vias that cannot be copper (non-finite coordinate, non-positive width / drill / diameter);
         #: such an item is in neither ``tracks`` nor ``vias``: it joins nothing and is compared with nothing
@@ -508,7 +530,20 @@ def connectivity_rows(ir: CircuitIR, board: _Board) -> tuple[list[dict[str, Any]
                     uf.union(i, j)
         root = uf.find(0)
         left_out = list(dict.fromkeys(p.label for k, p in enumerate(pads) if uf.find(k) != root))
-        if left_out and zones:
+        cut_off = _unreachable_by_pour(items, uf, len(pads), [layer for _, zone_net, layer in board.zones if zone_net == net.name]) if left_out and zones else []
+        if cut_off:
+            row.update(
+                status=str(ValidationStatus.FAIL), unconnected=cut_off,
+                message=(f"{', '.join(cut_off)} not connected: no track / via of the net reaches them and their copper is on no layer of "
+                         f"its pour {', '.join(zones)} (only a via or a through-hole barrel reaches an inner plane)"),
+            )
+        elif left_out and zones and all(_INNER_RE.match(layer) for _, zone_net, layer in board.zones if zone_net == net.name):
+            row.update(
+                status=str(ValidationStatus.NOT_VERIFIED), unconnected=left_out, plane=True,
+                message=(f"{', '.join(left_out)} not joined to {labels[0]} by tracks; each reaches the plane {', '.join(zones)} by a via or a "
+                         "through-hole barrel: connected only through a plane fill the IR does not measure (KiCad's fill and DRC decide)"),
+            )
+        elif left_out and zones:
             row.update(
                 status=str(ValidationStatus.NOT_VERIFIED), unconnected=left_out,
                 message=f"{', '.join(left_out)} not joined to {labels[0]} by tracks / vias; whether the copper pour {', '.join(zones)} reaches them is decided by KiCad's fill and DRC, not by the polygon",
@@ -519,6 +554,23 @@ def connectivity_rows(ir: CircuitIR, board: _Board) -> tuple[list[dict[str, Any]
             row.update(status=str(ValidationStatus.PASS), message=f"{len(labels)} pad(s) in one copper set")
         rows.append(row)
     return rows, item_rows
+
+
+#: an inner copper layer (a plane layer of a 4-layer board)
+_INNER_RE = re.compile(r"^In[1-9][0-9]*\.Cu$")
+
+
+def _unreachable_by_pour(items: list[_Item], uf: _UnionFind, n_pads: int, zone_layers: list[str]) -> list[str]:
+    """The pads of every copper set that no pour of the net can reach: none of its items is a via, a pad or a track on a pour layer."""
+    layers = set(zone_layers)
+    reach: dict[int, bool] = {}
+    for k, item in enumerate(items):
+        root = uf.find(k)
+        ok = isinstance(item, _ViaItem) or bool(_item_layers(item) & layers)
+        reach[root] = reach.get(root, False) or ok
+    if len({uf.find(k) for k in range(n_pads)}) < 2:
+        return []
+    return list(dict.fromkeys(items[k].label for k in range(n_pads) if not reach[uf.find(k)]))
 
 
 # --------------------------------------------------------------------------- clearance
@@ -943,3 +995,237 @@ class SilkscreenValidator(Validator):
 
 
 default_registry.register(SilkscreenValidator())
+
+
+# --------------------------------------------------------------------------- keep-outs, block regions, shield-can fences
+
+KEEPOUT_TOOL_ID = "pcb.keepout"
+KEEPOUT_TOOL_VERSION = "0.1"
+KEEPOUT_CHECK = "pcb.keepout"
+#: what the keep-out check says about KiCad
+KEEPOUT_NOT_DRC = "IR geometry, not DRC; KiCad's DRC reads the compiled rule areas, which know no exception"
+
+
+class KeepoutValidator(Validator):
+    """``pcb.keepout``: nothing a keep-out forbids lies in it, every block part lies in its region, every part under a can inside its fence.
+
+    Applies only to a board with keep-outs (``ir.pcb.keepouts``) or RF blocks
+    with a region or a shield can (``ir.rf.blocks``); every other design gets
+    no row. IR geometry (the keep-out areas through
+    :mod:`ai_eda.tools.keepout`, the pads as in the routing checks above),
+    never DRC:
+
+    * **footprints** - a placed part's extent (courtyard union pads, the box
+      the placers measure) sharing area with the keep-out on its side's
+      copper layer, unless its ref is in ``allowed_refs``;
+    * **pads** - a pad on a covered copper layer whose copper shares area with
+      it (a ``rect`` pad at a multiple of 90 degrees by its box, any other
+      shape by its inscribed circle for a FAIL; a pad whose bounding box
+      reaches the area but whose inscribed circle does not is NOT_VERIFIED),
+      unless its ref is in ``allowed_refs`` or its net in ``allowed_nets``;
+    * **tracks** - a track on a covered layer whose centreline comes closer
+      than half its width; **vias** - a through via (on every copper layer)
+      whose disc reaches the area when any board layer is covered;
+      **zones** - a zone on a covered layer whose polygon shares area with it
+      (two non-convex polygons: NOT_VERIFIED, not computed) - each unless
+      its net is in ``allowed_nets``;
+    * **regions** - every ref of a block with a region has its placed extent
+      inside the region; **fences** - every other part of a block with a
+      shield can lies strictly inside the can's fence (read from its pads,
+      :func:`~ai_eda.tools.placement.rf_floorplan.placed_fence_box`; the
+      least distance to the fence is recorded as ``ring_mm``).
+
+    FAIL on any violation; NOT_VERIFIED when something could not be judged
+    (no KiCad library, a footprint not on disk, a pad whose copper is not
+    bounded by its box, a fence not read, an unplaced block part); PASS only
+    when every item was compared; NOT_APPLICABLE when nothing is placed or
+    routed yet.
+    """
+
+    id = KEEPOUT_CHECK
+    description = "Keep-outs, RF block regions and shield-can fences on the IR geometry (not DRC)"
+
+    def applies_to(self, ir: CircuitIR) -> bool:
+        from ai_eda.tools.keepout import keepouts_of
+        from ai_eda.tools.placement.rf_floorplan import region_box, rf_blocks
+
+        return bool(keepouts_of(ir.pcb)) or any(region_box(b) is not None or getattr(b, "shield_ref", None) for b in rf_blocks(ir))
+
+    def _result(self, status: ValidationStatus, message: str, **details: Any) -> ValidationResult:
+        return ValidationResult(check_id=self.id, status=status, message=f"{message} ({KEEPOUT_NOT_DRC})", tool=KEEPOUT_TOOL_ID,
+                                tool_version=KEEPOUT_TOOL_VERSION, details={"kind": KIND, **details})
+
+    def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
+        from ai_eda.tools import keepout as ko_geom
+        from ai_eda.tools.kicad.geometry import footprint_bbox
+        from ai_eda.tools.placement.rf_floorplan import placed_fence_box, region_box, rf_blocks
+
+        pcb = ir.pcb
+        if pcb is None or not (pcb.placements or pcb.tracks or pcb.vias or pcb.zones):
+            return [self._result(ValidationStatus.NOT_APPLICABLE, "nothing placed or routed yet: no footprint, pad or copper to compare")]
+        library = ctx.tools.get("kicad_library")
+        unknown: list[str] = []
+        parts: dict[str, tuple[Any, Any]] = {}  # ref -> (placement, footprint)
+        board: _Board | None = None
+        if isinstance(library, KicadLibrary):
+            for comp in sorted(ir.components, key=lambda c: natural_ref_key(c.ref)):
+                placement = pcb.placement(comp.ref)
+                if placement is None or comp.footprint is None:
+                    continue
+                try:
+                    parts[comp.ref] = (placement, library.load_footprint(comp.footprint))
+                except LibraryLookupError:
+                    unknown.append(f"footprint {comp.footprint.library}:{comp.footprint.name} of {comp.ref} was not found in a KiCad library")
+                except CompileError as e:
+                    unknown.append(f"footprint {comp.footprint.library}:{comp.footprint.name} of {comp.ref}: {e}")
+            board = _Board(ir, library)
+            unknown.extend(u for u in board.unknown if u not in unknown and "has no placement" not in u)
+        else:
+            unknown.append("no KiCad library: footprint extents and pads unknown")
+        copper_layers = [layer.name for layer in pcb.layers]
+        rows: list[dict[str, Any]] = []
+        summaries: list[dict[str, Any]] = []
+
+        def row(status: ValidationStatus, what: str, message: str, **extra: Any) -> None:
+            rows.append({"item": what, "status": str(status), "message": message, **extra})
+
+        for k in ko_geom.keepouts_of(pcb):
+            kid = ko_geom.keepout_id(k)
+            pts = ko_geom.area_points(k)
+            bbox = ko_geom.area_bbox(pts)
+            refs, nets = set(ko_geom.allowed_refs(k)), set(ko_geom.allowed_nets(k))
+            layers = ko_geom.covered_layers(k, copper_layers)
+            info: dict[str, Any] = {"id": kid, "layers": layers, "forbids": [i for i in ko_geom.KEEPOUT_ITEMS if ko_geom.forbids(k, i)],
+                                    "allowed_refs": sorted(refs), "allowed_nets": sorted(nets), "reason": str(getattr(k, "reason", "") or ""),
+                                    "compared": 0, "exempt": []}
+            summaries.append(info)
+            at = f"keep-out {kid}"
+
+            def near(box: tuple[float, float, float, float], bbox: tuple[float, float, float, float] = bbox) -> bool:
+                return box[0] < bbox[2] and bbox[0] < box[2] and box[1] < bbox[3] and bbox[1] < box[3]
+
+            if ko_geom.forbids(k, "footprints"):
+                for ref, (placement, fp) in parts.items():
+                    side = "F.Cu" if placement.side == BoardSide.TOP else "B.Cu"
+                    if side not in layers:
+                        continue
+                    e = footprint_bbox(placement, fp)
+                    if e is None:
+                        continue
+                    info["compared"] += 1
+                    box = (e.x1, e.y1, e.x2, e.y2)
+                    if near(box) and ko_geom.box_area_overlap(box, pts) > 0.0:
+                        if ref in refs:
+                            info["exempt"].append(f"footprint {ref}")
+                        else:
+                            row(ValidationStatus.FAIL, f"footprint {ref}", f"{at} forbids footprints; the extent of {ref} lies in it", keepout=kid)
+            if ko_geom.forbids(k, "pads") and board is not None:
+                for pad in board.pads:
+                    if not (pad.layers & set(layers)):
+                        continue
+                    info["compared"] += 1
+                    box = _pad_box(pad)
+                    if not near(box) or ko_geom.box_area_overlap(box, pts) <= 0.0:
+                        continue
+                    ref = pad.label.split(".", 1)[0]
+                    if ref in refs or (pad.net is not None and pad.net in nets):
+                        info["exempt"].append(f"pad {pad.label}")
+                    elif pad.exact or ko_geom.point_area_distance((pad.cx, pad.cy), pts) < pad.r_in:
+                        row(ValidationStatus.FAIL, f"pad {pad.label}", f"{at} forbids pads; the copper of {pad.label} lies in it", keepout=kid)
+                    else:
+                        row(ValidationStatus.NOT_VERIFIED, f"pad {pad.label}",
+                            f"{at} forbids pads; the bounding box of {pad.label} reaches it but its copper shape is not judged here", keepout=kid)
+            if ko_geom.forbids(k, "tracks") and board is not None:
+                for t in board.tracks:
+                    if t.layer not in layers:
+                        continue
+                    info["compared"] += 1
+                    if ko_geom.segment_area_distance(t.a, t.b, pts) < t.w / 2.0 - 1e-9:
+                        if t.net in nets:
+                            info["exempt"].append(t.label)
+                        else:
+                            row(ValidationStatus.FAIL, t.label, f"{at} forbids tracks on {t.layer}; {t.label} ({t.net}) reaches into it", keepout=kid)
+            if ko_geom.forbids(k, "vias") and board is not None and layers:
+                for v in board.vias:
+                    info["compared"] += 1
+                    if ko_geom.point_area_distance((v.x, v.y), pts) < v.d / 2.0 - 1e-9:
+                        if v.net in nets:
+                            info["exempt"].append(v.label)
+                        else:
+                            row(ValidationStatus.FAIL, v.label, f"{at} forbids vias; {v.label} ({v.net}) reaches into it", keepout=kid)
+            if ko_geom.forbids(k, "zones"):
+                for i, z in enumerate(pcb.zones):
+                    if z.layer not in layers or len(z.polygon) < 3:
+                        continue
+                    info["compared"] += 1
+                    label = f"zone[{i}:{z.net}]"
+                    area = ko_geom.polygon_overlap_area([(float(x), float(y)) for x, y in z.polygon], pts)
+                    if area is None:
+                        row(ValidationStatus.NOT_VERIFIED, label,
+                            f"{at} forbids zones; {label} and the keep-out are both non-convex: their overlap is not computed here", keepout=kid)
+                    elif area > 0.0:
+                        if z.net in nets:
+                            info["exempt"].append(label)
+                        else:
+                            row(ValidationStatus.FAIL, label, f"{at} forbids zones on {z.layer}; {label} covers {area:.3f} mm^2 of it", keepout=kid)
+        regions: list[dict[str, Any]] = []
+        for b in rf_blocks(ir):
+            bid = str(getattr(b, "id", "?"))
+            box = region_box(b)
+            members = list(getattr(b, "refs", []) or [])
+            if box is not None:
+                region: dict[str, Any] = {"block": bid, "region": list(box), "refs": members, "outside": []}
+                regions.append(region)
+                for ref in members:
+                    if ref not in parts:
+                        if pcb.placements:
+                            row(ValidationStatus.NOT_VERIFIED, f"block {bid}: {ref}", f"{ref} of block {bid} is not placed (or its footprint is unknown)", block=bid)
+                        continue
+                    e = footprint_bbox(*parts[ref])
+                    if e is not None and (e.x1 < box[0] - 1e-6 or e.y1 < box[1] - 1e-6 or e.x2 > box[2] + 1e-6 or e.y2 > box[3] + 1e-6):
+                        region["outside"].append(ref)
+                        row(ValidationStatus.FAIL, f"block {bid}: {ref}",
+                            f"the extent of {ref} ({e.x1:g}, {e.y1:g})-({e.x2:g}, {e.y2:g}) leaves the region of block {bid} "
+                            f"({box[0]:g}, {box[1]:g})-({box[2]:g}, {box[3]:g})", block=bid)
+            can = getattr(b, "shield_ref", None)
+            if can is None:
+                continue
+            if can not in parts:
+                if pcb.placements:
+                    row(ValidationStatus.NOT_VERIFIED, f"can {can}", f"the shield can {can} of block {bid} is not placed (or its footprint is unknown)", block=bid)
+                continue
+            fence = placed_fence_box(*parts[can])
+            if fence is None:
+                row(ValidationStatus.NOT_VERIFIED, f"can {can}", f"the fence of the shield can {can} could not be read from its pads", block=bid)
+                continue
+            ring: float | None = None
+            for ref in members:
+                if ref == can or ref not in parts:
+                    continue
+                e = footprint_bbox(*parts[ref])
+                if e is None:
+                    continue
+                gap = min(e.x1 - fence.x1, fence.x2 - e.x2, e.y1 - fence.y1, fence.y2 - e.y2)
+                ring = gap if ring is None else min(ring, gap)
+                if gap <= 1e-6:
+                    row(ValidationStatus.FAIL, f"can {can}: {ref}", f"{ref} of block {bid} is not inside the fence of its can {can} (by {gap:.3f} mm)", block=bid)
+            regions.append({"block": bid, "can": can, "fence": [fence.x1, fence.y1, fence.x2, fence.y2], "ring_mm": None if ring is None else _q(ring)})
+        details: dict[str, Any] = {"keepouts": summaries, "regions": regions, "rows": rows, "unknown": unknown}
+        failed = [r for r in rows if r["status"] == str(ValidationStatus.FAIL)]
+        open_rows = [r for r in rows if r["status"] == str(ValidationStatus.NOT_VERIFIED)]
+        if failed:
+            return [self._result(ValidationStatus.FAIL, f"{len(failed)} violation(s): " + "; ".join(r["message"] for r in failed), **details, repair="human")]
+        if open_rows or unknown:
+            return [self._result(ValidationStatus.NOT_VERIFIED, "not every item could be judged: " + "; ".join([*(r["message"] for r in open_rows), *unknown]),
+                                 **details)]
+        n_ko, n_reg = len(summaries), sum(1 for r in regions if "region" in r)
+        n_can = sum(1 for r in regions if "can" in r)
+        exempt = sum(len(s["exempt"]) for s in summaries)
+        return [self._result(
+            ValidationStatus.PASS,
+            f"{n_ko} keep-out(s): nothing they forbid lies in them ({exempt} allowed item(s) named as exceptions); "
+            f"{n_reg} block region(s) hold their parts; {n_can} can fence(s) hold their block's parts", **details,
+        )]
+
+
+default_registry.register(KeepoutValidator())

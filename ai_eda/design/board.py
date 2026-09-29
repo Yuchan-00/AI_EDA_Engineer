@@ -22,13 +22,21 @@ or a registered calculator's output over those (``derived``, re-derived by
   crystal-loop length, the ISP timing path and the supply-rail minimum width.
 
 The stack: ``pcb_layers`` (alias ``layer_count``) read by
-:func:`~ai_eda.design.inputs.read_layer_count`; without it the default 2
-layers, shown as a choice. A 4-layer stack puts the ground plane on
-``In1.Cu`` and the template's supply net (:attr:`Template.plane_nets`) on
-``In2.Cu``, and adds the plane edge clearance as the parameter
-:data:`PLANE_CLEARANCE_KEY` (the PCB agent draws the plane zones from it).
-An IR that already carries a stack (a fab's, the user's) keeps it: the
-template proposes no stack then and says so.
+:func:`~ai_eda.design.inputs.read_layer_count` under the template's
+:attr:`~ai_eda.design.base.Template.layer_policy` (:func:`read_board_layers`);
+without it the policy's default (2 layers unless the template states
+another), shown as a choice. A stated count the policy does not allow refuses
+the template with the policy's reason - before any missing input is asked
+for (:func:`layer_policy_refusal`, called by the selection). A 4-layer stack
+puts the ground plane on ``In1.Cu`` and the template's supply net
+(:attr:`Template.plane_nets`) on ``In2.Cu``, and adds the plane edge
+clearance as the parameter :data:`PLANE_CLEARANCE_KEY` (the PCB agent draws
+the plane zones from it). An IR that already carries a stack (a fab's, the
+user's) keeps it: the template proposes no stack then and says so - unless
+the template's policy restricts the counts and that stack's count is not one
+of them (a 2-layer stack under a template whose lines need a plane), which
+refuses the template. The generic policy never refuses an existing stack, so
+every template without its own policy behaves exactly as before.
 """
 
 from __future__ import annotations
@@ -36,10 +44,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from ai_eda.ir import CircuitIR, NetClass, PCBDesign, Provenance, SIConstraints, Stackup, TimingPath, Traced
+from ai_eda.ir import CircuitIR, MissingInformation, NetClass, PCBDesign, Provenance, SIConstraints, Stackup, TimingPath, Traced
 
 from ai_eda.design.base import Choice, DesignChange, Plan, choice_provenance, structural_provenance
-from ai_eda.design.inputs import LAYER_COUNT_KEY, DesignInput, read_layer_count
+from ai_eda.design.inputs import LAYER_COUNT_KEY, DesignInput, LayerCountInput, read_layer_count
 from ai_eda.design.stackup import PLANE_EDGE_CLEARANCE_MM, board_layers, generic_stackup, stackup_choices
 
 if TYPE_CHECKING:
@@ -146,10 +154,60 @@ def path_line(p: TimingPath) -> str:
     )
 
 
+def _not_allowed(template: Template, layers: LayerCountInput) -> str:
+    """Why a stated layer count refuses ``template`` (its policy does not build it)."""
+    policy = template.layer_policy
+    rid = layers.requirement.id if layers.requirement is not None else LAYER_COUNT_KEY
+    return (f"{rid}: {layers.value} layers is not a count template {template.id} builds (it builds {policy.allowed_text()} layers)"
+            + (f": {policy.reason.strip()}" if policy.reason.strip() else ""))
+
+
+def read_board_layers(template: Template, ir: CircuitIR) -> tuple[LayerCountInput | None, str | None]:
+    """``(layers, None)`` with the board's layer count under ``template``'s layer policy, or ``(None, why)``.
+
+    :func:`~ai_eda.design.inputs.read_layer_count` reads the stated count (an
+    unreadable, ambiguous or non-generic one is refused there); no stated
+    count gives the policy's default (still ``is_default``: a choice the table
+    shows); a stated count the policy does not allow is refused with the
+    policy's reason. Under the generic policy this is ``read_layer_count``.
+    """
+    layers, why = read_layer_count(ir)
+    if layers is None:
+        return None, why
+    policy = template.layer_policy
+    if layers.is_default:
+        return (layers if layers.value == policy.default else LayerCountInput(value=policy.default)), None
+    if layers.value not in policy.allowed:
+        return None, _not_allowed(template, layers)
+    return layers, None
+
+
+def layer_policy_refusal(template: Template, ir: CircuitIR) -> MissingInformation | None:
+    """A non-required question under the requirement's own key when a stated, readable count is outside ``template``'s policy; else ``None``.
+
+    The selection calls it before it asks for any missing input: an input the
+    user already stated that refuses the template makes every answer to a
+    required question useless. The requirement exists, so the question asks
+    for the requirement to change (or another design), never for an
+    ``--answer`` under its key (a typed value is kept).
+    """
+    layers, _why = read_layer_count(ir)
+    if layers is None or layers.is_default or layers.requirement is None or layers.value in template.layer_policy.allowed:
+        return None
+    why = _not_allowed(template, layers)
+    return MissingInformation(
+        key=layers.requirement.key, required=False,
+        question=(f"{why}; no template design was proposed. Change the requirement to {template.layer_policy.allowed_text()} layers "
+                  f"(or leave it out: the template's default is {template.layer_policy.default} layers), or choose another design."),
+        rationale=why,
+    )
+
+
 def add_board(template: Template, ir: CircuitIR, plan: Plan, *, confirmed: bool) -> str | None:
     """Append the board's stack and SI classes to a buildable ``plan`` (choices, inputs, table lines, changes); the refusal reason otherwise."""
     t = template.id
-    layers, why = read_layer_count(ir)
+    policy = template.layer_policy
+    layers, why = read_board_layers(template, ir)
     if layers is None:
         return f"{LAYER_COUNT_KEY}: {why}"
     params = _plan_params(plan)
@@ -160,10 +218,13 @@ def add_board(template: Template, ir: CircuitIR, plan: Plan, *, confirmed: bool)
     power = power or ground
     stack: Stackup | None
     if existing is not None:
+        if policy.restricts and existing.layer_count not in policy.allowed:
+            return (f"{LAYER_COUNT_KEY}: the IR's own {existing.layer_count}-layer stack is not a count template {t} builds "
+                    f"(it builds {policy.allowed_text()} layers): {policy.reason.strip()}")
         stack = existing
         plan.board.append(f"stackup: the IR's own {existing.layer_count}-layer stack is kept (no generic stack proposed)")
     else:
-        plan.choices.extend(stackup_choices(layers, ground_net=ground, power_net=power))
+        plan.choices.extend(stackup_choices(layers, ground_net=ground, power_net=power, policy=policy))
         stack = generic_stackup(layers.value, t, confirmed=confirmed, ground_net=ground, power_net=power)
         if layers.traced is not None:  # the count is the user's: the stack's provenance says which requirement it serves
             inp = DesignInput(key=LAYER_COUNT_KEY, requirement=layers.requirement, traced=layers.traced)  # type: ignore[arg-type]
@@ -244,5 +305,7 @@ __all__ = [
     "SIDeclarations",
     "add_board",
     "class_line",
+    "layer_policy_refusal",
     "path_line",
+    "read_board_layers",
 ]

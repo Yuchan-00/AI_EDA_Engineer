@@ -373,6 +373,7 @@ APP_HTML = r"""<!doctype html>
 <select id="val-group">
 <option value="all">모든 검사</option>
 <option value="si">신호 무결성 (si.* / spice.si.*)</option>
+<option value="rf">RF (rf.* / spice.rf.* / block.interface.* / power.*)</option>
 </select>
 <span id="val-count" class="muted" role="status"></span>
 </div>
@@ -2117,7 +2118,10 @@ function drawValidation() {
   const filter = $('val-filter').value;
   const group = $('val-group').value;
   const known = ['PASS', 'FAIL', 'NOT_VERIFIED'];
-  const inGroup = (r) => group !== 'si' || r.check_id.startsWith('si.') || r.check_id.startsWith('spice.si.');
+  const rfPrefixes = ['rf.', 'spice.rf.', 'block.interface.', 'power.rail_budget.', 'power.headroom.'];
+  const rfIds = ['domain.rf.impedance', 'si.rf_length'];
+  const inGroup = (r) => (group === 'si' ? r.check_id.startsWith('si.') || r.check_id.startsWith('spice.si.')
+    : group === 'rf' ? rfPrefixes.some((p) => r.check_id.startsWith(p)) || rfIds.includes(r.check_id) : true);
   const rows = v.latest.filter((r) => inGroup(r) && (filter === 'all' || (filter === 'other' ? !known.includes(r.status) : r.status === filter)));
   $('val-count').textContent = rows.length + '개 표시 / 전체 ' + v.latest.length + '개';
   const view = $('val-view');

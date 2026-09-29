@@ -243,7 +243,7 @@ def test_read_modulation_takes_exactly_one_confirmed_name() -> None:
 
 
 def test_the_extraction_prompt_names_every_rf_key_and_the_level_units() -> None:
-    assert EXTRACTION_VERSION == "0.3"
+    assert EXTRACTION_VERSION == "0.4"
     for key in (*RF_KEY_ALIASES, "modulation", "battery_voltage"):
         assert key in REQUIREMENT_EXTRACTION_SYSTEM, key
     for unit in ("dBm", "dBW", "dBc", "dBi", "dBuV/m", "ppm", "V/m"):

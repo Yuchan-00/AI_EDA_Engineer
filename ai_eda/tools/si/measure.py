@@ -9,15 +9,37 @@ said, never replaced by a number:
 * no stackup -> no delay and no impedance (:data:`~ai_eda.tools.calc.tline.NO_STACKUP`);
 * a track on a layer whose adjacent copper is not a plane has no impedance
   (:data:`~ai_eda.tools.calc.tline.NO_REFERENCE_PLANE`). Its delay is
-  bounded, not computed: a line's field lies partly in the dielectric and
-  partly in air, so its effective permittivity is at most the dielectric's
-  er and its delay per length at most ``calc.tline.tpd(er)`` = sqrt(er)/c0.
+  bounded, not computed: a line's field lies partly in the dielectrics and
+  partly in air, so its effective permittivity is at most the largest er
+  its field can reach - with no plane to stop it, every dielectric of the
+  stack (on a 2-layer board the one dielectric; on a stack whose core er
+  exceeds the prepreg's, the core's) - and its delay per length at most
+  ``calc.tline.tpd(er_max)`` = sqrt(er_max)/c0 (the via barrel's bound too).
   The bound is conservative for the critical-length rule (it makes a line
   look longer, never shorter) and every result that uses it says so
-  (``bound``);
+  (``bound``); the ids name the dielectric whose er it is;
 * over a plane the segment is a microstrip: Z0 and e_eff from
   ``calc.tline.microstrip.*`` (Hammerstad & Jensen) at the routed width, the
   delay per length ``calc.tline.tpd(e_eff)``.
+
+* over a plane *layer* whose zone a keep-out forbids under the track (a
+  ``PCBDesign.keepouts`` area that forbids ``zones`` on the reference layer
+  and does not allow the plane's net, :func:`plane_keepout`; a polygon
+  keep-out by its bounding box, exactly as the PCB agent clips the plane
+  zones, so the two never disagree - conservative) there is no
+  reference plane either: "over a plane" is decided per layer by the
+  stackup, and a keep-out that clears the plane from under a feed line must
+  not leave it judged as a microstrip. Such a track is counted apart in its
+  segment (``keepout_mm`` / ``keepout_reason`` / ``keepout_id``): it has no
+  impedance (the impedance check makes it NOT_VERIFIED with that reason) and
+  its delay is the no-plane upper bound, like a track without a plane - the
+  largest er of the stack (``keepout_bound`` names it: with the plane
+  cleared the field reaches the core toward the next plane). Every check
+  that reports such a net as having no reference plane names the keep-out
+  (:func:`no_plane_reason`) - "use pcb_layers=4 or add a plane" is the
+  remedy only for a layer the stack gives no plane. Where the copper merely
+  comes near the plane's edge the fringing field is not judged. A board
+  without keep-outs is measured exactly as before.
 
 A via is a through via (the compiler writes it so): its barrel spans the
 stack from ``F.Cu`` to ``B.Cu`` (:meth:`~ai_eda.ir.Stackup.span_mm`) and its
@@ -43,6 +65,7 @@ import math
 from dataclasses import dataclass, field
 
 from ai_eda.ir import CircuitIR, Stackup
+from ai_eda.tools.keepout import allowed_nets, area_bbox, area_points, covers_layer, forbids, keepout_id, keepouts_of, segment_area_distance
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.si.paths import NetPath, longest_path, net_pads
 from ai_eda.tools.calc.tline import (
@@ -59,6 +82,53 @@ SI_TOOL = "si"
 SI_VERSION = "0.1"
 #: what every SI result says it is
 NOT_DRC = "IR geometry + calculators, not DRC; the fab's measured impedance is the only real one"
+#: how the reason of a track without a reference plane because of a keep-out begins (:func:`plane_keepout`)
+KEEPOUT_NO_PLANE = f"{NO_REFERENCE_PLANE} under keep-out"
+
+
+def _zone_keepouts(ir: CircuitIR) -> list:
+    """The board's keep-outs that forbid zones (empty for a board without keep-outs)."""
+    return [k for k in keepouts_of(ir.pcb) if forbids(k, "zones")]
+
+
+def _track_plane_keepout(stackup: Stackup | None, track, keepouts: list) -> tuple[str, str] | None:
+    """``(keep-out id, reason)`` of the first zone keep-out that clears the track's plane from under its copper, or ``None``."""
+    if not keepouts or stackup is None:
+        return None
+    geom, _why = line_geometry(stackup, track.layer)
+    if geom is None:
+        return None  # no plane in the stack under this layer anyway
+    layer, net = geom.reference_layer, str(geom.reference_net)
+    a = (float(track.start[0]), float(track.start[1]))
+    b = (float(track.end[0]), float(track.end[1]))
+    half = float(track.width_mm) / 2.0
+    for k in keepouts:
+        if not covers_layer(k, layer) or net in allowed_nets(k):
+            continue
+        x1, y1, x2, y2 = area_bbox(area_points(k))  # by its box, as the PCB agent clips the planes: the two never disagree
+        if segment_area_distance(a, b, [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]) < half - 1e-9:
+            reason = str(getattr(k, "reason", "") or "").strip()
+            return keepout_id(k), (f"{KEEPOUT_NO_PLANE} {keepout_id(k)}: it forbids zones on {layer} (the {net} plane) under this copper"
+                                   + (f" ({reason})" if reason else ""))
+    return None
+
+
+def plane_keepout(ir: CircuitIR, track) -> str | None:
+    """Why ``track`` has no reference plane because a keep-out forbids its plane's zone under its copper, or ``None`` (module docstring).
+
+    The plane is the stackup's reference layer of the track's layer
+    (:func:`~ai_eda.tools.calc.tline.line_geometry`); a keep-out counts when
+    it covers that layer, forbids ``zones``, does not allow the plane's net
+    and the track's copper (centreline within half its width) reaches its
+    area (a polygon by its bounding box, as the plane clipping cuts it).
+    ``None`` for a board without such a keep-out or a track without a
+    plane layer at all (that reason is the stackup's own).
+    """
+    pcb = ir.pcb
+    if pcb is None:
+        return None
+    hit = _track_plane_keepout(pcb.stackup, track, _zone_keepouts(ir))
+    return None if hit is None else hit[1]
 
 
 @dataclass(frozen=True)
@@ -112,11 +182,18 @@ def line_model(stackup: Stackup | None, layer: str, width_mm: float) -> tuple[Li
     d = _outer_dielectric(stackup, layer)
     if d is None:
         return None, why or f"{layer} is an inner layer"
-    er = float(stackup.dielectrics[d].er.value)
+    er, k = _bound_er(stackup, d)
     return LineModel(
         layer=layer, width_mm=width_mm, z0_ohm=None, e_eff=er, t_pd_s_per_m=propagation_delay(er), bound=True, reason=why,
-        ids=(f"pcb.stackup.dielectrics[{d}].er",),
+        ids=(f"pcb.stackup.dielectrics[{k}].er",),
     ), None
+
+
+def _bound_er(stackup: Stackup, outer: int) -> tuple[float, int]:
+    """``(er, index)`` of the no-plane delay bound: the largest er of the stack (module docstring), the layer's own dielectric on a tie."""
+    ers = [float(d.er.value) for d in stackup.dielectrics]
+    top = max(ers)
+    return top, outer if ers[outer] == top else ers.index(top)
 
 
 def via_model(stackup: Stackup | None) -> tuple[float, float] | None:
@@ -129,17 +206,34 @@ def via_model(stackup: Stackup | None) -> tuple[float, float] | None:
 
 @dataclass
 class Segment:
-    """All of a net's copper on one layer at one width: total length and its line model."""
+    """All of a net's copper on one layer at one width: total length and its line model.
+
+    ``keepout_mm`` of that length lies where a keep-out clears the plane from
+    under the copper (module docstring): no impedance there, and its delay
+    is the no-plane upper bound ``keepout_t_pd`` (``keepout_reason`` says
+    which keep-out).
+    """
 
     layer: str
     width_mm: float
     length_mm: float
     model: LineModel | None
     reason: str | None = None
+    keepout_mm: float = 0.0
+    keepout_reason: str | None = None
+    keepout_t_pd: float | None = None
+    #: the id of the keep-out that clears the plane, and which dielectric's er the bound ``keepout_t_pd`` is (``pcb.stackup.dielectrics[k].er``)
+    keepout_id: str | None = None
+    keepout_bound: str | None = None
 
     @property
     def delay_s(self) -> float | None:
-        return None if self.model is None else self.length_mm / 1000.0 * self.model.t_pd_s_per_m
+        if self.model is None:
+            return None
+        if self.keepout_mm > 0.0 and self.keepout_t_pd is not None:
+            over = max(self.length_mm - self.keepout_mm, 0.0)
+            return over / 1000.0 * self.model.t_pd_s_per_m + self.keepout_mm / 1000.0 * self.keepout_t_pd
+        return self.length_mm / 1000.0 * self.model.t_pd_s_per_m
 
 
 @dataclass(frozen=True)
@@ -199,7 +293,22 @@ class NetMeasure:
 
     @property
     def bound(self) -> bool:
-        """Whether any part of the delay is the no-plane upper bound."""
+        """Whether any part of the delay is the no-plane upper bound (a segment without a plane, or copper under a keep-out)."""
+        return any(s.model is not None and (s.model.bound or s.keepout_mm > 0.0) for s in self.segments)
+
+    @property
+    def keepout_reasons(self) -> list[str]:
+        """The distinct reasons (segment order) a keep-out clears this net's reference plane from under some of its copper."""
+        return list(dict.fromkeys(s.keepout_reason for s in self.segments if s.keepout_mm > 0.0 and s.keepout_reason))
+
+    @property
+    def keepout_ids(self) -> list[str]:
+        """The keep-outs (ids, segment order) that clear this net's reference plane from under some of its copper."""
+        return list(dict.fromkeys(s.keepout_id for s in self.segments if s.keepout_mm > 0.0 and s.keepout_id))
+
+    @property
+    def plane_less(self) -> bool:
+        """Whether some of the net's copper is on a layer the stack gives no reference plane (the no-plane bound for that reason)."""
         return any(s.model is not None and s.model.bound for s in self.segments)
 
     @property
@@ -234,7 +343,8 @@ class NetMeasure:
                 {"layer": s.layer, "width_mm": s.width_mm, "length_mm": _r(s.length_mm),
                  "z0_ohm": None if s.model is None or s.model.z0_ohm is None else round(s.model.z0_ohm, 4),
                  "t_pd_ps_per_mm": None if s.model is None else round(s.model.t_pd_s_per_m * 1e9, 6), "bound": None if s.model is None else s.model.bound,
-                 "reason": s.reason or (None if s.model is None else s.model.reason)}
+                 "reason": s.reason or (None if s.model is None else s.model.reason),
+                 **({"keepout_mm": _r(s.keepout_mm), "keepout_reason": s.keepout_reason, "keepout_bound": s.keepout_bound} if s.keepout_mm > 0.0 else {})}
                 for s in self.segments
             ],
             "problems": list(self.problems),
@@ -262,6 +372,8 @@ def measure_nets(ir: CircuitIR, nets: list[str] | None = None, library: KicadLib
         return out
     stackup = pcb.stackup
     per: dict[tuple[str, str, float], float] = {}
+    kos = _zone_keepouts(ir)
+    under: dict[tuple[str, str, float], list] = {}  # key -> [length under a zone-forbidding keep-out, first reason]
     for t in pcb.tracks:
         m = out.get(t.net)
         if m is None:
@@ -270,6 +382,11 @@ def measure_nets(ir: CircuitIR, nets: list[str] | None = None, library: KicadLib
         m.track_length_mm += length
         key = (t.net, t.layer, float(t.width_mm))
         per[key] = per.get(key, 0.0) + length
+        if kos:
+            hit = _track_plane_keepout(stackup, t, kos)
+            if hit is not None:
+                row = under.setdefault(key, [0.0, hit[1], hit[0]])
+                row[0] += length
     vm = via_model(stackup)
     for v in pcb.vias:
         m = out.get(v.net)
@@ -281,7 +398,13 @@ def measure_nets(ir: CircuitIR, nets: list[str] | None = None, library: KicadLib
         if (layer, width) not in models:
             models[(layer, width)] = line_model(stackup, layer, width)
         model, why = models[(layer, width)]
-        out[net].segments.append(Segment(layer=layer, width_mm=width, length_mm=length, model=model, reason=why))
+        seg = Segment(layer=layer, width_mm=width, length_mm=length, model=model, reason=why)
+        if (net, layer, width) in under and model is not None:
+            seg.keepout_mm, seg.keepout_reason, seg.keepout_id = under[(net, layer, width)]
+            bound = _bound_t_pd(stackup, layer)
+            if bound is not None:
+                seg.keepout_t_pd, seg.keepout_bound = bound
+        out[net].segments.append(seg)
     for m in out.values():
         if vm is not None:
             m.via_length_mm, t_pd_via = vm
@@ -322,23 +445,67 @@ def _paths(ir: CircuitIR, out: dict[str, NetMeasure], library: KicadLibrary | No
         if problems:
             m.path_problem = "; ".join(problems)
             continue
-        m.path, m.path_problem = longest_path(m.net, tracks.get(m.net, []), vias.get(m.net, []), pads.pads.get(m.net, {}), pcb.stackup, t_pd,
+        local = t_pd
+        under = [s for s in m.segments if s.keepout_mm > 0.0 and s.keepout_t_pd is not None]
+        if under:  # copper under a keep-out: the whole (layer, width) of this net takes the no-plane bound (conservative, module docstring)
+            local = dict(t_pd)
+            for s in under:
+                local[(s.layer, s.width_mm)] = (s.keepout_t_pd, True)
+        m.path, m.path_problem = longest_path(m.net, tracks.get(m.net, []), vias.get(m.net, []), pads.pads.get(m.net, {}), pcb.stackup, local,
                                               None if vm is None else vm[1])
 
 
+def _bound_t_pd(stackup: Stackup | None, layer: str) -> tuple[float, str] | None:
+    """``(t_pd, which er)``: the no-plane upper bound of the delay per length on an outer layer, sqrt(er_max)/c0 over the stack's dielectrics.
+
+    With a keep-out clearing the plane the field of the track reaches past
+    the prepreg toward the next plane, so its own dielectric's er is no bound
+    when the core's is larger (module docstring); ``None`` without a stackup
+    or on an inner layer.
+    """
+    if stackup is None or layer not in stackup.copper_names():
+        return None
+    d = _outer_dielectric(stackup, layer)
+    if d is None:
+        return None
+    er, k = _bound_er(stackup, d)
+    return propagation_delay(er), f"sqrt(er_max)/c0 with pcb.stackup.dielectrics[{k}].er = {er:g} (the largest er of the stack)"
+
+
+#: the remedy for copper on a layer the stack gives no plane (never for a plane a keep-out cleared)
+NO_PLANE_ADVICE = f"{NO_REFERENCE_PLANE} - use pcb_layers=4 or add a plane"
+
+
+def no_plane_reason(m: NetMeasure) -> str:
+    """Why a net whose delay is the no-plane bound has no impedance: the keep-out(s) that cleared its plane, and/or its plane-less layers.
+
+    A keep-out that clears the plane on a board that has one is named with
+    its own reason (``impedance is undefined without a reference plane under
+    keep-out ANT: ...``) - "use pcb_layers=4 or add a plane" would be the
+    wrong advice there; that remedy is given only for copper on a layer the
+    stack gives no plane (both when both apply).
+    """
+    parts = list(m.keepout_reasons)
+    if m.plane_less or not parts:
+        parts.append(NO_PLANE_ADVICE)
+    return "; ".join(parts)
+
+
 def undefined_impedance_reason(model: LineModel | None, why: str | None) -> str:
-    """The sentence an impedance check gives for a segment without Z0."""
+    """The sentence an impedance check gives for a segment without Z0 on a layer the stack gives no plane (a keep-out's is its own reason)."""
     if model is None:
         return why or NO_STACKUP
     reason = model.reason or NO_REFERENCE_PLANE
     if reason.startswith(NO_REFERENCE_PLANE):
         detail = reason[len(NO_REFERENCE_PLANE):].lstrip(": ")
-        return f"{NO_REFERENCE_PLANE} - use pcb_layers=4 or add a plane" + (f" ({detail})" if detail else "")
+        return NO_PLANE_ADVICE + (f" ({detail})" if detail else "")
     return reason
 
 
 __all__ = [
+    "KEEPOUT_NO_PLANE",
     "NOT_DRC",
+    "NO_PLANE_ADVICE",
     "SI_TOOL",
     "SI_VERSION",
     "LineModel",
@@ -347,6 +514,8 @@ __all__ = [
     "Segment",
     "line_model",
     "measure_nets",
+    "no_plane_reason",
+    "plane_keepout",
     "undefined_impedance_reason",
     "via_model",
 ]

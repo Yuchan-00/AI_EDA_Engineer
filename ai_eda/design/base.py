@@ -28,6 +28,21 @@ theory report should plot beside the expectations' own (the template's
 base nets, say); the report reads them from the recorded run, never from the
 template. Substitute part names are suggestions the pipeline never verified
 and carry :data:`UNVERIFIED_SUBSTITUTE` on every line.
+
+Selection hooks. :meth:`Template.triggered_by` decides whether the confirmed
+requirements select a template; the default is :meth:`Template.triggered` on
+the numeric inputs, so every template that does not override it is selected
+exactly as before. A template selected by a categorical requirement (the
+radio family, by ``radio_build``) overrides it and reads that requirement
+itself. :attr:`Template.layer_policy` (:class:`LayerPolicy`) names the board
+layer counts a template builds and the one it uses when no requirement
+states a count; the default is every generic stack
+(:data:`~ai_eda.design.inputs.LAYER_COUNT_OPTIONS`) with
+:data:`~ai_eda.design.inputs.DEFAULT_LAYER_COUNT`, so a template without its
+own policy builds exactly the stack it built before. A policy that allows
+fewer counts says why, and a stated count outside it refuses the template
+with that reason before any missing input is asked for (a required question
+whose only outcome is a refusal is never asked).
 """
 
 from __future__ import annotations
@@ -42,7 +57,18 @@ from pydantic import BaseModel
 from ai_eda.ir import CircuitIR, MissingInformation, Provenance, ProvenanceKind, Requirement, Traced
 from ai_eda.tools.kicad.library import KicadLibrary
 
-from ai_eda.design.inputs import BOARD_KEY_ALIASES, UNIT_OF, DesignInput, canonical_key, read_inputs, read_value
+from ai_eda.design.inputs import (
+    BOARD_KEY_ALIASES,
+    CATEGORICAL_KEYS,
+    DEFAULT_LAYER_COUNT,
+    KEY_ALIASES,
+    LAYER_COUNT_OPTIONS,
+    UNIT_OF,
+    DesignInput,
+    canonical_key,
+    read_inputs,
+    read_value,
+)
 
 if TYPE_CHECKING:  # the report package imports this one (stages -> TEMPLATES), so the figure type is a type-only import here
     from ai_eda.design.board import BoardContext, SIDeclarations
@@ -72,6 +98,8 @@ IGNORED_KEYS: frozenset[str] = frozenset({"application", "jurisdiction"})
 #: canonical board keys every template serves through the board stackup (:mod:`ai_eda.design.stackup`): the layer
 #: count ``pcb_layers`` (read by :func:`~ai_eda.design.inputs.read_layer_count`) is a board decision, not a circuit one
 BOARD_KEYS: frozenset[str] = frozenset(BOARD_KEY_ALIASES)
+#: the keys a template's ``needs`` may name: what :func:`~ai_eda.design.inputs.present_keys` can count as present
+_NEEDABLE_KEYS: frozenset[str] = frozenset(KEY_ALIASES) | frozenset(CATEGORICAL_KEYS)
 #: bare requirement keys that name a physical quantity but not *which* one (bare key -> its unit): never an alias of a
 #: template input, so no template reads them; the circuit agent asks which specific key is meant (:func:`specific_keys`)
 #: and a template counts one as served only beside the specific key stated with the same number
@@ -254,6 +282,58 @@ def unverified(name: str, note: str = "") -> str:
     return f"{name}{' - ' + note if note else ''} {UNVERIFIED_SUBSTITUTE}"
 
 
+@dataclass(frozen=True)
+class LayerPolicy:
+    """The board layer counts a template builds (``pcb_layers``) and the count it uses when no requirement states one.
+
+    ``allowed`` holds only counts a generic stack exists for
+    (:data:`~ai_eda.design.inputs.LAYER_COUNT_OPTIONS`) and contains
+    ``default``. A policy that allows fewer counts than the generic stacks
+    (:attr:`restricts`) must say why in ``reason``: the refusal of a stated
+    count outside it, and the confirmation table row of its default, quote
+    that sentence (``"the RF lines need a reference plane"``). Invalid
+    policies raise ``ValueError`` when the template class is defined, never
+    at run time.
+    """
+
+    allowed: tuple[int, ...] = LAYER_COUNT_OPTIONS
+    default: int = DEFAULT_LAYER_COUNT
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.allowed:
+            raise ValueError("a layer policy allows at least one layer count")
+        for n in (*self.allowed, self.default):
+            if isinstance(n, bool) or not isinstance(n, int):
+                raise ValueError(f"a layer count is a plain integer, got {n!r}")
+        unknown = [n for n in self.allowed if n not in LAYER_COUNT_OPTIONS]
+        if unknown:
+            raise ValueError(f"layer count(s) {unknown} have no generic stack (one of {list(LAYER_COUNT_OPTIONS)})")
+        if len(set(self.allowed)) != len(self.allowed):
+            raise ValueError(f"layer counts {list(self.allowed)} repeat a count")
+        if self.default not in self.allowed:
+            raise ValueError(f"the default {self.default} layers is not one of the allowed counts {list(self.allowed)}")
+        if self.restricts and not self.reason.strip():
+            raise ValueError(f"a policy that builds only {list(self.allowed)} layers must say why (reason)")
+
+    @property
+    def restricts(self) -> bool:
+        """Whether the template builds fewer counts than the generic stacks (a design need, e.g. a reference plane)."""
+        return set(self.allowed) != set(LAYER_COUNT_OPTIONS)
+
+    @property
+    def is_generic(self) -> bool:
+        """Whether this is the policy every template had before policies existed: every generic stack, the global default."""
+        return not self.restricts and self.default == DEFAULT_LAYER_COUNT
+
+    def allowed_text(self) -> str:
+        return " or ".join(str(n) for n in self.allowed)
+
+
+#: every generic stack, 2 layers when no requirement states a count: the policy of every template that declares none
+DEFAULT_LAYER_POLICY = LayerPolicy()
+
+
 class Template(ABC):
     """A verified circuit template: which confirmed requirement keys select it, which it needs, serves and may ignore."""
 
@@ -264,7 +344,10 @@ class Template(ABC):
     #: canonical keys that select the template; ``all_triggers`` says whether every one of them is needed to trigger
     triggers: tuple[str, ...]
     all_triggers: bool = True
-    #: canonical keys the template must have (missing ones are asked as required questions)
+    #: canonical keys the template must have (missing ones are asked as required questions). A numeric key counts as present
+    #: when :func:`~ai_eda.design.inputs.read_inputs` reads it; a categorical one (``modulation``, ``radio_build``) only when
+    #: its reader reads it - :func:`~ai_eda.design.inputs.present_keys` is the one rule, for the selection gate (whose
+    #: closed-world refusals run only once nothing is missing) and for the template's own ``build``
     needs: tuple[str, ...]
     #: canonical keys the template's design serves (the closed world: any other confirmed design requirement refuses it)
     serves: tuple[str, ...]
@@ -272,10 +355,31 @@ class Template(ABC):
     ignores: tuple[str, ...] = ()
     #: the nets of a 4-layer board's planes: ``In1.Cu`` (ground) and ``In2.Cu`` (a supply; ``None``: ground again)
     plane_nets: tuple[str, str | None] = ("GND", None)
+    #: the board layer counts this template builds and its default (read by :mod:`ai_eda.design.board`)
+    layer_policy: LayerPolicy = DEFAULT_LAYER_POLICY
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        needs = cls.__dict__.get("needs")
+        if isinstance(needs, tuple):
+            unknown = [k for k in needs if k not in _NEEDABLE_KEYS]
+            if unknown:
+                # a key no reader can supply would never count as present, and a missing need switches the closed-world refusals off
+                raise TypeError(f"template {cls.__name__}: needs {unknown}, which neither read_inputs nor a categorical reader supplies")
 
     def triggered(self, inputs: dict[str, DesignInput]) -> bool:
         present = [k in inputs for k in self.triggers]
         return all(present) if self.all_triggers else any(present)
+
+    def triggered_by(self, ir: CircuitIR, inputs: dict[str, DesignInput]) -> bool:
+        """Whether the confirmed requirements of ``ir`` select this template (``inputs``: :func:`~ai_eda.design.inputs.read_inputs` of it).
+
+        The default is :meth:`triggered` on the numeric inputs. A template
+        selected by a categorical requirement (``radio_build``, read by
+        :func:`~ai_eda.design.inputs.read_radio_build`) overrides this and
+        reads it from ``ir``; it never reads an unconfirmed value.
+        """
+        return self.triggered(inputs)
 
     def refusals(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str]) -> list[MissingInformation]:
         """One non-required question per confirmed design requirement this template cannot serve (closed world); empty when it may build.
@@ -409,6 +513,7 @@ __all__ = [
     "BOARD_KEYS",
     "CHOICE_NOTE_PREFIX",
     "CONFIRM_DESIGN_KEY",
+    "DEFAULT_LAYER_POLICY",
     "DESIGN_CATEGORIES",
     "IGNORED_KEYS",
     "NO_RECORD",
@@ -418,6 +523,7 @@ __all__ = [
     "UNVERIFIED_SUBSTITUTE",
     "Choice",
     "DesignChange",
+    "LayerPolicy",
     "PartNote",
     "Plan",
     "Template",

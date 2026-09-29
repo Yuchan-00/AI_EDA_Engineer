@@ -92,6 +92,25 @@ What the file contains (verified with kicad-cli 10.0.6 ``pcb drc
   passes ``--refill-zones`` and ``KicadCli.export_gerbers`` ``--check-zones``,
   so DRC judges and the fab files contain the filled pour, and the gerber
   check verifies the pour's copper is really in the plot.
+* Keep-outs (``ir.pcb.keepouts``, read through :mod:`ai_eda.tools.keepout`)
+  become KiCad rule areas after the zones, in IR order: ``(zone (layers ..)
+  (uuid ..) (name "keepout_<id>[_<n>]") ... (keepout (tracks ..) (vias ..)
+  (pads ..) (copperpour ..) (footprints ..)) (polygon (pts ..)))`` with no
+  net, ``not_allowed`` for each forbidden item (``zones`` is KiCad's
+  ``copperpour``) and ``allowed`` for the rest, on the board's copper layers
+  the keep-out covers (``*.Cu`` written out as the board's copper layers). A
+  rule area has no per-net or per-footprint exception, so a keep-out with
+  ``allowed_refs`` / ``allowed_nets`` is written with each exempt item's box
+  cut out of its polygon (+ :data:`EXEMPTION_MARGIN_MM`): an allowed ref's
+  footprint extent (for the ``footprints`` / ``pads`` bans), an allowed
+  net's pads (``pads``), tracks (``tracks``), vias (``vias``) and zones
+  (``zones``) - the bans that need the same cuts share one rule area, and a
+  cut area is split into simple polygons without holes
+  (:func:`~ai_eda.tools.keepout.rect_difference`; a convex polygon keep-out
+  as its rectangle pieces clipped to it; a non-convex polygon with
+  exceptions is a CompileError). Only the ``pcb.keepout`` IR check knows
+  the exceptions themselves. The rule-area form follows KiCad's board
+  writer; no kicad-cli has read it here (not measured).
 """
 
 from __future__ import annotations
@@ -105,8 +124,25 @@ from ai_eda.compilers.base import CompileContext, Compiler, check_finite
 from ai_eda.compilers.pins import load_verified_symbol, pad_pin_types
 from ai_eda.errors import CompileError, NothingToCompileError
 from ai_eda.ir import ArtifactKind, ArtifactRef, BoardSide, CircuitIR, Component, Placement, SilkKind, SilkText, Track, Via, Zone
+from ai_eda.tools.keepout import (
+    KEEPOUT_ITEMS,
+    allowed_nets,
+    allowed_refs,
+    area_bbox,
+    area_is_rect,
+    area_points,
+    clip_convex,
+    covered_layers,
+    forbids,
+    is_convex,
+    keepout_id,
+    keepouts_of,
+    polygon_area,
+    rect_difference,
+    rect_pieces,
+)
 from ai_eda.tools.kicad import sexpr
-from ai_eda.tools.kicad.geometry import footprint_angle, mirrored_layer, normalize_angle, rotate, text_angle
+from ai_eda.tools.kicad.geometry import _q, footprint_angle, footprint_bbox, mirrored_layer, normalize_angle, pad_angle, pad_center, rotate, text_angle
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary
 from ai_eda.tools.kicad.sexpr import Q, S
 from ai_eda.tools.silkscreen.geometry import KICAD_TEXT_SIZE_MM, KICAD_TEXT_THICKNESS_MM, silk_text_problems
@@ -118,6 +154,7 @@ __all__ = [
     "GENERATOR_VERSION",
     "NON_COPPER_LAYERS",
     "MANUFACTURING_RULE_KEYS",
+    "EXEMPTION_MARGIN_MM",
     "net_numbers",
     "design_rules",
     "copper_layer_index",
@@ -126,6 +163,10 @@ __all__ = [
 FILE_VERSION = 20260206
 GENERATOR = "pcbnew"
 GENERATOR_VERSION = "10.0"
+#: how far (mm) beyond an exempt item's box a keep-out's rule area is cut back (module docstring: keep-outs)
+EXEMPTION_MARGIN_MM = 0.1
+#: KiCad's name of each keep-out item in a rule area's ``(keepout ..)``
+_RULE_AREA_ITEMS = {"tracks": "tracks", "vias": "vias", "pads": "pads", "zones": "copperpour", "footprints": "footprints"}
 
 #: Non-copper layers of a default board, in the exact order and with the exact
 #: indices / user names KiCad 10 writes them (only enabled layers are listed).
@@ -334,8 +375,115 @@ class PCBCompiler(Compiler):
             node.append(self._via(ir.project.id, i, via, net_names, copper_names))
         for i, zone in enumerate(ir.pcb.zones):
             node.append(self._zone(ir.project.id, i, zone, net_names, copper_names))
+        for i, keepout in enumerate(keepouts_of(ir.pcb)):
+            node.extend(self._rule_areas(ir, i, keepout, copper_names, placed))
         node.append(S("embedded_fonts", False))
         return node
+
+    # --- keep-outs ---------------------------------------------------------------------
+
+    @classmethod
+    def _rule_areas(cls, ir: CircuitIR, index: int, keepout, copper_names: list[str], placed: list[_Placed]) -> list:
+        """The KiCad rule area(s) of one keep-out (module docstring: keep-outs); refuses what it cannot write exactly."""
+        kid = keepout_id(keepout)
+        layers = covered_layers(keepout, copper_names)
+        if not layers:
+            raise CompileError(f"keep-out {kid} covers none of this board's copper layers ({copper_names}): {list(getattr(keepout, 'layers', []))}")
+        pts = area_points(keepout)
+        check_finite([list(p) for p in pts], f"keep-out {kid}")
+        if len(pts) < 3 or abs(polygon_area(pts)) <= 0.0:
+            raise CompileError(f"keep-out {kid}: its area needs at least 3 points enclosing a non-zero area")
+        bans = [item for item in KEEPOUT_ITEMS if forbids(keepout, item)]
+        if not bans:
+            raise CompileError(f"keep-out {kid} forbids nothing")
+        groups: list[tuple[tuple, list[str]]] = []
+        for item in bans:
+            cuts = tuple(sorted(set(cls._exemption_boxes(ir, keepout, item, placed, area_bbox(pts)))))
+            for key, items in groups:
+                if key == cuts:
+                    items.append(item)
+                    break
+            else:
+                groups.append((cuts, [item]))
+        out: list = []
+        for g, (cuts, items) in enumerate(groups):
+            for p, poly in enumerate(cls._cut_area(kid, keepout, pts, list(cuts))):
+                name = f"keepout_{kid}" + (f"_{g + 1}" if len(groups) > 1 else "") + (f"_{p + 1}" if p else "")
+                out.append(S(
+                    "zone",
+                    S("layers", *[Q(layer) for layer in layers]),
+                    S("uuid", Q(ids.net_item_uuid(ir.project.id, "keepout", index, g, p))),
+                    S("name", Q(name)),
+                    S("hatch", "edge", 0.5),
+                    S("connect_pads", S("clearance", 0)),
+                    S("min_thickness", 0.25),
+                    S("filled_areas_thickness", "no"),
+                    S("keepout", *[S(kicad, "not_allowed" if item in items else "allowed") for item, kicad in _RULE_AREA_ITEMS.items()]),
+                    S("fill", S("thermal_gap", 0.5), S("thermal_bridge_width", 0.5)),
+                    S("polygon", S("pts", *[S("xy", _q(x), _q(y)) for x, y in poly])),
+                ))
+        return out
+
+    @staticmethod
+    def _exemption_boxes(ir: CircuitIR, keepout, item: str, placed: list[_Placed], area: tuple[float, float, float, float]) -> list[tuple]:
+        """The boxes (mm, + :data:`EXEMPTION_MARGIN_MM`) cut out of ``item``'s rule area: the copper / footprints its exceptions allow."""
+        m = EXEMPTION_MARGIN_MM
+        refs, nets = set(allowed_refs(keepout)), set(allowed_nets(keepout))
+        boxes: list[tuple[float, float, float, float]] = []
+        if item in ("footprints", "pads") and refs:
+            for p in placed:
+                if p.component.ref in refs:
+                    b = footprint_bbox(p.placement, p.footprint)
+                    if b is not None:
+                        boxes.append((b.x1 - m, b.y1 - m, b.x2 + m, b.y2 + m))
+        if item == "pads" and nets:
+            for p in placed:
+                for pad in p.footprint.pads:
+                    if pad.number and p.pad_nets.get(pad.number) in nets:
+                        cx, cy = pad_center(p.placement, pad)
+                        angle = pad_angle(p.placement, pad) % 180.0
+                        if abs(angle) < 1e-9 or abs(angle - 90.0) < 1e-9:
+                            hw, hh = (pad.size_w / 2.0, pad.size_h / 2.0) if abs(angle) < 1e-9 else (pad.size_h / 2.0, pad.size_w / 2.0)
+                        else:
+                            hw = hh = (pad.size_w ** 2 + pad.size_h ** 2) ** 0.5 / 2.0
+                        boxes.append((cx - hw - m, cy - hh - m, cx + hw + m, cy + hh + m))
+        pcb = ir.pcb
+        if item == "tracks" and nets:
+            for t in pcb.tracks:
+                if t.net in nets:
+                    r = float(t.width_mm) / 2.0 + m
+                    boxes.append((min(t.start[0], t.end[0]) - r, min(t.start[1], t.end[1]) - r, max(t.start[0], t.end[0]) + r, max(t.start[1], t.end[1]) + r))
+        if item == "vias" and nets:
+            for v in pcb.vias:
+                if v.net in nets:
+                    r = float(v.diameter_mm) / 2.0 + m
+                    boxes.append((v.x_mm - r, v.y_mm - r, v.x_mm + r, v.y_mm + r))
+        if item == "zones" and nets:
+            for z in pcb.zones:
+                if z.net in nets and z.polygon:
+                    xs, ys = [q[0] for q in z.polygon], [q[1] for q in z.polygon]
+                    boxes.append((min(xs) - m, min(ys) - m, max(xs) + m, max(ys) + m))
+        x1, y1, x2, y2 = area
+        return [tuple(_q(v) for v in b) for b in boxes if b[0] < x2 and x1 < b[2] and b[1] < y2 and y1 < b[3]]
+
+    @staticmethod
+    def _cut_area(kid: str, keepout, pts: list[tuple[float, float]], cuts: list[tuple]) -> list[list[tuple[float, float]]]:
+        """The keep-out's area minus the exemption boxes as simple polygons (module docstring: keep-outs)."""
+        if not cuts:
+            return [pts]
+        if area_is_rect(keepout):
+            return rect_difference(area_bbox(pts), cuts)
+        if not is_convex(pts):
+            raise CompileError(
+                f"keep-out {kid}: a non-convex polygon with allowed refs / nets cannot be written as KiCad rule areas without its exceptions "
+                "(a rule area has no per-net or per-footprint exception); give it as a rectangle or a convex polygon"
+            )
+        out = []
+        for x1, y1, x2, y2 in rect_pieces(area_bbox(pts), cuts):
+            piece = clip_convex([(x1, y1), (x2, y1), (x2, y2), (x1, y2)], pts)
+            if len(piece) >= 3 and abs(polygon_area(piece)) > 1e-9:
+                out.append(piece)
+        return out
 
     # --- inputs --------------------------------------------------------------------
 
