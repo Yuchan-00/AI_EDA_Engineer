@@ -73,7 +73,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
-from ai_eda.agents.keys import CONFIRM_DESIGN_KEY, CONTROL_KEYS, REQUIREMENT_DECISION_KEYS
+from ai_eda.agents.keys import CONFIRM_DESIGN_KEY, CONTROL_KEYS, LEAVE_OUT_KEY, REQUIREMENT_DECISION_KEYS
 from ai_eda.gui.labels import label_map
 from ai_eda.gui.preview import (
     BOM_FILE,
@@ -426,6 +426,8 @@ class GuiApp:
                     "confirm_key": CONFIRM_DESIGN_KEY,
                     "control_keys": sorted(CONTROL_KEYS),
                     "decision_keys": sorted(REQUIREMENT_DECISION_KEYS),
+                    # a question whose answer_key is this one (a closed-world refusal) is answered by leaving its key out
+                    "leave_out_key": LEAVE_OUT_KEY,
                 },
                 "llm": {
                     "providers": providers,

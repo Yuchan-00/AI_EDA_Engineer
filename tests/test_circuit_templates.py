@@ -1085,12 +1085,17 @@ def test_a_zero_load_stated_after_the_build_is_served_by_a_proposal_and_a_load_i
 
 
 def test_a_typed_answer_dropped_for_a_key_that_holds_a_typed_value_is_noted(tmp_path: Path):
-    """The refusal names req.output_current and says to change it; answering the key again does nothing, and a note says so."""
+    """The refusal names req.output_current and says to change it; answering the key again does nothing, and a note says so.
+
+    The refusal suggests no ``--answer output_current=...`` (a typed value is kept), but it names the answer that *does* change
+    something: ``--answer leave_out=output_current`` (tests/test_leave_out.py), so the refusal is no dead end.
+    """
     lib = template_library(tmp_path / "kicad")
     ir = _ir(tmp_path)
     state, _ = _run(ir, tmp_path, lib, {**BASE, **DIVIDER, "output_current": "2 A"})
     [q] = [q for q in state.optional_questions if q.key == "output_current"]
-    assert "Change the requirement req.output_current in the IR" in q.question and "--answer" not in q.question and "Answer output_current=" not in q.question
+    assert "Change the requirement req.output_current in the IR" in q.question and "--answer output_current" not in q.question and "Answer output_current=" not in q.question
+    assert "--answer leave_out=output_current" in q.question
     state, _ = _run(ir, tmp_path, lib, {"output_current": "0 A"})
     assert ir.requirements.get("output_current").value.value == "2 A" and [r.key for r in ir.requirements.requirements].count("output_current") == 1
     msg = state.outcome(Stage.REQUIREMENT_ANALYSIS).message

@@ -117,6 +117,9 @@ EXTRACTION_VERSION = "0.4"
 
 #: the one question the agent always asks after an extraction; the user's answer decides the upgrade
 CONFIRM_KEY = "confirm_requirements"
+#: the control answer that leaves requirement keys out of the design (``ai_eda.design.base.LEAVE_OUT_KEY``; spelled here
+#: because this module is pure and imports nothing of the design package), named by the confirmation table
+LEAVE_OUT_ANSWER_KEY = "leave_out"
 #: answer keys that decide model-inferred items one by one (comma-separated requirement keys); see :func:`decide_inferred`
 ACCEPT_KEY = "accept_implicit"
 REJECT_KEY = "reject_implicit"
@@ -1262,13 +1265,18 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join([line, sep, *body])
 
 
-def confirmation_question(grounded: GroundedExtraction) -> MissingInformation:
+def confirmation_question(grounded: GroundedExtraction, *, left_out: list[str] | None = None, unread: list[str] | None = None) -> MissingInformation:
     """The required ``confirm_requirements`` question: a table of every extracted item for the user to confirm or correct.
 
     Every grounded explicit item is shown with its quote *in the request's
     own context* so a wrong key assignment (``12V`` filed under
     ``output_voltage``) is visible; the basis column carries the provenance
     note (quote, deterministic parse, model, the model's own statement).
+    The caller (the requirement agent, which knows the design keys) may add
+    ``left_out`` - the keys the user left out of the design, one line each -
+    and ``unread`` - extracted design-category keys no template reads, each of
+    which refuses a template design once it is the user's requirement, with
+    the answer that leaves them out; neither section appears when empty.
     """
     rows: list[list[str]] = []
     for r in grounded.requirements:
@@ -1294,6 +1302,12 @@ def confirmation_question(grounded: GroundedExtraction) -> MissingInformation:
         parts += ["", "Dropped:", *[f"  - {k}: {why}" for k, why in grounded.dropped]]
     if grounded.notes:
         parts += ["", "Notes:", *[f"  - {n}" for n in grounded.notes]]
+    if unread:
+        parts += ["", "No template reads these keys: once one is your requirement in a design category, every template design is refused until you "
+                  f"leave it out (--answer {LEAVE_OUT_ANSWER_KEY}={','.join(unread)}) or provide the circuit yourself:",
+                  *[f"  - {k}" for k in unread]]
+    if left_out:
+        parts += ["", f"Left out of the design by your decision ({LEAVE_OUT_ANSWER_KEY}; not proposed, not read by any template):", *[f"  - {x}" for x in left_out]]
     parts += [
         "",
         "Reply yes / y / ok / confirm (네 / 예 / 확인) to confirm the explicit items as your requirements, "

@@ -216,6 +216,11 @@ def _questions(data: ReportData) -> str:
     )
 
 
+def _closed_question(question: str, source: str) -> Markup:
+    """A left-out row's closed question, labelled as model output when a model wrote it (as the open-questions table does)."""
+    return Markup(block("td", tag("span", question), tag("span", " (model output)" if question and source == "llm" else "", class_="warn")))
+
+
 def _requirements(data: ReportData) -> str:
     r = data.requirements
     parts = [tag("h2", "Requirements"), tag("h3", "request"), _pre(r.raw_input or "(empty)")]
@@ -227,6 +232,13 @@ def _requirements(data: ReportData) -> str:
             [[x.id, x.text, x.kind, x.status, x.category, x.value, x.unit, x.provenance_kind, "yes" if x.needs_verification else "no"] for x in r.rows],
         )
     )
+    if r.left_out:
+        parts += [
+            tag("h3", "left out of the design (the user's decision: --answer leave_out; not read by any template, not demanded by the review)"),
+            rows(["key", "id", "text", "category", "value", "unit", "provenance", "closed question", "note"],
+                 [[x.key, x.id, x.text, x.category, x.value, x.unit, x.provenance_kind, _closed_question(x.question, x.question_source), x.note]
+                  for x in r.left_out]),
+        ]
     if r.parameters:
         parts += [tag("h3", "parameters"), rows(["key", "value", "unit", "provenance", "tool"], [[p.key, p.value, p.unit, p.provenance_kind, p.tool] for p in r.parameters])]
     if r.conflicts:

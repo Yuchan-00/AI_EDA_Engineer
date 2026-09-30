@@ -352,10 +352,32 @@ class IndependentReviewer:
         FAIL the design when unserved, and a component that lists it in
         ``serves_requirements`` does not make anything PASS. While any such
         requirement exists the verdict is NOT_VERIFIED, naming them.
+
+        A requirement the user left out of the design (``--answer leave_out=<key>``,
+        ``ir.requirements.left_out``) is not in the requirement list, so it is
+        never demanded; every verdict names the left-out keys
+        (``details["left_out"]`` and the message) so a PASS never hides them.
+        A FAIL names the untraced requirements and - for those the design does
+        not reference anywhere (a referenced one cannot be left out) - the
+        exact answer that leaves them out (``details["leave_out_keys"]``); an
+        open question names its keys.
         """
+        result = self._requirements_vs_ir(ir)
+        if ir.requirements.left_out:
+            # the user's decision is named on every verdict: the check does not demand these, and it says so
+            left = [x.requirement.id if x.requirement is not None else x.key for x in ir.requirements.left_out]
+            result.details = {**result.details, "left_out": left}
+            result.message = f"{result.message}; left out of the design by the user (not demanded): {', '.join(left)}"
+        return result
+
+    def _requirements_vs_ir(self, ir: CircuitIR) -> ValidationResult:
         reqs = ir.requirements
         if not reqs.can_proceed:
-            return ValidationResult(check_id="", status=ValidationStatus.USER_INPUT_REQUIRED, message=f"{len(reqs.blocking_questions)} open question(s), {len(reqs.conflicts)} conflict(s)")
+            keys = [q.key for q in reqs.blocking_questions]
+            named = f" ({', '.join(keys)})" if keys else ""
+            return ValidationResult(check_id="", status=ValidationStatus.USER_INPUT_REQUIRED,
+                                    message=f"{len(keys)} open question(s){named}, {len(reqs.conflicts)} conflict(s)",
+                                    details={"open_questions": keys})
         if not reqs.requirements:
             return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no structured requirements")
         served = {rid for c in ir.components for rid in c.serves_requirements}
@@ -369,9 +391,14 @@ class IndependentReviewer:
         authoritative = [r for r in reqs.requirements if r.id not in set(unverified)]
         unserved = [r.id for r in authoritative if r.category in design_categories and r.id not in served]
         if unserved:
+            # the answer that leaves them out (a closed-world FAIL is leavable) - only for those the design does not reference
+            from ai_eda.design.base import leavable_keys, leave_out_answer  # lazily: the design package is not needed by the other checks
+
+            keys = leavable_keys(ir, [r for r in authoritative if r.id in set(unserved)])
+            leave = f"; to leave them out of the design: {leave_out_answer(keys)}" if keys else ""
             return ValidationResult(
-                check_id="", status=ValidationStatus.FAIL, message="requirements not traced to any component",
-                details={"unserved": unserved, "unverified": unverified, "repair": "human"},
+                check_id="", status=ValidationStatus.FAIL, message=f"requirements not traced to any component: {', '.join(unserved)}{leave}",
+                details={"unserved": unserved, "unverified": unverified, "repair": "human", "leave_out_keys": keys},
             )
         if unverified:
             return ValidationResult(

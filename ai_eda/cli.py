@@ -14,6 +14,10 @@
                              exit 2 for a usage error such as --answer without '=')
         --answer KEY=VALUE               answer an open question (confirm_requirements=yes,
                                          accept_implicit=k1,k2 / reject_implicit=k3 for model-inferred items;
+                                         leave_out=k1,k2 leaves those requirements out of the design (recorded
+                                         in ir.requirements.left_out as your decision; closes an open question
+                                         under the key; a typed answer to the key in a later run brings it
+                                         back; a confirm_design=yes in the same run is ignored);
                                          regulatory scope: mains_powered=no radio=no finished_apparatus=yes
                                          evaluation_kit=no highest_rated_voltage="12 V DC" ...;
                                          confirm_parts=yes|no for the candidate-parts table; datasheet_facts_file=<json>;
@@ -212,6 +216,8 @@ RUN_OPTIONS: tuple[RunOption, ...] = (
     RunOption(
         "--answer", "answer", "append", "KEY=VALUE",
         "answer an open question; confirm_requirements=yes, accept_implicit=k1,k2, reject_implicit=k3 steer the LLM extraction; "
+        "leave_out=k1,k2 leaves those requirements out of the design (recorded as your decision; it closes an open question under the key, "
+        "a typed answer to the key in a later run brings it back, and a confirm_design=yes in the same run is ignored); "
         "mains_powered=yes|no, radio=yes|no, finished_apparatus=yes|no, evaluation_kit=yes|no, digital_device=yes|no, kr_licence_free_class=yes|no, "
         "highest_rated_voltage='12 V DC', intended_use=... are the regulatory scope answers; "
         "confirm_parts=yes|no decides the candidate-parts table; datasheet_facts_file=<json> grounds your datasheet facts "

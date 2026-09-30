@@ -25,11 +25,13 @@ Invariants this agent keeps:
 * A confirmation counts only for the table the user saw, checked two ways.
   (a) By the answers of this run: any answer that can change what
   :func:`~ai_eda.design.read_inputs` sees - a non-control answer (a template
-  input or any other requirement) or a decision on the requirement
-  extraction (``confirm_requirements`` / ``accept_implicit`` /
-  ``reject_implicit``, which turn a model's value into the user's within
-  the same run) - means the table this run would show was not the one on
-  screen: the confirmation is ignored with a note and the table is asked.
+  input or any other requirement) or a decision on the requirements
+  (``confirm_requirements`` / ``accept_implicit`` / ``reject_implicit``,
+  which turn a model's value into the user's within the same run, and
+  ``leave_out``, which takes requirements out of what a template reads and
+  lists them in the table) - means the table this run would show was not
+  the one on screen: the confirmation is ignored with a note and the table
+  is asked.
   (b) By content: every run that asks the table records ``sha256`` of its
   text under the key in ``ir.requirements.presented`` (bookkeeping outside
   the design hash; a proposal like any other), and ``yes`` applies the plan
@@ -56,7 +58,10 @@ Invariants this agent keeps:
   requirements that nothing serves, so the reviewer's ``requirements not
   traced`` FAIL is explained.
 * Refusals are notes and non-required questions under the *real*
-  requirement key, never a system-authored key: a request no template
+  requirement key, never a system-authored key, and a closed-world refusal
+  names the exact answer that leaves the requirement out
+  (``--answer leave_out=<key>``, recorded in ``ir.requirements.left_out``;
+  the table of the next buildable plan lists it): a request no template
   serves (a divider asked for 2 A, an ``efficiency`` requirement), two
   templates triggered at once, an unreadable or ambiguous value, a missing
   library entry, LED pins not named ``A`` / ``K``. A refusal caused by a
@@ -96,7 +101,16 @@ from ai_eda.design import (
     read_inputs,
     template_keys_text,
 )
-from ai_eda.design.base import AMBIGUOUS_KEYS, requirement_text, served_through_specific_key, specific_keys
+from ai_eda.design.base import (
+    AMBIGUOUS_KEYS,
+    alias_duplicates,
+    leavable_keys,
+    leave_out_answer,
+    requirement_text,
+    served_through_specific_key,
+    specific_keys,
+    unusable_note,
+)
 from ai_eda.ir import CircuitIR, Component, MissingInformation, Net
 from ai_eda.llm.extraction import is_confirmation, is_rejection
 from ai_eda.llm.router import TaskKind
@@ -120,7 +134,7 @@ class CircuitDesignAgent(Agent):
         if not isinstance(library, KicadLibrary):
             return self._result(notes=["no KiCad library in ctx.tools['kicad_library']: a template cannot resolve its symbols and footprints, nothing proposed"])
         inputs, unusable = read_inputs(ir)
-        notes = [f"{k} not usable: {why}" for k, why in unusable.items()]
+        notes = [unusable_note(ir, k, why) for k, why in unusable.items()]  # with the answer that clears it (a typed value is kept)
         confirmed = answer is not None and is_confirmation(answer)
         plan = design_from_requirements(ir, library, inputs, unusable, confirmed=confirmed)
         if plan is None:
@@ -204,7 +218,9 @@ class CircuitDesignAgent(Agent):
         proposals = [IRProposal(description=c.description, target=c.target, operation=c.operation, payload=c.payload, rationale=c.rationale) for c in late.changes]
         unserved = [rid for rid in _unserved(ir) if rid not in late.served]
         if unserved:
-            notes.append(f"confirmed design requirement(s) no component or net serves: {', '.join(unserved)} (the reviewer reports them as not traced)")
+            leavable = leavable_keys(ir, [r for r in ir.requirements.requirements if r.id in set(unserved)])
+            leave = f"; to leave them out of the design: {leave_out_answer(leavable)}" if leavable else ""
+            notes.append(f"confirmed design requirement(s) no component or net serves: {', '.join(unserved)} (the reviewer reports them as not traced){leave}")
         return self._result(proposals=proposals, validation=validation, notes=notes)
 
 
@@ -245,7 +261,7 @@ def _ambiguity_questions(ir: CircuitIR, notes: list[str]) -> list[MissingInforma
         example = _AMBIGUITY_EXAMPLES.get(r.key) or f"e.g. --answer {specific[0] if specific else r.key}=<value>"
         question = (
             f"'{r.key}' does not say which {r.key}, so no template reads it: state the quantity you mean instead - one of {keys} "
-            f"({example}); the requirement {r.id} stays as written"
+            f"({example}; or leave it out of the design with {leave_out_answer([r.key])}); the requirement {r.id} stays as written"
         )
         why = f"{r.id} ({requirement_text(r)}) does not say which {r.key}: no template reads it (state one of {keys})"
         out.append(MissingInformation(key=r.key, question=question, required=False, rationale=why))
@@ -254,14 +270,18 @@ def _ambiguity_questions(ir: CircuitIR, notes: list[str]) -> list[MissingInforma
 
 
 def _trace_ambiguous(ir: CircuitIR, plan: Plan, notes: list[str]) -> None:
-    """Trace an ambiguous requirement the template serves through its specific key (same number) to the parts serving that key.
+    """Trace a requirement the template counts as served through another one to the parts serving that one.
 
-    :func:`~ai_eda.design.base.served_through_specific_key` let the template
-    build beside it; the plan's components and nets that serve the specific
-    key's requirement also list the ambiguous one in
-    ``serves_requirements``, so the reviewer's traceability check sees the
-    same thing the template decided. Nothing changes for a plan without such
-    a requirement.
+    Two kinds: an ambiguous requirement the template serves through its
+    specific key (same number, :func:`~ai_eda.design.base.served_through_specific_key`),
+    and a requirement under another alias of an input the template read
+    (``req.battery_voltage`` beside ``req.input_voltage``: :func:`~ai_eda.design.inputs.read_inputs`
+    used the key only because both read the same number,
+    :func:`~ai_eda.design.base.alias_duplicates`). The template's closed world
+    let it build beside them; the plan's components and nets that serve the
+    input's requirement also list them in ``serves_requirements``, so the
+    reviewer's traceability check sees the same thing the template decided.
+    Nothing changes for a plan without such a requirement.
     """
     template = next((t for t in all_templates() if t.id == plan.template), None)
     if template is None:
@@ -273,6 +293,11 @@ def _trace_ambiguous(ir: CircuitIR, plan: Plan, notes: list[str]) -> None:
             continue
         extra.setdefault(inp.requirement.id, []).append(rid)
         notes.append(f"{rid} is served as {canon} ({inp.requirement.id}): the specific key states the same number")
+    for canon, others in alias_duplicates(ir, plan.inputs).items():
+        inp = plan.inputs[canon]
+        for r in others:
+            extra.setdefault(inp.requirement.id, []).append(r.id)
+            notes.append(f"{r.id} is served as {canon} ({inp.requirement.id}): another alias of the same key stating the same number")
     if not extra:
         return
     changes = []

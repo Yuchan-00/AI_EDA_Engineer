@@ -138,17 +138,26 @@ from ai_eda.design.base import (
     Plan,
     Template,
     TheorySection,
+    alias_duplicates,
     choice_provenance,
+    leavable_keys,
+    leave_out_answer,
+    leave_out_remedy,
+    left_out_lines,
+    refusal_question,
     number,
     parameter_value,
     quantity,
     structural_provenance,
     template_tool,
     unserved_requirements,
+    unusable_note,
+    unusable_remedy,
     unverified,
 )
 from ai_eda.design.inputs import (
     KEY_ALIASES,
+    RADIO_BUILD_ALIASES,
     RADIO_BUILD_KEY,
     RADIO_BUILDS,
     UNIT_OF,
@@ -459,30 +468,37 @@ class DividerTemplate(Template):
         "otherwise provide the circuit (components / nets) in the IR yourself - no verified template supplies a load."
     )
     #: the refusal when a load current *is* stated: the requirement exists, so an ``--answer`` for its key is not what changes it
+    #: (a typed value is kept); the answer that leaves it out (``leave_out``) is named instead
     LOAD_REFUSAL = (
         "This template cannot serve that requirement: a resistive divider is only valid unloaded (a high-impedance reference) and no verified "
         "template supplies a load. Change the requirement {rid} in the IR (or correct the request) so it states 0 A, choose another design, "
-        "or provide the circuit (components / nets) in the IR yourself."
+        "or provide the circuit (components / nets) in the IR yourself. {leave}."
     )
 
-    def _load_question(self, why: str, requirement_id: str | None = None) -> MissingInformation:
+    def _load_question(self, why: str, requirement_id: str | None = None, keys: tuple[str, ...] = ("output_current",)) -> MissingInformation:
+        """The load question (no load stated) or the load refusal (``requirement_id`` states one), which names the answer leaving it out (``keys``)."""
         text = f"{why[0].upper()}{why[1:]}. "
-        text += self.LOAD_QUESTION if requirement_id is None else self.LOAD_REFUSAL.format(rid=requirement_id)
-        return MissingInformation(key="output_current", required=False, question=text, rationale=why)
+        if requirement_id is None:
+            return MissingInformation(key="output_current", required=False, question=text + self.LOAD_QUESTION, rationale=why)
+        # a refusal: the requirement's own key, answered by leaving it out (a typed value under it is kept - the dead end)
+        text += self.LOAD_REFUSAL.format(rid=requirement_id, leave=leave_out_remedy(keys[0], keys, where="the divider"))
+        return refusal_question(keys[0], text, why)
 
     def refusals(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str]) -> list[MissingInformation]:
         """The closed-world rule plus the divider's own: a stated load current must be 0 A."""
         out = super().refusals(ir, inputs, unusable)
         v_in, v_out = inputs["input_voltage"], inputs["output_voltage"]
         if "output_current" in unusable:
-            ids = ", ".join(r.id for r in ir.requirements.requirements if r.key in KEY_ALIASES["output_current"]) or "req.output_current"
-            out.append(self._load_question(f"output_current is stated but not readable ({unusable['output_current']}), and the divider is only valid unloaded", ids))
+            stated = [r for r in ir.requirements.requirements if r.key in KEY_ALIASES["output_current"]]
+            ids = ", ".join(r.id for r in stated) or "req.output_current"
+            keys = tuple(dict.fromkeys(r.key for r in stated)) or ("output_current",)
+            out.append(self._load_question(f"output_current is stated but not readable ({unusable['output_current']}), and the divider is only valid unloaded", ids, keys))
         elif "output_current" in inputs and inputs["output_current"].traced.value != 0.0:
             i_out = inputs["output_current"]
             out.append(self._load_question(
                 f"the request needs {v_out.traced.value:.12g} V at {i_out.traced.value:.12g} A from {v_in.traced.value:.12g} V ({i_out.requirement.id}): "
                 f"a resistive divider cannot supply a load",
-                i_out.requirement.id,
+                i_out.requirement.id, (i_out.requirement.key,),
             ))
         return out
 
@@ -655,7 +671,7 @@ class LedTemplate(Template):
         plan = Plan(template=t, title=self.title)
         missing = [k for k in self.needs if k not in inputs]
         if missing:
-            return _missing_inputs(plan, "The LED indicator template", missing, unusable)
+            return _missing_inputs(plan, "The LED indicator template", missing, unusable, ir=ir)
         v_in, v_f, i_f = inputs["input_voltage"], inputs["led_forward_voltage"], inputs["led_forward_current"]
         plan.inputs = {"input_voltage": v_in, "led_forward_voltage": v_f, "led_forward_current": i_f}
         params: dict[str, Traced] = {"v_in": v_in.traced, "v_f": v_f.traced, "i_f": i_f.traced}
@@ -795,15 +811,18 @@ def _example(key: str) -> str:
     }.get(key, f"<value {UNIT_OF[key]}>")
 
 
-def _missing_inputs(plan: Plan, who: str, missing: list[str], unusable: dict[str, str], examples: dict[str, str] | None = None) -> Plan:
+def _missing_inputs(
+    plan: Plan, who: str, missing: list[str], unusable: dict[str, str], examples: dict[str, str] | None = None, *, ir: CircuitIR | None = None,
+) -> Plan:
     """A template input no requirement states is a required question; one stated but unreadable is a note (the requirement must change).
 
     ``examples`` overrides the example answer per key (a template whose
-    validity range excludes the generic example gives one inside it).
+    validity range excludes the generic example gives one inside it). With
+    ``ir`` an unusable key's note names the answer that clears it.
     """
     for k in missing:
         if k in unusable:
-            plan.notes.append(f"{k} not usable: {unusable[k]}")
+            plan.notes.append(unusable_note(ir, k, unusable[k]))
         else:
             example = (examples or {}).get(k) or _example(k)
             plan.questions.append(MissingInformation(
@@ -1132,7 +1151,7 @@ class AstableTemplate(Template):
             return _refused(plan, why)
         missing = [k for k in self.needs if k not in inputs]
         if missing:
-            return _missing_inputs(plan, "The BJT astable multivibrator template", missing, unusable)
+            return _missing_inputs(plan, "The BJT astable multivibrator template", missing, unusable, ir=ir)
         f_osc, v_in = inputs["oscillation_frequency"], inputs["input_voltage"]
         plan.inputs = {"oscillation_frequency": f_osc, "input_voltage": v_in}
         req_f, req_v = f_osc.requirement.id, v_in.requirement.id
@@ -1631,7 +1650,8 @@ def design_from_requirements(
     if len(triggered) > 1:
         ids = [t.id for t in triggered]
         plan = Plan(template="+".join(ids), title="ambiguous")
-        plan.notes.append(f"ambiguous: templates {ids} all match the confirmed requirements ({', '.join(sorted(inputs))}); refusing to guess - state the requirements of one circuit")
+        plan.notes.append(f"ambiguous: templates {ids} all match the confirmed requirements ({', '.join(sorted(inputs))}); refusing to guess - state the requirements of one circuit"
+                          + _one_circuit_remedy(ir, triggered))
         return plan
     template = triggered[0]
     from ai_eda.design.board import add_board, layer_policy_refusal  # the board module imports the shared helpers of this one
@@ -1653,7 +1673,37 @@ def design_from_requirements(
         if why is not None:
             plan.changes = []
             return _refused(plan, why)
+        plan.left_out = left_out_lines(ir)  # the user's leave-outs are part of the table they confirm (and of its hash)
+        # a requirement under another alias of an input read (the same number) is served by the input's parts: listed with the inputs
+        for canon, others in alias_duplicates(ir, plan.inputs).items():
+            inp = plan.inputs[canon]
+            plan.also_read += [f"{r.id}: {canon} = {_fmt_same(inp)} (stated as {r.value.value if r.value is not None else None!r}; "
+                               f"the same number as {inp.requirement.id}, served by the parts serving it)" for r in others]
     return plan
+
+
+def _fmt_same(inp: DesignInput) -> str:
+    """The value an input read, as the table's input lines print it."""
+    return f"{inp.traced.value:.12g} {inp.traced.unit}"
+
+
+def _one_circuit_remedy(ir: CircuitIR, triggered: list[Template]) -> str:
+    """For each triggered template, the one answer that leaves the others' requirements out (``""`` when none can).
+
+    A typed value is kept and a typed answer never removes a requirement, so
+    "state the requirements of one circuit" is carried out only by a
+    leave-out: the requirements a template does not serve
+    (:func:`~ai_eda.design.base.unserved_requirements`, by their recorded
+    keys - the ones only the other circuits read) - after it that template
+    alone is selected (or refuses in its own words). A template whose
+    unserved requirements the design references, or has none, gets no answer.
+    """
+    ways: list[str] = []
+    for t in triggered:
+        keys = leavable_keys(ir, unserved_requirements(ir, t))
+        if keys:
+            ways.append(f"to build {t.id}: {leave_out_answer(keys)}")
+    return f" ({'; '.join(ways)}; a later typed answer to a key brings it back)" if ways else ""
 
 
 #: the ``Plan.template`` of what the radio selection says when no template triggered (it names the key, not a template)
@@ -1685,10 +1735,13 @@ def _radio_build_plan(ir: CircuitIR, inputs: dict[str, DesignInput], rf: list[Te
     build, why = read_radio_build(ir)
     plan = Plan(template=RADIO_SELECTION, title="radio build selection")
     if why is not None:
-        plan.notes.append(f"{RADIO_BUILD_KEY} not usable: {why}")
+        # an unconfirmed build is answered under the key; one the user typed is kept, so a leave-out is what clears it
+        remedy = unusable_remedy(ir, RADIO_BUILD_ALIASES)
+        plan.notes.append(f"{RADIO_BUILD_KEY} not usable: {why}" + (f"; {remedy}" if remedy else ""))
         plan.questions.append(MissingInformation(
             key=RADIO_BUILD_KEY, required=False, rationale=f"{RADIO_BUILD_KEY} not usable: {why}",
-            question=f"{why}; no radio template was proposed (a radio board is chosen by {RADIO_BUILD_KEY} = exactly one of {', '.join(RADIO_BUILDS)}).",
+            question=f"{why}; no radio template was proposed (a radio board is chosen by {RADIO_BUILD_KEY} = exactly one of {', '.join(RADIO_BUILDS)})"
+                     + (f"; {remedy}." if remedy else "."),
         ))
         return plan
     if build is not None:

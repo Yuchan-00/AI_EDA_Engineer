@@ -11,7 +11,11 @@ confirmed design requirement a build does not serve refuses it through the
 template's ``refusals`` rule, and :func:`unserved_message` names the builds
 that do serve it (``tx_power is served by radio_build=tx_exciter,
 transceiver or transceiver_conducted``), so the reviewer never sees an
-unserved requirement disguised as served.
+unserved requirement disguised as served. Every such refusal names the
+exact answer that leaves the requirement out of the board
+(:func:`refusal_question`: ``--answer leave_out=<key>``, recorded in
+``ir.requirements.left_out`` as the user's decision) beside the builds that
+serve it: a refusal is never a dead end.
 
 The serve / need table is kr447 design §2.0 ("Requirement keys": ✓ served,
 ○ optional read, R refused); every build also serves ``radio_build`` itself
@@ -40,7 +44,9 @@ from dataclasses import dataclass
 
 from ai_eda.ir import CircuitIR, MissingInformation
 
-from ai_eda.design.inputs import RADIO_BUILD_KEY, RADIO_BUILDS, canonical_key
+from ai_eda.design.base import leave_out_remedy
+from ai_eda.design.base import refusal_question as base_refusal_question
+from ai_eda.design.inputs import RADIO_BUILD_KEY, RADIO_BUILDS, RF_UNIT_OF, canonical_key
 
 #: the categorical requirement key that selects the board (``ai_eda.design.inputs.RADIO_BUILD_KEY``)
 SELECTOR_KEY = RADIO_BUILD_KEY
@@ -129,12 +135,35 @@ def _or_list(items: tuple[str, ...]) -> str:
 
 
 def unserved_message(key: str, build: str | None = None) -> str:
-    """The closed-world sentence for a confirmed requirement ``key`` the build (if given) does not serve, naming the builds that do."""
+    """The closed-world sentence for a confirmed requirement ``key`` the build (if given) does not serve, naming the builds that do.
+
+    A radio key no build serves (``modulation_depth``, an AM figure) says why
+    (the licence-exempt class is FM telephony); any other key no build serves
+    (``antenna_switch_present``) is only named - the FM reason would not be
+    its reason.
+    """
     here = f"{key} is not served by radio_build={build}; " if build is not None else ""
     builds = serving_builds(key)
     if not builds:
-        return f"{here}{key} is served by no radio_build of the KR 447 MHz family (the licence-exempt 447 MHz class is FM telephony [UNVERIFIED])"
+        why = " (the licence-exempt 447 MHz class is FM telephony [UNVERIFIED])" if key in RF_UNIT_OF else ""
+        return f"{here}{key} is served by no radio_build of the KR 447 MHz family{why}"
     return f"{here}{key} is served by radio_build={_or_list(builds)}"
+
+
+def refusal_question(why: str, key: str, build: str, keys: list[str] | tuple[str, ...] = ()) -> MissingInformation:
+    """A closed-world refusal of ``build``: the reason, the exact answer that leaves ``key`` out, and a build that serves it.
+
+    ``key`` is the requirement's key as recorded (the leave-out names it
+    exactly); ``keys`` are every key refused at once (one answer leaves them
+    all out). The builds named are those serving the canonical key, never
+    ``build`` itself. The question is marked as answered by ``leave_out``
+    (:func:`~ai_eda.design.base.refusal_question`), so the report and the GUI
+    offer that answer, not a value under the refused key.
+    """
+    others = tuple(b for b in serving_builds(canonical_key(key) or key) if b != build)
+    alt = f"; or start the project of radio_build={_or_list(others)}, which serves it" if others else ""
+    text = f"{why}; no template design was proposed. {leave_out_remedy(key, keys, where=f'the {build} board')}{alt}."
+    return base_refusal_question(key, text, why)
 
 
 def selector_question(ir: CircuitIR) -> MissingInformation:
@@ -162,6 +191,7 @@ __all__ = [
     "SELECTOR_KEYS",
     "BuildInfo",
     "selector_question",
+    "refusal_question",
     "serving_builds",
     "unserved_message",
 ]

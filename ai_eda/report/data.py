@@ -136,6 +136,23 @@ class RequirementRow(BaseModel):
     needs_verification: bool
 
 
+class LeftOutRow(BaseModel):
+    """A requirement the user left out of the design (``ir.requirements.left_out``), copied as recorded."""
+
+    key: str
+    id: str
+    text: str
+    category: str
+    value: str
+    unit: str
+    provenance_kind: str
+    #: the open question the leave-out closed, as asked ("" when none)
+    question: str
+    note: str
+    #: who wrote ``question``: "llm" (a model's question - labelled wherever it is shown) or "system"; "" without a question
+    question_source: str = ""
+
+
 class ParameterRow(BaseModel):
     key: str
     value: str
@@ -158,6 +175,8 @@ class RequirementsSection(BaseModel):
     conflicts: list[str]
     #: what a model said (count + flags only): labelled MODEL_OUTPUT, never design data
     extraction: list[ExtractionRow]
+    #: the requirements the user left out of the design (``--answer leave_out``): the user's decision, listed beside the requirements
+    left_out: list[LeftOutRow] = Field(default_factory=list)
 
 
 class QuestionRow(BaseModel):
@@ -360,7 +379,15 @@ def artifact_disk_state(art: ArtifactRef, confine: Path | None = None) -> str:
 
 
 def answer_command(ir_path: Path, q: MissingInformation) -> str:
-    """The ``ai-eda run ... --answer key=value`` line that answers ``q``; the value is a placeholder the human fills in."""
+    """The ``ai-eda run ... --answer key=value`` line that answers ``q``; the value is a placeholder the human fills in.
+
+    A question answered by a control key (``q.answer_key``: a closed-world
+    refusal, answered by ``leave_out``) gets that answer with the question's
+    key as its value (``--answer leave_out=<key>``), never a value under the
+    refused key - that is the dead end the refusal is about.
+    """
+    if q.answer_key:
+        return f"ai-eda run {shlex.quote(str(ir_path))} --answer {q.answer_key}={q.key}"
     if q.source == "llm" or not q.options:
         value = "<value>"
     else:
@@ -502,6 +529,15 @@ def _requirements(ir: CircuitIR) -> RequirementsSection:
         for h, entry in sorted(rs.extraction_cache.items())
         if isinstance(entry, dict)
     ]
+    left_out: list[LeftOutRow] = []
+    for x in rs.left_out:
+        r = x.requirement
+        value, unit, kind, _tool, _needs = _traced_fields(r.value if r is not None else None)
+        left_out.append(LeftOutRow(
+            key=x.key, id=r.id if r is not None else "", text=r.text if r is not None else "", category=r.category if r is not None else "",
+            value=value, unit=unit, provenance_kind=kind, question=x.question.question if x.question is not None else "", note=x.note,
+            question_source=x.question.source if x.question is not None else "",
+        ))
     return RequirementsSection(
         raw_input=rs.raw_input,
         corrections=list(rs.corrections),
@@ -509,6 +545,7 @@ def _requirements(ir: CircuitIR) -> RequirementsSection:
         parameters=params,
         conflicts=[f"{', '.join(c.requirement_ids)}: {c.description}" for c in rs.conflicts],
         extraction=extraction,
+        left_out=left_out,
     )
 
 
@@ -520,7 +557,16 @@ def _question_row(q: MissingInformation, origin: str, ir_path: Path) -> Question
 
 
 def _questions(ir: CircuitIR, record: PipelineRecord | None, ir_path: Path) -> list[QuestionRow]:
-    rows = [_question_row(q, "ir.requirements.missing", ir_path) for q in ir.requirements.missing]
+    """The recorded open questions and the last run's stage questions, copied.
+
+    A recorded question under a key the user left out of the design is
+    closed (the requirement agent drops it from ``requirements.missing``; an
+    IR saved before it did may still hold one): it is listed with the
+    left-out requirements, never here with an answer that would bring the key
+    back.
+    """
+    left = ir.requirements.left_out_keys
+    rows = [_question_row(q, "ir.requirements.missing", ir_path) for q in ir.requirements.missing if q.key not in left]
     if record is not None:
         for o in record.state.outcomes:
             rows.extend(_question_row(q, f"stage {o.stage}", ir_path) for q in o.questions)

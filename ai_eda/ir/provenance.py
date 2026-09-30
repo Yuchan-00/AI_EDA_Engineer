@@ -35,14 +35,23 @@ def design_data(model: BaseModel) -> dict:
     return model.model_dump(mode="json", context={"view": DESIGN_VIEW})
 
 
-def drop_in_design_view(*names: str):
-    """A ``model_serializer`` that leaves ``names`` out of the design view (they are not design content)."""
+def drop_in_design_view(*names: str, while_empty: tuple[str, ...] = ()):
+    """A ``model_serializer`` that leaves ``names`` out of the design view (they are not design content).
+
+    ``while_empty`` names design fields of the same model that were added after
+    IRs were saved with it: they are left out only while they hold their empty
+    default, exactly as :func:`drop_empty_in_design_view` does (a model has one
+    serializer, so one that needs both passes both here).
+    """
 
     def _serialize(self, handler: SerializerFunctionWrapHandler, info: SerializationInfo):
         data = handler(self)
         if in_design_view(info):
             for name in names:
                 data.pop(name, None)
+            for name in while_empty:
+                if name in data and (data[name] is None or data[name] == [] or data[name] == {}):
+                    del data[name]
         return data
 
     return model_serializer(mode="wrap")(_serialize)

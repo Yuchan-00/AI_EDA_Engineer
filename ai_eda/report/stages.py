@@ -275,12 +275,16 @@ def template_for(ir: CircuitIR) -> Template | None:
 def _header(title: str, ir: CircuitIR) -> list[str]:
     found = template_of(ir)
     template_line = f"템플릿 `{found[0]}` v{found[1]}" if found is not None else NO_TEMPLATE
+    # the user's leave-outs are named at the top of every report (a report of a design without any is unchanged)
+    left = ["- 설계에서 뺀 요구사항 (사용자 결정, `--answer leave_out`): " + ", ".join(
+        f"`{x.requirement.id if x.requirement is not None else x.key}`" for x in ir.requirements.left_out)] if ir.requirements.left_out else []
     return [
         f"# {title}: {ir.project.name}",
         "",
         f"- 프로젝트 id: `{ir.project.id}`",
         f"- 설명: {ir.project.description or NO_RECORD}",
         f"- 설계 출처: {template_line}",
+        *left,
         "- 이 보고서는 IR(설계 데이터)과 그 검증 기록을 읽어 만든 뷰입니다. 판정을 새로 계산하지 않고, 산출물로 등록되지 않으며, IR 에 아무것도 쓰지 않습니다. "
         "IR 에 없는 값은 '" + NO_RECORD + "' 으로 표시합니다.",
         "",
@@ -1492,7 +1496,34 @@ def _requirements_section(ir: CircuitIR) -> list[str]:
     for r in ir.requirements.requirements:
         rows.append([f"`{r.id}`", r.key, r.text, r.kind.value, r.status.value, _traced_text(r.value), r.category, _provenance_text(r.value.provenance) if r.value is not None else "-"])
     out += [_table(["id", "키", "본문", "종류", "상태", "값", "범주", "값의 출처"], rows) if rows else f"요구사항 {NO_RECORD}.", ""]
+    out += _left_out_section(ir)
     return out
+
+
+def _left_out_section(ir: CircuitIR) -> list[str]:
+    """The requirements the user left out of the design (``--answer leave_out``): copied from ``ir.requirements.left_out``; nothing when none."""
+    if not ir.requirements.left_out:
+        return []
+    rows = []
+    for x in ir.requirements.left_out:
+        r = x.requirement
+        if r is not None:
+            rows.append([x.key, f"`{r.id}`", r.text, _traced_text(r.value), r.category, _provenance_text(r.value.provenance) if r.value is not None else "-"])
+        elif x.question is not None:
+            # a model's question is labelled wherever it is shown (MissingInformation.source)
+            label = " (모델 질문)" if x.question.source == "llm" else ""
+            rows.append([x.key, "-", f"(요구사항 없음; 닫힌 질문{label}: {x.question.question})", "-", "-", "-"])
+        else:
+            rows.append([x.key, "-", "(요구사항 없음)", "-", "-", "-"])
+    return [
+        "### 설계에서 뺀 요구사항 (사용자 결정)",
+        "",
+        "사용자가 `--answer leave_out=<키>` 로 설계에서 뺀 요구사항입니다. 템플릿은 이를 읽지도 충족하지도 않으며 검토(`review.requirements_vs_ir`)도 "
+        "요구하지 않습니다. 같은 키에 값을 다시 입력하면 설계로 돌아옵니다.",
+        "",
+        _table(["키", "id", "본문", "값", "범주", "값의 출처"], rows),
+        "",
+    ]
 
 
 def _all_stages_section(record: RunRecord) -> list[str]:

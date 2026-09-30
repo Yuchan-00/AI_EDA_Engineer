@@ -9,16 +9,20 @@ second literal set drifted once (``pcb.placement`` and ``confirm_design``
 reached the regulatory rules and were recorded as scope answers).
 
 The keys that steer the confirmation flow of the requirement extraction live
-with it (:mod:`ai_eda.llm.extraction`) and the design confirmation key with
-the templates (:mod:`ai_eda.design.base`, which must not import the agents);
+with it (:mod:`ai_eda.llm.extraction`) and the design confirmation key and
+the leave-out key (``leave_out``) with the templates (:mod:`ai_eda.design.base`,
+which must not import the agents);
 the component, regulatory and PCB agents' keys are defined here and
 re-exported by those modules.
 """
 
 from __future__ import annotations
 
-from ai_eda.design.base import CONFIRM_DESIGN_KEY
-from ai_eda.llm.extraction import ACCEPT_KEY, CONFIRM_KEY, REJECT_KEY
+from ai_eda.design.base import CONFIRM_DESIGN_KEY, LEAVE_OUT_KEY
+from ai_eda.llm.extraction import ACCEPT_KEY, CONFIRM_KEY, LEAVE_OUT_ANSWER_KEY, REJECT_KEY
+
+if LEAVE_OUT_ANSWER_KEY != LEAVE_OUT_KEY:  # the extraction's table names the same answer the agents read (checked when imported)
+    raise ValueError(f"ai_eda.llm.extraction.LEAVE_OUT_ANSWER_KEY {LEAVE_OUT_ANSWER_KEY!r} is not ai_eda.design.base.LEAVE_OUT_KEY {LEAVE_OUT_KEY!r}")
 
 #: component agent: confirm the presented part candidates / datasheet facts, name a facts file, request the billed extraction
 CONFIRM_PARTS_KEY = "confirm_parts"
@@ -39,16 +43,21 @@ ROUTING_KEY = "pcb.routing"
 #: the library's reference positions)
 SILKSCREEN_KEY = "pcb.silkscreen"
 
-#: the answer keys that decide on something the requirement extraction showed: they can turn a model's value into the
-#: user's within one run, so a design confirmation given beside them refers to a table that was never shown
-REQUIREMENT_DECISION_KEYS: frozenset[str] = frozenset({CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY})
+#: requirement agent: ``--answer leave_out=k1,k2`` leaves the requirements under those keys out of the design (moved into
+#: ``ir.requirements.left_out``, the user's recorded decision; a closed-world refusal names this answer). Defined with the
+#: templates (:mod:`ai_eda.design.base`), which name it in their refusals and must not import the agents.
+
+#: the answer keys that decide on the requirements themselves - on something the requirement extraction showed, or which
+#: requirements the design leaves out: they can turn a model's value into the user's, or take a requirement out of what a
+#: template reads, within one run, so a design confirmation given beside them refers to a table that was never shown
+REQUIREMENT_DECISION_KEYS: frozenset[str] = frozenset({CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY, LEAVE_OUT_KEY})
 
 #: every answer key that steers an agent; never a requirement, never a scope answer
 CONTROL_KEYS: frozenset[str] = frozenset({
     CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY,
     CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY,
     ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY,
-    PLACEMENT_KEY, ROUTING_KEY, SILKSCREEN_KEY, CONFIRM_DESIGN_KEY,
+    PLACEMENT_KEY, ROUTING_KEY, SILKSCREEN_KEY, CONFIRM_DESIGN_KEY, LEAVE_OUT_KEY,
 })
 
 __all__ = [
@@ -61,6 +70,7 @@ __all__ = [
     "CONTROL_KEYS",
     "EXTRACT_FACTS_KEY",
     "FACTS_FILE_KEY",
+    "LEAVE_OUT_KEY",
     "PLACEMENT_KEY",
     "PROPOSE_REGS_KEY",
     "REJECT_KEY",

@@ -129,8 +129,10 @@ from ai_eda.design.base import (
     requirement_text,
     unserved_requirements,
     unverified,
+    unusable_remedy,
+    with_remedy,
 )
-from ai_eda.design.inputs import DesignInput, canonical_key, present_keys, read_modulation, read_radio_build
+from ai_eda.design.inputs import MODULATION_ALIASES, DesignInput, canonical_key, present_keys, read_modulation, read_radio_build
 from ai_eda.design.library_parts import TemplateRefusal
 from ai_eda.design.rf.blocks.base import Block, BlockBuilder, BlockContext, BlockPrefix, BlockResult, exclude_floating, merge_results
 from ai_eda.design.rf.blocks.pa import P_OUT_RANGE_W, PaBlock, pa_net_classes
@@ -145,7 +147,7 @@ from ai_eda.design.rf.blocks.tx_chain import (
     calc,
     copy_input,
 )
-from ai_eda.design.rf.family import BUILDS, unserved_message
+from ai_eda.design.rf.family import BUILDS, refusal_question, unserved_message
 from ai_eda.design.rf.models import MODEL_VERDICT
 from ai_eda.design.rf.parts import part_line
 from ai_eda.design.rf.profile import PROFILE, PROFILE_BY_KEY, profile_choices, profile_keys, raster_refusal
@@ -342,13 +344,14 @@ class Kr447TxExciterTemplate(Template):
         if modulation is not None and modulation != BUILD.modulation:
             why = f"modulation {modulation}: the KR 447 MHz licence-exempt class is FM (F3E) [UNVERIFIED: 「무선설비규칙」]; radio_build={RADIO_BUILD} builds an FM transmitter only"
             out.append(MissingInformation(key="modulation", required=False, rationale=why,
-                                          question=f"{why}; no template design was proposed. State modulation=FM or choose another design."))
-        for r in unserved_requirements(ir, self):
+                                          question=with_remedy(f"{why}; no template design was proposed. State modulation=FM or choose another design", unusable_remedy(ir, MODULATION_ALIASES)) + "."))
+        unserved = unserved_requirements(ir, self)
+        keys = [r.key for r in unserved]
+        for r in unserved:
             canon = canonical_key(r.key) or r.key
             extra = " (no antenna on this board: its output is the conducted U.FL into an attenuator or a dummy load)" if canon in ANTENNA_KEYS else ""
             why = f"{r.id} ({requirement_text(r)}): {unserved_message(canon, RADIO_BUILD)}{extra}"
-            out.append(MissingInformation(key=r.key, required=False, rationale=why,
-                                          question=f"{why}; no template design was proposed. Start the project of the build that serves it, or leave this requirement out of the {RADIO_BUILD} board."))
+            out.append(refusal_question(why, r.key, RADIO_BUILD, keys))
         return out
 
     @staticmethod
@@ -386,11 +389,11 @@ class Kr447TxExciterTemplate(Template):
         present = present_keys(ir, inputs)
         missing = [k for k in ("carrier_frequency", "input_voltage") if k not in present]
         if missing:
-            _missing_inputs(plan, f"The {self.title} template", missing, unusable, examples={"carrier_frequency": "447.5625 MHz", "input_voltage": "7.4 V"})
+            _missing_inputs(plan, f"The {self.title} template", missing, unusable, examples={"carrier_frequency": "447.5625 MHz", "input_voltage": "7.4 V"}, ir=ir)
         modulation, mod_why = read_modulation(ir)
         if modulation is None:
             plan.questions.append(MissingInformation(key="modulation", required=mod_why is None, rationale="template input",
-                                                     question=mod_why or f"The {self.title} template needs modulation: answer modulation=fm (the KR 447 MHz class is FM [UNVERIFIED])"))
+                                                     question=with_remedy(mod_why, unusable_remedy(ir, MODULATION_ALIASES)) or f"The {self.title} template needs modulation: answer modulation=fm (the KR 447 MHz class is FM [UNVERIFIED])"))
             if not missing:
                 return _refused(plan, f"modulation missing{': ' + mod_why if mod_why else ''}")
         if plan.questions or plan.notes:

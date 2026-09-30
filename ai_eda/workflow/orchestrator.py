@@ -65,7 +65,7 @@ from ai_eda.agents import (
     ReviewAgent,
     SimulationAgent,
 )
-from ai_eda.agents.requirement import EXTRACTION_CHECK
+from ai_eda.agents.requirement import EXTRACTION_CHECK, blocks_pipeline, regulatory_scope_keys
 from ai_eda.compilers import (
     BOMCompiler,
     CPLCompiler,
@@ -403,7 +403,10 @@ class Orchestrator:
         question list, so copying it into ``requirements.missing`` would ask
         twice and still verify nothing.
         """
-        pending = [q for q in ir.requirements.missing if q.required and q.key not in ctx.answers]
+        # a question under a key the user left out of the design is closed, and a model question under a key nothing reads never
+        # blocks (``blocks_pipeline``: the requirement agent's own rule, applied here too to questions an older run recorded)
+        scope_keys = regulatory_scope_keys(ctx)
+        pending = [q for q in ir.requirements.missing if blocks_pipeline(q, ir, scope_keys) and q.key not in ctx.answers]
         if pending:
             return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.USER_INPUT_REQUIRED, questions=pending, message=f"{len(pending)} required question(s)")
         text = ir.requirements.request_text()

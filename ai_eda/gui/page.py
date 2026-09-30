@@ -1014,6 +1014,11 @@ function renderHead() {
     h('dt', {}, '실행 기록'), h('dd', {}, stages ? [ko(stages.run_hash_label), ' · ', ko(meta.pipeline_note)] : '실행 기록 없음')));
   const notices = [];
   if (info.warning) notices.push(notice('warn', '주의', info.warning));
+  // the user's leave-outs (--answer leave_out): copied from the report data, never computed here
+  const leftOut = d.report.requirements.left_out || [];
+  if (leftOut.length) notices.push(h('p', {class: 'notice'}, h('strong', {}, '설계에서 뺀 요구사항: '),
+    leftOut.map((x, i) => [i ? ', ' : '', code(x.id || x.key)]),
+    ' (사용자 결정, ', code('leave_out'), '; 템플릿이 읽지 않고 검토도 요구하지 않습니다. 같은 키에 값을 다시 답하면 설계로 돌아옵니다.)'));
   if (info.last_run && info.last_run.error) notices.push(notice('error', 'pipeline.json을 읽을 수 없음', info.last_run.error));
   const required = d.questions.required.length;
   if (required) notices.push(h('p', {class: 'notice warn'}, h('strong', {}, '답이 필요합니다: '),
@@ -1112,7 +1117,7 @@ function renderQuestions() {
     h('summary', {}, '선택 질문 ' + q.optional.length + '개 (' + confirmKey + ' 답과 같은 실행에 보내지 마십시오)'),
     h('p', {class: 'notice warn'}, h('strong', {}, '주의: '), '선택 질문에 답하면 그 값이 확정된 요구사항이 됩니다. 같은 실행에 ', code(confirmKey + '=yes'),
       '가 있으면 CLI가 확인을 무시하고 표를 다시 묻고, 템플릿이 쓰지 않는 설계 요구사항(예: ', code('operating_temperature'),
-      ')이면 그 템플릿은 설계를 내지 않습니다 (이유는 개요의 architecture 줄에 나옵니다).'),
+      ')이면 그 템플릿은 설계를 내지 않습니다 (이유는 개요의 architecture 줄에 나옵니다; ', code('leave_out=<키>'), ' 답으로 그 요구사항을 설계에서 뺄 수 있습니다).'),
     optional)]);
 }
 
@@ -1136,7 +1141,13 @@ function questionField(q, required) {
     h('span', {class: 'question-text'}, ' ' + (long ? text.slice(0, cut) : text)));
   const described = [bodyId, why].filter(Boolean).join(' ') || null;
   let input;
-  if (q.options && q.options.length) {
+  const leaveKey = state.data.answers_rule && state.data.answers_rule.leave_out_key;
+  if (leaveKey && q.answer_key === leaveKey) {
+    // a closed-world refusal: a value under the refused key is the dead end, so the field is the leave-out itself; the ticked keys of
+    // every such field (and a leave_out= line of the extra answers) go as ONE comma-separated answer (collectAnswers)
+    input = h('label', {class: 'check'}, h('input', {id, type: 'checkbox', 'data-leave-out': q.key, 'aria-describedby': described}),
+      ' 설계에서 빼기 (', code(leaveKey + '=' + q.key), '; 기록되고, 나중에 이 키에 값을 답하면 설계로 돌아옵니다)');
+  } else if (q.options && q.options.length) {
     input = h('select', {id, 'data-answer': q.key, 'aria-describedby': described},
       h('option', {value: ''}, required ? '(고르십시오)' : '(답하지 않음)'), q.options.map((o) => h('option', {value: o}, o)));
   } else {
@@ -1156,14 +1167,23 @@ function collectAnswers() {
     const value = el.value.trim();
     if (value) answers[el.dataset.answer] = value;
   }
+  // the leave-out answer is one comma-separated list: the ticked refusal fields and any leave_out= line of the extra answers are merged,
+  // never one overwriting another
+  const leaveKey = state.data && state.data.answers_rule ? state.data.answers_rule.leave_out_key : null;
+  const leave = [];
+  for (const el of document.querySelectorAll('[data-leave-out]')) if (el.checked) leave.push(el.dataset.leaveOut);
   const lines = $('extra-answers').value.split('\n');
   for (const [i, raw] of lines.entries()) {
     const line = raw.trim();
     if (!line) continue;
     const at = line.indexOf('=');
     if (at <= 0) throw new Error('추가 답변 ' + (i + 1) + '번째 줄은 키=값 형식이어야 합니다: ' + line);
-    answers[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+    const key = line.slice(0, at).trim();
+    const value = line.slice(at + 1).trim();
+    if (leaveKey && key === leaveKey) leave.push(...value.split(/[,;]/).map((k) => k.trim()).filter(Boolean));
+    else answers[key] = value;
   }
+  if (leaveKey && leave.length) answers[leaveKey] = [...new Set(leave)].join(',');
   return answers;
 }
 

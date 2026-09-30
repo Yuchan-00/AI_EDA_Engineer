@@ -46,8 +46,8 @@ from typing import TYPE_CHECKING, Any
 
 from ai_eda.ir import CircuitIR, Keepout, MissingInformation, NetClass, PCBDesign, Provenance, SIConstraints, Stackup, TimingPath, Traced
 
-from ai_eda.design.base import Choice, DesignChange, Plan, choice_provenance, structural_provenance
-from ai_eda.design.inputs import LAYER_COUNT_KEY, DesignInput, LayerCountInput, read_layer_count
+from ai_eda.design.base import Choice, DesignChange, Plan, choice_provenance, leave_out_remedy, refusal_question, structural_provenance, unusable_remedy
+from ai_eda.design.inputs import LAYER_COUNT_ALIASES, LAYER_COUNT_KEY, DesignInput, LayerCountInput, read_layer_count
 from ai_eda.design.stackup import PLANE_EDGE_CLEARANCE_MM, board_layers, generic_stackup, stackup_choices
 
 if TYPE_CHECKING:
@@ -197,17 +197,21 @@ def layer_policy_refusal(template: Template, ir: CircuitIR) -> MissingInformatio
     user already stated that refuses the template makes every answer to a
     required question useless. The requirement exists, so the question asks
     for the requirement to change (or another design), never for an
-    ``--answer`` under its key (a typed value is kept).
+    ``--answer`` under its key (a typed value is kept) - and names the answer
+    that leaves it out (``--answer leave_out=<key>``: the template's default
+    stack is then used).
     """
     layers, _why = read_layer_count(ir)
     if layers is None or layers.is_default or layers.requirement is None or layers.value in template.layer_policy.allowed:
         return None
     why = _not_allowed(template, layers)
-    return MissingInformation(
-        key=layers.requirement.key, required=False,
-        question=(f"{why}; no template design was proposed. Change the requirement to {template.layer_policy.allowed_text()} layers "
-                  f"(or leave it out: the template's default is {template.layer_policy.default} layers), or choose another design."),
-        rationale=why,
+    key = layers.requirement.key
+    return refusal_question(
+        key,
+        (f"{why}; no template design was proposed. Change the requirement to {template.layer_policy.allowed_text()} layers "
+         f"(or leave it out: the template's default is {template.layer_policy.default} layers), or choose another design. "
+         f"{leave_out_remedy(key, where='this design')}."),
+        why,
     )
 
 
@@ -224,7 +228,9 @@ def add_board(template: Template, ir: CircuitIR, plan: Plan, *, confirmed: bool)
     policy = template.layer_policy
     layers, why = read_board_layers(template, ir)
     if layers is None:
-        return f"{LAYER_COUNT_KEY}: {why}"
+        # a stated count no reader can use (or one the policy refuses) is cleared by leaving it out: a typed value is kept
+        remedy = unusable_remedy(ir, LAYER_COUNT_ALIASES)
+        return f"{LAYER_COUNT_KEY}: {why}" + (f"; {remedy}" if remedy else "")
     params = _plan_params(plan)
     board_params: dict[str, Traced] = {}
     changes: list[DesignChange] = []

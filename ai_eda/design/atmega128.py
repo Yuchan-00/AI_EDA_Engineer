@@ -310,7 +310,7 @@ class Atmega128DevboardTemplate(Template):
             return _refused(plan, why)
         missing = [k for k in self.needs if k not in inputs]
         if missing:
-            return _missing_inputs(plan, "The ATmega128 development board template", missing, unusable, examples={"input_voltage": "9 V", "clock_frequency": "16 MHz"})
+            return _missing_inputs(plan, "The ATmega128 development board template", missing, unusable, examples={"input_voltage": "9 V", "clock_frequency": "16 MHz"}, ir=ir)
         f_in, v_in = inputs["clock_frequency"], inputs["input_voltage"]
         plan.inputs = {"clock_frequency": f_in, "input_voltage": v_in}
         req_f, req_v = f_in.requirement.id, v_in.requirement.id

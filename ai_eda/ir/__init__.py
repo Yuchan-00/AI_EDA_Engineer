@@ -31,6 +31,7 @@ from ai_eda.ir.requirements import (
     MissingInformation,
     RequirementConflict,
     RequirementSet,
+    LeftOutRequirement,
 )
 from ai_eda.ir.components import (
     PinElectricalType,
@@ -101,7 +102,7 @@ __all__ = [
     "authoritative", "assumption", "derived", "llm_generated", "user_requirement",
     "ValidationStatus", "Evidence", "ValidationResult", "ValidationState", "worst_status",
     "RequirementKind", "RequirementStatus", "Requirement", "MissingInformation",
-    "RequirementConflict", "RequirementSet",
+    "RequirementConflict", "RequirementSet", "LeftOutRequirement",
     "PinElectricalType", "Pin", "LibraryRef", "SourcingInfo", "Component",
     "NetKind", "PinRef", "Net",
     "SpiceDevice", "SpiceBinding", "StimulusKind", "Stimulus", "AnalysisSpec", "Reduce",

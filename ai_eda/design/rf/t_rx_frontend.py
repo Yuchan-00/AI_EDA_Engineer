@@ -110,15 +110,18 @@ from ai_eda.design.base import (
     quantity,
     requirement_text,
     unserved_requirements,
+    unusable_note,
     unverified,
+    unusable_remedy,
+    with_remedy,
 )
-from ai_eda.design.inputs import DesignInput, canonical_key, present_keys, read_modulation, read_radio_build
+from ai_eda.design.inputs import MODULATION_ALIASES, DesignInput, canonical_key, present_keys, read_modulation, read_radio_build
 from ai_eda.design.library_parts import TemplateRefusal
 from ai_eda.design.rf.blocks.base import Block, BlockBuilder, BlockContext, BlockPrefix, BlockResult, exclude_floating, merge_results
 from ai_eda.design.rf.blocks.lo_chain import BUFFER_ID, CHAIN_ID, LoBufferBlock, LoChainBlock
 from ai_eda.design.rf.blocks.power import PACK_CUTOFF_V, PACK_MAX_V
 from ai_eda.design.rf.blocks.rx_frontend import FRONTEND_ID, MIXER_ID, RxFrontendBlock, RxMixerBlock, exclude, requirement_ids
-from ai_eda.design.rf.family import BUILDS, unserved_message
+from ai_eda.design.rf.family import BUILDS, refusal_question, unserved_message
 from ai_eda.design.rf.models import MODEL_VERDICT
 from ai_eda.design.rf.parts import PlacedPart
 from ai_eda.design.rf.profile import profile_choices, profile_keys, raster_refusal
@@ -275,13 +278,12 @@ class KR447RxFrontendTemplate(Template):
     def refusals(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str]) -> list[MissingInformation]:
         """The closed world with the family's sentence: every unserved confirmed design requirement names the builds that serve it."""
         out: list[MissingInformation] = []
-        for r in unserved_requirements(ir, self):
+        unserved = unserved_requirements(ir, self)
+        keys = [r.key for r in unserved]
+        for r in unserved:
             canon = canonical_key(r.key) or r.key
             why = f"{r.id} ({requirement_text(r)}): {unserved_message(canon, RADIO_BUILD)}"
-            out.append(MissingInformation(
-                key=r.key, required=False, rationale=why,
-                question=f"{why}; no template design was proposed. Start the project of the build that serves it, or leave this requirement out of the {RADIO_BUILD} board.",
-            ))
+            out.append(refusal_question(why, r.key, RADIO_BUILD, keys))
         return out
 
     # ------------------------------------------------------------------ build
@@ -294,7 +296,7 @@ class KR447RxFrontendTemplate(Template):
         if missing:
             for k in missing:
                 if k in unusable:
-                    plan.notes.append(f"{k} not usable: {unusable[k]}")
+                    plan.notes.append(unusable_note(ir, k, unusable[k]))
                 elif k == "carrier_frequency":
                     plan.questions.append(MissingInformation(key=k, rationale="template input", question=(
                         f"The {self.title} template needs carrier_frequency in Hz: the channel of the KR 447 MHz raster the receiver is built for "
@@ -305,9 +307,9 @@ class KR447RxFrontendTemplate(Template):
             return _refused(plan, f"input(s) {missing} missing")
         modulation, why_mod = read_modulation(ir)
         if why_mod is not None:
-            return _refused(plan, f"modulation not usable: {why_mod}")
+            return _refused(plan, with_remedy(f"modulation not usable: {why_mod}", unusable_remedy(ir, MODULATION_ALIASES)))
         if modulation is not None and modulation != BUILD.modulation:
-            return _refused(plan, f"modulation {modulation!r}: the KR 447 MHz licence-exempt class is FM telephony [UNVERIFIED: 「무선설비규칙」]; this receiver is built for FM")
+            return _refused(plan, with_remedy(f"modulation {modulation!r}: the KR 447 MHz licence-exempt class is FM telephony [UNVERIFIED: 「무선설비규칙」]; this receiver is built for FM", unusable_remedy(ir, MODULATION_ALIASES)))
         profile = profile_choices(t, confirmed)
         shared: dict[str, Traced] = {c.key: tr for c, tr in profile}
         f_c = float(inputs["carrier_frequency"].traced.value)

@@ -95,6 +95,7 @@ from ai_eda.design.base import (
     quantity,
     requirement_text,
     unserved_requirements,
+    unusable_note,
     unverified,
 )
 from ai_eda.design.inputs import DesignInput, canonical_key, present_keys, read_modulation, read_radio_build
@@ -103,7 +104,7 @@ from ai_eda.design.rf.blocks.base import Block, BlockBuilder, BlockContext, Bloc
 from ai_eda.design.rf.blocks.if_backend import BLOCK_ID as IF_BLOCK_ID
 from ai_eda.design.rf.blocks.if_backend import IfBackendBlock
 from ai_eda.design.rf.blocks.power import PACK_CUTOFF_V, PACK_MAX_V
-from ai_eda.design.rf.family import BUILDS, unserved_message
+from ai_eda.design.rf.family import BUILDS, refusal_question, unserved_message
 from ai_eda.design.rf.models import MODEL_VERDICT
 from ai_eda.design.rf.parts import part_line
 from ai_eda.design.rf.profile import profile_choices, profile_keys
@@ -232,13 +233,12 @@ class KR447RxBackendTemplate(Template):
     def refusals(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str]) -> list[MissingInformation]:
         """The closed world with the family's sentence: every unserved confirmed design requirement names the builds that serve it."""
         out: list[MissingInformation] = []
-        for r in unserved_requirements(ir, self):
+        unserved = unserved_requirements(ir, self)
+        keys = [r.key for r in unserved]
+        for r in unserved:
             canon = canonical_key(r.key) or r.key
             why = f"{r.id} ({requirement_text(r)}): {unserved_message(canon, RADIO_BUILD)}"
-            out.append(MissingInformation(
-                key=r.key, required=False, rationale=why,
-                question=f"{why}; no template design was proposed. Start the project of the build that serves it, or leave this requirement out of the {RADIO_BUILD} board.",
-            ))
+            out.append(refusal_question(why, r.key, RADIO_BUILD, keys))
         return out
 
     # ------------------------------------------------------------------ build
@@ -251,7 +251,7 @@ class KR447RxBackendTemplate(Template):
         if missing:
             for k in missing:
                 if k in unusable:
-                    plan.notes.append(f"{k} not usable: {unusable[k]}")
+                    plan.notes.append(unusable_note(ir, k, unusable[k]))
                 elif k == "modulation":
                     plan.questions.append(MissingInformation(key=k, rationale="template input",
                                                              question=f"The {self.title} template needs modulation: answer modulation=fm (the KR 447 MHz class is FM [UNVERIFIED])"))

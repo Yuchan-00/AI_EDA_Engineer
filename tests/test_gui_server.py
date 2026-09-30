@@ -1304,12 +1304,13 @@ def test_warning_text_meets_wcag_aa_on_every_list_background():
 def test_the_confirm_design_guard_is_the_circuit_agents_rule(shared, tmp_path: Path):
     """The page refuses to send confirm_design=yes with an answer that makes the CLI ignore it - exactly those (the rule the server
     copies from the circuit agent's key sets): a control answer such as pcb.routing=skip still goes with it."""
-    from ai_eda.agents.keys import CONTROL_KEYS, REQUIREMENT_DECISION_KEYS
+    from ai_eda.agents.keys import CONTROL_KEYS, LEAVE_OUT_KEY, REQUIREMENT_DECISION_KEYS
     from ai_eda.gui.page import APP_JS
 
     running, *_ = shared
     rule = get_json(running.port, "/api/projects/divider")["answers_rule"]
-    assert rule == {"confirm_key": CONFIRM_DESIGN_KEY, "control_keys": sorted(CONTROL_KEYS), "decision_keys": sorted(REQUIREMENT_DECISION_KEYS)}
+    assert rule == {"confirm_key": CONFIRM_DESIGN_KEY, "control_keys": sorted(CONTROL_KEYS), "decision_keys": sorted(REQUIREMENT_DECISION_KEYS),
+                    "leave_out_key": LEAVE_OUT_KEY}
     function = re.search(r"function confirmVoiders\(answers\) \{.*?\n\}", APP_JS, re.S).group(0)
     cases = [
         {"confirm_design": "yes", "operating_temperature": "0 to 40 C"},
@@ -1318,6 +1319,7 @@ def test_the_confirm_design_guard_is_the_circuit_agents_rule(shared, tmp_path: P
         {"confirm_design": "yes", "confirm_requirements": "yes"},
         {"confirm_design": "yes"},
         {"operating_temperature": "0 to 40 C", "application": "bench"},
+        {"confirm_design": "yes", "leave_out": "a,b"},
     ]
     script = tmp_path / "guard.js"
     script.write_text(f"const state = {{data: {{answers_rule: {json.dumps(rule)}}}}};\n{function}\n"
@@ -1326,7 +1328,7 @@ def test_the_confirm_design_guard_is_the_circuit_agents_rule(shared, tmp_path: P
     assert result.returncode == 0, result.stderr
     # the circuit agent's own predicate (ai_eda/agents/circuit.py): what it lists as "given in this run" beside the confirmation
     expected = [sorted(k for k in c if k != CONFIRM_DESIGN_KEY and (k not in CONTROL_KEYS or k in REQUIREMENT_DECISION_KEYS)) if c.get(CONFIRM_DESIGN_KEY) else [] for c in cases]
-    assert [sorted(v) for v in json.loads(result.stdout)] == expected == [["operating_temperature"], ["mains_powered"], [], ["confirm_requirements"], [], []]
+    assert [sorted(v) for v in json.loads(result.stdout)] == expected == [["operating_temperature"], ["mains_powered"], [], ["confirm_requirements"], [], [], ["leave_out"]]
 
 
 def test_the_default_model_of_each_provider_is_the_clis_resolution(shared):
