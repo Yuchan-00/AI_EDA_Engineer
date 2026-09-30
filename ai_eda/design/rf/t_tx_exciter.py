@@ -73,14 +73,29 @@ confirmed ``frequency_deviation``, PASS / FAIL on the factors this design
 PASSed (2.1945 kHz against 2.5 kHz at the default models: PASS);
 ``rf.model_grounding`` / ``rf.regulatory_profile`` / ``rf.lab.*``
 NOT_VERIFIED. The bench board places (106 x 42 mm, both cans with their parts
-inside their fences; 106 x 73 mm with the P9 blocks) but is not routed:
-``routing.maze`` refuses the board because the PHA-1's library footprint
-(``Package_TO_SOT_SMD:SOT-89-3``) has a custom-shape pad 2 it cannot bound,
-so ``pcb.routing.connectivity`` FAILs on the nets of known pads left without
-copper (the nets holding the custom pad are NOT_VERIFIED rows; RELEASE
-FAILs), ``pcb.routing.clearance`` has no copper to compare, and
-``domain.rf.impedance`` and the RF ``si.*`` rows are NOT_VERIFIED ("no
-routed copper"). ``si.rf_length``
+inside their fences; 106 x 73 mm with the P9 blocks) - the PA's QFN-12 with
+its fan-out room, every other part 2.2 mm from its pads
+(``placement.rf_floorplan`` 0.2, decision 2A) - and routes: ``routing.maze``
+0.6 reads the PHA-1's ``SOT-89-3`` custom pad 2 as the boxes of its anchor and
+primitives and joins the PA's fenced pads (U901.2 / .3 / .6 / .10 / .11) and
+R806.2's ground pad to its grid by escapes; measured 2026-09-30 through the
+pipeline (``tests/test_kr447_tx_exciter.py``): 57 of 57 nets in 19
+negotiation iterations, PA_PD and TX_X3_E promoted and re-routed once,
+``pcb.routing.connectivity`` NOT_VERIFIED (GND joined only through the plane
+fill), ``domain.rf.impedance`` and the RF ``si.impedance.*`` PASS, and
+``spice.si.PA_PD`` FAILs (the 89.73 mm line J2.2 - U901.10 overshoots 30.5 %
+against its class's 15 %: an honest verdict on the copper, left to a human).
+With the P9 blocks the MAX9814 (U301) gets its fan-out room too and the board
+(108 nets, a large board: up to 150 negotiation iterations) is routing.maze
+0.7's: 0.6's first pass left U301 pads without an escape (U302.2's ground via
+in U301's escape area), the second run keeps U301's room clear of the other
+footprints' plane vias and every U301 / U901 pad escapes; the router alone
+connects 108 of 108 nets, legal after 93 iterations (2524 tracks, 467 vias,
+4932.4 mm, about 480 s with four routes sharing 4 CPUs; at the old cap of 40
+it had 4 conflicting nets left); through the whole pipeline (2026-09-30) six
+nets are promoted to Z50 and the single re-route is legal after 36
+iterations and kept (2392 tracks, 468 vias, 4872.8 mm), no check FAILs and
+RELEASE is NOT_VERIFIED. ``si.rf_length``
 is NOT_VERIFIED on any routed board too: ``ai_eda.design.board.add_board``
 builds ``ir.si`` without ``rf_length_fraction`` (a wave-1 gap no template can
 close). On the bench board ``review.requirements_vs_ir`` FAILs naming

@@ -16,15 +16,16 @@ What runs where:
   23 fixture networks - the cascade ant_end among them -, 15 blocks with ports and regions), the variant
   difference (``ANT1`` and what goes with the antenna against ``J1001``, in
   the design view), byte-identical rebuilds (design hash, table, compiled
-  schematic and board), the RF floorplan on the board's 60 x 243 mm outline
+  schematic and board), the RF floorplan on the board's 60 x 245 mm outline
   for both builds and with every option (about 0.1 s) and the strict area
   bound that rules out the design's 60 x 145 mm, the keep-outs (and their
   compiled rule areas), the RF checks without ngspice (every block interface
   PASS; a tx_power above the profile placeholder FAILs the profile row), the
   SI classes, the Korean theory / part notes / figures and the four stage
-  reports, every optional input served, the full board's router refusal
-  (the PA's QFN pad below the 0.2 mm grid; the three custom pads - the
-  microphone's and the two PHA-1s' - are read) and a reduced routing case - the
+  reports, every optional input served, the full board's PA pads below the
+  0.2 mm grid escaping it (the two custom pads - the two PHA-1s' - are read;
+  the microphone is the through-hole POM-2244P-C3310-2-R, no custom pad) and
+  a reduced routing case - the
   antenna end alone (trx + antenna blocks) routed on the real footprints for
   both builds, ``ANT_FEED`` through the antenna band, the GND vias inside
   ``trx_bcu``, ``pcb.keepout`` PASS;
@@ -93,7 +94,7 @@ EVERYTHING = {**BASE, "antenna_gain": "2.15 dBi", "link_range": "1 km", "antenna
 FIXTURE_BUDGET_S = 10.0
 RAWFILE_BUDGET_BYTES = 60_000_000
 #: the board outline the floorplan gives (mm): 60 mm wide like the design, the length the composed blocks need
-OUTLINE_MM = (60.0, 243.0)
+OUTLINE_MM = (60.0, 245.0)
 #: the block ids of the board in build order
 BLOCK_IDS = ["power", "ptt", "lo_chain", "lo_buffer", "rx_frontend", "rx_mixer", "if_backend", "rx_audio", "tx_mod", "tx_chain", "tx_driver", "pa", "trx",
              "antenna", "tx_audio"]
@@ -366,8 +367,8 @@ def test_the_floorplan_places_every_build_on_the_boards_outline(tmp_path: Path, 
     assert box.y1 >= 2.0 - 1e-9 and (box.y2 <= BAND_H_MM if feed == "ANT1" else box.y2 <= 8.0)  # at the top edge, inside the band / its region
     ir.pcb.outline, ir.pcb.placements = fp.outline, fp.placements
     ko = _run("pcb.keepout", ir, tmp_path)["pcb.keepout"]
-    # nothing violates a keep-out, a region or a can fence, and every pad's copper is bounded - the three custom pads (the microphone's
-    # and the two PHA-1s') by the boxes of their anchor and primitives
+    # nothing violates a keep-out, a region or a can fence, and every pad's copper is bounded - the two custom pads (the two PHA-1s')
+    # by the boxes of their anchor and primitives
     assert ko.status is S.PASS and ko.details["unknown"] == [] and [r for r in ko.details["rows"] if r["status"] != "PASS"] == [], ko.message
     assert len(ko.details["regions"]) == len(BLOCK_IDS) + 4  # every region and every can fence was judged
 
@@ -376,8 +377,8 @@ def test_the_floorplan_places_every_build_on_the_boards_outline(tmp_path: Path, 
 #: template's docstring and its Korean floorplan section state them - a deviation from the design's §2.5 (pots, mic and connectors on the
 #: bottom edge) left to manual placement; SW201 is on the left edge as §2.5 asks
 UI_EDGES_MM = {
-    "SW201": (2.0, 49.5, 97.5, 139.5), "RV401": (12.2, 33.4, 185.5, 44.2), "RV402": (2.0, 43.6, 199.8, 29.9), "MK301": (2.0, 53.5, 67.5, 171.0),
-    "J401": (44.9, 8.2, 185.5, 52.0), "J101": (2.0, 51.1, 218.5, 19.0),
+    "SW201": (2.0, 49.5, 100.5, 138.5), "RV401": (12.2, 33.4, 187.5, 44.2), "RV402": (2.0, 43.6, 201.8, 29.9), "MK301": (2.0, 51.5, 67.5, 171.0),
+    "J401": (44.9, 8.2, 187.5, 52.0), "J101": (2.0, 51.1, 220.5, 19.0),
 }
 
 
@@ -402,7 +403,7 @@ def test_the_user_facing_parts_land_where_the_template_says(built) -> None:
 
 @needs_libs
 def test_the_designs_60_by_145_mm_outline_cannot_hold_the_composed_board(built) -> None:
-    """Why the outline is 60 x 243 mm, not the kr447 design's 60 x 145 mm: a strict area bound. The placer keeps every part MARGIN_MM inside
+    """Why the outline is 60 x 245 mm, not the kr447 design's 60 x 145 mm: a strict area bound. The placer keeps every part MARGIN_MM inside
     the edge and SPACING_MM from every other part (a can holds its block's parts inside its fence), so the parts' extents grown by SPACING_MM
     are disjoint inside the outline shrunk by MARGIN_MM and grown by SPACING_MM - their area already exceeds it (the antenna band not even
     counted)."""
@@ -469,7 +470,11 @@ def test_the_korean_views_cover_the_board(built) -> None:
     own = sections[:7]
     assert all("기록 없음" not in s.body for s in own) and "UNVERIFIED" in sections[0].body
     assert "R219" not in "".join(s.body for s in sections)  # the stage-1 bench sentence is rewritten for this board
-    assert "60 × 243 mm" in next(s.body for s in sections if s.title.startswith("기판 배치"))
+    board_text = next(s.body for s in sections if s.title.startswith("기판 배치"))
+    assert "60 × 245 mm" in board_text
+    # decision 1A: wherever the microphone is described, its case / negative terminal is said to be unverified
+    mic = board_text[board_text.index("POM-2244P-C3310-2-R"):]
+    assert "케이스(음극)" in mic[:200] and "검증되지 않음" in mic[:200]
     notes = t.part_notes(ir)
     assert set(notes) == {c.ref for c in ir.components} and notes["ANT1"].role.startswith("일체형") and "PIN" in notes["D1001"].role
     figures = t.theory_figures(ir)
@@ -497,11 +502,13 @@ def test_the_stage_reports_are_deterministic_views(built) -> None:
 
 
 @needs_libs
-def test_the_full_board_is_placed_and_the_pas_qfn_pads_off_the_grid_escape_it(built, tmp_path: Path) -> None:
+def test_the_full_board_is_placed_and_the_pas_fenced_qfn_pads_escape(built, tmp_path: Path) -> None:
     """routing.maze 0.5 refused this board before routing at U901.1 (the PA's 0.825 x 0.25 mm QFN pad, 0.1296 mm from the nearest 0.2 mm
-    grid point, outside its inscribed circle). 0.6 joins every U901 pad to the grid by an escape stub no wider than the pad (the router's
-    module docstring: escape stubs). Routing the whole board takes minutes here, so the PA's nets are routed alone on the placed board,
-    every other part and the plane nets in place."""
+    grid point under placement 0.1, U901 at x = 6.92). Placement 0.2 keeps the QFN's fan-out room (decision 2A) and puts U901 at
+    (7.87, 21.55), where no pad is off the grid but six are fenced by their neighbours (0.5 mm pitch); 0.6 joins each of them to the grid
+    by an escape stub no wider than the pad (the router's module docstring: escape stubs; the off-grid case of the real QFN-12 is
+    tests/test_routing_fine_pitch.py's). Routing the whole board takes about 10-20 minutes here (211 nets, legal after 123 negotiation
+    iterations, measured), so the PA's nets are routed alone on the placed board, every other part and the plane nets in place."""
     from ai_eda.agents.pcb import ROUTING_KEY, _routes_around_planes
     from ai_eda.tools.routing.maze import RoutingParams, route_board
     from ai_eda.tools.si.rules import net_rules
@@ -516,8 +523,10 @@ def test_the_full_board_is_placed_and_the_pas_qfn_pads_off_the_grid_escape_it(bu
     placed.nets = [n for n in placed.nets if n.name in extra["plane_nets"] or any(p.component_ref == "U901" for p in n.pins)]
     params = RoutingParams.for_board(placed, _REAL)
     r = route_board(placed, _REAL, params, rules=net_rules(placed, params).rules or None, inner_layers=_routes_around_planes(board), **extra)
+    assert [(p.x_mm, p.y_mm) for p in board.placements if p.component_ref == "U901"] == [(7.87, 21.55)]
     rows = {e["pad"]: e for e in r.stats["escapes"] if e["pad"].startswith("U901.")}
-    assert rows["U901.1"]["why"] == rows["U901.3"]["why"] == "off-grid" and all(row["width_mm"] <= 0.25 for row in rows.values())
+    assert sorted(rows) == ["U901.10", "U901.11", "U901.12", "U901.2", "U901.3", "U901.6"]
+    assert {row["why"] for row in rows.values()} == {"fenced"} and all(row["width_mm"] <= 0.25 for row in rows.values())
     assert not [k for k in r.stats["escape_refused"] if k.startswith("U901.")] and r.version == "0.6"
     pa = {n.name for n in placed.nets if n.name not in extra["plane_nets"]}
     assert pa and not pa & set(r.unrouted), {k: r.unrouted[k] for k in pa & set(r.unrouted)}

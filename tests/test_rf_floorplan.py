@@ -12,7 +12,12 @@ ngspice. What is proved:
   around the regions, honours keep-outs that ban footprints, and refuses
   (never overlaps) a region too small for a part or a can, a region outside
   the outline or on another, and a shielded block without a region; it
-  places a board the grid placer cannot;
+  places a board the grid placer cannot; a part whose pad pitch is below
+  ``FANOUT_PITCH_MM`` (``Test:QFN5``, 0.5 mm; the real DFN-14 / QFN-12 when
+  the KiCad libraries are installed) keeps every other part's extent
+  ``fanout_margin`` (the router's parameters: 2.2 mm at the fine rules) from
+  its pads, and only such a board is placement 0.2, each placement naming
+  the room;
 * the router (routing.maze 0.4, only when keep-outs or plane nets are given)
   keeps every track out of a track keep-out (an allowed net may pass), no
   via in a via keep-out, joins a plane net's SMD pads by a via each (none
@@ -58,6 +63,7 @@ from ai_eda.ir import (
     CircuitIR,
     ManufacturingConstraints,
     NetKind,
+    ProjectMeta,
     Provenance,
     ProvenanceKind,
     Track,
@@ -71,8 +77,10 @@ from ai_eda.tools import keepout as kg
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.placement.grid import grid_placement
-from ai_eda.tools.placement.rf_floorplan import PLACER_ID, RING_MM, fence_box, rf_floorplan_placement
-from ai_eda.tools.routing.maze import PLANE_VIA_REACH_MM, ROUTER_KEEPOUT_VERSION, ROUTER_VERSION, route_board
+import ai_eda.tools.placement.rf_floorplan as rf_floorplan_module
+from ai_eda.tools.kicad.geometry import pads_bbox
+from ai_eda.tools.placement.rf_floorplan import PLACER_FANOUT_VERSION, PLACER_ID, PLACER_VERSION, RING_MM, fence_box, rf_floorplan_placement
+from ai_eda.tools.routing.maze import FINE_RULES, PLANE_VIA_REACH_MM, ROUTER_KEEPOUT_VERSION, ROUTER_VERSION, RoutingParams, fanout_margin, route_board
 from ai_eda.tools.calc.tline import propagation_delay
 from ai_eda.tools.si.measure import KEEPOUT_NO_PLANE, measure_nets
 from ai_eda.tools.spice.si_check import spice_si_results
@@ -132,6 +140,12 @@ _EXTRA_FOOTPRINTS = {
     ),
     # a QFN "..._ThermalVias" exposed pad: EP 2 on F.Cu and B.Cu, four same-numbered through-hole vias on it, and a ring of
     # unconnected leads (pad 1) on every axis, so no stub can leave the EP along the grid axes
+    # one side of a QFN: five 0.7 x 0.25 mm pads at a 0.5 mm pitch (below FANOUT_PITCH_MM) and a courtyard 0.25 mm around them
+    "QFN5": (
+        '(attr smd)\n'
+        '  (fp_rect (start -0.6 -1.375) (end 0.6 1.375) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))\n'
+        + "\n".join(f'  (pad "{i + 1}" smd rect (at 0 {y}) (size 0.7 0.25) (layers "F.Cu" "F.Mask" "F.Paste"))' for i, y in enumerate((-1.0, -0.5, 0.0, 0.5, 1.0)))
+    ),
     "EPTV": (
         '(attr smd)\n'
         '  (fp_rect (start -2.2 -2.2) (end 2.2 2.2) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))\n'
@@ -690,6 +704,104 @@ def test_without_an_outline_the_regions_size_the_board(tmp_path: Path, lib: Kica
     ir = with_rf(unplaced(tmp_path, lib, [("J1", "PAD2"), ("R1", "SMDB")], size=None), [block("io", ["J1", "R1"], chain=["J1", "R1"], region=(0.0, 0.0, 30.0, 12.0))])
     got = rf_floorplan_placement(ir, lib)
     assert (got.outline.width_mm, got.outline.height_mm, got.outline.origin_x_mm, got.outline.origin_y_mm) == (30.0, 12.0, 0.0, 0.0)
+
+
+def _fine_ir(tmp_path: Path, lib: KicadLibrary, fine: str = "QFN5", region: tuple[float, float, float, float] = (0.0, 0.0, 30.0, 20.0)) -> CircuitIR:
+    """One block of a part ``U1`` (``QFN5``: a 0.5 mm pitch) and eight 2-pad parts, chain C1 -> U1 -> C2."""
+    parts = [("U1", fine), *[(f"C{i}", "SMDB") for i in range(1, 9)]]
+    ir = unplaced(tmp_path, lib, parts, size=(40.0, 30.0))
+    return with_rf(ir, [block("mic", [r for r, _ in parts], chain=["C1", "U1", "C2"], region=region)])
+
+
+def _gap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    """Distance between two boxes (0 when they touch or overlap)."""
+    return math.hypot(max(a[0] - b[2], b[0] - a[2], 0.0), max(a[1] - b[3], b[1] - a[3], 0.0))
+
+
+def test_a_fine_pitch_part_keeps_the_routers_fan_out_room_and_only_its_board_is_placement_0_2(tmp_path: Path, lib: KicadLibrary,
+                                                                                              monkeypatch: pytest.MonkeyPatch):
+    ir = _fine_ir(tmp_path, lib)
+    got = rf_floorplan_placement(ir, lib, outline=ir.pcb.outline)
+    margin = fanout_margin(RoutingParams(**FINE_RULES))  # the 0.5 mm pitch picks the fine rules
+    assert margin == 2.2 and got.fanout == {"U1": 2.2} and got.version == PLACER_FANOUT_VERSION == "0.2"
+    at = {p.component_ref: p for p in got.placements}
+    pads = _box(pads_bbox(at["U1"], lib.load_footprint(ir.component("U1").footprint)))
+    gaps = {ref: _gap(pads, _box(e)) for ref, e in got.extents.items() if ref != "U1"}
+    assert min(gaps.values()) >= margin - 1e-6, gaps
+    entry = "fanout:U1=0.5;below_mm=0.65;margin_mm=2.2;escape_reach=1.5,grid=0.2,clearance=0.2,width=0.25,via=0.6"
+    assert all(p.provenance.tool_version == "0.2" and entry in p.provenance.derived_from for p in got.placements)
+    text = got.description("user", 1.0, 2.0, RING_MM)
+    assert text.startswith("placement.rf_floorplan 0.2: ") and "fan-out room: U1 2.2 mm from the pads of each part whose pad pitch is below 0.65 mm" in text
+    # the room is the router's: another escape reach, another margin
+    shorter = rf_floorplan_placement(ir, lib, outline=ir.pcb.outline, routing=RoutingParams(**FINE_RULES, escape_reach_mm=1.0))
+    assert shorter.fanout == {"U1": 1.7}
+    # without the rule (the threshold below the part's pitch) the packer puts a neighbour 1 mm from U1's courtyard - inside the room
+    monkeypatch.setattr(rf_floorplan_module, "FANOUT_PITCH_MM", 0.5)
+    before = rf_floorplan_placement(ir, lib, outline=ir.pcb.outline)
+    at0 = {p.component_ref: p for p in before.placements}
+    pads0 = _box(pads_bbox(at0["U1"], lib.load_footprint(ir.component("U1").footprint)))
+    assert before.version == PLACER_VERSION == "0.1" and before.fanout == {}
+    assert min(_gap(pads0, _box(e)) for ref, e in before.extents.items() if ref != "U1") < margin - 0.5
+    assert all(p.provenance.tool_version == "0.1" and not any(e.startswith("fanout:") for e in p.provenance.derived_from) for p in before.placements)
+    monkeypatch.undo()
+    # a board without such a part is placement 0.1's
+    plain = _fine_ir(tmp_path / "plain", lib, fine="SMDB")
+    assert rf_floorplan_placement(plain, lib, outline=plain.pcb.outline).version == "0.1"
+    # a region the room does not fit refuses, naming the room
+    small = _fine_ir(tmp_path / "small", lib, region=(0.0, 0.0, 5.0, 20.0))
+    with pytest.raises(CompileError, match=r"U1 \(Test:QFN5, [0-9.]+ x [0-9.]+ mm with its fan-out room\) is larger than the box it belongs in"):
+        rf_floorplan_placement(small, lib, outline=small.pcb.outline)
+
+
+def test_a_refused_routing_parameter_leaves_the_placement_and_the_router_says_not_routed(tmp_path: Path, lib: KicadLibrary):
+    """A fab drill limit that reaches the via diameter is the router's refusal (``not routed:``), never the placement's: the fan-out room
+    falls back to the unraised parameters (recorded), and parameters that fail their own check leave the part without room (0.1)."""
+    ir = _fine_ir(tmp_path, lib)
+    ir.pcb.manufacturing = ManufacturingConstraints(min_via_drill_mm=authoritative(0.6, DS, unit="mm"))
+    res = PCBAgent().run(ir, AgentContext(workdir=tmp_path, tools={"kicad_library": lib}))
+    assert [p.target for p in res.proposals] == ["pcb"]
+    assert not any(n.startswith("not placed") for n in res.notes), res.notes
+    assert any(n.startswith("not routed: ir.pcb.manufacturing raises the via drill to 0.6 mm") for n in res.notes), res.notes
+    placements = res.proposals[0].payload.placements
+    assert len(placements) == 9 and all(p.provenance.tool_version == "0.2" for p in placements)
+    entry = next(e for e in placements[0].provenance.derived_from if e.startswith("fanout:"))
+    assert entry.startswith("fanout:U1=0.5;below_mm=0.65;margin_mm=2.2;escape_reach=1.5,grid=0.2,clearance=0.2,width=0.25,via=0.6;raised=refused(")
+    assert "ir.pcb.manufacturing raises the via drill to 0.6 mm, which is not below the via diameter 0.6 mm)" in entry
+    got = rf_floorplan_placement(ir, lib, outline=ir.pcb.outline)
+    assert got.fanout == {"U1": 2.2} and "whose raise is refused (ir.pcb.manufacturing raises the via drill" in got.description("user", 1.0, 2.0, RING_MM)
+    # the same board without the refused limit: the same placement (the room is the unraised parameters' either way)
+    ok = _fine_ir(tmp_path / "ok", lib)
+    assert [(p.x_mm, p.y_mm, p.rotation_deg) for p in rf_floorplan_placement(ok, lib, outline=ok.pcb.outline).placements] == \
+        [(p.x_mm, p.y_mm, p.rotation_deg) for p in got.placements]
+    # invalid parameters given directly: no room (0.1), the reason in the description; the router refuses them later
+    bad = rf_floorplan_placement(ir, lib, outline=ir.pcb.outline, routing=RoutingParams(**{**FINE_RULES, "via_drill_mm": 0.7}))
+    assert bad.fanout == {} and bad.version == "0.1" and all(p.provenance.tool_version == "0.1" for p in bad.placements)
+    assert "no fan-out room for U1: the routing parameters are refused (via diameter 0.6 mm must exceed the via drill 0.7 mm)" in \
+        bad.description("user", 1.0, 2.0, RING_MM)
+    res_bad = PCBAgent(routing=RoutingParams(**{**FINE_RULES, "via_drill_mm": 0.7})).run(_fine_ir(tmp_path / "bad", lib),
+                                                                                         AgentContext(workdir=tmp_path, tools={"kicad_library": lib}))
+    assert [p.target for p in res_bad.proposals] == ["pcb"] and any(n.startswith("not routed: via diameter 0.6 mm must exceed") for n in res_bad.notes)
+
+
+@needs_real_libs
+def test_the_real_dfn14_and_qfn12_get_their_fan_out_room(tmp_path: Path):
+    """The MAX9814's DFN-14 (0.4 mm pitch) and the PA's QFN-12 (0.5 mm) on the real 10.0.6 footprints: 2.2 mm of room each, a 0603 part
+    (1.55 mm pitch) none."""
+    lib = _REAL
+    from tests.test_routing_fine_pitch import DFN14, QFN12, _part
+
+    ir = CircuitIR(project=ProjectMeta(id="fp", name="fp", workdir=str(tmp_path)))
+    ir.components = [_part("U1", DFN14, [str(i) for i in range(1, 16)]), _part("U2", QFN12, [str(i) for i in range(1, 14)]),
+                     *[_part(f"R{i}", ("Resistor_SMD", "R_0603_1608Metric"), ["1", "2"]) for i in range(1, 7)]]
+    ir = with_rf(ir, [block("a", [c.ref for c in ir.components], chain=["U1", "U2"], region=(0.0, 0.0, 40.0, 20.0))])
+    got = rf_floorplan_placement(ir, lib)
+    assert got.fanout == {"U1": 2.2, "U2": 2.2} and got.version == "0.2"
+    entry = next(e for e in got.placements[0].provenance.derived_from if e.startswith("fanout:"))
+    assert entry.startswith("fanout:U1=0.4,U2=0.5;below_mm=0.65;margin_mm=2.2;")
+    at = {p.component_ref: p for p in got.placements}
+    for ref in ("U1", "U2"):
+        pads = _box(pads_bbox(at[ref], lib.load_footprint(ir.component(ref).footprint)))
+        assert min(_gap(pads, _box(e)) for other, e in got.extents.items() if other != ref) >= 2.2 - 1e-6, ref
 
 
 def test_pcb_keepout_checks_regions_and_can_fences(tmp_path: Path, lib: KicadLibrary):

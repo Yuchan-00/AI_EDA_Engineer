@@ -19,9 +19,11 @@ What runs where:
   P-FET switch, the potentiometer's divider - and a deck whose floating
   capacitors ``exclude_floating`` removed;
 * with the packed KiCad 10.0.6 libraries (``needs_libs``,
-  ``KICAD10_SYMBOL_DIR``): every parts-table row instantiates, the three
-  refused rows refuse with the compilers' reasons, and one of every row
-  compiles through the real schematic and PCB compilers;
+  ``KICAD10_SYMBOL_DIR``): every parts-table row instantiates (the
+  microphone's two through-hole pads carry its symbol's pin numbers, its
+  polarity UNVERIFIED), the three refused rows refuse with the compilers'
+  reasons, and one of every row compiles through the real schematic and
+  PCB compilers;
 * with the kr447 wave-1 IR types (``ai_eda.ir.rf``, part P1) and requirement
   keys (``RADIO_BUILDS``, part P3): the contract field names the block API
   renames through, and the build names - skipped until those parts are merged.
@@ -922,6 +924,24 @@ def test_every_part_instantiates_from_the_real_libraries() -> None:
     assert any("'open_collector'" in n for n in notes["comparator"]) and any("A AND B = B AND A" in n for n in notes["and_gate"])
     assert instantiate(_REAL, "opamp", "U1", "v", "d", STRUCT).functions["OUT"] == ("1",)
     assert instantiate(_REAL, "ldo_rx5v", "U1", "v", "d", STRUCT).functions == {"OUT": ("1",), "GND": ("2",), "IN": ("3",)}  # the library's order (critic2)
+
+
+@needs_libs
+def test_the_microphone_is_the_through_hole_capsule_whose_pads_follow_the_symbol_pins_and_whose_polarity_is_unverified() -> None:
+    """Decision 1A: the microphone is ``Sensor_Audio:POM-2244P-C3310-2-R`` - two plain through-hole pads (no custom ring pad around the
+    signal pad, so the + terminal needs no via in a pad). The symbol's pin 1 is named ``-`` and pin 2 ``+``; the footprint's pads carry
+    the same numbers, so ``-`` lands on pad 1 and ``+`` on pad 2 (invariant 2: both read from the library files). Which terminal PUI Audio
+    makes the case is not checked against its datasheet, and the row says so."""
+    row = PARTS["mic"]
+    assert row.footprint_id == "Sensor_Audio:POM-2244P-C3310-2-R" and row.lib_id == "Device:Microphone_Condenser"
+    assert any("case / negative" in u and u.endswith("[UNVERIFIED: PUI Audio POM-2244P-C3310-2-R datasheet]") for u in row.unverified)
+    placed = instantiate(_REAL, "mic", "MK1", "v", "d", STRUCT)
+    assert placed.functions == {"-": ("1",), "+": ("2",)}
+    fp = _REAL.load_footprint(placed.component.footprint)
+    assert fp.attr == "through_hole"
+    pads = {p.number: (p.pad_type, p.shape, p.x, p.y, p.drill) for p in fp.pads}
+    assert pads == {"1": ("thru_hole", "roundrect", 0.0, 0.0, 0.65), "2": ("thru_hole", "circle", 1.9, 0.0, 0.65)}
+    assert {p.number for p in _REAL.load_symbol(placed.component.symbol).pins} == set(pads)
 
 
 @needs_libs

@@ -24,8 +24,10 @@ Invariants this agent keeps:
   <ai_eda.tools.routing.maze.RoutingParams.for_board>` - the fine rules
   (0.2 mm grid, 0.25 mm track, 0.2 mm clearance, 0.6 / 0.3 mm via) when a
   footprint's pads are closer than 1.0 mm centre to centre, the defaults
-  otherwise. The fine rules and the pitch that chose them are in every
-  track's ``params:`` provenance entry and in a ``fine rules: ...`` note; a
+  otherwise, and a board with more than ``LARGE_BOARD_NETS`` nets to route
+  negotiates up to ``LARGE_BOARD_ITERATIONS`` iterations instead of 40. The
+  fine rules and the pitch that chose them, and a large board's net count,
+  are in every track's ``params:`` provenance entry and in the notes; a
   default-rule board's notes and copper are exactly what they were before
   the selection existed.
 * It never guesses a footprint, never resizes a user outline, never places
@@ -104,7 +106,12 @@ Invariants this agent keeps:
   :func:`ai_eda.tools.placement.rf_floorplan.rf_floorplan_placement`
   (``placement.rf_floorplan``: block regions, chain order, shield cans first
   with their parts inside the fence ring, keep-outs, a per-region shelf
-  packer - never the grid for "the rest"); every other IR keeps the choice
+  packer - never the grid for "the rest"; a part whose pad pitch is below
+  ``FANOUT_PITCH_MM`` keeps every other part the router's escape room away
+  from its pads, computed from the routing parameters this agent routes
+  with: ``placement.rf_floorplan`` 0.2 - parameters the router refuses are
+  still a ``not routed:`` note under the placement, never ``not placed:``);
+  every other IR keeps the choice
   above. A board with keep-outs (``ir.pcb.keepouts``) or RF blocks hands the
   router its keep-outs and its plane nets (routing.maze 0.4: keep-out
   obstacles, each plane net's SMD pads joined to the plane by a via each,
@@ -156,7 +163,7 @@ from ai_eda.tools.placement.core_ring import PLACER_ID as RING_PLACER_ID
 from ai_eda.tools.placement.core_ring import PLACER_VERSION as RING_PLACER_VERSION
 from ai_eda.tools.placement.grid import COLUMNS, MARGIN_MM, PLACER_ID, PLACER_VERSION, SPACING_MM, _resolve, grid_placement
 from ai_eda.tools.placement.rf_floorplan import RING_MM, rf_blocks, rf_floorplan_placement
-from ai_eda.tools.routing.maze import FINE_PITCH_MM, INNER_LAYER_RE, ROUTER_ID, Routing, RoutingParams, route_board
+from ai_eda.tools.routing.maze import FINE_PITCH_MM, INNER_LAYER_RE, LARGE_BOARD_NETS, ROUTER_ID, Routing, RoutingParams, route_board
 from ai_eda.tools.si.promote import promote
 from ai_eda.tools.si.rules import SIRules, net_rules
 from ai_eda.tools.silkscreen.place import SilkParams, place_silkscreen
@@ -223,7 +230,8 @@ class PCBAgent(Agent):
         origin = "user" if base.outline is not None else "generated"
         try:
             if rf_blocks(ir):
-                plan = rf_floorplan_placement(ir, library, spacing=self.spacing_mm, margin=self.margin_mm, outline=base.outline, keepouts=keepouts_of(base))
+                plan = rf_floorplan_placement(ir, library, spacing=self.spacing_mm, margin=self.margin_mm, outline=base.outline, keepouts=keepouts_of(base),
+                                              routing=self.routing)
                 rf_placed = base.model_copy(update={"outline": plan.outline, "placements": list(plan.placements)})
                 rf_description = plan.description(origin, self.spacing_mm, self.margin_mm, RING_MM)
         except (CompileError, LibraryLookupError) as e:  # LibraryFormatError is a CompileError
@@ -530,6 +538,8 @@ class PCBAgent(Agent):
         )
         if p.rules is not None:
             text += f"; {p.rules} rules: pad pitch {p.pad_pitch_mm} mm ({p.pitch_footprint}) is below {FINE_PITCH_MM} mm"
+        if p.board_nets is not None:  # a large board: its negotiation cap (RoutingParams.for_board)
+            text += f"; large board: {p.board_nets} nets to route (more than {LARGE_BOARD_NETS}), up to {p.max_iterations} negotiation iterations"
         if s["skipped_nets"]:
             text += f"; {len(s['skipped_nets'])} net(s) with fewer than 2 pads skipped ({', '.join(s['skipped_nets'])})"
         if s["raised"]:

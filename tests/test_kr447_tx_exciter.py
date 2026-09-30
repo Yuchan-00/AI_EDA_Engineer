@@ -511,11 +511,13 @@ def test_the_pipeline_on_the_bench_header_board(tmp_path: Path, monkeypatch: pyt
     assert status["rf.deviation"] is S.NOT_VERIFIED and "spice.pm_drive_peak: no result recorded" in latest["rf.deviation"].message
     # routing.maze 0.5 routed 53 of the 57 nets here and so proposed the placement only (three of the PA's 0.5 mm-pitch QFN pins fenced by
     # their neighbours, GND without a via site for R806.2); 0.6 joins them to the grid by escapes (the router's module docstring: escape
-    # stubs) and the whole board routes - every track and via stamped 0.6
+    # stubs) and the whole board routes - every track and via stamped 0.6. The floorplan keeps the PA's fan-out room (placement 0.2,
+    # decision 2A), so the PA sits elsewhere than under 0.1 and other pads escape
     placement = state.outcome(Stage.PLACEMENT).message
-    assert "131 component(s) on a 106.0 x 42.0 mm" in placement and "2 shield can(s)" in placement
+    assert "placement.rf_floorplan 0.2: 131 component(s) on a 106.0 x 42.0 mm" in placement and "2 shield can(s)" in placement
+    assert "fan-out room: U901 2.2 mm" in placement
     assert "routing.maze 0.6: 57 net(s) routed" in placement and "not applied" not in placement and "shape 'custom'" not in placement, placement
-    assert "4 pad(s) reach the grid by an escape stub or cell (U901.11, U901.12, U901.2, R806.2)" in placement, placement
+    assert "6 pad(s) reach the grid by an escape stub or cell (U901.11, U901.10, U901.2, U901.3, U901.6, R806.2)" in placement, placement
     assert ir.pcb is not None and ir.pcb.tracks and {t.provenance.tool_version for t in ir.pcb.tracks} == {"0.6"}
     # every net is judged (U850.2 is bounded by its anchor and tab boxes); GND is joined only through the plane fill, which the check cannot see
     conn = latest["pcb.routing.connectivity"]
@@ -524,11 +526,11 @@ def test_the_pipeline_on_the_bench_header_board(tmp_path: Path, monkeypatch: pyt
     assert status["pcb.routing.clearance"] is S.NOT_VERIFIED  # the IR states no clearance limit: the router's own is a parameter
     # the routed RF nets are judged: every RF segment within 50 ohm over its plane (escape stubs are named, not judged)
     assert status["domain.rf.impedance"] is S.PASS and all(status[f"si.impedance.{c}"] is S.PASS for c in ("RF50", "RF50_H", "RF_OUT", "Z50"))
-    # PA_PD (the PA's POWER_DOWN line, here from the bench header J2.2, 101.8 mm to U901.10) is electrically long over the plane: spice.si
+    # PA_PD (the PA's POWER_DOWN line, here from the bench header J2.2, 89.73 mm to U901.10) is electrically long over the plane: spice.si
     # drives its one line (Z0 49.7 ohm) through the class's confirmed 25 ohm / 1 ns into 5 pF and it rings - an honest verdict on the new
     # copper, left to a human (the router never re-routes for it; the full board drives PA_PD from the PTT block beside the PA)
     si_pd = latest["spice.si.PA_PD"]
-    assert si_pd.status is S.FAIL and "J2.2-U901.10" in si_pd.message and "overshoot 32.2% > 15%" in si_pd.message
+    assert si_pd.status is S.FAIL and "J2.2-U901.10 89.73 mm" in si_pd.message and "overshoot 30.5% > 15%" in si_pd.message
     # the stand-in's honest FAIL: input_voltage is the P9 power block's, not the bench headers'
     assert status["review.requirements_vs_ir"] is S.FAIL and latest["review.requirements_vs_ir"].details["unserved"] == ["req.input_voltage"]
     assert sorted(k for k, s in status.items() if s is S.FAIL) == ["repair.loop", "review.requirements_vs_ir", "spice.si.PA_PD"]

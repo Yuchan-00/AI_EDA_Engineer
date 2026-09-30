@@ -17,12 +17,13 @@ does. What is checked:
   the parts that serve the stated requirements name them, the RF design
   carries the five floorplan regions, the rails, the lab items and the model
   keys; two independent builds are the same design, place the same and
-  compile to byte-identical schematic, board and netlist files; the router
-  reads the microphone footprint's custom ring pad but finds no route for
-  any net of the microphone or its 0.4 mm-pitch preamp (pad 2 inside the
-  ring, the DFN pads closer than the fine rules' clearance) - so the
-  deliverable is placement only; the Korean theory / figures / part notes
-  render with the design's numbers.
+  compile to byte-identical schematic, board and netlist files; the
+  microphone is the through-hole ``POM-2244P-C3310-2-R`` (decision 1A: two
+  plain THT pads, no custom pad); the floorplan leaves the 0.4 mm-pitch
+  preamp its fan-out room (``placement.rf_floorplan`` 0.2) and every one of
+  its pads escapes to the router's grid under ``routing.maze`` 0.7 (decision
+  2A; the whole board then routes, measured, not re-run here); the Korean
+  theory / figures / part notes render with the design's numbers.
 * ``needs_ngspice`` too (ngspice-42 here): the design deck's 27 expectations
   all PASS (principle verdicts under the confirmed model values - no IC is
   simulated), within the design's run-time budget (about 1-3 s of engine
@@ -31,8 +32,8 @@ does. What is checked:
   and 20 MB),
   and the whole pipeline runs to RELEASE (routing skipped) with exactly one
   FAIL, the honest one - ``pcb.routing.connectivity``: the placed board has no
-  copper, so its nets are open (the microphone's custom ring pad is read as
-  the boxes of its anchor and ring, so its nets are judged too) - and
+  copper, so its nets are open (every pad's copper is known: the board has
+  no custom pad, so every net is judged) - and
   ``rf.deviation`` / ``rf.model_grounding`` /
   ``rf.regulatory_profile`` / ``rf.lab.*`` / ``power.*`` NOT_VERIFIED,
   ``block.interface.*`` PASS, RELEASE FAIL.
@@ -65,7 +66,7 @@ from ai_eda.design.rf.t_audio_ptt import KR447_AUDIO_PTT, REGIONS, TEMPLATE_ID, 
 from ai_eda.ir import CircuitIR, ProjectMeta, ValidationStatus as S
 from ai_eda.tools.calc import recompute_parameters
 from ai_eda.tools.kicad.library import KicadLibrary
-from ai_eda.tools.routing.maze import ROUTER_ESCAPE_VERSION, RoutingParams, route_board
+from ai_eda.tools.routing.maze import RoutingParams, route_board
 from ai_eda.tools.spice import NgspiceShared
 from ai_eda.workflow import Orchestrator, Stage
 
@@ -75,7 +76,7 @@ LIB = KicadLibrary()
 #: the symbol libraries the board's parts come from, and the footprints only the 10.0.6 libraries hold
 HAS_LIBS = all(LIB.symbol_file(lib) is not None for lib in (
     "Amplifier_Audio", "Amplifier_Operational", "Comparator", "74xGxx", "4xxx", "Regulator_Linear", "Transistor_FET", "Transistor_BJT", "Sensor_Audio",
-)) and LIB.footprint_file("Sensor_Audio", "CUI_CMC-4013-SMT") is not None and LIB.footprint_file("Package_DFN_QFN", "DFN-14-1EP_3x3mm_P0.4mm_EP1.78x2.35mm") is not None
+)) and LIB.footprint_file("Sensor_Audio", "POM-2244P-C3310-2-R") is not None and LIB.footprint_file("Package_DFN_QFN", "DFN-14-1EP_3x3mm_P0.4mm_EP1.78x2.35mm") is not None
 needs_libs = pytest.mark.skipif(not HAS_LIBS, reason="KiCad 10 libraries with the audio / PTT parts not installed (set KICAD10_SYMBOL_DIR)")
 
 #: what the scope questions of a KR run need (they stay non-required) and the stage-1 inputs
@@ -263,7 +264,9 @@ def test_two_builds_are_one_design_and_compile_byte_identical(registered: None, 
     assert one.design_dict() == two.design_dict() and one.content_hash() == two.content_hash()
     notes = _placed(one, tmp_path / "a")
     _placed(two, tmp_path / "b")
-    assert "placement.rf_floorplan 0.1" in " ".join(notes) and "74.0 x 82.0 mm generated outline" in " ".join(notes)
+    # placement 0.2: the MAX9814's DFN-14 (0.4 mm pitch) keeps its fan-out room (decision 2A)
+    assert "placement.rf_floorplan 0.2" in " ".join(notes) and "74.0 x 82.0 mm generated outline" in " ".join(notes)
+    assert "fan-out room: U301 2.2 mm" in " ".join(notes)
     assert [(p.component_ref, p.x_mm, p.y_mm, p.rotation_deg) for p in one.pcb.placements] == [(p.component_ref, p.x_mm, p.y_mm, p.rotation_deg) for p in two.pcb.placements]
     assert len(one.pcb.placements) == len(one.components) and one.pcb.tracks == []
     for compiler in (SchematicCompiler(), PCBCompiler(), SpiceNetlistCompiler()):
@@ -275,43 +278,25 @@ def test_two_builds_are_one_design_and_compile_byte_identical(registered: None, 
 
 
 @needs_libs
-def test_the_router_cannot_route_this_board_so_the_deliverable_is_placement_only(registered: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """A known limit, named. The router reads the microphone footprint's custom pad 1 (a ring, its circle anchor on it) as the boxes of
-    its anchor and its ring: MK301.2, the capsule's centre contact, lies inside the ring's box - and on the real copper the closed ring
-    leaves it no way out on F.Cu (a via would have to sit in the pad) - so MIC_P has no route and, by the all-or-nothing rule, the
-    agent's proposal for the whole board is the placement only, never half the nets. The MAX9814's 0.4 mm-pitch DFN pads are 0.15 mm
-    apart, below the fine rules' 0.2 mm clearance, so each terminal cell is inside a neighbour's keep-out: routing.maze 0.6 joins them to
-    the grid by escape stubs (0.1-0.15 mm wide).
-
-    First the MK301 / U301 nets alone (GND, a plane net, left out: its pads are net-less here; about 10 s): eight of the ten signal pads
-    escape and two are refused, each for its own cause (measured by moving one part at a time). U301.6 (MICOUT, west row): the
-    microphone's ring, whose box ends about 1.7 mm west of the pad row, blocks the straight westward ways out, so U301.5's way out turns
-    south along the row through the one cell in front of U301.6 (with MK301 1 mm further west, U301.6 escapes there). U301.13 (MIC_BIAS,
-    east row), wherever the microphone is: U302's SOT-23-5 pads, about 1.4 mm east of the pad row, bound that row, and U301.12's escape
-    and its way out take the cells in front of it (with U302 moved away, it escapes). A refusal names only its nearest candidate cell's
-    problem, not the whole cause. Then the whole board's static phase (the plane vias and the escape pass, about 15 s): GND's pads
-    escape to vias first, TX_3V3 is doomed (U301.5 and U301.10 have no escape), so the pass runs again without it and U301.2's escape
-    is withdrawn - and U301.3 (MIC_CG), which that escape's way out had fenced, escapes. tests/test_routing_fine_pitch.py routes the
-    same package on an open board."""
+def test_every_preamp_pad_escapes_on_the_floorplan_that_leaves_it_room(registered: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Decision 2A, measured. The MAX9814's 0.4 mm-pitch DFN pads are 0.15 mm apart, below the fine rules' 0.2 mm clearance, so each
+    terminal cell is inside a neighbour's keep-out and every pad needs an escape (routing.maze 0.6). The floorplan (placement.rf_floorplan
+    0.2) keeps every other part 2.2 mm (fanout_margin at the fine rules) from U301's pads; the router's first static pass (0.6) still
+    leaves U301 pads without an escape - U302.2's ground via walks into U301's escape area and takes the lanes its fan needs -, so the
+    static phase runs again under 0.7 with U301's fan-out room kept clear of every other footprint's plane vias (U302.2 takes another
+    site) and its escapes' ways out running to the room's edge: all fourteen pads escape (GND's 4 / 7 / 9 / 11 by stubs to their own
+    vias). The microphone is the through-hole ``Sensor_Audio:POM-2244P-C3310-2-R`` (decision 1A: two plain THT pads, no custom pad on
+    the board). Routing the whole board with the agent's arguments then connects all 76 nets, legal after 18 negotiation iterations
+    (1522 tracks, 277 vias, 3766.5 mm, about 70 s here; measured 2026-09-30, not re-run in this test): the deliverable is the routed
+    board. Before the room (placement 0.1, U302 1 mm from U301's courtyard) 0.7 frees no more pads than 0.6, and TX_3V3 / MIC_VB stayed
+    unrouted - the placement and the router rule are both needed."""
     ir = _confirmed(AUDIO, tmp_path)
     _placed(ir, tmp_path)
-    whole = ir.model_copy(deep=True)
-    mic = {"MK301", "U301"}
-    ir.nets = [n for n in ir.nets if any(p.component_ref in mic for p in n.pins) and n.name != "GND"]
-    r = route_board(ir, LIB, RoutingParams.for_board(ir, LIB), inner_layers=True)
-    assert r.version == ROUTER_ESCAPE_VERSION and len(ir.nets) == 9 and r.stats["routed_nets"] == 6
-    assert sorted(r.unrouted) == ["MICOUT", "MIC_BIAS", "MIC_P"]
-    assert r.unrouted["MIC_P"].startswith("MK301.2 terminal cell") and "is inside a keep-out on every copper layer of the pad" in r.unrouted["MIC_P"]
-    assert "(MK301.1 within clearance 0.2 + width/2 of it); no escape stub" in r.unrouted["MIC_P"]
-    assert r.unrouted["MICOUT"].startswith("U301.6 terminal cell") and r.unrouted["MIC_BIAS"].startswith("U301.13 terminal cell")
-    assert all("; no escape stub within 1.5 mm in front of its edge" in r.unrouted[n] for n in ("MICOUT", "MIC_BIAS"))
-    assert r.unrouted["MICOUT"].endswith("the nearest candidate cell (47.6, 4.8): it is on the way out reserved for an escape of net TX_3V3")
-    assert r.unrouted["MIC_BIAS"].endswith("(52.4, 2.8): its clearance would take a cell on the way out reserved for an escape of net MIC_VB")
-    escaped = sorted((e["pad"] for e in r.stats["escapes"]), key=lambda pad: int(pad.split(".")[1]))
-    assert escaped == ["U301.1", "U301.2", "U301.3", "U301.5", "U301.8", "U301.10", "U301.12", "U301.14"]
-    assert all(e["kind"] == "stub" and 0.1 <= e["width_mm"] <= 0.15 for e in r.stats["escapes"])
-    assert [(c["pad"], [p["part"] for p in c["parts"]]) for c in r.stats["custom_pads"]] == [("MK301.1", ["anchor circle", "gr_circle[0]"])]
-    # the whole board's static phase, with the agent's router arguments (stopped before the negotiation)
+    mk = ir.component("MK301")
+    assert (mk.footprint.library, mk.footprint.name) == ("Sensor_Audio", "POM-2244P-C3310-2-R")
+    u301 = ir.pcb.placement("U301")
+    assert u301.provenance.tool_version == "0.2"
+    assert any(e.startswith("fanout:U301=0.4;below_mm=0.65;margin_mm=2.2;") for e in u301.provenance.derived_from)
     from ai_eda.agents.pcb import _routes_around_planes
     from ai_eda.tools.routing import maze
     from ai_eda.tools.si.rules import net_rules
@@ -325,18 +310,27 @@ def test_the_router_cannot_route_this_board_so_the_deliverable_is_placement_only
         boards.append(board)
         raise _Stop
 
+    def static_phase() -> object:
+        boards.clear()
+        params = RoutingParams.for_board(ir, LIB)
+        with pytest.raises(_Stop):
+            route_board(ir, LIB, params, rules=net_rules(ir, params).rules or None, inner_layers=_routes_around_planes(ir.pcb),
+                        **PCBAgent._router_extras(ir, ir.pcb))
+        return boards[0]
+
     monkeypatch.setattr(maze._Negotiation, "__init__", stop)
-    params = RoutingParams.for_board(whole, LIB)
-    with pytest.raises(_Stop):
-        route_board(whole, LIB, params, rules=net_rules(whole, params).rules or None, inner_layers=_routes_around_planes(whole.pcb),
-                    **PCBAgent._router_extras(whole, whole.pcb))
-    (board,) = boards
-    assert board.static_passes == 2 and list(board.doomed) == ["TX_3V3"]
-    escaped = {e["pad"]: e["net"] for e in board.escapes}
-    assert escaped["U301.3"] == "MIC_CG" and "U301.2" not in escaped and all(escaped[f"U301.{n}"] == "GND" for n in (4, 7, 9, 11))
-    assert sorted(board.escape_refused) == ["MK301.2", "U301.10", "U301.12", "U301.2", "U301.5"]
-    assert board.escape_refused["U301.2"].endswith("; its escape is withdrawn: net TX_3V3 stays unrouted, since no escape reaches U301.5")
-    assert board.escape_refused["U301.12"].endswith("it is on the way out reserved for an escape of net MIC_BIAS")
+    board = static_phase()  # the whole board's plane vias and escape passes, stopped before the negotiation (about 15 s)
+    assert board.rules07 and board.escape_refused == {} and board.doomed == {}
+    assert list(board.fanout_rooms) == ["U301"] and board.fanout_kept == ["U302.2"]
+    escaped = {e["pad"]: e for e in board.escapes}
+    assert all(f"U301.{n}" in escaped for n in range(1, 15)) and not any(pad.startswith("MK301.") for pad in escaped)
+    assert all(escaped[f"U301.{n}"]["kind"] == "via" and escaped[f"U301.{n}"]["net"] == "GND" for n in (4, 7, 9, 11))
+    assert all(escaped[f"U301.{n}"]["kind"] == "stub" and 0.1 <= escaped[f"U301.{n}"]["width_mm"] <= 0.15 for n in (1, 2, 3, 5, 6, 8, 10, 12, 13, 14))
+    # the first (0.6) run alone - the room switched off, so the second run is no better and is not kept - leaves U301 pads unescaped
+    monkeypatch.setattr(maze._Board, "_in_fanout", lambda self, ref, box: None)
+    monkeypatch.setattr(maze._Board, "_room_of", lambda self, ref, margin: self._area_of(ref))
+    old = static_phase()
+    assert not old.rules07 and old.escape_refused and all(pad.startswith("U301.") for pad in old.escape_refused)
 
 
 @needs_libs
@@ -419,7 +413,7 @@ def _deck_numbers(ir: CircuitIR) -> tuple[float, int]:
 #: template's docstring and its Korean overview state them - a deviation from the design's §2.1 (connectors on the bottom edge, the PTT
 #: switch and the pots on the top edge) left to manual placement
 UI_EDGES_MM = {
-    "RV401": (12.2, 47.4, 2.0, 66.7), "MK301": (42.5, 27.0, 2.0, 75.5), "RV402": (23.9, 35.7, 16.3, 52.4), "SW201": (42.5, 23.0, 36.5, 39.5),
+    "RV401": (12.2, 47.4, 2.0, 66.7), "MK301": (42.5, 25.0, 2.0, 73.5), "RV402": (23.9, 35.7, 16.3, 52.4), "SW201": (42.5, 23.0, 37.5, 38.5),
     "J101": (2.0, 65.1, 42.5, 34.0), "J401": (10.9, 56.2, 16.3, 60.2),
 }
 
@@ -439,7 +433,7 @@ def test_the_user_facing_parts_land_where_the_template_says(registered: None, an
         b = fp.extents[ref]
         assert (b.x1, w - b.x2, b.y1, h - b.y2) == pytest.approx(want, abs=0.05), ref
     doc = " ".join((module.__doc__ or "").split())
-    for sentence in ("``RV402`` (squelch) is 16.3 mm below the top edge", "``SW201`` (PTT) is in the board's interior, 36.5 mm below the top edge",
+    for sentence in ("``RV402`` (squelch) is 16.3 mm below the top edge", "``SW201`` (PTT) is in the board's interior, 37.5 mm below the top edge",
                      "``J101`` (pack) is on the left edge, 34 mm above the bottom edge", "``J401`` (speaker) is in the interior, 60.2 mm above the bottom edge"):
         assert sentence in doc, sentence
     overview = KR447_AUDIO_PTT.theory(ir)[0].body
@@ -455,11 +449,10 @@ def test_the_pipeline_runs_to_release_with_every_deck_expectation_passing_and_no
     state = Orchestrator(AgentContext(workdir=tmp_path, tools={"kicad_library": LIB, "spice": runner}, answers={CONFIRM_DESIGN_KEY: "yes", ROUTING_KEY: "skip"})).run(ir)
     assert not state.blocked and state.outcomes[-1].stage is Stage.RELEASE
     latest = ir.validation.latest_by_check()
-    # routing skipped: the one FAIL is the measured open of the placed board's nets (the microphone's custom ring pad is read, so its nets
-    # are judged too), as on rx_backend
+    # routing skipped: the one FAIL is the measured open of the placed board's nets (no custom pad: every net is judged), as on rx_backend
     assert [c for c, r in latest.items() if r.status is S.FAIL] == ["pcb.routing.connectivity"]
     conn = latest["pcb.routing.connectivity"]
-    assert conn.details["unknown"] == [] and conn.details["custom_pads"] == ["MK301.1"]
+    assert conn.details["unknown"] == [] and "custom_pads" not in conn.details
     rows = {r["net"]: r for r in conn.details["nets"]}
     assert rows["VBAT"]["status"] == "FAIL" and rows["MIC_P"]["status"] == "FAIL"
     # the design deck: every expectation PASSes on ngspice (principle verdicts; no IC is simulated), within the run-time budget
@@ -482,7 +475,7 @@ def test_the_pipeline_runs_to_release_with_every_deck_expectation_passing_and_no
     assert latest["calc.recompute"].status is S.PASS and latest["review.requirements_vs_ir"].status is S.PASS
     assert state.outcome(Stage.SCHEMATIC).status is S.PASS and state.outcome(Stage.PCB).status is S.PASS
     assert state.outcome(Stage.ERC).status is S.NOT_VERIFIED and state.outcome(Stage.DRC).status is S.NOT_VERIFIED
-    assert "placement.rf_floorplan 0.1: 144 component(s) on a 74.0 x 82.0 mm" in state.outcome(Stage.PLACEMENT).message
+    assert "placement.rf_floorplan 0.2: 144 component(s) on a 74.0 x 82.0 mm" in state.outcome(Stage.PLACEMENT).message
     assert state.outcome(Stage.RELEASE).status is S.FAIL  # the placement-only board's open nets: not releasable, and the record says why
 
 

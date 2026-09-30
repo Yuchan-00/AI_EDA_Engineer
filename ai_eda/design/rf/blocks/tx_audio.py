@@ -16,7 +16,10 @@ NOT_VERIFIED here. Nothing claims the MAX9814 works: it has no model.
 The chain (kr447 design §2.1, decision 4B; local references, re-based by 300
 on a board; every op-amp an MCP6001-OT single, critic2):
 
-* MK1 electret microphone, biased from U1's MICBIAS through R1 and coupled by
+* MK1 electret microphone (the through-hole ``Sensor_Audio:POM-2244P-C3310-2-R``
+  capsule; its + terminal - symbol pin 2, footprint pad 2 - on ``MIC_P``, its
+  - terminal on GND: which terminal PUI Audio makes the case is UNVERIFIED
+  against the datasheet), biased from U1's MICBIAS through R1 and coupled by
   C1 into U1 (MAX9814, AGC; its straps and timing capacitors are UNVERIFIED
   choices) -> ``MICOUT``. In the design deck ``MICOUT`` is the stimulus
   ``VMIC`` (a 1 kHz sine at ``tx.test_level``, +20 dB over a normal mic
@@ -245,7 +248,7 @@ class TxAudioBlock(Block):
         opamp, diode = models.opamp_card(a0, gbw), models.diode_card()
         pos = model_once(b, "model.pot.position")
         # --- choices
-        mic_r = c("tx.mic_bias_r", 2.2e3, "ohm", "R301: electret bias resistor from MICBIAS [UNVERIFIED: Maxim MAX9814 and CUI CMC-4013 datasheets]")
+        mic_r = c("tx.mic_bias_r", 2.2e3, "ohm", "R301: electret bias resistor from MICBIAS [UNVERIFIED: Maxim MAX9814 and PUI Audio POM-2244P-C3310-2-R datasheets]")
         mic_c = c("tx.mic_couple", 100e-9, "F", "C301: microphone coupling capacitor into MICIN")
         ct = c("tx.agc_ct", 470e-9, "F", "C302: the MAX9814's AGC timing capacitor on CT [UNVERIFIED: Maxim MAX9814 datasheet]")
         cg = c("tx.agc_cg", 2.2e-6, "F", "C303: the MAX9814's CG capacitor [UNVERIFIED: Maxim MAX9814 datasheet]")

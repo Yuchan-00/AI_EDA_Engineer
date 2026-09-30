@@ -55,12 +55,53 @@ What this is: the placement the PCB agent uses for every IR with RF blocks
    obstacle that blocked it. A part that fits nowhere in its box is refused
    with the box's size and the part's extent.
 
+6. **Fan-out room (placement.rf_floorplan 0.2).** A part whose footprint's
+   finest pad pitch (:func:`~ai_eda.tools.routing.maze.footprint_pad_pitch`:
+   copper pads that can carry different nets, centre to centre) is below
+   :data:`FANOUT_PITCH_MM` - the 0.4 / 0.5 mm-pitch DFN / QFN packages,
+   whose pads routing.maze 0.6 joins to its grid by escape stubs - keeps
+   every other part's extent at least :func:`fanout_margin` from its pads'
+   copper box: the router's escape area (its pads' box grown by
+   ``escape_reach_mm`` + ``grid_mm``, where every escape cell, plane-via stub
+   and way out of the footprint lies) plus the farthest a foreign copper
+   reaches into it (the owner map's pad keep-out ``clearance +
+   track_width/2 + grid/2``, or a via disc's ``via_diameter/2 +
+   clearance``). The margin is computed from the routing parameters the
+   router will use (``routing``, default :meth:`RoutingParams.for_board
+   <ai_eda.tools.routing.maze.RoutingParams.for_board>`, raised to the fab
+   minimums by :func:`~ai_eda.tools.routing.maze.effective_params`), never
+   from a constant of its own: 2.2 mm at the fine rules (1.5 + 0.2 +
+   max(0.425, 0.5)). A routing-parameter refusal never takes the placement
+   with it (the router refuses the same parameters and the PCB agent reports
+   ``not routed:``, as for any other board): when the fab minimums' raise is
+   refused (a via drill raised to the via diameter) the room is the unraised
+   parameters' - recorded as ``;raised=refused(<reason>)`` in the entry and
+   in the description -, and parameters that fail their own check leave the
+   part without room (a 0.1 board; the description says why). The PCB agent
+   never re-places an existing layout, so a room computed without the raise
+   stays after the fab limits are fixed, though the router then drills
+   larger vias. Such a part is packed by its *fan-out box* - the hull
+   of its extent and its pads' box grown by the margin less
+   ``SPACING_MM`` - in place of its extent, so every part packed beside it
+   keeps ``SPACING_MM`` from that box and the margin from its pads, and a
+   part of another region keeps it too (the box lies inside the region
+   shrunk by ``SPACING_MM / 2``). A board with such a part is stamped
+   :data:`PLACER_FANOUT_VERSION` ``"0.2"`` on every placement, each naming
+   the fan-out parts, the threshold, the margin and the parameters it came
+   from in ``derived_from`` (``fanout:...``); every other board places
+   exactly as 0.1 did (byte for byte, stamp included). The router keeps the
+   same room (its pads' box grown by the same margin) clear of the other
+   footprints' plane vias when its first escape pass leaves a pad of the
+   part without an escape (routing.maze 0.7, its module docstring: fan-out
+   room): the placement keeps the parts out, the router their vias.
+
 Before returning, the placed extents are re-measured with
 :func:`~ai_eda.tools.kicad.geometry.footprint_bbox`: two extents that touch
 (except a part inside its own can's fence), a part outside the outline, a
-block part outside its region or a part in a keep-out it may not enter is a
-:class:`CompileError` - the guard behind the arithmetic, as in the grid and
-core-ring placers.
+block part outside its region, a part in a keep-out it may not enter or an
+extent inside a fan-out part's margin (its pads' box grown by the margin;
+its own can excepted) is a :class:`CompileError` - the guard behind the
+arithmetic, as in the grid and core-ring placers.
 
 What this is not: an RF layout judgement. Whether the board is valid is
 decided only by ``kicad-cli pcb drc`` on the compiled board (a can's
@@ -69,9 +110,10 @@ courtyard around its contents is DRC's to judge, not measured here); the
 geometry. Placement is always the top side.
 
 Traceability: every :class:`~ai_eda.ir.Placement` carries ``derived``
-provenance naming this tool (:data:`PLACER_ID` / :data:`PLACER_VERSION`),
-the footprint, the block and its region, the row, the rotation, the can and
-the parameters in ``derived_from``. ``Provenance.inputs`` stays empty: that
+provenance naming this tool (:data:`PLACER_ID` / :data:`PLACER_VERSION`, or
+:data:`PLACER_FANOUT_VERSION` on a board with fan-out room), the footprint,
+the block and its region, the row, the rotation, the can, the fan-out room
+and the parameters in ``derived_from``. ``Provenance.inputs`` stays empty: that
 field is the calculator role map, and a placement is not a calculator
 output.
 """
@@ -85,17 +127,21 @@ from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import BoardOutline, BoardSide, CircuitIR, Placement, Provenance, ProvenanceKind
 from ai_eda.tools.keepout import allowed_refs, area_bbox, area_points, box_area_overlap, covers_layer, forbids, keepout_id, keepouts_of
-from ai_eda.tools.kicad.geometry import footprint_bbox, pad_copper_center, to_board
+from ai_eda.tools.kicad.geometry import footprint_bbox, pad_copper_center, pads_bbox, to_board
 from ai_eda.tools.kicad.library import BBox, FootprintDef, KicadLibrary
 from ai_eda.tools.placement.grid import MARGIN_MM, SPACING_MM, _disjoint, _inside, _q, _resolve, footprint_extent
+from ai_eda.tools.routing.maze import RoutingParams, effective_params, fanout_margin, footprint_pad_pitch
 
 __all__ = [
     "PLACER_ID",
     "PLACER_VERSION",
+    "PLACER_FANOUT_VERSION",
+    "FANOUT_PITCH_MM",
     "RING_MM",
     "SPACING_MM",
     "MARGIN_MM",
     "FloorplanPlacement",
+    "fanout_margin",
     "fence_box",
     "placed_fence_box",
     "region_box",
@@ -106,6 +152,12 @@ __all__ = [
 #: provenance ``tool`` / ``tool_version`` stamped on every placement
 PLACER_ID = "placement.rf_floorplan"
 PLACER_VERSION = "0.1"
+#: ``tool_version`` stamped on every placement of a board with a fan-out part (module docstring, step 6); every other board keeps 0.1
+PLACER_FANOUT_VERSION = "0.2"
+#: a part whose footprint's finest pad pitch (mm) is below this gets fan-out room (module docstring, step 6): the 0.4 / 0.5 mm-pitch
+#: DFN / QFN packages (0.25 mm pads 0.15 / 0.25 mm apart), every one of whose pads routing.maze 0.6 found inside its neighbours'
+#: keep-out at the fine rules; the 0.65 mm SC-70 and coarser pitches are packed as before
+FANOUT_PITCH_MM = 0.65
 #: the ring (mm) kept free inside a shield can's fence: the can's parts stay this far inside its pads
 RING_MM = 1.0
 _TOL = 1e-6
@@ -128,17 +180,32 @@ class FloorplanPlacement:
     cans: dict[str, str] = field(default_factory=dict)
     #: the keep-out ids the packer honoured (footprint / pad bans)
     keepouts: list[str] = field(default_factory=list)
+    #: ref -> the fan-out margin (mm) its pads keep from every other part (module docstring, step 6); empty on a 0.1 board
+    fanout: dict[str, float] = field(default_factory=dict)
+    #: why the fan-out room is not the fab-raised routing parameters' (the raise refused: the unraised ones' room) or is missing (the
+    #: parameters refused: no room, a 0.1 board); ``None`` normally (module docstring, step 6)
+    fanout_note: str | None = None
+
+    @property
+    def version(self) -> str:
+        """The ``tool_version`` stamped on the placements: :data:`PLACER_FANOUT_VERSION` with fan-out room, else :data:`PLACER_VERSION`."""
+        return PLACER_FANOUT_VERSION if self.fanout else PLACER_VERSION
 
     def description(self, origin: str, spacing: float, margin: float, ring: float) -> str:
         o = self.outline
         regions = sorted({b for b in self.block_of.values() if b})
         rest = sum(1 for b in self.block_of.values() if not b)
         text = (
-            f"{PLACER_ID} {PLACER_VERSION}: {len(self.placements)} component(s) on a {o.width_mm} x {o.height_mm} mm {origin} outline at "
+            f"{PLACER_ID} {self.version}: {len(self.placements)} component(s) on a {o.width_mm} x {o.height_mm} mm {origin} outline at "
             f"({o.origin_x_mm}, {o.origin_y_mm}), {len(regions)} block region(s) ({', '.join(regions)}), {len(self.cans)} shield can(s) placed first "
             f"with their parts inside the fence less a {ring} mm ring, {rest} part(s) outside the regions; shelf packing by each part's own extent "
             f"in chain order, spacing {spacing} mm, margin {margin} mm"
         )
+        if self.fanout:
+            text += (f"; fan-out room: {', '.join(f'{r} {m:g} mm' for r, m in self.fanout.items())} from the pads of each part whose pad pitch is "
+                     f"below {FANOUT_PITCH_MM:g} mm to every other part (the router's escape area and the farthest foreign copper reaches into it)")
+        if self.fanout_note is not None:
+            text += f"; {self.fanout_note}"
         if self.keepouts:
             text += f"; keep-outs {', '.join(self.keepouts)} honoured"
         return text
@@ -218,12 +285,24 @@ def placed_fence_box(placement: Placement, fp: FootprintDef) -> BBox | None:
 # --------------------------------------------------------------------------- packing
 
 
-def _extent_at(fp: FootprintDef, rotation: float) -> BBox:
-    """The footprint's extent around its own origin at ``rotation`` on the top side (exact at multiples of 90 degrees)."""
+def _extent_at(fp: FootprintDef, rotation: float, fanout: float | None = None) -> BBox:
+    """The footprint's extent around its own origin at ``rotation`` on the top side (exact at multiples of 90 degrees); with ``fanout``
+    (a fan-out part's margin less the spacing, module docstring step 6) the hull of that extent and its pads' box grown by ``fanout``."""
     if rotation == 0.0:
-        return footprint_extent(fp)
-    box = footprint_bbox(Placement(component_ref="", x_mm=0.0, y_mm=0.0, rotation_deg=rotation, side=BoardSide.TOP), fp)
-    assert box is not None  # the extent at 0 was measurable
+        box = footprint_extent(fp)
+    else:
+        box = footprint_bbox(Placement(component_ref="", x_mm=0.0, y_mm=0.0, rotation_deg=rotation, side=BoardSide.TOP), fp)
+        assert box is not None  # the extent at 0 was measurable
+    if fanout is None:
+        return box
+    pads = _pads_at(fp, rotation)
+    return BBox(min(box.x1, pads.x1 - fanout), min(box.y1, pads.y1 - fanout), max(box.x2, pads.x2 + fanout), max(box.y2, pads.y2 + fanout))
+
+
+def _pads_at(fp: FootprintDef, rotation: float) -> BBox:
+    """The box of the footprint's pad copper around its own origin at ``rotation`` (a fan-out part has pads: its pitch was measured)."""
+    box = pads_bbox(Placement(component_ref="", x_mm=0.0, y_mm=0.0, rotation_deg=rotation, side=BoardSide.TOP), fp)
+    assert box is not None
     return box
 
 
@@ -271,22 +350,26 @@ def _pad_layers(fp: FootprintDef, board_layers: list[str]) -> frozenset[str]:
 
 def _shelf_pack(
     entries: list[tuple[str, FootprintDef]], target: Box, obstacles: _Obstacles, spacing: float, what: str, board_layers: list[str],
+    fanout: dict[str, float] | None = None,
 ) -> dict[str, tuple[float, float, float, int]]:
-    """Pack ``entries`` into ``target`` (module docstring, step 5): ``ref -> (x, y, rotation, row)`` of each placement anchor."""
+    """Pack ``entries`` into ``target`` (module docstring, step 5): ``ref -> (x, y, rotation, row)`` of each placement anchor. A ref in
+    ``fanout`` (ref -> its margin less the spacing, step 6) is packed by its fan-out box in place of its extent."""
     x1, y1, x2, y2 = target
     if not (x2 - x1 > _TOL and y2 - y1 > _TOL):
         raise CompileError(f"{what}: no room at all ({x2 - x1:.3f} x {y2 - y1:.3f} mm after the margin and spacing)")
     out: dict[str, tuple[float, float, float, int]] = {}
     cy, cx, shelf_h, row = y1, x1, 0.0, 0
     for ref, fp in entries:
-        options = [(0.0, _extent_at(fp, 0.0)), (90.0, _extent_at(fp, 90.0))]
+        grow = (fanout or {}).get(ref)
+        options = [(0.0, _extent_at(fp, 0.0, grow)), (90.0, _extent_at(fp, 90.0, grow))]
         layers = _pad_layers(fp, board_layers)
         min_h = min(e.height for _, e in options)
         if all(e.width > x2 - x1 + _TOL or e.height > y2 - y1 + _TOL for _, e in options):
             e = options[0][1]
             raise CompileError(
-                f"{what}: {ref} ({fp.lib_id}, {e.width:.3f} x {e.height:.3f} mm) is larger than the box it belongs in "
-                f"({x2 - x1:.3f} x {y2 - y1:.3f} mm after the margin and spacing) in both orientations; the region is refused, parts never overlap"
+                f"{what}: {ref} ({fp.lib_id}, {e.width:.3f} x {e.height:.3f} mm{' with its fan-out room' if grow is not None else ''}) is larger than "
+                f"the box it belongs in ({x2 - x1:.3f} x {y2 - y1:.3f} mm after the margin and spacing) in both orientations; the region is refused, "
+                "parts never overlap"
             )
         while True:
             if cy + min_h > y2 + _TOL:
@@ -328,16 +411,20 @@ def _shelf_pack(
 
 
 def _provenance(fp: FootprintDef, block: str, region: Box | None, row: int, rotation: float, spacing: float, margin: float,
-                ring: float, can: str | None) -> Provenance:
+                ring: float, can: str | None, fanout: str | None = None) -> Provenance:
     derived = [f"footprint:{fp.lib_id}", f"block:{block or '(outside the regions)'}"]
     if region is not None:
         derived.append("region:" + ",".join(f"{v:g}" for v in (region[0], region[1], region[2] - region[0], region[3] - region[1])))
     derived += [f"row:{row}", f"rotation:{rotation:g}", f"spacing_mm:{spacing}", f"margin_mm:{margin}"]
     if can is not None:
         derived.append(f"inside_can:{can},ring_mm:{ring}")
+    note = "shelf packing in the RF block regions from library footprint extents; validity is decided by kicad-cli DRC only"
+    if fanout is not None:  # a 0.2 board (module docstring, step 6): every placement names the fan-out room
+        derived.append(fanout)
+        note += "; fan-out room kept around the fine-pitch parts named in the fanout entry"
     return Provenance(
-        kind=ProvenanceKind.DERIVED, tool=PLACER_ID, tool_version=PLACER_VERSION, derived_from=derived,
-        note="shelf packing in the RF block regions from library footprint extents; validity is decided by kicad-cli DRC only",
+        kind=ProvenanceKind.DERIVED, tool=PLACER_ID, tool_version=PLACER_VERSION if fanout is None else PLACER_FANOUT_VERSION,
+        derived_from=derived, note=note,
     )
 
 
@@ -350,18 +437,44 @@ def rf_floorplan_placement(
     ring: float = RING_MM,
     outline: BoardOutline | None = None,
     keepouts: list[Any] | None = None,
+    routing: RoutingParams | None = None,
 ) -> FloorplanPlacement:
     """Place every component of ``ir`` by its RF block's region (module docstring); pure (same IR + library + parameters -> same result).
 
     ``outline`` (the user's) is kept verbatim; ``keepouts`` default to
-    ``ir.pcb.keepouts``. Raises :class:`CompileError` for every case the
-    module docstring lists.
+    ``ir.pcb.keepouts``; ``routing`` is the router's parameters the fan-out
+    room is computed from (step 6; default :meth:`RoutingParams.for_board`,
+    the PCB agent's own choice - fab minimums in ``ir.pcb.manufacturing``
+    raise it as they raise the router's; a refused raise or invalid
+    parameters never refuse the placement, step 6). Raises
+    :class:`CompileError` for every case the module docstring lists.
     """
     if spacing <= 0 or margin < 0 or ring < 0:
         raise CompileError("spacing must be > 0, margin and ring >= 0")
     parts = _resolve(ir, library)
     fps = dict(parts)
     order = [ref for ref, _ in parts]
+    fan_pitch = {ref: pitch for ref, fp in parts if (pitch := footprint_pad_pitch(fp)) is not None and pitch < FANOUT_PITCH_MM}
+    fan_margin: dict[str, float] = {}
+    fan_entry: str | None = None
+    grow_of: dict[str, float] = {}
+    fan_note: str | None = None
+    if fan_pitch:  # module docstring, step 6: the router's parameters say how much room the escapes need
+        p, refused = _fanout_params(ir, library, routing)
+        if p is None:  # the parameters themselves are refused: no room (0.1), the router refuses them again and the agent says so
+            fan_note = f"no fan-out room for {', '.join(fan_pitch)}: {refused}"
+        else:
+            m = fanout_margin(p)
+            fan_margin = {ref: m for ref in fan_pitch}
+            grow_of = {ref: m - spacing for ref in fan_pitch if m - spacing > _TOL}
+            fan_entry = (
+                "fanout:" + ",".join(f"{ref}={fan_pitch[ref]:g}" for ref in fan_pitch) + f";below_mm={FANOUT_PITCH_MM:g};margin_mm={m:g}"
+                f";escape_reach={p.escape_reach_mm},grid={p.grid_mm},clearance={p.clearance_mm},width={p.track_width_mm},via={p.via_diameter_mm}"
+            )
+            if refused is not None:  # the fab raise was refused: the room is the unraised parameters' (module docstring, step 6)
+                fan_entry += f";raised=refused({refused})"
+                fan_note = (f"fan-out room from the routing parameters without the fab minimums, whose raise is refused ({refused}); a "
+                            "placement is never redone, so this room stays when the fab limits are fixed")
     blocks = rf_blocks(ir)
     if not blocks:
         raise CompileError("no RF blocks (ir.rf.blocks): the floorplan placer has no regions to pack")
@@ -450,18 +563,19 @@ def rf_floorplan_placement(
             fence_of[shield] = BBox(ax + fence.x1, ay + fence.y1, ax + fence.x2, ay + fence.y2)
             cans[bid] = shield
             region_of[shield] = box
-            got = _shelf_pack([(r, fps[r]) for r in members], inner, obstacles, spacing, f"{what}, inside the fence of {shield} less {ring} mm", board_layers)
+            got = _shelf_pack([(r, fps[r]) for r in members], inner, obstacles, spacing, f"{what}, inside the fence of {shield} less {ring} mm", board_layers,
+                              grow_of)
             for r in members:
                 can_of[r] = shield
         else:
-            got = _shelf_pack([(r, fps[r]) for r in members], target, obstacles, spacing, what, board_layers)
+            got = _shelf_pack([(r, fps[r]) for r in members], target, obstacles, spacing, what, board_layers, grow_of)
         anchors.update(got)
         for r in members:
             region_of[r] = box
     outside = [r for r in order if r not in region_of]
     if outside:
         obstacles = _Obstacles(boxes=[(_grow(box, spacing / 2.0), f"region {bid}") for bid, _b, box in with_region], areas=list(areas))
-        got = _shelf_pack([(r, fps[r]) for r in outside], inner_edge, obstacles, spacing, "the parts outside the block regions", board_layers)
+        got = _shelf_pack([(r, fps[r]) for r in outside], inner_edge, obstacles, spacing, "the parts outside the block regions", board_layers, grow_of)
         anchors.update(got)
     placements: list[Placement] = []
     placed: dict[str, BBox] = {}
@@ -471,17 +585,45 @@ def rf_floorplan_placement(
         region = region_of.get(ref)
         p = Placement(
             component_ref=ref, x_mm=x, y_mm=y, rotation_deg=rot, side=BoardSide.TOP,
-            provenance=_provenance(fp, block_of.get(ref, "") if region is not None else "", region, row, rot, spacing, margin, ring, can_of.get(ref)),
+            provenance=_provenance(fp, block_of.get(ref, "") if region is not None else "", region, row, rot, spacing, margin, ring, can_of.get(ref),
+                                   fan_entry),
         )
         box = footprint_bbox(p, fp)
         assert box is not None
         placements.append(p)
         placed[ref] = box
-    _guard(order, placed, outline, region_of, can_of, fence_of, areas, fps, board_layers)
+    pl_of = {p.component_ref: p for p in placements}
+    fan_boxes = {ref: _grow(_box(pads_bbox(pl_of[ref], fps[ref])), m) for ref, m in fan_margin.items()}
+    _guard(order, placed, outline, region_of, can_of, fence_of, areas, fps, board_layers, fan_boxes)
     return FloorplanPlacement(
         outline=outline, placements=placements, extents=placed, block_of={r: (block_of.get(r, "") if r in region_of else "") for r in order},
-        cans=cans, keepouts=honoured,
+        cans=cans, keepouts=honoured, fanout=fan_margin, fanout_note=fan_note,
     )
+
+
+def _fanout_params(ir: CircuitIR, library: KicadLibrary, routing: RoutingParams | None) -> tuple[RoutingParams | None, str | None]:
+    """The routing parameters the fan-out margin is computed from (module docstring, step 6) and why a fab raise was not applied.
+
+    ``(effective, None)`` normally (:func:`~ai_eda.tools.routing.maze.effective_params`); when the fab minimums' raise is refused
+    (a drill raised to the via diameter, :class:`CompileError`), ``(unraised, reason)``; when the unraised parameters fail their own
+    check too (a caller's invalid ``routing``), ``(None, reason)``. A routing-parameter refusal is the router's to report (the PCB
+    agent's ``not routed:`` note): it never takes the placement with it.
+    """
+    base = routing if routing is not None else RoutingParams.for_board(ir, library)
+    try:
+        return effective_params(ir, base)[0], None
+    except CompileError as e:
+        refused = str(e).split(";", 1)[0]
+    try:
+        base.check()
+    except CompileError as e:
+        return None, f"the routing parameters are refused ({str(e).split(';', 1)[0]})"
+    return base, refused
+
+
+def _box(b: BBox | None) -> Box:
+    assert b is not None
+    return b.x1, b.y1, b.x2, b.y2
 
 
 def _clip(a: Box, b: Box) -> Box:
@@ -490,9 +632,14 @@ def _clip(a: Box, b: Box) -> Box:
 
 def _guard(
     order: list[str], placed: dict[str, BBox], outline: BoardOutline, region_of: dict[str, Box], can_of: dict[str, str],
-    fence_of: dict[str, BBox], areas: list, fps: dict[str, FootprintDef], board_layers: list[str],
+    fence_of: dict[str, BBox], areas: list, fps: dict[str, FootprintDef], board_layers: list[str], fan_boxes: dict[str, Box] | None = None,
 ) -> None:
     """The re-measured extents against every rule of the module docstring; a violation is a :class:`CompileError`."""
+    for ref, kept in (fan_boxes or {}).items():  # step 6: no other extent inside a fan-out part's margin (its own can excepted)
+        for other in order:
+            e = placed[other]
+            if other != ref and can_of.get(ref) != other and _touch(kept, (e.x1, e.y1, e.x2, e.y2)):
+                raise CompileError(f"placed extent of {other!r} ({e}) lies inside the fan-out room of {ref!r} ({kept}); refusing the floorplan")
     for i, a in enumerate(order):
         for b in order[i + 1:]:
             if can_of.get(b) == a or can_of.get(a) == b:

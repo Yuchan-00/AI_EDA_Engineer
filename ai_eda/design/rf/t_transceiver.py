@@ -86,9 +86,10 @@ counted); and the stage blocks' cans are four (the front end and the modulator e
 their own BMI-S-103 in parts P11 / P12) where the design drew three, one of
 them a BMI-S-102. Two BMI-S-103 cans side by side need 60.04 mm of width
 with the placer's margins, so every can has its own row and the outline is
-60 x 243 mm (measured: ``placement.rf_floorplan`` places both builds' 441
+60 x 245 mm (measured: ``placement.rf_floorplan`` places both builds' 441
 parts, 453 with the time-out and the antenna match, in about 0.1 s; the PTT
-region holds the 4060 time-out and the PA_5V discharge on every build).
+region holds the 4060 time-out and the PA_5V discharge on every build; the
+PA and TX audio regions hold the fan-out room of their fine-pitch parts).
 Edge placement is a deviation from kr447 design §2.5 ("VOL / SQL pots and
 the mic on the bottom edge", with the pack and speaker connectors): the
 placer packs each block's parts from its region's top-left corner, so on
@@ -130,23 +131,37 @@ the RF transistors' bias, ``pm_couple_*`` and ``pin_bias``) PASS;
 ``block.interface.*`` PASS (IR arithmetic); ``rf.freq_plan`` NOT_VERIFIED
 (its margin rows PASS; the response / gated rows point to lab items);
 ``rf.model_grounding`` / ``rf.regulatory_profile`` / ``rf.lab.*``
-NOT_VERIFIED; RELEASE NOT_VERIFIED at best (FAIL on the placement-only
-board below). The board places but is not
-routed: ``routing.maze`` refuses it before routing - the microphone's
-``CUI_CMC-4013-SMT`` and the two PHA-1s' ``SOT-89-3`` (the LO buffer's
-``U750``, the TX driver's ``U850``) have custom pads whose copper it cannot
-bound, and behind them the MAX9814's (``U301``, 0.7 x 0.25 mm) and the PA's
-(``U901``, 0.825 x 0.25 mm) pads are too small for its 0.2 mm grid
-(measured on copies without the parts refused before them) - so the
-proposal is the placement only: ``pcb.routing.connectivity`` FAILs on the
-nets whose pads are all known and have no copper (the nets holding a custom
-pad are NOT_VERIFIED rows naming it), so RELEASE FAILs;
-``pcb.routing.clearance`` has no copper to compare (NOT_APPLICABLE), and
-``domain.rf.impedance`` / the RF ``si.*`` rows are NOT_VERIFIED (no routed
-copper). The same blocks route on their own (the
-antenna end, ``tests/test_kr447_transceiver.py``). ``pcb.keepout`` on the
-placed board judges every keep-out, region and can fence and says
-NOT_VERIFIED only for the three custom pads it cannot bound.
+NOT_VERIFIED; RELEASE NOT_VERIFIED at best. The board places and its router
+result is whole (decision 2A): the floorplan leaves the MAX9814 (``U301``,
+DFN-14, 0.4 mm pitch) and the PA (``U901``, QFN-12, 0.5 mm) their fan-out
+room (``placement.rf_floorplan`` 0.2: every other part 2.2 mm from their
+pads), ``routing.maze`` reads the two PHA-1s' ``SOT-89-3`` custom pads (the
+LO buffer's ``U750``, the TX driver's ``U850``) as the boxes of their anchor
+and primitives and joins every U301 / U901 pad whose own grid cell does not
+serve to its 0.2 mm grid by an escape stub (0.6); 0.6's first pass still
+left U301 pads without one (``U302.2``'s ground via walked into U301's
+escape area), so the static phase ran again as routing.maze 0.7 - U301's
+fan-out room kept clear of the other footprints' plane vias (``U302.2`` and
+``SH801.1`` took other sites), its escapes' ways out running to the room's
+edge - and every pad escapes; with 211 nets to route the board is a large
+one and negotiates up to 150 iterations. Measured 2026-09-30 on both
+builds' placed boards (the router alone, four routes sharing 4 CPUs): 211
+of 211 nets, legal after 123 iterations (the antenna build 4428 tracks,
+792 vias, 10064.2 mm, about 1080 s; the conducted one 4424 / 798 /
+10090.6 mm, about 630 s); at the old 40-iteration cap 5 / 6 conflicting
+nets were left. Through the whole pipeline (2026-09-30) five nets
+(PTT_ACTIVE, PA_PD, MUTE, SQ_SET, PM_DRIVE) are promoted to Z50 and the
+single re-route is legal after 98 / 104 iterations and kept (4259 / 4270
+tracks, 770 / 776 vias), ``si.impedance.Z50`` PASSes, no check FAILs and
+RELEASE is NOT_VERIFIED. The microphone ``MK301``
+is the through-hole ``Sensor_Audio:POM-2244P-C3310-2-R`` (decision 1A;
+the symbol's pin 1 "-" / pin 2 "+" land on pads 1 / 2, and which terminal
+is the case is UNVERIFIED against the PUI Audio datasheet): the SMT ``CUI_CMC-4013-SMT`` it replaced has its pad 2 inside the ring of
+its custom pad 1, which left ``MIC_P`` no way out on F.Cu without a via in
+the pad (wave 2c's route of this board with it: 206 of 211 nets). The same
+blocks route on their own (the antenna end, ``tests/test_kr447_transceiver.py``).
+``pcb.keepout`` on the placed board judges every keep-out, region and can
+fence and PASSes (the two custom pads bounded by the boxes of their parts).
 """
 
 from __future__ import annotations
@@ -241,27 +256,30 @@ PREFIXES: dict[str, BlockPrefix] = {
 BOARD_W_MM = 60.0
 BAND_H_MM = 6.0
 #: the floorplan region of each block (x, y, w, h mm from the board's top-left corner, Y down): choices ``floor.<block>.*``; the board is their
-#: bounding box, 60 x 243 mm. Rows from the antenna end: the feed in the band; the switch / low-pass, the PA and the driver beside the front
+#: bounding box, 60 x 245 mm. Rows from the antenna end: the feed in the band; the switch / low-pass, the PA and the driver beside the front
 #: end's can; the multipliers' BMI-S-105 beside the mixer and the LO buffer; the TX audio beside the LO chain's can; the PTT block beside the
 #: modulator's can; then the IF back-end, the RX audio and the power section across the width. A BMI-S-103 region is 30.5 mm wide at the
 #: right edge (27.52 mm can + the 2 mm edge margin + 0.5 mm spacing, 0.49 mm to spare); every region packs both builds (measured on the
-#: KiCad 10.0.6 footprints).
+#: KiCad 10.0.6 footprints). The fan-out room ``placement.rf_floorplan`` 0.2 keeps around the fine-pitch parts (2.2 mm from their pads at
+#: the fine rules) sized two regions: the PA's (QFN-12 U901) is 11 mm tall, taken from the driver's (9 mm), and the TX audio region
+#: (DFN-14 U301, and the through-hole microphone's 6.5 x 6.5 mm courtyard) 33 mm (3 mm more), the PTT region below it 37 mm (1 mm less
+#: than before; it still holds the time-out and the PA_5V discharge), so every row below them is 2 mm lower.
 REGIONS: dict[str, tuple[float, float, float, float]] = {
     ANTENNA_ID: (6.0, 0.0, 8.0, 8.0),
     TRX_ID: (0.0, 8.0, 29.5, 10.0),
-    PA_ID: (0.0, 18.0, 29.5, 9.0),
-    DRIVER_ID: (0.0, 27.0, 29.5, 11.0),
+    PA_ID: (0.0, 18.0, 29.5, 11.0),
+    DRIVER_ID: (0.0, 29.0, 29.5, 9.0),
     FRONTEND_ID: (29.5, 6.0, 30.5, 32.0),
     TX_CHAIN_ID: (0.0, 38.0, 42.0, 29.0),
     MIXER_ID: (42.0, 38.0, 18.0, 18.0),
     LO_BUFFER_ID: (42.0, 56.0, 18.0, 11.0),
-    "tx_audio": (0.0, 67.0, 29.5, 30.0),
+    "tx_audio": (0.0, 67.0, 29.5, 33.0),
     LO_CHAIN_ID: (29.5, 67.0, 30.5, 30.0),
-    "ptt": (0.0, 97.0, 29.5, 38.0),
+    "ptt": (0.0, 100.0, 29.5, 37.0),
     MOD_ID: (29.5, 97.0, 30.5, 30.0),
-    IF_BLOCK_ID: (0.0, 135.0, 60.0, 50.0),
-    "rx_audio": (0.0, 185.0, 60.0, 33.0),
-    "power": (0.0, 218.0, 60.0, 25.0),
+    IF_BLOCK_ID: (0.0, 137.0, 60.0, 50.0),
+    "rx_audio": (0.0, 187.0, 60.0, 33.0),
+    "power": (0.0, 220.0, 60.0, 25.0),
 }
 _REGION_WHAT = {
     ANTENNA_ID: "the part at the antenna feed, at the top edge in the antenna band",
@@ -815,9 +833,16 @@ class Kr447TransceiverTemplate(Template):
                 + "`trx_bcu`: trx 영역 아래 B.Cu 트랙 금지(λ/4 와 저역통과 인덕터). GND 만 예외입니다: 라우터는 트랙 금지를 비아의 B.Cu 패드에도 적용하므로 "
                 "예외가 없으면 병렬 소자의 접지 비아(`c.kr447.rf_ground_vias`)를 영역 안에 둘 수 없고, 두 내층이 모두 GND 평면이라 B.Cu 의 GND 는 접지 위의 "
                 "접지입니다. 컴파일된 기판에는 예외 부분을 잘라 낸 규칙 영역으로 쓰이며 예외는 IR 검사 `pcb.keepout` 만 압니다. 이 배치는 RF 품질 판정이 "
-                "아니며(라우터는 RF 를 모름), 조합 기판은 라우팅되지 않습니다: 마이크(CUI_CMC-4013-SMT)와 두 PHA-1(SOT-89-3)의 사용자 정의 패드, 그 뒤로 "
-                "MAX9814(U301)와 PA(U901)의 0.25 mm 폭 패드가 라우터의 0.2 mm 격자보다 작습니다. 제안은 배치만이며, 라우팅 검사(`pcb.routing.*`)의 "
-                "판정은 회로 보고서가 기록된 결과에서 옮겨 적습니다(동박이 없는 넷의 개방은 측정된 사실이고, 사용자 정의 패드가 있는 넷은 판정하지 않습니다).\n\n"
+                "아니며(라우터는 RF 를 모름). 배치기(`placement.rf_floorplan` 0.2)는 MAX9814(U301, 0.4 mm 피치)와 PA(U901, 0.5 mm 피치) 둘레에 팬아웃 여유를 "
+                "남겨 다른 부품을 패드에서 2.2 mm 떨어뜨리고(결정 2A), 라우터(`routing.maze`)는 두 PHA-1(SOT-89-3)의 사용자 정의 패드를 앵커와 도형의 상자로 "
+                "읽고 U301·U901 의 0.25 mm 폭 패드를 탈출 스텁으로 0.2 mm 격자에 잇습니다. 0.6 의 첫 통과가 U301 의 일부 핀에 탈출을 주지 못하면(U302.2 의 "
+                "접지 비아가 U301 의 탈출 영역에 들어감) 정적 단계를 0.7 로 한 번 더 돌려 U301 의 팬아웃 여유에서 다른 부품의 평면 비아를 빼고 탈출의 출구를 "
+                "여유의 가장자리까지 잇게 하며, 넷이 100개를 넘는 큰 기판은 협상을 최대 150회까지 합니다. 2026-09-30 두 빌드의 배치된 기판에서 라우터만 돌려 "
+                "측정: 211 넷 모두 배선, 123회에서 합법(40회 상한이었다면 충돌 넷 5·6개가 남았음). 같은 날 전체 파이프라인에서는 긴 넷 다섯 개(PTT_ACTIVE, "
+                "PA_PD, MUTE, SQ_SET, PM_DRIVE)가 Z50 으로 승격되고 한 번의 재배선이 98·104회에서 합법으로 끝나 적용되었으며, si.impedance.Z50 이 "
+                "PASS, FAIL 인 검사는 없고 RELEASE 는 NOT_VERIFIED 입니다. 마이크 MK301 은 스루홀 POM-2244P-C3310-2-R 입니다(결정 1A; 심볼 핀 1 '-' / 2 '+' 가 "
+                "패드 1 / 2 에 붙지만 어느 단자가 케이스(음극)인지는 PUI Audio 데이터시트로 확인하지 않았습니다(검증되지 않음)). 앞서 쓰던 "
+                "SMT 캡슐 CUI_CMC-4013-SMT 는 패드 2 가 링 모양 패드 1 안에 있어 패드 안 비아 없이는 MIC_P 를 F.Cu 로 꺼낼 수 없었습니다.\n\n"
                 "사용자가 만지는 부품의 가장자리 배치는 설계(§2.5: 음량·스퀠치 가변저항과 마이크, 팩·스피커 커넥터를 아래쪽 가장자리에)와 다릅니다. 영역 "
                 "배치기는 각 블록의 부품을 영역 왼쪽 위부터 채우므로, SW201(PTT)만 설계대로 왼쪽 가장자리에 있고 RV401(음량)은 아래쪽 가장자리에서 44.2 mm, "
                 "RV402(스퀠치)는 29.9 mm 위(수신 오디오 영역), MK301 은 왼쪽 가장자리에서 아래쪽으로부터 171 mm 위(LO 체인 옆 송신 오디오 영역), J401(스피커)은 "

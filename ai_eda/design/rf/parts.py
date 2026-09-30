@@ -56,7 +56,13 @@ Measured on the packed KiCad 10.0.6 libraries (symbols and footprints from the
 ``10.0.6`` tags) on 2026-09-29: every :data:`PARTS` row instantiates and a board
 holding one of each compiles through the real schematic and PCB compilers
 (``tests/test_rf_design_lib.py``, skipped without the libraries); the three
-:data:`REFUSED_PARTS` rows refuse with the compilers' reasons.
+:data:`REFUSED_PARTS` rows refuse with the compilers' reasons. Re-measured
+on 2026-09-30 after the microphone row became the through-hole
+``Sensor_Audio:POM-2244P-C3310-2-R`` (decision 1A; it replaced the SMT
+``CUI_CMC-4013-SMT``, whose signal pad 2 lies inside its ring-shaped custom
+pad 1, so no track reaches it on F.Cu without a via in the pad): its pads
+``1`` / ``2`` are the symbol's pins ``-`` / ``+``, and which terminal is the
+case is UNVERIFIED (the row says so).
 """
 
 from __future__ import annotations
@@ -217,8 +223,14 @@ _ROWS: tuple[PartDef, ...] = (
             _named("Q12", "Q13", "Q14", "Q6", "Q5", "Q7", "Q4", "VSS", "~{Φ0}", "Φ0", "~{Φ1}", "CLR", "Q9", "Q8", "Q10", "VDD"),
             "excluded (no model); the time-out is calc.rf.tot.* from the RC formula",
             unverified=("the 4060 RC oscillator formula constant [UNVERIFIED: 4060 datasheet]",)),
-    PartDef("mic", "electret microphone", ("Device", "Microphone_Condenser"), ("Sensor_Audio", "CUI_CMC-4013-SMT"), _named("-", "+"),
-            "excluded; MICOUT is a SINE stimulus"),
+    PartDef("mic", "electret microphone (through-hole capsule: two THT pads 1 / 2 at 1.9 mm, drill 0.65 mm)", ("Device", "Microphone_Condenser"),
+            ("Sensor_Audio", "POM-2244P-C3310-2-R"), _named("-", "+"),
+            "excluded; MICOUT is a SINE stimulus",
+            unverified=("which terminal is the case / negative one: the library symbol names pin 1 '-' and pin 2 '+', the footprint's pads 1 / 2 "
+                        "follow those numbers and its silkscreen '+' mark lies on the pad-2 side, but PUI Audio's pinout is not checked "
+                        "[UNVERIFIED: PUI Audio POM-2244P-C3310-2-R datasheet]",
+                        "operating current and sensitivity at the MAX9814's MICBIAS through the 2.2 kohm bias resistor "
+                        "[UNVERIFIED: PUI Audio POM-2244P-C3310-2-R datasheet]")),
     PartDef("mic_amp", "microphone preamplifier with AGC", ("Amplifier_Audio", "MAX9814"),
             ("Package_DFN_QFN", "DFN-14-1EP_3x3mm_P0.4mm_EP1.78x2.35mm"),
             (*_named("CT", "~{SHDN}", "CG", "VDD", "MICOUT", "MICIN", "A/R", "GAIN", "BIAS", "MICBIAS", "TH"), PinSpec("GND", name="GND", count=4)),

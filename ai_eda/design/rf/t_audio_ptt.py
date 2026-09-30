@@ -26,7 +26,12 @@ to 4 (one stack across the stages); the floorplan regions are choices
 (``floor.*``) the RF floorplan placer packs, 74 x 82 mm (the design's
 50 x 60 mm does not hold the ~145 parts' footprints with the shelf packer's
 1 mm spacing and 2 mm edge margin; the power region grew 4 mm for the
-LM1117's electrolytic output capacitor C105).
+LM1117's electrolytic output capacitor C105, and the TX audio region 1 mm -
+taken from the PTT region below it - for the through-hole microphone MK301,
+``Sensor_Audio:POM-2244P-C3310-2-R``, whose 6.5 mm courtyard is 2 mm wider
+than the SMT capsule it replaced; the symbol's pin 1 "-" / pin 2 "+" land on
+pads 1 / 2, and which terminal is the case is UNVERIFIED against the PUI
+Audio datasheet).
 
 Edge placement is a deviation from kr447 design §2.1 ("connectors on the
 bottom edge; PTT and pots on the top edge"): the placer packs each block's
@@ -35,7 +40,7 @@ part lands wherever its block's region and the packing put it. Measured on
 both builds (74 x 82 mm, the KiCad 10.0.6 footprints, 2 mm edge margin):
 ``RV401`` (volume) and ``MK301`` sit on the top edge by packing order;
 ``RV402`` (squelch) is 16.3 mm below the top edge; ``SW201`` (PTT) is in the
-board's interior, 36.5 mm below the top edge; ``J101`` (pack) is on the
+board's interior, 37.5 mm below the top edge; ``J101`` (pack) is on the
 left edge, 34 mm above the bottom edge; ``J401`` (speaker) is in the
 interior, 60.2 mm above the bottom edge; only the bench headers J402-J404
 are on the bottom edge. Moving them is left to manual placement in KiCad
@@ -117,11 +122,13 @@ BANDWIDTH_RANGE = (2000.0, 4000.0)
 #: why the stage-1 board allows 2 or 4 layers and defaults to 4
 LAYER_REASON = "no RF on this board: 2 or 4 layers; 4 by default for one stack across the stages"
 #: block id -> (x, y, w, h) mm of its floorplan region (origin top-left, Y down): 74 x 82 mm, the smallest arrangement of these five
-#: rectangles found in which ``placement.rf_floorplan`` packs every part with and without the time-out (measured on the KiCad 10.0.6 footprints)
+#: rectangles found in which ``placement.rf_floorplan`` packs every part with and without the time-out (measured on the KiCad 10.0.6 footprints);
+#: the TX audio region is 37 mm tall (36 mm no longer holds its parts with the through-hole microphone's 6.5 x 6.5 mm courtyard) and the PTT
+#: region below it 45 mm (it still holds the time-out)
 REGIONS: dict[str, tuple[float, float, float, float]] = {
     "rx_audio": (0.0, 0.0, 42.0, 42.0),
-    "tx_audio": (42.0, 0.0, 32.0, 36.0),
-    "ptt": (42.0, 36.0, 32.0, 46.0),
+    "tx_audio": (42.0, 0.0, 32.0, 37.0),
+    "ptt": (42.0, 37.0, 32.0, 45.0),
     "power": (0.0, 42.0, 42.0, 30.0),
     "bench": (0.0, 72.0, 42.0, 10.0),
 }
@@ -399,7 +406,7 @@ class Kr447AudioPttTemplate(Template):
                 "배치(설계 §2.1 과 다름): 설계는 커넥터를 아래쪽 가장자리에, PTT 와 가변저항을 위쪽 가장자리에 두라고 하지만, 영역 배치기는 각 블록의 부품을 "
                 "영역 왼쪽 위부터 차례로 채우므로 사용자가 만지는 부품이 가장자리에 오지 않습니다. 74 × 82 mm 기판에서(두 빌드 같음, 가장자리 여백 2 mm) "
                 "RV401(음량)과 MK301 은 채우는 순서 덕에 위쪽 가장자리에 있지만, RV402(스퀠치)는 위쪽 가장자리에서 16.3 mm 안쪽, SW201(PTT)은 기판 안쪽"
-                "(위쪽에서 36.5 mm), J101(팩)은 왼쪽 가장자리(아래쪽에서 34 mm 위), J401(스피커)은 기판 안쪽(아래쪽에서 60.2 mm 위)에 놓입니다. 아래쪽 "
+                "(위쪽에서 37.5 mm), J101(팩)은 왼쪽 가장자리(아래쪽에서 34 mm 위), J401(스피커)은 기판 안쪽(아래쪽에서 60.2 mm 위)에 놓입니다. 아래쪽 "
                 "가장자리에는 시험용 헤더 J402–J404 만 있습니다. 이 부품들의 가장자리 배치는 KiCad 에서 손으로 옮기는 일로 남겨 둡니다.\n\n"
                 "| 규제 프로파일 키 | 값 (검증되지 않음) | 확인할 문서 |\n|---|---|---|\n" + profile_rows
             )),
@@ -590,7 +597,12 @@ _PART_NOTES: dict[str, PartNote] = {
     "SW201": _ic("SW201: PTT 버튼", "SW_Push (TL3342).", ["순간 접점, 정상 개방"], []),
     "U301": _ic("U301: 마이크 앰프 (AGC)", "MAX9814; GAIN / A/R / TH 스트랩은 검증되지 않은 선택값. 모델이 없어 설계 덱에서는 MICOUT 을 사인 자극으로 대체.",
                 ["AGC 마이크 앰프, 2.7–5.5 V", "DFN-14 핀 배열"], [unverified("SSM2167", "압축기 내장, 핀·스트랩이 다름")]),
-    "MK301": _ic("MK301: 일렉트릿 마이크", "CUI CMC-4013 풋프린트.", ["2단자 일렉트릿, 바이어스 2.2 kΩ"], []),
+    "MK301": _ic("MK301: 일렉트릿 마이크",
+                 "PUI Audio POM-2244P-C3310-2-R 스루홀 캡슐(Sensor_Audio:POM-2244P-C3310-2-R: THT 패드 1 / 2, 간격 1.9 mm, 드릴 0.65 mm). "
+                 "심볼 Device:Microphone_Condenser 의 핀 1 '-' / 2 '+' 가 패드 1 / 2 에 붙고(- 는 GND, + 는 MIC_P), 풋프린트 실크의 '+' 표시는 패드 2 쪽이지만, "
+                 "어느 단자가 케이스(음극)인지는 PUI Audio 데이터시트로 확인하지 않았습니다(검증되지 않음). 앞서 쓰던 SMT 캡슐 CUI CMC-4013 은 "
+                 "중앙 패드 2 가 링 패드 1 안에 있어 패드 안 비아 없이는 F.Cu 로 빠져나올 수 없었습니다(2b / 2c 측정).",
+                 ["2단자 일렉트릿, 바이어스 2.2 kΩ", "케이스(음극) 단자를 GND 에: 데이터시트로 극성 확인"], []),
     "D301": _ic("D301: 리미터 다이오드 (양의 반파)", "1N4148WS; 클리핑 레벨 ≈ 순방향 전압(선택값 0.6 V, 검증되지 않음).", ["소신호 실리콘 다이오드", "D302 와 짝"], []),
     "D302": _ic("D302: 리미터 다이오드 (음의 반파)", "1N4148WS.", ["D301 과 같은 부품"], []),
     "RV301": _ic("RV301: 편이 트림 (실험실 정렬)", "Bourns 3314J 트리머; 적분기 입력 레벨을 정함 - 편이는 변조 분석기로 맞춤.", ["10 kΩ 선형"], []),
