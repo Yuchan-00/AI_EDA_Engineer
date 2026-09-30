@@ -66,19 +66,27 @@ def _write(tmp_path: Path, data: dict) -> Path:
 def test_packaged_file_loads_and_states_its_provenance():
     cl = load_candidates()
     assert cl.source_path == str(DEFAULT_CANDIDATES_PATH) and cl.sha256 and cl.sha256.startswith("sha256:")
-    assert UNVERIFIED_NOTE in cl.provenance and cl.curated_at == "2026-09-23"
+    assert UNVERIFIED_NOTE in cl.provenance and cl.curated_at == "2026-09-28"
+    assert "offline from general knowledge, with no URL and no quote" in cl.provenance and "2026-09-23" in cl.provenance
     assert cl.jurisdictions() == ["EU", "KR", "US"]
     assert {c.id for c in cl.for_jurisdiction("EU")} == {"reg.EU.LVD.2014-35-EU", "reg.EU.EMC.2014-30-EU", "reg.EU.RoHS.2011-65-EU", "reg.EU.RED.2014-53-EU"}
     assert {c.id for c in cl.for_jurisdiction("KR")} == {"reg.KR.ElectricalAppliancesSafetyAct", "reg.KR.ElectricalAppliancesSafetyAct.EnforcementRule", "reg.KR.RadioWavesAct.58-2",
-                                                         "reg.KR.RadioWavesAct.ConformityAssessmentNotice"}
+                                                         "reg.KR.RadioWavesAct.ConformityAssessmentNotice",
+                                                         # the KR 447 MHz walkie-talkie entries (2026-09-28, offline; tests/test_regulatory_kr447.py)
+                                                         "reg.KR.MSIT.LicenceExemptRadioStationEquipmentNotice", "reg.KR.MSIT.RadioEquipmentRules",
+                                                         "reg.KR.RadioWavesAct.LicenceExemptStations", "reg.KR.MSIT.FrequencyAllocationTable",
+                                                         "reg.KR.MSIT.HumanEMFProtectionStandard", "reg.KR.RRA.ConformityTestMethods"}
     assert [c.id for c in cl.for_jurisdiction("US")] == ["reg.US.FCC.47CFR15"]
     assert cl.for_jurisdiction("JP") == []
     d = cl.describe()
-    assert d["candidates"] == 9 and d["sha256"] == cl.sha256
-    # the one entry whose text the probe did not fetch is kept, says why, and guesses neither a URL nor a quote
+    assert d["candidates"] == 15 and d["sha256"] == cl.sha256
+    # the entries whose text was never fetched are kept, say why, and guess neither a URL nor a quote
     unfetchable = [c for c in cl.candidates if not c.fetchable]
-    assert [c.id for c in unfetchable] == ["reg.KR.RadioWavesAct.ConformityAssessmentNotice"]
-    assert unfetchable[0].official_url is None and unfetchable[0].grounding_quotes == [] and "target=admrul" in unfetchable[0].unfetchable_reason
+    assert [c.id for c in unfetchable] == ["reg.KR.RadioWavesAct.ConformityAssessmentNotice", "reg.KR.MSIT.LicenceExemptRadioStationEquipmentNotice",
+                                           "reg.KR.MSIT.RadioEquipmentRules", "reg.KR.RadioWavesAct.LicenceExemptStations", "reg.KR.MSIT.FrequencyAllocationTable",
+                                           "reg.KR.MSIT.HumanEMFProtectionStandard", "reg.KR.RRA.ConformityTestMethods"]
+    assert all(c.official_url is None and c.grounding_quotes == [] and c.documents() == [] and c.unfetchable_reason for c in unfetchable)
+    assert "target=admrul" in unfetchable[0].unfetchable_reason
 
 
 def test_packaged_file_every_url_host_is_allow_listed_and_https():
@@ -93,8 +101,9 @@ def test_packaged_file_every_url_host_is_allow_listed_and_https():
         for q in c.grounding_quotes:
             assert (q.url or c.official_url) in {d.url for d in c.documents()}
     hosts = cl.allowed_hosts()
-    assert set(hosts) == {"eur-lex.europa.eu", "law.go.kr", "ecfr.gov"}
-    assert "reg.EU.LVD.2014-35-EU" in hosts["eur-lex.europa.eu"]
+    # rra.go.kr is allow-listed for the RRA test-method entry only; that entry names no URL, so nothing is fetched there
+    assert set(hosts) == {"eur-lex.europa.eu", "law.go.kr", "ecfr.gov", "rra.go.kr"}
+    assert "reg.EU.LVD.2014-35-EU" in hosts["eur-lex.europa.eu"] and hosts["rra.go.kr"] == "reg.KR.RRA.ConformityTestMethods"
 
 
 def test_packaged_file_rules_only_read_asked_questions_and_cite_existing_quotes():
@@ -117,7 +126,8 @@ def test_packaged_file_rules_only_read_asked_questions_and_cite_existing_quotes(
     assert lvd.not_evaluated and "Annex II" in lvd.not_evaluated and cl.get("reg.EU.RoHS.2011-65-EU").not_evaluated.startswith("the 'subject to paragraph 2'")
     assert [q.key for q in cl.questions_for(["EU"])] == ["intended_use", "mains_powered", "highest_rated_voltage", "evaluation_kit", "radio", "finished_apparatus"]
     assert [q.key for q in cl.questions_for(["US"])] == ["intended_use", "mains_powered", "radio", "digital_device"]
-    assert [q.key for q in cl.questions_for(["EU", "KR"])] == ["intended_use", "mains_powered", "highest_rated_voltage", "evaluation_kit", "radio", "finished_apparatus", "digital_device"]
+    assert [q.key for q in cl.questions_for(["EU", "KR"])] == ["intended_use", "mains_powered", "highest_rated_voltage", "evaluation_kit", "radio", "finished_apparatus", "digital_device",
+                                                            "kr_licence_free_class"]
 
 
 def test_packaged_placeholders_are_declared_and_come_from_env_or_default(monkeypatch):

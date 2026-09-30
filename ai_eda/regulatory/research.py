@@ -27,8 +27,14 @@ Invariants this module enforces:
   from the answers and requirements given, and reported with its inputs,
   its missing keys and the grounding quotes it rests on. The
   ``regulatory.applicability`` result is ``PASS`` only when every candidate
-  was decided *and* every quote its decision cites was found in the archived
-  text; otherwise ``NOT_VERIFIED`` naming what is missing.
+  was decided *and* its decision cites at least one official sentence *and*
+  every quote it cites was found in the archived text; otherwise
+  ``NOT_VERIFIED`` naming what is missing. A decision that cites nothing
+  (a curated rule without ``evidence`` on the branch that decided it, such
+  as the EU ``not radio`` exclusions or the KR 고시 entry) is not grounded -
+  an empty list of citations is never "all found" - and is named
+  ("the decision cites no official sentence for ...") until someone adds a
+  citation the archived text verifies.
 * **``regulatory.compliance`` is always ``NOT_VERIFIED``.** Reading a
   regulation is not compliance; the message says an engineer / notified
   body must assess it. ``regulatory.research`` summarises the three and can
@@ -109,7 +115,7 @@ class CandidateResult(BaseModel):
     source_status: str
     verification: ValidationStatus
     reason: str
-    #: whether every quote the applicability decision cites was found
+    #: whether the applicability decision cites at least one official sentence and every quote it cites was found
     evidence_grounded: bool
     requirement: RegulatoryRequirement
 
@@ -271,8 +277,8 @@ def _ground_quotes(candidate: RegulatoryCandidate, docs: dict[str, DocumentResul
         dres = docs.get(key)
         if dres is None or not dres.usable:
             reason = dres.reason if dres is not None else "document not obtained"
-            out.append(GroundedQuote(section=q.section, quote=q.quote, found=False, reason=f"{dres.status if dres else 'unresolved'}: {reason}",
-                                     source_url=dres.final_url if dres else None, content_hash=dres.sha256 if dres else None))
+            # no archived document was looked in: the URL a 404 / interstitial came from is this run's story, not a document
+            out.append(GroundedQuote(section=q.section, quote=q.quote, found=False, reason=f"{dres.status if dres else 'unresolved'}: {reason}"))
             continue
         assert dres.document is not None
         hits = dres.document.find_quote(q.quote)
@@ -304,13 +310,6 @@ def _source_status(candidate: RegulatoryCandidate, docs: list[DocumentResult], q
         f"official text archived ({'fetched in this run' if fresh else 'hash-verified copy from an earlier run'}) and all {len(quotes)} quote(s) found")
 
 
-def _first_grounded(quotes: list[GroundedQuote]) -> GroundedQuote | None:
-    for q in quotes:
-        if q.found:
-            return q
-    return None
-
-
 def research_candidate(candidate: RegulatoryCandidate, candidates: CandidateList, archive: DocumentArchive | None, online: bool,
                        answers: dict[str, str], requirements: Any, env: dict[str, str] | None = None) -> CandidateResult:
     """One candidate: applicability from the inputs, documents through the archive, quotes grounded, requirement built."""
@@ -330,17 +329,18 @@ def research_candidate(candidate: RegulatoryCandidate, candidates: CandidateList
     quotes = _ground_quotes(candidate, by_url)
     source_status, verification, reason = _source_status(candidate, doc_results, quotes)
     found_sections = {q.section for q in quotes if q.found}
-    evidence_grounded = all(label in found_sections for label in ev.evidence)
+    # a decision that cites no official sentence rests on nothing the archive can check: empty evidence is not grounded
+    evidence_grounded = bool(ev.evidence) and all(label in found_sections for label in ev.evidence)
     official = by_url.get(candidate.official_url)
-    first = _first_grounded(quotes)
-    section = f"{first.section} (page {first.page})" if first is not None else None
+    # the section the decision cites is the claim; where (page) and whether it was found are this run's verdict (GroundedQuote)
+    section = ", ".join(ev.evidence) if ev.evidence else (candidate.grounding_quotes[0].section if candidate.grounding_quotes else None)
     rationale = f"rule: {ev.rationale}"
     if ev.inputs_used:
         rationale += "; inputs: " + ", ".join(f"{k} = {v}" for k, v in ev.inputs_used.items())
     if ev.missing:
         rationale += "; missing: " + ", ".join(f"{m.key} ({m.reason})" for m in ev.missing)
     if ev.evidence:
-        rationale += "; evidence: " + ", ".join(f"{label} ({'grounded' if label in found_sections else 'not grounded'})" for label in ev.evidence)
+        rationale += "; evidence: " + ", ".join(ev.evidence)  # grounded or not is GroundedQuote.found / regulatory.sources, not the design
     if candidate.not_evaluated:
         rationale += f"; not evaluated: {candidate.not_evaluated}"
     retrieved = None
@@ -488,8 +488,16 @@ def research(
                    + "; ".join(f"{cid} needs {', '.join(keys)}" for cid, keys in undecided.items()))
     elif ungrounded:
         app_status = ValidationStatus.NOT_VERIFIED
-        app_msg = (f"all {len(results)} candidate(s) decided on the curated rules, but the official sentence(s) the decision cites were not grounded for "
-                   f"{', '.join(ungrounded)} ({OFFLINE_REASON if not online else 'see regulatory.sources'})")
+        by_id = {r.candidate_id: r for r in results}
+        uncited = [cid for cid in ungrounded if not by_id[cid].evaluation.evidence]
+        unfound = [cid for cid in ungrounded if by_id[cid].evaluation.evidence]
+        parts = []
+        if unfound:
+            parts.append(f"the official sentence(s) the decision cites were not grounded for {', '.join(unfound)} "
+                         f"({OFFLINE_REASON if not online else 'see regulatory.sources'})")
+        if uncited:
+            parts.append(f"the decision cites no official sentence for {', '.join(uncited)} (the curated rule names no section to ground it in)")
+        app_msg = f"all {len(results)} candidate(s) decided on the curated rules, but " + "; ".join(parts)
     else:
         app_status = ValidationStatus.PASS
         app_msg = (f"all {len(results)} candidate(s) decided from the answers and requirements on the curated inclusion / exclusion rules, "

@@ -65,8 +65,8 @@ from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
 from ai_eda.ir import CircuitIR, MissingInformation, ProvenanceKind, ValidationResult, ValidationStatus
 from ai_eda.ir.regulatory import Applicability, GroundedQuote, ProposedRegulation, RegulatoryProvenance, RegulatoryRequirement, RegulatoryState
 from ai_eda.llm.client import LLMError, LLMMessage
-from ai_eda.agents.component import CONFIRM_FACTS_KEY, CONFIRM_PARTS_KEY, EXTRACT_FACTS_KEY, FACTS_FILE_KEY
-from ai_eda.llm.extraction import ACCEPT_KEY, CONFIRM_KEY, REJECT_KEY, _strictify, find_directive, is_confirmation
+from ai_eda.agents.keys import ACCEPT_REGS_KEY, CONTROL_KEYS, PROPOSE_REGS_KEY, REJECT_REGS_KEY
+from ai_eda.llm.extraction import _strictify, find_directive, is_confirmation
 from ai_eda.llm.router import TaskKind
 from ai_eda.llm.service import BudgetExceededError, LLMService, StructuredOutputError
 from ai_eda.regulatory.applicability import yes_no
@@ -76,15 +76,11 @@ from ai_eda.security.approval import ApprovalGate
 from ai_eda.tools.sources.archive import DocumentArchive
 from ai_eda.tools.sources.policy import NetworkPolicy, host_key, host_of, normalise_url
 
-#: answer keys that steer this agent (comma-separated proposal ids) and are never scope answers
-ACCEPT_REGS_KEY = "accept_regulations"
-REJECT_REGS_KEY = "reject_regulations"
-#: ``--answer propose_regulations=yes``: the user's explicit request for the (billed) model call that proposes further regulations;
-#: without it the model is never asked, while decisions on proposals shown in an earlier run are still applied
-PROPOSE_REGS_KEY = "propose_regulations"
-CONTROL_KEYS: frozenset[str] = frozenset({
-    ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY, CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY, CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY,
-})
+#: ``ACCEPT_REGS_KEY`` / ``REJECT_REGS_KEY`` (comma-separated proposal ids) steer this agent and are never scope answers;
+#: ``--answer propose_regulations=yes`` is the user's explicit request for the (billed) model call that proposes further
+#: regulations - without it the model is never asked, while decisions on proposals shown in an earlier run are still applied.
+#: All three are defined in :mod:`ai_eda.agents.keys` with every other control key (``CONTROL_KEYS``): a control answer of
+#: any agent never reaches the applicability rules and is never recorded as a scope answer.
 PROPOSALS_CHECK = "regulatory.proposals"
 #: bumped whenever the prompt, the schema or the screening rules change (cached proposals made under other rules are stale)
 PROPOSAL_VERSION = "1"
@@ -335,8 +331,21 @@ class RegulatoryAgent(Agent):
                 notes.append(f"{p.id}: accepted; its official document is fetched and the title grounded on the next --online run")
                 continue
             assert archive is not None
-            archive.policy.trust_host(host_of(p.official_url), f"official domain allow-listed in candidates.json (accepted model proposal {p.id})")
-            outcome = archive.fetch(p.official_url, purpose=f"{p.id}: official text of an accepted model proposal", expect="any")
+            # the allow-list is checked again here, not only when the proposal was screened: ``refused`` is a stored
+            # field of the IR (a hand edit or an older candidate list could clear it), and a model URL is fetched only
+            # while its host is in the official-domain allow-list of the candidate list in force now
+            try:
+                norm, _ = normalise_url(p.official_url)
+                host = host_key(host_of(norm))
+            except ValueError as e:
+                notes.append(f"{p.id}: accepted, but its URL is unusable ({e}); not fetched")
+                continue
+            allowed_now = candidates.allowed_hosts(codes) or candidates.allowed_hosts()
+            if host not in {host_key(h) for h in allowed_now}:
+                notes.append(f"{p.id}: accepted, but host {host!r} is not in the official-domain allow-list of candidates.json; not fetched")
+                continue
+            archive.policy.trust_host(host, f"official domain allow-listed in candidates.json (accepted model proposal {p.id})")
+            outcome = archive.fetch(norm, purpose=f"{p.id}: official text of an accepted model proposal", expect="any")
             doc = outcome.document if outcome.ok else archive.lookup(p.official_url)
             if doc is None:
                 notes.append(f"{p.id}: official document {outcome.status} ({outcome.reason}); not accepted into the requirements")
@@ -351,7 +360,7 @@ class RegulatoryAgent(Agent):
                 id=p.id, jurisdiction=p.jurisdiction, title=p.title, summary=p.summary, status=ValidationStatus.NOT_VERIFIED,
                 provenance=RegulatoryProvenance(
                     jurisdiction=p.jurisdiction, authority=p.authority, source_title=p.title + (f" [{doc.title}]" if doc.title else ""),
-                    source_url=doc.final_url or doc.url or p.official_url, retrieved_at=doc.retrieved_at, section=f"title quote (page {h.page})",
+                    source_url=doc.final_url or doc.url or p.official_url, retrieved_at=doc.retrieved_at, section="title quote",
                     applicability_rationale=(f"accepted by the user (--answer {ACCEPT_REGS_KEY}={p.id}); proposed by model {p.model}; no declarative rule - "
                                              f"applicability is the user's decision, compliance is not assessed"),
                     verification_status=ValidationStatus.PASS, source_document=str(doc.path), content_hash=doc.sha256,

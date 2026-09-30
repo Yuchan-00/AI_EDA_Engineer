@@ -22,10 +22,23 @@ embedded in a schematic's ``lib_symbols`` or a board's ``footprint`` list.
 Coordinates: symbol pins are in the symbol's own frame with **Y up** (as in
 the library); footprint pads are in the footprint frame with **Y down**
 (board convention). The schematic compiler must negate pin ``y``.
+
+A ``custom`` pad's copper is its **anchor** (``(options (anchor rect|circle))``,
+KiCad's ``rect`` when the file names none; a circle anchor's diameter is the
+size's x) plus every copper **primitive** of its ``(primitives ...)`` block,
+kept as read (:class:`PadPrimitive`: ``gr_poly`` - with the ``arc`` pieces of
+its outline -, ``gr_line``, ``gr_rect``, ``gr_circle``, ``gr_arc``,
+``gr_curve``, each with its stroke width and fill) in the pad's own frame
+(relative to the pad's copper centre, the pad's angle not applied). The
+editor annotations ``gr_bbox`` / ``gr_vector`` are not copper and are
+skipped; any other head is listed in :attr:`Pad.unread_primitives` (its
+copper is then unknown, and every user says so instead of guessing). A
+``trapezoid``'s ``rect_delta`` is not kept.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -45,6 +58,8 @@ __all__ = [
     "SymbolPin",
     "FootprintDef",
     "Pad",
+    "PadPrimitive",
+    "PAD_PRIMITIVE_KINDS",
     "BBox",
     "KICAD_PIN_TYPES",
     "kicad_pin_type_to_ir",
@@ -133,6 +148,31 @@ class SymbolDef:
         return node
 
 
+Point = tuple[float, float]
+
+#: the copper primitive heads of a ``custom`` pad this reader keeps, as :attr:`PadPrimitive.kind` (``gr_`` dropped)
+PAD_PRIMITIVE_KINDS: dict[str, str] = {"gr_poly": "poly", "gr_line": "line", "gr_rect": "rect", "gr_circle": "circle", "gr_arc": "arc", "gr_curve": "curve"}
+#: primitive heads that are editor annotations, not copper
+_PAD_ANNOTATION_HEADS = frozenset({"gr_bbox", "gr_vector"})
+
+
+@dataclass(frozen=True, slots=True)
+class PadPrimitive:
+    """One copper primitive of a ``custom`` pad, in the pad's own frame (mm, Y down, relative to the pad's copper centre, the pad's
+    angle not applied), exactly as the file gives it.
+
+    ``points`` by ``kind``: ``poly`` its ``xy`` vertices (each ``arc`` piece of its outline in ``arcs`` as start / mid / end);
+    ``line`` / ``rect`` start and end; ``circle`` the centre and a point on the circle; ``arc`` start, mid and end; ``curve`` the
+    four Bezier control points. ``width`` is the stroke width (0: none), ``fill`` whether the file says ``(fill yes)`` (or
+    ``solid``)."""
+
+    kind: str  # poly | line | rect | circle | arc | curve
+    points: tuple[Point, ...]
+    width: float = 0.0
+    fill: bool = False
+    arcs: tuple[tuple[Point, Point, Point], ...] = ()
+
+
 @dataclass(frozen=True, slots=True)
 class Pad:
     """One footprint pad, in footprint coordinates (mm, Y down)."""
@@ -148,6 +188,16 @@ class Pad:
     drill: float | None
     layers: list[str]
     roundrect_rratio: float | None = None
+    #: ``(drill ... (offset x y))``: the copper shape sits at ``(x, y)`` plus this offset rotated by the pad angle (KiCad's
+    #: ``PAD::ShapePos``); the hole stays at ``(x, y)``. 0 when the file gives none.
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+    #: a ``custom`` pad's anchor shape (``"rect"`` / ``"circle"``; ``rect`` when the file names none); ``None`` for every other shape
+    anchor: str | None = None
+    #: a ``custom`` pad's copper primitives (module docstring); empty for every other shape
+    primitives: tuple[PadPrimitive, ...] = ()
+    #: a ``custom`` pad's primitives this reader does not read (their heads, or ``head (malformed)``): its copper is then unknown
+    unread_primitives: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +376,88 @@ def _flatten(child: list, parent: list) -> list:
 # --------------------------------------------------------------------------- footprint parsing helpers
 
 
+def _finite(atom: Any, what: str, name: str) -> float:
+    """``atom`` as a finite float; ``nan`` / ``inf`` (which ``float`` and KiCad's reader accept) are :class:`LibraryFormatError` naming the footprint.
+
+    A non-finite coordinate or size has no geometry: ``min`` / ``max`` drop a
+    NaN silently and an infinite pad is everywhere, so a later extent or DRC
+    would be computed on a footprint that is not the one on disk.
+    """
+    value = sexpr.to_float(atom)
+    if not math.isfinite(value):
+        raise LibraryFormatError(f"footprint {name!r}: {what} is not a finite number ({atom!r}); refusing the footprint")
+    return value
+
+
+def _primitive_point(node: list | None, what: str, name: str) -> Point | None:
+    """``(start x y)`` / ``(xy x y)`` ... as a finite point; ``None`` when the node is missing or short."""
+    if node is None or len(node) < 3 or isinstance(node[1], list) or isinstance(node[2], list):
+        return None
+    return (_finite(node[1], f"{what} x", name), _finite(node[2], f"{what} y", name))
+
+
+def _primitive(prim: list, kind: str, what: str, name: str) -> PadPrimitive | None:
+    """One copper primitive as read (module docstring), or ``None`` when a point it needs is missing (the caller lists it unread)."""
+    stroke = sexpr.find(prim, "stroke")
+    width_atom = sexpr.get(stroke, "width") if stroke is not None else sexpr.get(prim, "width")
+    width = _finite(width_atom, f"{what} width", name) if width_atom is not None else 0.0
+    if width < 0.0:
+        return None
+    fill = str(sexpr.get(prim, "fill", 1, "no")) in ("yes", "solid")
+    points: list[Point] = []
+    arcs: list[tuple[Point, Point, Point]] = []
+    if kind in ("poly", "curve"):
+        pts = sexpr.find(prim, "pts")
+        for child in (pts[1:] if pts is not None else []):
+            head = sexpr.head(child)
+            if head == "xy":
+                p = _primitive_point(child, f"{what} xy", name)
+                if p is None:
+                    return None
+                points.append(p)
+            elif head == "arc":
+                ends = [_primitive_point(sexpr.find(child, h), f"{what} arc {h}", name) for h in ("start", "mid", "end")]
+                if any(p is None for p in ends) or kind == "curve":
+                    return None
+                arcs.append((ends[0], ends[1], ends[2]))  # type: ignore[arg-type]
+            elif head is not None:
+                return None  # a piece of the outline this reader does not know
+        if (kind == "curve" and len(points) != 4) or (kind == "poly" and not points and not arcs):
+            return None
+    else:
+        heads = {"line": ("start", "end"), "rect": ("start", "end"), "circle": ("center", "end"), "arc": ("start", "mid", "end")}[kind]
+        for h in heads:
+            p = _primitive_point(sexpr.find(prim, h), f"{what} {h}", name)
+            if p is None:
+                return None
+            points.append(p)
+    return PadPrimitive(kind, tuple(points), width, fill, tuple(arcs))
+
+
+def _custom_pad(pad: list, name: str) -> tuple[str, tuple[PadPrimitive, ...], tuple[str, ...]]:
+    """``(anchor, primitives, unread heads)`` of a ``custom`` pad node (module docstring)."""
+    what = f"pad {str(pad[1])!r} primitive"
+    options = sexpr.find(pad, "options")
+    anchor = str(sexpr.get(options, "anchor", 1, "rect")) if options is not None else "rect"
+    unread: list[str] = []
+    if anchor not in ("rect", "circle"):
+        unread.append(f"anchor {anchor}")
+        anchor = "rect"
+    prims: list[PadPrimitive] = []
+    block = sexpr.find(pad, "primitives")
+    for prim in (block[1:] if block is not None else []):
+        head = sexpr.head(prim)
+        if head is None or head in _PAD_ANNOTATION_HEADS:
+            continue
+        kind = PAD_PRIMITIVE_KINDS.get(head)
+        got = _primitive(prim, kind, what, name) if kind is not None else None
+        if got is None:
+            unread.append(head if kind is None else f"{head} (malformed)")
+        else:
+            prims.append(got)
+    return anchor, tuple(prims), tuple(unread)
+
+
 def _parse_pads(fp: list) -> list[Pad]:
     name = str(fp[1])
     pads: list[Pad] = []
@@ -338,6 +470,7 @@ def _parse_pads(fp: list) -> list[Pad]:
         if at is None or len(at) < 3 or size is None or len(size) < 3 or layers is None:
             raise LibraryFormatError(f"footprint {name!r}: pad {str(pad[1])!r} lacks (at)/(size)/(layers)")
         drill: float | None = None
+        offset = (0.0, 0.0)
         drill_node = sexpr.find(pad, "drill")
         if drill_node is not None:
             for atom in sexpr.args(drill_node):
@@ -346,20 +479,31 @@ def _parse_pads(fp: list) -> list[Pad]:
                     break
                 except ValueError:
                     continue  # "oval" etc.
+            off = sexpr.find(drill_node, "offset")
+            if off is not None:
+                if len(off) < 3:
+                    raise LibraryFormatError(f"footprint {name!r}: pad {str(pad[1])!r} has a malformed (drill (offset ...))")
+                offset = (_finite(off[1], f"pad {str(pad[1])!r} (drill offset x)", name), _finite(off[2], f"pad {str(pad[1])!r} (drill offset y)", name))
         rr = sexpr.get(pad, "roundrect_rratio")
+        custom = _custom_pad(pad, name) if str(pad[3]) == "custom" else (None, (), ())
         pads.append(
             Pad(
                 number=str(pad[1]),
                 pad_type=str(pad[2]),
                 shape=str(pad[3]),
-                x=sexpr.to_float(at[1]),
-                y=sexpr.to_float(at[2]),
-                rotation=sexpr.to_float(at[3]) if len(at) > 3 else 0.0,
-                size_w=sexpr.to_float(size[1]),
-                size_h=sexpr.to_float(size[2]),
+                x=_finite(at[1], f"pad {str(pad[1])!r} (at x)", name),
+                y=_finite(at[2], f"pad {str(pad[1])!r} (at y)", name),
+                rotation=_finite(at[3], f"pad {str(pad[1])!r} (at angle)", name) if len(at) > 3 else 0.0,
+                size_w=_finite(size[1], f"pad {str(pad[1])!r} (size w)", name),
+                size_h=_finite(size[2], f"pad {str(pad[1])!r} (size h)", name),
                 drill=drill,
                 layers=[str(layer) for layer in sexpr.args(layers)],
                 roundrect_rratio=sexpr.to_float(rr) if rr is not None else None,
+                offset_x=offset[0],
+                offset_y=offset[1],
+                anchor=custom[0],
+                primitives=custom[1],
+                unread_primitives=custom[2],
             )
         )
     return pads
@@ -369,13 +513,17 @@ _COURTYARD_LAYERS = frozenset({"F.CrtYd", "B.CrtYd"})
 
 
 def _courtyard_bbox(fp: list) -> BBox | None:
+    name = str(fp[1])
     xs: list[float] = []
     ys: list[float] = []
 
+    def num(atom: Any, what: str) -> float:
+        return _finite(atom, f"courtyard {what}", name)
+
     def add(node: list | None) -> None:
         if node is not None and len(node) >= 3:
-            xs.append(sexpr.to_float(node[1]))
-            ys.append(sexpr.to_float(node[2]))
+            xs.append(num(node[1], f"({node[0]} x)"))
+            ys.append(num(node[2], f"({node[0]} y)"))
 
     for item in fp:
         if not isinstance(item, list) or not item or sexpr.get(item, "layer") not in _COURTYARD_LAYERS:
@@ -391,8 +539,8 @@ def _courtyard_bbox(fp: list) -> BBox | None:
             center = sexpr.find(item, "center")
             end = sexpr.find(item, "end")
             if center is not None and end is not None and len(center) >= 3 and len(end) >= 3:
-                cx, cy = sexpr.to_float(center[1]), sexpr.to_float(center[2])
-                r = ((sexpr.to_float(end[1]) - cx) ** 2 + (sexpr.to_float(end[2]) - cy) ** 2) ** 0.5
+                cx, cy = num(center[1], "(center x)"), num(center[2], "(center y)")
+                r = ((num(end[1], "(end x)") - cx) ** 2 + (num(end[2], "(end y)") - cy) ** 2) ** 0.5
                 xs += [cx - r, cx + r]
                 ys += [cy - r, cy + r]
         elif kind == "fp_poly":
@@ -522,6 +670,8 @@ class KicadLibrary:
                 library_path=str(path),
             )
         except sexpr.SExprError as exc:
+            raise LibraryFormatError(f"{path}: {exc}") from exc
+        except LibraryFormatError as exc:  # a malformed pad / courtyard (a non-finite number ...): the file is named too
             raise LibraryFormatError(f"{path}: {exc}") from exc
         self._footprint_cache[key] = fp
         return fp

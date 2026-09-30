@@ -476,6 +476,30 @@ def test_expectation_vector_rules():
         build(ir)
 
 
+def test_reduce_frequency_is_only_for_a_tran_analysis():
+    """Rising edges are counted over time: op has one point, dc / ac sweep a source or a frequency, not time."""
+    ir = divider_ir()
+    ir.simulation.stimuli[0].params["ac"] = user_requirement(1)
+    ir.simulation.analyses += [
+        AnalysisSpec(id="dc", kind=SpiceAnalysis.DC, params={"source": user_requirement("VIN"), "start": user_requirement(0), "stop": user_requirement(12), "step": user_requirement(1)}, provenance=USER),
+        AnalysisSpec(id="ac", kind=SpiceAnalysis.AC, params={"variation": user_requirement("dec"), "points": user_requirement(10), "fstart": user_requirement(1.0), "fstop": user_requirement(1e6)}, provenance=USER),
+        AnalysisSpec(id="tran", kind=SpiceAnalysis.TRAN, params={"step": user_requirement(1e-6), "stop": user_requirement(5e-3), "uic": user_requirement(True)}, provenance=USER),
+    ]
+    exp = ir.simulation.expectations[0]
+    exp.reduce = Reduce.FREQUENCY
+    exp.nominal = user_requirement(1000.0, "Hz")
+    with pytest.raises(CompileError, match="expectation vout: an op result is a single point; use reduce=value"):
+        build(ir)
+    for analysis_id in ("dc", "ac"):
+        exp.analysis_id = analysis_id
+        with pytest.raises(CompileError, match=f"expectation vout: reduce=frequency counts rising edges over time, which only a tran analysis produces \\({analysis_id} is {analysis_id}\\)"):
+            build(ir)
+    exp.analysis_id = "tran"
+    report = build_report(ir)
+    assert report["analyses"]["tran"] == "tran 1u 5m uic"
+    assert build(ir) == GOLDEN.replace("DC 12", "DC 12 AC 1")  # no analysis, no ``uic`` and no expectation ever reaches the netlist text
+
+
 def test_dc_analysis_must_reference_a_stimulus():
     setup = op_setup()
     setup.analyses.append(AnalysisSpec(id="sweep", kind=SpiceAnalysis.DC, params={"source": user_requirement("VX"), "start": user_requirement(0), "stop": user_requirement(12), "step": user_requirement(1)}, provenance=USER))
@@ -501,6 +525,11 @@ def test_analysis_commands():
     assert analysis_command(analysis(SpiceAnalysis.DC, source="VIN", start=12, stop=0, step=-0.5), setup) == "dc VVIN 12 0 -500m"
     assert analysis_command(analysis(SpiceAnalysis.TRAN, step=1e-6, stop=5e-3)) == "tran 1u 5m"
     assert analysis_command(analysis(SpiceAnalysis.TRAN, step=1e-5, stop=5e-3, start=1e-3)) == "tran 1e-5 5m 1m"  # "10u" would be misread
+    # ``uic`` is a bool: True appends ngspice's keyword after start (or after stop without one), False emits nothing
+    assert analysis_command(analysis(SpiceAnalysis.TRAN, step=5e-6, stop=30e-3, start=10e-3, uic=True)) == "tran 5.00u 30m 10m uic"
+    assert analysis_command(analysis(SpiceAnalysis.TRAN, step=1e-6, stop=5e-3, uic=True)) == "tran 1u 5m uic"
+    assert analysis_command(analysis(SpiceAnalysis.TRAN, step=1e-6, stop=5e-3, uic=False)) == "tran 1u 5m"
+    assert analysis_command(analysis(SpiceAnalysis.TRAN, step=1e-6, stop=5e-3, start=1e-3, uic=False)) == "tran 1u 5m 1m"
     assert analysis_command(analysis(SpiceAnalysis.AC, variation="dec", points=10, fstart=1, fstop=1e6), setup) == "ac dec 10 1 1meg"
     assert analysis_command(analysis(SpiceAnalysis.AC, variation="LIN", points=100, fstart=1e3, fstop=2e3)) == "ac lin 100 1k 2k"
     # every number parses back to the IR value (m = milli, meg = mega) - by our parser and by ngspice's arithmetic
@@ -520,6 +549,13 @@ def test_analysis_command_refusals():
         analysis_command(analysis(SpiceAnalysis.TRAN, step=1, stop=1e-3))
     with pytest.raises(CompileError, match="tran start must satisfy"):
         analysis_command(analysis(SpiceAnalysis.TRAN, step=1e-5, stop=1e-3, start=2e-3))
+    for bad in (1, 0, 1.0, "uic", "true", None):  # ngspice would take any token; the IR takes only a bool
+        with pytest.raises(CompileError, match=f"analysis a_tran param uic must be a bool .*got {type(bad).__name__}"):
+            analysis_command(analysis(SpiceAnalysis.TRAN, step=1e-5, stop=1e-3, uic=bad))
+    with pytest.raises(CompileError, match=r"analysis a_dc: unexpected params \['uic'\] for dc"):
+        analysis_command(analysis(SpiceAnalysis.DC, source="VIN", start=0, stop=12, step=1, uic=True), setup)
+    with pytest.raises(CompileError, match="llm_generated"):
+        analysis_command(AnalysisSpec(id="a_tran", kind=SpiceAnalysis.TRAN, params={"step": user_requirement(1e-6), "stop": user_requirement(1e-3), "uic": llm_generated(True, model="x")}, provenance=USER))
     with pytest.raises(CompileError, match="dc sweep 0.0 -> 12.0 with step -1.0 never terminates"):
         analysis_command(analysis(SpiceAnalysis.DC, source="VIN", start=0, stop=12, step=-1), setup)
     with pytest.raises(CompileError, match=r"ac variation must be one of \['dec', 'oct', 'lin'\], got 'log'"):

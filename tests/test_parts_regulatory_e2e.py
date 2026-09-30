@@ -262,7 +262,7 @@ def test_online_run_grounds_parts_and_regulations_against_the_fake(fake, tmp_pat
     assert lvd.applicability_inputs["radio"] == "no (answer)" and lvd.applicability_inputs["input_voltage"].startswith("12 V DC (requirement req.v_in")
     scope = lvd.grounded_quotes[0]
     assert scope.section == "Article 1" and scope.found and scope.page == 1 and "1 000 V" in scope.context and scope.content_hash == lvd.provenance.content_hash
-    assert "evidence: Article 1 (grounded)" in lvd.provenance.applicability_rationale
+    assert "; evidence: Article 1" in lvd.provenance.applicability_rationale and "grounded" not in lvd.provenance.applicability_rationale
     assert by[EMC_ID].applicability is Applicability.APPLICABLE and by[ROHS_ID].applicability is Applicability.APPLICABLE and by[RED_ID].applicability is Applicability.NOT_APPLICABLE
     assert by[EMC_ID].status is S.NOT_VERIFIED and by[ROHS_ID].status is S.NOT_VERIFIED  # they apply; compliance is not verified
     for r in by.values():
@@ -386,13 +386,14 @@ def test_session_trust_rules_and_usage_errors(tmp_path: Path):
         reasons = session.policy.trust_reasons
         assert reasons["example-vendor.com"].startswith("KiCad Datasheet field of Test:VR1")  # rule (a): the library's own Datasheet host
         assert reasons["eur-lex.europa.eu"].startswith("official domain listed for reg.EU.LVD.2014-35-EU") and "law.go.kr" in reasons and "ecfr.gov" in reasons
+        assert reasons["rra.go.kr"].startswith("official domain listed for reg.KR.RRA.ConformityTestMethods")  # the RRA test-method entry (no URL of its own)
         assert reasons["mirror.example.org"] == "host trusted by the user (--trust-host)"
         assert session.policy.user_urls == {"R2": "http://mirror.example.org/r2.pdf", "eu_lvd": "https://eur-lex.europa.eu/x"}
         assert session.policy.trusted_origin("https://mirror.example.org/r2.pdf")[0] == "mirror.example.org"
         assert session.policy.trusted_origin("https://model-invented.example.com/ds.pdf")[0] is None  # a model's host is never trusted
         assert not session.online and not session.archive.online and session.sources_dir == tmp_path / "sources"
         assert session.tools()["archive"] is session.archive and session.tools()["regulatory_candidates"].get("reg.EU.LVD.2014-35-EU") is not None and "catalog" not in session.tools()
-        assert "offline" in session.summary() and "trusted hosts: 5" in session.summary()
+        assert "offline" in session.summary() and "trusted hosts: 6" in session.summary()
         assert not [e for e in session.policy.gate.audit if e["action"] == ExternalAction.NETWORK_FETCH]
     finally:
         session.close()

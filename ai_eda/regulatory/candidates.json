@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "provenance": "curated candidate list; every entry is unverified until fetched and grounded. Entries, URLs, markers and quotes were taken from a read-only probe of the official sites on 2026-09-23 (UA ai-eda-regulatory-probe/0.1); summaries, applicability rules and engineering implications are curated prose, not official text, and never become a compliance verdict.",
-  "curated_at": "2026-09-23",
-  "curated_by": "ai-eda-engineer regulatory probe 2026-09-23 (reviewed by hand)",
+  "provenance": "curated candidate list; every entry is unverified until fetched and grounded. The EU, US and first four KR entries, their URLs, markers and quotes were taken from a read-only probe of the official sites on 2026-09-23 (UA ai-eda-regulatory-probe/0.1); the six KR radio entries for the licence-exempt 447 MHz walkie-talkie class (reg.KR.MSIT.LicenceExemptRadioStationEquipmentNotice, reg.KR.MSIT.RadioEquipmentRules, reg.KR.RadioWavesAct.LicenceExemptStations, reg.KR.MSIT.FrequencyAllocationTable, reg.KR.MSIT.HumanEMFProtectionStandard, reg.KR.RRA.ConformityTestMethods) and the kr_licence_free_class scope question were added on 2026-09-28 offline from general knowledge, with no URL and no quote, because law.go.kr was blocked by the environment's network policy; summaries, applicability rules and engineering implications are curated prose, not official text, and never become a compliance verdict.",
+  "curated_at": "2026-09-28",
+  "curated_by": "ai-eda-engineer regulatory probe 2026-09-23 (reviewed by hand); KR 447 MHz radio entries 2026-09-28 (offline, general knowledge, nothing fetched)",
   "placeholders": {
     "LAW_GO_KR_OC": {
       "env": "AI_EDA_LAW_GO_KR_OC",
@@ -54,6 +54,13 @@
       "options": ["yes", "no"],
       "jurisdictions": ["US", "KR"],
       "rationale": "47 CFR 15.3(k) defines a digital device by pulses above 9,000 per second; 전파법 제58조의2 covers equipment that causes 전자파장해"
+    },
+    {
+      "key": "kr_licence_free_class",
+      "question": "Is the product intended as radio equipment of the licence-exempt 447 MHz walkie-talkie class (신고하지 아니하고 개설할 수 있는 무선국용 무선기기, 생활무선국)? (yes/no)",
+      "options": ["yes", "no"],
+      "jurisdictions": ["KR"],
+      "rationale": "selects the licence-exempt notice and the station-licence exemption; the class name and its conditions are unverified until the notice is archived"
     }
   ],
   "candidates": [
@@ -283,6 +290,123 @@
         {"role": "api_hint", "url": null, "note": "law.go.kr DRF lawService.do with target=admrul is the expected machine-readable form (not probed)"}
       ],
       "curation_note": "included without a URL and without quotes on purpose: an unverified pointer would be a guess"
+    },
+    {
+      "id": "reg.KR.MSIT.LicenceExemptRadioStationEquipmentNotice",
+      "jurisdiction": "KR",
+      "title": "신고하지 아니하고 개설할 수 있는 무선국용 무선기기 (과학기술정보통신부 고시)",
+      "authority": "과학기술정보통신부 (고시); text expected on 법제처 국가법령정보센터 (law.go.kr, 행정규칙 - DRF target=admrul, not probed)",
+      "official_url": null,
+      "allowed_domains": ["www.law.go.kr"],
+      "fetchable": false,
+      "unfetchable_reason": "law.go.kr was blocked by the environment's network policy on 2026-09-28 and the admrul URL form was never probed; a URL is never guessed and no quote from this notice has been verified",
+      "summary": "Curated from general knowledge, UNVERIFIED: lists the radio equipment of stations that may be opened without a licence or report, with technical conditions per class; believed to include the 447 MHz 생활무선국 walkie-talkie class (447.5625-447.8625 MHz, 12.5 kHz raster, up to 0.5 W, F3E, integral antenna). None of these numbers is grounded.",
+      "engineering_implication": "Ground before ordering parts: band edges and channel list, power limit and its reference point (conducted or ERP), emission class, maximum deviation, occupied bandwidth, frequency tolerance, antenna condition, any transmit time-out or other operating condition. The template's kr447.* profile choices are placeholders for these numbers.",
+      "applicability_rule": {
+        "kind": "all_of",
+        "text": "applies when the product is radio equipment intended for the licence-exempt 447 MHz walkie-talkie class",
+        "rules": [
+          {"kind": "answer", "key": "radio", "equals": "yes"},
+          {"kind": "answer", "key": "kr_licence_free_class", "equals": "yes"}
+        ]
+      },
+      "not_evaluated": "whether the design meets the class's technical conditions (band and channel, power and its reference point, emission class, deviation, occupied bandwidth, frequency tolerance, antenna, operating conditions) is not evaluated: the rule reads only the user's class answer, and the RF templates compare their kr447.* placeholders in rf.regulatory_profile, which never passes",
+      "grounding_quotes": [],
+      "related": [
+        {"role": "parent_statute", "url": null, "note": "전파법 and 전파법 시행령 (the article that names stations opened without a licence or report - article number to confirm); see reg.KR.RadioWavesAct.LicenceExemptStations"},
+        {"role": "technical_rules", "url": null, "note": "reg.KR.MSIT.RadioEquipmentRules"},
+        {"role": "conformity", "url": null, "note": "reg.KR.RadioWavesAct.58-2 and reg.KR.RadioWavesAct.ConformityAssessmentNotice"}
+      ],
+      "curation_note": "added for the KR 447 MHz walkie-talkie templates without URL or quotes on purpose; every kr447.* number in the templates is a user-confirmed placeholder until this notice is archived and grounded"
+    },
+    {
+      "id": "reg.KR.MSIT.RadioEquipmentRules",
+      "jurisdiction": "KR",
+      "title": "무선설비규칙 (과학기술정보통신부 고시) (instrument type to confirm)",
+      "authority": "과학기술정보통신부; text expected on law.go.kr (행정규칙, not probed)",
+      "official_url": null,
+      "allowed_domains": ["www.law.go.kr"],
+      "fetchable": false,
+      "unfetchable_reason": "law.go.kr blocked on 2026-09-28; URL form not probed; never guessed",
+      "summary": "Curated, UNVERIFIED: technical standards of radio equipment per service - frequency tolerance, occupied bandwidth, spurious emission limits, receiver spurious emissions.",
+      "engineering_implication": "Source of kr447.freq_tolerance, kr447.max_obw, kr447.spurious_max, kr447.rx_spurious_max, kr447.max_deviation - all placeholders now.",
+      "applicability_rule": {"kind": "answer", "key": "radio", "equals": "yes"},
+      "grounding_quotes": [],
+      "related": [],
+      "curation_note": "added for the KR 447 MHz walkie-talkie templates without URL or quotes on purpose; whether it is a 고시 or a 부령 is not confirmed offline"
+    },
+    {
+      "id": "reg.KR.RadioWavesAct.LicenceExemptStations",
+      "jurisdiction": "KR",
+      "title": "전파법 시행령 - 신고하지 아니하고 개설할 수 있는 무선국 (article number to confirm)",
+      "authority": "대통령령; text served by law.go.kr DRF (target=law), not fetched here",
+      "official_url": null,
+      "allowed_domains": ["www.law.go.kr"],
+      "fetchable": false,
+      "unfetchable_reason": "law.go.kr blocked on 2026-09-28; the MST / article were not looked up; never guessed",
+      "summary": "Curated, UNVERIFIED: the decree provision that lets stations using the equipment of the licence-exempt notice be opened without a licence or report.",
+      "engineering_implication": "Confirms that the 447 MHz class needs no station licence - it does not replace KC conformity assessment of the equipment.",
+      "applicability_rule": {
+        "kind": "all_of",
+        "text": "licence-exempt class",
+        "rules": [
+          {"kind": "answer", "key": "radio", "equals": "yes"},
+          {"kind": "answer", "key": "kr_licence_free_class", "equals": "yes"}
+        ]
+      },
+      "grounding_quotes": [],
+      "related": [
+        {"role": "parent_statute", "url": null, "note": "전파법; the provision may sit in the Act itself (제19조의2, 신고하지 아니하고 개설할 수 있는 무선국) rather than only in the 시행령 - UNVERIFIED general knowledge, article number to confirm"},
+        {"role": "conformity_exemption", "url": null, "note": "전파법 제58조의3 (적합성평가의 면제) may exempt R&D / test samples; it decides whether the conducted bench boards need anything before they transmit into a dummy load - UNVERIFIED general knowledge, article number to confirm"},
+        {"role": "equipment_notice", "url": null, "note": "reg.KR.MSIT.LicenceExemptRadioStationEquipmentNotice"}
+      ],
+      "curation_note": "added for the KR 447 MHz walkie-talkie templates without URL or quotes on purpose; the article numbers in related (제19조의2, 제58조의3) are offline hints to confirm, not citations"
+    },
+    {
+      "id": "reg.KR.MSIT.FrequencyAllocationTable",
+      "jurisdiction": "KR",
+      "title": "대한민국 주파수 분배표 (과학기술정보통신부 고시)",
+      "authority": "과학기술정보통신부",
+      "official_url": null,
+      "allowed_domains": ["www.law.go.kr"],
+      "fetchable": false,
+      "unfetchable_reason": "law.go.kr blocked on 2026-09-28; never guessed",
+      "summary": "Curated, UNVERIFIED: allocation of the 447 MHz band and of the receiver's response frequencies (for the templates' example channel 447.5625 MHz with a 21.4 MHz first IF and a low-side LO: image 404.76 MHz, half-IF 436.86 MHz, the LO-spur response 440.28 MHz at image + the 35.51 MHz LO reference, the rejected high-side image 490.36 MHz).",
+      "engineering_implication": "Receiver design only (which services occupy the image and spurious-response frequencies); not a transmitter limit.",
+      "applicability_rule": {"kind": "answer", "key": "radio", "equals": "yes"},
+      "grounding_quotes": [],
+      "curation_note": "added for the KR 447 MHz walkie-talkie templates without URL or quotes on purpose; the frequencies in the summary are the templates' own arithmetic, not allocation data"
+    },
+    {
+      "id": "reg.KR.MSIT.HumanEMFProtectionStandard",
+      "jurisdiction": "KR",
+      "title": "전자파 인체보호기준 (과학기술정보통신부 고시)",
+      "authority": "과학기술정보통신부 / 국립전파연구원",
+      "official_url": null,
+      "allowed_domains": ["www.law.go.kr"],
+      "fetchable": false,
+      "unfetchable_reason": "law.go.kr blocked on 2026-09-28; never guessed",
+      "summary": "Curated, UNVERIFIED: human exposure limits (SAR for devices used near the body) and when a handheld transmitter must be evaluated; the measurement method is in a separate 고시 (title to confirm).",
+      "engineering_implication": "A 0.5 W handheld at 447 MHz may need an SAR evaluation - lab-only.",
+      "applicability_rule": {"kind": "answer", "key": "radio", "equals": "yes"},
+      "not_evaluated": "whether the product transmits at all, its power and its distance from the body - which decide whether an exposure evaluation is needed - are not evaluated: the rule reads only the radio answer (transmit or receive)",
+      "grounding_quotes": [],
+      "curation_note": "added for the KR 447 MHz walkie-talkie templates without URL or quotes on purpose; the title of the measurement-method 고시 is to confirm"
+    },
+    {
+      "id": "reg.KR.RRA.ConformityTestMethods",
+      "jurisdiction": "KR",
+      "title": "국립전파연구원 적합성평가 시험방법 (무선설비) - exact title and number to confirm",
+      "authority": "국립전파연구원 (RRA)",
+      "official_url": null,
+      "allowed_domains": ["www.law.go.kr", "www.rra.go.kr"],
+      "fetchable": false,
+      "unfetchable_reason": "no network; the title of the test-method document for this class is not known offline",
+      "summary": "Curated, UNVERIFIED: the test conditions (e.g. the test modulation for occupied bandwidth and deviation, conducted vs radiated measurement, whether a temporary antenna connector sample is accepted).",
+      "engineering_implication": "Decides which of calc.rf.fm.obw99's single-tone results is the compliance number and whether the transceiver_conducted variant is an acceptable KC sample.",
+      "applicability_rule": {"kind": "answer", "key": "radio", "equals": "yes"},
+      "grounding_quotes": [],
+      "curation_note": "added for the KR 447 MHz walkie-talkie templates without URL or quotes on purpose; the exact title and number of the test-method document are to confirm"
     },
     {
       "id": "reg.US.FCC.47CFR15",

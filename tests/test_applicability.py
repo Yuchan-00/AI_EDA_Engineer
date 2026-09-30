@@ -265,9 +265,19 @@ def test_packaged_rules_decide_the_documented_scenarios():
         "reg.KR.ElectricalAppliancesSafetyAct.EnforcementRule": Applicability.APPLICABLE,
         "reg.KR.RadioWavesAct.58-2": Applicability.NOT_APPLICABLE,
         "reg.KR.RadioWavesAct.ConformityAssessmentNotice": Applicability.NOT_APPLICABLE,
+        # the KR 447 MHz radio entries: radio = no decides them all, the licence-exempt pair without the class answer (all_of short-circuits)
+        "reg.KR.MSIT.LicenceExemptRadioStationEquipmentNotice": Applicability.NOT_APPLICABLE,
+        "reg.KR.MSIT.RadioEquipmentRules": Applicability.NOT_APPLICABLE,
+        "reg.KR.RadioWavesAct.LicenceExemptStations": Applicability.NOT_APPLICABLE,
+        "reg.KR.MSIT.FrequencyAllocationTable": Applicability.NOT_APPLICABLE,
+        "reg.KR.MSIT.HumanEMFProtectionStandard": Applicability.NOT_APPLICABLE,
+        "reg.KR.RRA.ConformityTestMethods": Applicability.NOT_APPLICABLE,
         "reg.US.FCC.47CFR15": Applicability.NOT_APPLICABLE,
     }
     mains = {c.id: evaluate(c.applicability_rule, {**answers, MAINS_KEY: "yes", "radio": "yes", "digital_device": "yes"}, _reqs(_req(230.0))).applicability for c in cl.candidates}
+    # a radio without the class answer: the licence-exempt pair waits for kr_licence_free_class, the radio-only entries apply
+    assert mains["reg.KR.MSIT.LicenceExemptRadioStationEquipmentNotice"] is Applicability.UNDECIDED and mains["reg.KR.RadioWavesAct.LicenceExemptStations"] is Applicability.UNDECIDED
+    assert mains["reg.KR.MSIT.RadioEquipmentRules"] is Applicability.APPLICABLE and mains["reg.KR.RRA.ConformityTestMethods"] is Applicability.APPLICABLE
     assert mains["reg.EU.LVD.2014-35-EU"] is Applicability.NOT_APPLICABLE  # radio equipment: RED carries the safety objectives
     assert mains["reg.EU.RED.2014-53-EU"] is Applicability.APPLICABLE and mains["reg.EU.EMC.2014-30-EU"] is Applicability.NOT_APPLICABLE
     assert mains["reg.US.FCC.47CFR15"] is Applicability.APPLICABLE and mains["reg.KR.RadioWavesAct.58-2"] is Applicability.APPLICABLE
