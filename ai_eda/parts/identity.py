@@ -45,7 +45,7 @@ SourceStatus = Literal["ok", "unarchived", "missing", "tampered"]
 #: the sub-directory of a project workdir where the CLI's document archive lives
 SOURCES_DIRNAME = "sources"
 
-_PAGE_RE = re.compile(r"page\s+(\d+)")
+_PAGE_RE = re.compile(r"(?:page|p\.)\s*(\d+)", re.IGNORECASE)
 
 
 def _read_only(root: Path) -> DocumentArchive:
@@ -184,13 +184,15 @@ def mpn_grounding(component: Component, archive: DocumentArchive | None = None) 
                             reason=f"MPN {mpn!r} is tagged from {src.content_hash} whose text can not be extracted ({doc.extraction_error or 'no text'}); nothing can be re-located in it", **base)
     m = _PAGE_RE.search(src.section or "")
     page = int(m.group(1)) if m else None
-    hits = find_mpn(doc, mpn)
-    if page is not None:
-        hits = [h for h in hits if h.page == page]
+    if page is None:
+        # the tag says which page the MPN was found on (``page N``); without it there is nothing to re-locate the
+        # claim against, and a search of the whole document would silently weaken the check
+        return MpnGrounding(status=ValidationStatus.NOT_VERIFIED, label="authoritative, no page recorded", extraction=doc.extraction_stamp,
+                            reason=f"MPN {mpn!r} is tagged from {src.content_hash} without a page (section {src.section!r}); re-run the existence check to record where it was found", **base)
+    hits = [h for h in find_mpn(doc, mpn) if h.page == page]
     if not hits:
-        where = f"on {src.section}" if page is not None else "anywhere"
         return MpnGrounding(status=ValidationStatus.NOT_VERIFIED, label="authoritative, not in text", extraction=doc.extraction_stamp,
-                            reason=f"MPN {mpn!r} is tagged from {src.content_hash} but is not found verbatim {where} of the archived text at check time (the tag does not match the document)", **base)
+                            reason=f"MPN {mpn!r} is tagged from {src.content_hash} but is not found verbatim on {src.section} of the archived text at check time (the tag does not match the document)", **base)
     return MpnGrounding(
         status=ValidationStatus.PASS, label="authoritative, ok", page=hits[0].page, extraction=doc.extraction_stamp,
         reason=f"MPN {mpn!r} grounded in the archived datasheet {src.content_hash} (re-located on page {hits[0].page}); {reason}; {doc.extraction_stamp}", **base,

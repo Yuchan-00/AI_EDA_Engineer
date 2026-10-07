@@ -8,9 +8,11 @@ artifact, and the generated file records the IR hash it came from.
 from ai_eda.compilers.base import Compiler, CompileContext
 from ai_eda.compilers.schematic import SchematicCompiler
 from ai_eda.compilers.pcb import PCBCompiler
-from ai_eda.compilers.bom import BOMCompiler, CPLCompiler
+from ai_eda.compilers.bom import BOMCompiler, CPLCompiler, TEXT_PREFIX, bom_cell_text, free_text_cell
 from ai_eda.compilers.spice import SpiceNetlistCompiler
 from ai_eda.compilers.gerber import DrillExporter, GerberExporter
+from ai_eda.compilers.project import ProjectFileCompiler
+from ai_eda.compilers.model3d import GlbExporter, Preview3DCompiler, RenderExporter, StepExporter
 
 __all__ = [
     "Compiler",
@@ -19,7 +21,15 @@ __all__ = [
     "PCBCompiler",
     "BOMCompiler",
     "CPLCompiler",
+    "TEXT_PREFIX",
+    "bom_cell_text",
+    "free_text_cell",
     "SpiceNetlistCompiler",
     "GerberExporter",
     "DrillExporter",
+    "ProjectFileCompiler",
+    "Preview3DCompiler",
+    "StepExporter",
+    "GlbExporter",
+    "RenderExporter",
 ]

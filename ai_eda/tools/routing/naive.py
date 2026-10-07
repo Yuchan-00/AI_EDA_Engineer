@@ -19,9 +19,11 @@ check. It is deliberately dumb and DRC-unaware:
   fab constraints.
 
 The *only* statement about validity comes from ``kicad-cli pcb drc`` run by
-:class:`ai_eda.tools.kicad.cli.KicadCli`. A layout that this router cannot
-connect cleanly is a layout problem to be solved by a real router (future
-work), never by loosening DRC.
+:class:`ai_eda.tools.kicad.cli.KicadCli`. The pipeline's router is
+:mod:`ai_eda.tools.routing.maze` (``route_board``, used by the ``PCBAgent``);
+this module is kept only as a fixture helper for the tests that need some
+copper on a board. A layout that neither router can connect cleanly is a
+layout problem, never one to be solved by loosening DRC.
 
 Invariant kept: pad positions come from the library footprint file, never
 from memory; a net pin whose component has no placement / footprint / pad

@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 
 from ai_eda.errors import AiEdaError
 from ai_eda.ir import SourceRef, SourcingInfo, Traced, authoritative
+from ai_eda.tools.manufacturing.csv_cells import FORMULA_PREFIXES, unsafe_cell  # the one 'would execute' rule, shared with the BOM compiler and the reviewer
 
 REQUIRED_COLUMNS: tuple[str, ...] = ("mpn", "manufacturer", "package")
 OPTIONAL_COLUMNS: tuple[str, ...] = ("supplier_part_number", "stock", "unit_price", "currency", "assembly_class", "description", "datasheet_url")
@@ -76,23 +77,10 @@ _CURRENCY_IN_HEADER: dict[str, str] = {"price (usd)": "USD", "price usd": "USD"}
 
 _TIER_RE = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+|\+)?|\+)?\s*:\s*([0-9]*\.?[0-9]+)")
 _NUMBER_RE = re.compile(r"^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$")
-#: characters a spreadsheet reads as the start of a formula / command
-FORMULA_PREFIXES = "=+-@"
 #: what a supplier part number may look like (LCSC ``C25792``, Digi-Key ``296-1234-1-ND``, Mouser ``595-LM2596SX-5.0/NOPB``)
 SUPPLIER_PN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/#+\-]{0,63}$")
 #: text columns the injection gate applies to (numbers are parsed, never copied)
 _TEXT_COLUMNS: tuple[str, ...] = ("mpn", "manufacturer", "package", "supplier_part_number", "currency", "assembly_class", "description", "datasheet_url")
-
-
-def unsafe_cell(value: str | None) -> str | None:
-    """Why a (stripped) cell must not be copied anywhere: a formula / command prefix or a control character; ``None`` when it is plain text."""
-    if not value:
-        return None
-    if value[0] in FORMULA_PREFIXES:
-        return f"starts with {value[0]!r} (a spreadsheet would read it as a formula or command)"
-    if any(ord(ch) < 0x20 or ch == "\x7f" for ch in value):
-        return "contains a control character"
-    return None
 
 
 class CatalogError(AiEdaError):
@@ -209,14 +197,13 @@ class CatalogSource:
         self.columns = columns
         self.notes = notes
         self.encoding = encoding
-        self._by_key: dict[str, CatalogRow] = {}
+        self._by_key: dict[str, list[CatalogRow]] = {}
         self.duplicates: dict[str, int] = {}
         for row in rows:
             key = mpn_key(row.mpn)
             if key in self._by_key:
                 self.duplicates[key] = self.duplicates.get(key, 1) + 1
-                continue
-            self._by_key[key] = row
+            self._by_key.setdefault(key, []).append(row)
 
     # ------------------------------------------------------------ loading
 
@@ -313,10 +300,15 @@ class CatalogSource:
         )
 
     def lookup(self, mpn: str | None) -> CatalogRow | None:
-        """The first row whose MPN equals ``mpn`` ignoring ASCII case and whitespace, else ``None``."""
+        """The first row whose MPN equals ``mpn`` ignoring ASCII case and whitespace, else ``None`` (see :meth:`rows_for`)."""
+        rows = self.rows_for(mpn)
+        return rows[0] if rows else None
+
+    def rows_for(self, mpn: str | None) -> list[CatalogRow]:
+        """Every row whose MPN equals ``mpn`` ignoring ASCII case and whitespace, in file order (community dumps list one MPN under several brands)."""
         if not mpn or not str(mpn).strip():
-            return None
-        return self._by_key.get(mpn_key(mpn))
+            return []
+        return list(self._by_key.get(mpn_key(mpn), ()))
 
     def sourcing_info(self, row: CatalogRow) -> SourcingInfo:
         """``SourcingInfo`` for a row: every value ``authoritative`` with this file as its source (row noted)."""

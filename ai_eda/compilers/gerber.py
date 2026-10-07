@@ -30,10 +30,10 @@ from ai_eda.tools.kicad.cli import KicadCli, gerber_layers
 EXPORT_DIR = "gerber"
 
 
-def _kicad(ctx: CompileContext) -> KicadCli:
+def _kicad(ctx: CompileContext, what: str = "gerber/drill export") -> KicadCli:
     kicad = ctx.tools.get("kicad_cli")
     if not isinstance(kicad, KicadCli):
-        raise ToolUnavailableError("gerber/drill export needs ctx.tools['kicad_cli'] (a KicadCli)")
+        raise ToolUnavailableError(f"{what} needs ctx.tools['kicad_cli'] (a KicadCli)")
     if not kicad.available():
         raise ToolUnavailableError("kicad-cli not found")
     return kicad
@@ -52,14 +52,18 @@ def _fresh_pcb(ir: CircuitIR) -> Path:
 
 class _Exporter(Compiler):
     version = "0.2"
+    #: the workdir subdirectory the export writes into
+    export_dir: str = EXPORT_DIR
+    #: what the refusal without a KicadCli calls this export
+    what: str = "gerber/drill export"
 
     def _export(self, kicad: KicadCli, pcb: Path, out_dir: Path, ir: CircuitIR) -> list[Path]:
         raise NotImplementedError
 
     def compile(self, ir: CircuitIR, ctx: CompileContext) -> ArtifactRef:
-        kicad = _kicad(ctx)
+        kicad = _kicad(ctx, self.what)
         pcb = _fresh_pcb(ir)
-        files = self._export(kicad, pcb, Path(ctx.workdir) / EXPORT_DIR, ir)
+        files = self._export(kicad, pcb, Path(ctx.workdir) / self.export_dir, ir)
         return ArtifactRef(
             kind=self.kind,
             path=str(self._primary(files)),
