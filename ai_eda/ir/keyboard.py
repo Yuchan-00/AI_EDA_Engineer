@@ -39,8 +39,9 @@ The models refuse what they cannot mean (a ``ValueError`` naming it):
   active and the columns that must then read pressed / unpressed, plus the
   parameter keys of the scanner's input pull-up, its input thresholds, the
   closed contact's resistance and the supply.
-* :class:`KeyboardDesign` - the build it belongs to, the matrix, the buses,
-  the scenarios and ``model_values``.
+* :class:`KeyboardDesign` - the build it belongs to, the parameter key of
+  the key unit (the keycap pitch, mm), the matrix, the buses, the scenarios
+  and ``model_values``.
 
 Identifiers (bus and scenario ids) are plain identifiers: they become
 check-id segments and deck stems.
@@ -250,6 +251,8 @@ class KeyboardDesign(BaseModel):
 
     #: the build this board is (``main_half`` / ``secondary_half``)
     build: str
+    #: ``ir.parameters`` key of the key unit (mm): a 1u keycap is this wide (19.05 mm for MX-spaced keys)
+    unit_key: str
     matrix: KeyMatrix
     i2c: list[I2CBus] = Field(default_factory=list)
     scenarios: list[MatrixScenario] = Field(default_factory=list)
@@ -260,6 +263,7 @@ class KeyboardDesign(BaseModel):
     @model_validator(mode="after")
     def _consistent(self) -> KeyboardDesign:
         _check_name(self.build, "keyboard build")
+        _check_name(self.unit_key, "key unit parameter key")
         _unique([b.id for b in self.i2c], "I2C bus id")
         _unique([s.id for s in self.scenarios], "matrix scenario id")
         refs = {k.ref for k in self.matrix.keys}
