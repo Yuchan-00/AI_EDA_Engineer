@@ -65,6 +65,7 @@ from ai_eda.ir.pcb import (
     SilkKind,
     SilkText,
     Keepout,
+    PackRegion,
     ManufacturingConstraints,
     PCBDesign,
     unrecorded_origin,
@@ -76,6 +77,7 @@ from ai_eda.ir.pcb import (
     Stackup,
 )
 from ai_eda.ir.si import DiffPair, NetClass, Promotion, SIConstraints, TimingPath
+from ai_eda.ir.keyboard import I2CBus, KeyboardDesign, KeyboardKey, KeyMatrix, MatrixScenario
 from ai_eda.ir.rf import (
     LabItem,
     PlanLine,
@@ -109,10 +111,11 @@ __all__ = [
     "Expectation", "SimulationSetup",
     "CircuitDomain", "Block", "Topology",
     "ConstraintKind", "Constraint",
-    "BoardSide", "Layer", "BoardOutline", "Placement", "Track", "Via", "Zone", "SilkKind", "SilkText", "Keepout",
+    "BoardSide", "Layer", "BoardOutline", "Placement", "Track", "Via", "Zone", "SilkKind", "SilkText", "Keepout", "PackRegion",
     "ManufacturingConstraints", "PCBDesign", "UNRECORDED_ORIGIN", "unrecorded_origin",
     "CopperRole", "DielectricKind", "StackupCopper", "StackupDielectric", "SolderMask", "Stackup",
     "DiffPair", "NetClass", "Promotion", "SIConstraints", "TimingPath",
+    "I2CBus", "KeyboardDesign", "KeyboardKey", "KeyMatrix", "MatrixScenario",
     "LabItem", "PlanLine", "RailBudget", "RFBlock", "RFDesign", "RFExpectation", "RFNetwork", "RFPort", "RFProbe",
     "RFRegion", "RFState",
     "Jurisdiction", "RegulatoryProvenance", "RegulatoryRequirement", "RegulatoryState",

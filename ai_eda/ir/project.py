@@ -21,6 +21,7 @@ from ai_eda.ir.pcb import PCBDesign
 from ai_eda.ir.provenance import DESIGN_VIEW, Traced, design_data, drop_empty_in_design_view, drop_in_design_view
 from ai_eda.ir.regulatory import RegulatoryState
 from ai_eda.ir.requirements import RequirementSet
+from ai_eda.ir.keyboard import KeyboardDesign
 from ai_eda.ir.rf import RFDesign
 from ai_eda.ir.si import SIConstraints
 from ai_eda.ir.simulation import SimulationSetup
@@ -195,6 +196,10 @@ class CircuitIR(BaseModel):
     #: ``None`` when the design states none - left out of the design view while ``None``, so an IR saved before the
     #: field existed keeps its hash
     rf: RFDesign | None = None
+    #: keyboard design content (the key matrix, I2C buses, matrix scenarios; :mod:`ai_eda.ir.keyboard`), ``None`` when
+    #: the design states none - left out of the design view while ``None``, so an IR saved before the field existed
+    #: keeps its hash
+    keyboard: KeyboardDesign | None = None
     regulatory: RegulatoryState = Field(default_factory=RegulatoryState)
     validation: ValidationState = Field(default_factory=ValidationState)
     artifacts: dict[ArtifactKind, ArtifactRef] = Field(default_factory=dict)
@@ -222,7 +227,7 @@ class CircuitIR(BaseModel):
 
     # --- hashing -------------------------------------------------------------
 
-    _design = drop_empty_in_design_view("si", "rf")
+    _design = drop_empty_in_design_view("si", "rf", "keyboard")
 
     #: fields that describe *state about* the design rather than the design itself
     _NON_DESIGN_FIELDS = ("validation", "artifacts")

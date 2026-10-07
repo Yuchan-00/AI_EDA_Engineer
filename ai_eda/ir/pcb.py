@@ -506,6 +506,47 @@ def _shoelace(pts: list[tuple[float, float]]) -> float:
     return sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]))
 
 
+class PackRegion(BaseModel):
+    """A rectangle of the board (board frame, mm, Y down) a placer packs the named parts into.
+
+    ``rect`` is ``[x, y, w, h]`` (traced, unit ``mm``, ``w`` / ``h`` > 0),
+    ``refs`` the parts packed there (no ref twice), ``side`` the side they go
+    on. Used with :attr:`PCBDesign.fixed`: the fixed parts are where the
+    design put them and the parts named here are packed around them by the
+    ``placement.fixed`` placer, never moved outside the region.
+    """
+
+    id: str
+    rect: Traced[list[float]]
+    refs: list[str]
+    side: BoardSide = BoardSide.TOP
+    #: the template / user that decided the region; unrecorded = assumption
+    provenance: Provenance = Field(default_factory=unrecorded_origin)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> PackRegion:
+        what = f"pack region {self.id}"
+        if not _KEEPOUT_ID_RE.match(self.id):
+            raise ValueError(f"pack region id {self.id!r} must be a plain identifier (a letter, then letters, digits or _)")
+        if self.rect.unit != "mm":
+            raise ValueError(f"{what}: rect must carry unit 'mm', got {self.rect.unit!r}")
+        r = self.rect.value
+        if len(r) != 4 or any(not math.isfinite(float(v)) for v in r):
+            raise ValueError(f"{what}: rect must be [x, y, w, h] (four finite numbers), got {r!r}")
+        if not (r[2] > 0 and r[3] > 0):
+            raise ValueError(f"{what}: rect width and height must be > 0, got {r[2]!r} x {r[3]!r}")
+        if not self.refs:
+            raise ValueError(f"{what}: names no part")
+        if len(set(self.refs)) != len(self.refs):
+            raise ValueError(f"{what}: a ref is listed twice in {self.refs}")
+        return self
+
+    def box(self) -> tuple[float, float, float, float]:
+        """``(x0, y0, x1, y1)`` of the region in mm."""
+        x, y, w, h = (float(v) for v in self.rect.value)
+        return x, y, x + w, y + h
+
+
 class PCBDesign(BaseModel):
     layers: list[Layer] = Field(default_factory=lambda: [Layer(name="F.Cu", kind="signal"), Layer(name="B.Cu", kind="signal")])
     outline: BoardOutline | None = None
@@ -521,14 +562,33 @@ class PCBDesign(BaseModel):
     stackup: Stackup | None = None
     #: areas where tracks / vias / pads / zones / footprints are forbidden (:class:`Keepout`); empty = none
     keepouts: list[Keepout] = Field(default_factory=list)
+    #: parts whose position, rotation and side the design fixes (a keyboard's keys and their diodes, edge connectors):
+    #: the ``placement.fixed`` placer copies them into ``placements`` verbatim; empty = no part is fixed
+    fixed: list[Placement] = Field(default_factory=list)
+    #: rectangles the ``placement.fixed`` placer packs the named non-fixed parts into (:class:`PackRegion`)
+    pack_regions: list[PackRegion] = Field(default_factory=list)
 
-    _design = drop_empty_in_design_view("silkscreen", "stackup", "keepouts")
+    _design = drop_empty_in_design_view("silkscreen", "stackup", "keepouts", "fixed", "pack_regions")
 
     @model_validator(mode="after")
     def _unique_keepouts(self) -> PCBDesign:
         ids = [k.id for k in self.keepouts]
         if len(set(ids)) != len(ids):
             raise ValueError(f"keep-out ids must be unique, got {ids}")
+        fixed = [p.component_ref for p in self.fixed]
+        if len(set(fixed)) != len(fixed):
+            raise ValueError(f"a part is fixed twice: {sorted({r for r in fixed if fixed.count(r) > 1})}")
+        region_ids = [r.id for r in self.pack_regions]
+        if len(set(region_ids)) != len(region_ids):
+            raise ValueError(f"pack region ids must be unique, got {region_ids}")
+        packed: dict[str, str] = {}
+        for r in self.pack_regions:
+            for ref in r.refs:
+                if ref in packed:
+                    raise ValueError(f"ref {ref!r} is in two pack regions ({packed[ref]}, {r.id})")
+                if ref in fixed:
+                    raise ValueError(f"ref {ref!r} is both fixed and packed in region {r.id}")
+                packed[ref] = r.id
         return self
 
     def keepout(self, id: str) -> Keepout | None:
@@ -548,4 +608,6 @@ class PCBDesign(BaseModel):
         out += [(f"zone[{i}:{z.net}]", z.provenance) for i, z in enumerate(self.zones)]
         out += [(f"silk[{i}:{t.kind}:{t.text}]", t.provenance) for i, t in enumerate(self.silkscreen)]
         out += [(f"keepout[{i}:{k.id}]", k.provenance) for i, k in enumerate(self.keepouts)]
+        out += [(f"fixed[{p.component_ref}]", p.provenance) for p in self.fixed]
+        out += [(f"pack_region[{i}:{r.id}]", r.provenance) for i, r in enumerate(self.pack_regions)]
         return out
