@@ -343,6 +343,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"kicad-cli : {kicad.binary}  (v{version}){note}")
             if note:
                 missing.append(f"KiCad {MIN_KICAD_MAJOR}")
+            else:
+                line, ok = _library_tables_line(kicad.binary, version)
+                print(line)
+                if not ok:
+                    missing.append("KiCad library tables")
     else:
         print(f"kicad-cli : NOT FOUND  - {remedy('kicad')}")
         missing.append("kicad-cli")
@@ -411,6 +416,49 @@ def _major_version(version: str) -> int | None:
     """The major number of a ``kicad-cli version`` string (``10.0.6`` -> 10), else ``None``."""
     head = version.strip().split(".", 1)[0]
     return int(head) if head.isdigit() else None
+
+
+def _library_tables_line(binary: str | None, version: str) -> tuple[str, bool]:
+    """``kicad tables: <folder>`` when KiCad's global library tables exist, else what is missing and the remedy; and whether they exist."""
+    from ai_eda.tools.kicad.install import library_tables
+
+    tables = library_tables(binary, version)
+    folder = tables[0].path.parent if tables and tables[0].path is not None else None
+    absent = [t.name for t in tables if not t.present]
+    if not absent:
+        return f"kicad tables: {folder} ({', '.join(t.name for t in tables)})", True
+    where = f" in {folder}" if folder is not None else " (no KiCad settings folder: HOME / APPDATA unset)"
+    return (
+        f"kicad tables: MISSING {', '.join(absent)}{where} - run `ai-eda setup-kicad` (KiCad writes them on its first start; "
+        "without them ERC / DRC warn about every part and FAIL)",
+        False,
+    )
+
+
+def cmd_setup_kicad(args: argparse.Namespace) -> int:
+    """Write KiCad's missing global library tables as KiCad's own first start does; an existing table is never changed."""
+    from ai_eda.errors import ToolExecutionError, ToolUnavailableError
+    from ai_eda.setup_help import remedy
+    from ai_eda.tools.kicad import KicadCli
+    from ai_eda.tools.kicad.install import install_library_tables, library_tables
+
+    kicad = KicadCli()
+    if not kicad.available():
+        print(f"setup-kicad: kicad-cli NOT FOUND - {remedy('kicad')}")
+        return 1
+    try:
+        version = kicad.version()
+    except (ToolUnavailableError, ToolExecutionError) as e:
+        print(f"setup-kicad: kicad-cli {kicad.binary} is unusable: {e}")
+        return 1
+    try:
+        lines = install_library_tables(kicad.binary, version)
+    except OSError as e:
+        print(f"setup-kicad: a library table could not be written: {e}")
+        return 1
+    for line in lines:
+        print(f"setup-kicad: {line}")
+    return 0 if all(t.present for t in library_tables(kicad.binary, version)) else 1
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
@@ -1200,8 +1248,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("doctor", help="check external tools")
     d.add_argument("--online", action="store_true", help="with a key set, fetch the OpenRouter key's limit/usage (one GET; the key is never printed)")
-    d.add_argument("--strict", action="store_true", help="exit 1 when kicad-cli (KiCad 10+), the KiCad libraries or ngspice is missing")
+    d.add_argument("--strict", action="store_true", help="exit 1 when kicad-cli (KiCad 10+), its libraries and library tables or ngspice is missing")
     d.set_defaults(fn=cmd_doctor)
+
+    sk = sub.add_parser(
+        "setup-kicad",
+        help="write KiCad's global library tables (sym-lib-table, fp-lib-table) when missing, as KiCad's first start does; never changes an existing one",
+    )
+    sk.set_defaults(fn=cmd_setup_kicad)
 
     st = sub.add_parser("selftest", help="design the 12 V -> 5 V divider end to end and report which tools ran (proves an installation works)")
     st.add_argument("--dir", help="folder to design in (default: a new temporary folder, removed when everything ran)")

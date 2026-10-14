@@ -9,7 +9,8 @@
 #   2. Python     - uv (Astral) into %USERPROFILE%\.local\bin, a uv-managed Python 3.12 and .venv with the package
 #   3. KiCad 10   - with winget (KiCad.KiCad); KiCad brings kicad-cli, the libraries and ngspice (bin\ngspice.dll)
 #   4. a browser  - none needed: Microsoft Edge prints the PDF copies of the stage reports
-#   5. ai-eda     - %USERPROFILE%\.local\bin\ai-eda.cmd on the user PATH, then `ai-eda doctor` and `ai-eda selftest`
+#   5. ai-eda     - %USERPROFILE%\.local\bin\ai-eda.cmd on the user PATH, KiCad's global library tables
+#                   (`ai-eda setup-kicad`, what KiCad's first start writes), then `ai-eda doctor` and `ai-eda selftest`
 # Re-running it updates the code (git checkouts) and repairs whatever is missing.
 #
 # Options (environment variables in brackets, for `irm ... | iex`):
@@ -200,6 +201,12 @@ if (-not $NoPath) {
 # --------------------------------------------------------------------------- 6. check
 
 $env:PYTHONUTF8 = "1"
+if (-not $NoKicad) {
+    # what KiCad's first start does: the global library tables, without which ERC / DRC warn about every part
+    Say "KiCad's global library tables"
+    & $aiEda setup-kicad
+    if ($LASTEXITCODE -ne 0) { Warn "ai-eda setup-kicad could not write KiCad's library tables (ai-eda doctor says what is missing)" }
+}
 Say "ai-eda doctor"
 & $aiEda doctor
 $status = 0

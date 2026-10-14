@@ -15,8 +15,13 @@ running the binary, see ``docs/ARCHITECTURE.md``):
 * ``--schematic-parity`` needs ``<stem>.kicad_sch`` next to the board. With
   no sibling schematic kicad-cli exits 0, prints a (localized) message to
   stderr and writes ``schematic_parity: []`` - i.e. parity silently "passes".
-  stderr is empty on every successful run, so a non-empty stderr with parity
-  requested is treated as "parity did not run".
+  stderr is empty on every successful run on Windows, so a non-empty stderr
+  with parity requested is treated as "parity did not run" - except the lines
+  of wxWidgets' own debug / trace log, which kicad-cli prints on Linux and
+  macOS on every run that loads the schematic (``08:14:16: Debug: Adding
+  duplicate image handler for 'PNM file'``, kicad-cli 10.0.7 on Arch Linux and
+  10.0.6 on macOS in CI, 2026-10-14; wx never translates the ``Debug:`` /
+  ``Trace:`` prefix): :func:`complaint_lines` drops them.
 * The default gerber export uses Protel extensions; with ``--no-protel-ext``
   every plot is ``*.gbr`` and the ``<stem>-job.gbrjob`` manifest lists exactly
   the files of that run, which is how :meth:`KicadCli.export_gerbers` tells
@@ -101,6 +106,16 @@ NON_COPPER_GERBER_LAYERS: tuple[str, ...] = (
 )
 #: The 2-layer fab set; boards with inner layers use :func:`gerber_layers`.
 DEFAULT_GERBER_LAYERS: tuple[str, ...] = ("F.Cu", "B.Cu", *NON_COPPER_GERBER_LAYERS)
+
+#: a line of wxWidgets' debug / trace log on stderr: ``<time>: Debug: ...`` (the time in the locale's format; the
+#: prefix is never translated) - printed by kicad-cli on Linux and macOS whatever it checks, so not a complaint
+WX_LOG_NOISE_RE = re.compile(r"^[^:]*\d{1,2}:\d{2}:\d{2}[^:]*: (?:Debug|Trace): ")
+
+
+def complaint_lines(stderr: str) -> list[str]:
+    """The non-empty lines of kicad-cli's ``stderr`` that are not wxWidgets' debug / trace log (:data:`WX_LOG_NOISE_RE`)."""
+    return [line for line in stderr.splitlines() if line.strip() and not WX_LOG_NOISE_RE.match(line)]
+
 
 WARNING_POLICY = "any violation (error or warning, excluded or not) is FAIL; counts in message, lists in details"
 
@@ -249,10 +264,11 @@ class KicadCli:
         args.append(str(pcb))
         project = _project_snapshot(pcb)
         proc = self._run(args)
-        if schematic_parity and proc.stderr.strip():
+        complaints = complaint_lines(proc.stderr) if schematic_parity else []
+        if complaints:
             # kicad-cli exits 0 and writes schematic_parity: [] when the schematic could not be netlisted;
-            # the only sign is a localized stderr message, so do not match on its text.
-            raise ToolExecutionError("schematic parity did not run: " + proc.stderr.strip()[-500:])
+            # the only sign is a localized stderr message, so do not match on its text (only wx's log noise is dropped).
+            raise ToolExecutionError("schematic parity did not run: " + "\n".join(complaints)[-500:])
         res = self._report_to_result("kicad.drc", pcb, report_path, None)
         res.details.update(_project_after(project))
         res.details["zones_refilled"] = refill_zones

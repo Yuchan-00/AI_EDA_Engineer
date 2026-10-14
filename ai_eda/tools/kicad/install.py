@@ -22,6 +22,14 @@ would let a project folder (GUI runs start in the project folder) supply a
   ``kicad-cli`` on ``PATH`` (``/usr/bin``) and the libraries in
   ``<prefix>/share/kicad``; nothing else is searched.
 
+KiCad's global library tables (``sym-lib-table``, ``fp-lib-table`` in its
+settings folder, :func:`user_config_dir`) are written by the KiCad GUI on its
+first start, from its ``template`` folder; ``kicad-cli`` never writes them, and
+without them its ERC / DRC warn about every part ("the current configuration
+does not include the library"). :func:`install_library_tables` does what that
+first start does - it only ever adds a missing table, never changes an
+existing one - and is run by the installers through ``ai-eda setup-kicad``.
+
 :func:`platform` is the one place that reads the operating system, so tests
 can exercise every layout on any machine.
 """
@@ -31,6 +39,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 #: where KiCad.app is looked for on macOS, in order (``~`` expanded at call time)
@@ -224,8 +233,131 @@ def bundled_codemodels(dll: Path) -> Path | None:
     return None
 
 
+# --- the global library tables ---------------------------------------------------------
+
+#: KiCad's global library tables: file name -> (s-expression head, library kind) - what KiCad's first start writes
+LIBRARY_TABLES: dict[str, tuple[str, str]] = {"sym-lib-table": ("sym_lib_table", "symbols"), "fp-lib-table": ("fp_lib_table", "footprints")}
+#: the folder of the KiCad library folder that holds the default tables KiCad copies on its first start
+TEMPLATE_DIR = "template"
+
+
+def settings_version(version: str) -> str | None:
+    """KiCad's settings folder name for a ``kicad-cli --version`` string: ``10.0.6`` -> ``10.0`` (major.minor), else ``None``."""
+    parts = version.strip().split(".")
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    minor = "".join(ch for ch in parts[1] if ch.isdigit())  # "0-rc1" -> "0"
+    return f"{int(parts[0])}.{int(minor)}" if minor else None
+
+
+def user_config_dir(version: str) -> Path | None:
+    """The folder KiCad ``version`` reads its settings and global library tables from, else ``None``.
+
+    ``$KICAD_CONFIG_HOME/<major.minor>`` when that variable is an absolute path
+    (KiCad appends the version to it too), else ``%APPDATA%\\kicad\\<v>``
+    (Windows), ``~/Library/Preferences/kicad/<v>`` (macOS),
+    ``$XDG_CONFIG_HOME/kicad/<v>`` or ``~/.config/kicad/<v>`` (Linux and other
+    POSIX systems); never a path built from an empty or relative variable.
+    """
+    ver = settings_version(version)
+    if ver is None:
+        return None
+    root = _absolute_env("KICAD_CONFIG_HOME")
+    if root is None:
+        system = platform()
+        if system == "win32":
+            base = _absolute_env("APPDATA")
+        elif system == "darwin":
+            home = _absolute_env("HOME")
+            base = home / "Library" / "Preferences" if home is not None else None
+        else:
+            home = _absolute_env("HOME")
+            base = _absolute_env("XDG_CONFIG_HOME") or (home / ".config" if home is not None else None)
+        if base is None:
+            return None
+        root = base / "kicad"
+    return root / ver
+
+
+@dataclass(frozen=True)
+class LibraryTable:
+    """One global library table: where KiCad reads it, whether it is there, and what :func:`install_library_tables` would write."""
+
+    name: str
+    path: Path | None
+    present: bool
+    template: Path | None
+
+
+def library_tables(binary: str | None, version: str) -> list[LibraryTable]:
+    """The state of each of :data:`LIBRARY_TABLES` for the KiCad whose ``kicad-cli`` is ``binary`` (``version`` as it prints it)."""
+    config = user_config_dir(version)
+    share = share_dir(binary)
+    out: list[LibraryTable] = []
+    for name in LIBRARY_TABLES:
+        path = config / name if config is not None else None
+        template = share / TEMPLATE_DIR / name if share is not None else None
+        out.append(LibraryTable(name, path, path is not None and path.is_file(), template if template is not None and template.is_file() else None))
+    return out
+
+
+def _quoted(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def listed_table(name: str, share: Path) -> str | None:
+    """A global table ``name`` listing every library in ``share`` by absolute path (no template on disk), else ``None`` when it holds none."""
+    head, kind = LIBRARY_TABLES[name]
+    folder = share / kind
+    if not folder.is_dir():
+        return None
+    if kind == "symbols":
+        libs = sorted((p.stem, p) for p in folder.glob("*.kicad_sym") if p.is_file())
+    else:
+        libs = sorted((p.stem, p) for p in folder.glob("*.pretty") if p.is_dir())
+    if not libs:
+        return None
+    rows = "".join(
+        f'  (lib (name {_quoted(nick)})(type "KiCad")(uri {_quoted(path.resolve().as_posix())})(options "")(descr ""))\n' for nick, path in libs
+    )
+    return f"({head}\n  (version 7)\n{rows})\n"
+
+
+def install_library_tables(binary: str | None, version: str) -> list[str]:
+    """Write each missing global library table as KiCad's first start does; one line per table saying what was done.
+
+    A table already there is never touched (it may hold the user's own
+    libraries). A missing one is copied from the KiCad library folder's
+    ``template`` (the file KiCad itself copies), else written listing the
+    libraries found there. Raises ``OSError`` when a table cannot be written.
+    """
+    share = share_dir(binary)
+    lines: list[str] = []
+    for table in library_tables(binary, version):
+        if table.path is None:
+            lines.append(f"{table.name}: no KiCad settings folder for version {version!r} (HOME / APPDATA unset)")
+        elif table.present:
+            lines.append(f"{table.name}: kept {table.path} (already there)")
+        elif table.template is not None:
+            table.path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(table.template, table.path)
+            lines.append(f"{table.name}: wrote {table.path} (copied from {table.template})")
+        else:
+            text = listed_table(table.name, share) if share is not None else None
+            if text is None:
+                lines.append(f"{table.name}: not written (no KiCad library folder with {LIBRARY_TABLES[table.name][1]} found)")
+                continue
+            table.path.parent.mkdir(parents=True, exist_ok=True)
+            table.path.write_text(text, encoding="utf-8", newline="\n")
+            lines.append(f"{table.name}: wrote {table.path} (listing the libraries in {share})")
+    return lines
+
+
 __all__ = [
     "CODEMODEL_MARKER",
+    "LIBRARY_TABLES",
+    "LibraryTable",
+    "TEMPLATE_DIR",
     "MACOS_APP_LOCATIONS",
     "MACOS_CLI",
     "MACOS_NGSPICE_DIRS",
@@ -234,11 +366,16 @@ __all__ = [
     "bundled_codemodels",
     "bundled_ngspice",
     "find_kicad_cli",
+    "install_library_tables",
     "library_shares",
+    "library_tables",
+    "listed_table",
     "macos_bundles",
     "platform",
+    "settings_version",
     "share_dir",
     "version_dirs",
+    "user_config_dir",
     "version_key",
     "windows_install_bases",
 ]

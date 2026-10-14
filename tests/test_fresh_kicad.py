@@ -1,0 +1,207 @@
+"""What a freshly installed KiCad does differently from one whose GUI has started once.
+
+Both were measured in the install CI (``.github/workflows/install.yml``,
+2026-10-14) on machines that never ran the KiCad GUI:
+
+* kicad-cli on Linux and macOS prints wxWidgets' debug log on stderr whenever
+  it loads a schematic (``08:14:16: Debug: Adding duplicate image handler for
+  'PNM file'``), which the schematic-parity guard of ``run_drc`` took for a
+  parity complaint - the DRC stage then aborted the run;
+* the global library tables (``sym-lib-table`` / ``fp-lib-table``) do not
+  exist until the GUI's first start writes them, so ERC warned
+  ``lib_symbol_issues`` / ``footprint_link_issues`` for every part and DRC
+  ``lib_footprint_issues``; ``ai-eda setup-kicad`` writes them the same way.
+
+No real kicad-cli is run here: ``KicadCli._run`` is replaced, and every path
+the table functions read points into ``tmp_path``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+import ai_eda.tools.kicad.install as kicad_install
+from ai_eda.errors import ToolExecutionError
+from ai_eda.ir import ValidationStatus
+from ai_eda.tools.kicad.cli import KicadCli, complaint_lines
+
+WX_NOISE = (
+    "08:14:16: Debug: Adding duplicate image handler for 'PNM file'\n"
+    "08:14:16: Debug: Adding duplicate image handler for 'PCX file'\n"
+    "오전 8:14:16: Debug: Adding duplicate image handler for 'TGA file'\n"
+    "08:14:16 AM: Trace: something wx traces\n"
+)
+
+
+def test_complaint_lines_drop_only_wx_debug_and_trace_log():
+    assert complaint_lines(WX_NOISE) == []
+    assert complaint_lines("") == [] and complaint_lines("\n  \n") == []
+    real = "Schematic file '/x/b.kicad_sch' could not be loaded"
+    assert complaint_lines(WX_NOISE + real + "\n") == [real]
+    # wx translates Error: / Warning:, never Debug: / Trace: - an error line is always a complaint
+    assert complaint_lines("08:14:16: Error: cannot open file") == ["08:14:16: Error: cannot open file"]
+    assert complaint_lines("Debug: no time stamp in front") == ["Debug: no time stamp in front"]
+
+
+def _board(tmp_path: Path) -> Path:
+    pcb = tmp_path / "b.kicad_pcb"
+    pcb.write_text("(kicad_pcb)", encoding="utf-8")
+    pcb.with_suffix(".kicad_sch").write_text("(kicad_sch)", encoding="utf-8")
+    return pcb
+
+
+def _fake_drc(stderr: str):
+    def run(args, ok_codes=(0, 5), timeout=600):
+        report = Path(args[args.index("-o") + 1])
+        report.write_text(
+            json.dumps(
+                {"kicad_version": "10.0.7", "included_severities": ["error", "warning"], "violations": [], "unconnected_items": [], "schematic_parity": []}
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args, 0, "", stderr)
+
+    return run
+
+
+def test_parity_survives_wx_log_noise_and_still_refuses_a_real_complaint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pcb = _board(tmp_path)
+    kicad = KicadCli(binary="kicad-cli")
+    monkeypatch.setattr(kicad, "_run", _fake_drc(WX_NOISE))
+    res = kicad.run_drc(pcb, tmp_path / "reports" / "drc.json", schematic_parity=True)
+    assert res.status is ValidationStatus.PASS and res.details["schematic_parity_checked"] is True
+    monkeypatch.setattr(kicad, "_run", _fake_drc(WX_NOISE + "Failed to load schematic\n"))
+    with pytest.raises(ToolExecutionError, match="schematic parity did not run: Failed to load schematic$"):
+        kicad.run_drc(pcb, tmp_path / "reports" / "drc.json", schematic_parity=True)
+
+
+# --------------------------------------------------------------------------- the global library tables
+
+
+@pytest.fixture
+def linux_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(kicad_install, "platform", lambda: "linux")
+    monkeypatch.setenv("HOME", str(home))
+    for name in ("KICAD_CONFIG_HOME", "XDG_CONFIG_HOME", "APPDATA"):
+        monkeypatch.delenv(name, raising=False)
+    return home
+
+
+def _kicad_root(tmp_path: Path, template: bool = True) -> str:
+    """``<root>/bin/kicad-cli`` with ``<root>/share/kicad/{symbols,footprints}`` (and the template tables)."""
+    root = tmp_path / "kicad"
+    (root / "bin").mkdir(parents=True)
+    exe = root / "bin" / "kicad-cli"
+    exe.write_text("", encoding="utf-8")
+    share = root / "share" / "kicad"
+    (share / "symbols").mkdir(parents=True)
+    (share / "symbols" / "Device.kicad_sym").write_text("(kicad_symbol_lib)", encoding="utf-8")
+    (share / "symbols" / "Connector_Generic.kicad_sym").write_text("(kicad_symbol_lib)", encoding="utf-8")
+    (share / "footprints" / "Resistor_SMD.pretty").mkdir(parents=True)
+    if template:
+        (share / "template").mkdir()
+        (share / "template" / "sym-lib-table").write_text('(sym_lib_table\n  (version 7)\n  (lib (name "Device")(type "KiCad")(uri "${KICAD10_SYMBOL_DIR}/Device.kicad_sym")(options "")(descr ""))\n)\n', encoding="utf-8")
+        (share / "template" / "fp-lib-table").write_text("(fp_lib_table\n  (version 7)\n)\n", encoding="utf-8")
+    return str(exe)
+
+
+def test_settings_version_is_major_minor():
+    assert kicad_install.settings_version("10.0.6") == "10.0"
+    assert kicad_install.settings_version("10.0.7\n") == "10.0"
+    assert kicad_install.settings_version("9.0.0-rc1") == "9.0"
+    assert kicad_install.settings_version("10.99.0-123-gabc") == "10.99"
+    assert kicad_install.settings_version("10") is None and kicad_install.settings_version("") is None
+    assert kicad_install.settings_version("v10.0") is None
+
+
+def test_user_config_dir_per_system(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linux_home: Path):
+    assert kicad_install.user_config_dir("10.0.6") == linux_home / ".config" / "kicad" / "10.0"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert kicad_install.user_config_dir("10.0.6") == tmp_path / "xdg" / "kicad" / "10.0"
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/xdg")  # never a path relative to the working directory
+    assert kicad_install.user_config_dir("10.0.6") == linux_home / ".config" / "kicad" / "10.0"
+    monkeypatch.setattr(kicad_install, "platform", lambda: "darwin")
+    assert kicad_install.user_config_dir("10.0.6") == linux_home / "Library" / "Preferences" / "kicad" / "10.0"
+    monkeypatch.setattr(kicad_install, "platform", lambda: "win32")
+    assert kicad_install.user_config_dir("10.0.6") is None  # no APPDATA
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    assert kicad_install.user_config_dir("10.0.6") == tmp_path / "Roaming" / "kicad" / "10.0"
+    monkeypatch.setenv("KICAD_CONFIG_HOME", str(tmp_path / "cfg"))  # KiCad appends the version to it too
+    assert kicad_install.user_config_dir("10.0.6") == tmp_path / "cfg" / "10.0"
+    monkeypatch.setenv("KICAD_CONFIG_HOME", "")
+    assert kicad_install.user_config_dir("10.0.6") == tmp_path / "Roaming" / "kicad" / "10.0"
+
+
+def test_missing_tables_are_copied_from_the_template_and_an_existing_one_is_kept(tmp_path: Path, linux_home: Path):
+    cli = _kicad_root(tmp_path)
+    config = linux_home / ".config" / "kicad" / "10.0"
+    config.mkdir(parents=True)
+    own = '(fp_lib_table\n  (version 7)\n  (lib (name "Mine")(type "KiCad")(uri "/x/Mine.pretty")(options "")(descr ""))\n)\n'
+    (config / "fp-lib-table").write_text(own, encoding="utf-8")
+    before = {t.name: t.present for t in kicad_install.library_tables(cli, "10.0.6")}
+    assert before == {"sym-lib-table": False, "fp-lib-table": True}
+    lines = kicad_install.install_library_tables(cli, "10.0.6")
+    template = Path(cli).parent.parent / "share" / "kicad" / "template"
+    assert (config / "sym-lib-table").read_bytes() == (template / "sym-lib-table").read_bytes()
+    assert (config / "fp-lib-table").read_text(encoding="utf-8") == own  # the user's own table is never touched
+    assert lines[0].startswith("sym-lib-table: wrote ") and "copied from" in lines[0]
+    assert lines[1].startswith("fp-lib-table: kept ")
+    assert all(t.present for t in kicad_install.library_tables(cli, "10.0.6"))
+    again = kicad_install.install_library_tables(cli, "10.0.6")  # idempotent
+    assert all(": kept " in line for line in again)
+
+
+def test_without_a_template_the_tables_list_the_installed_libraries(tmp_path: Path, linux_home: Path):
+    cli = _kicad_root(tmp_path, template=False)
+    lines = kicad_install.install_library_tables(cli, "10.0.6")
+    assert all("listing the libraries" in line for line in lines)
+    config = linux_home / ".config" / "kicad" / "10.0"
+    share = (Path(cli).parent.parent / "share" / "kicad").resolve()
+    sym = (config / "sym-lib-table").read_text(encoding="utf-8")
+    assert sym.startswith("(sym_lib_table\n  (version 7)\n")
+    assert sym.index('(name "Connector_Generic")') < sym.index('(name "Device")')
+    assert f'(uri "{(share / "symbols" / "Device.kicad_sym").as_posix()}")' in sym
+    fp = (config / "fp-lib-table").read_text(encoding="utf-8")
+    assert f'(lib (name "Resistor_SMD")(type "KiCad")(uri "{(share / "footprints" / "Resistor_SMD.pretty").as_posix()}")' in fp
+
+
+def test_nothing_is_written_without_a_kicad_or_a_settings_folder(tmp_path: Path, linux_home: Path, monkeypatch: pytest.MonkeyPatch):
+    lines = kicad_install.install_library_tables(None, "10.0.6")  # no kicad-cli: no library folder to take tables from
+    assert all("not written" in line for line in lines)
+    assert not (linux_home / ".config").exists()
+    monkeypatch.delenv("HOME")
+    lines = kicad_install.install_library_tables(_kicad_root(tmp_path), "10.0.6")
+    assert all("no KiCad settings folder" in line for line in lines)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the fake kicad-cli is a #! script")
+def test_setup_kicad_command_and_the_doctor_line(tmp_path: Path, linux_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    from ai_eda import cli
+
+    exe = Path(_kicad_root(tmp_path))
+    exe.write_text(f"#!{sys.executable}\nprint('10.0.6')\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(exe.parent))
+    line, ok = cli._library_tables_line(str(exe), "10.0.6")
+    config = linux_home / ".config" / "kicad" / "10.0"
+    assert not ok and line.startswith(f"kicad tables: MISSING sym-lib-table, fp-lib-table in {config} - run `ai-eda setup-kicad`")
+    assert cli.main(["setup-kicad"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert [o.split(":")[1].strip() for o in out] == ["sym-lib-table", "fp-lib-table"]
+    assert all(" wrote " in o for o in out)
+    assert cli._library_tables_line(str(exe), "10.0.6") == (f"kicad tables: {config} (sym-lib-table, fp-lib-table)", True)
+    assert cli.main(["setup-kicad"]) == 0
+    assert all(" kept " in o for o in capsys.readouterr().out.splitlines())
+    monkeypatch.setenv("PATH", str(tmp_path / "nowhere"))
+    monkeypatch.setattr(kicad_install, "find_kicad_cli", lambda: None)
+    monkeypatch.setattr("ai_eda.tools.kicad.cli.find_kicad_cli", lambda: None)
+    assert cli.main(["setup-kicad"]) == 1
+    assert "kicad-cli NOT FOUND" in capsys.readouterr().out

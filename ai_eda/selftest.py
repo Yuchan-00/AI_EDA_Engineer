@@ -15,7 +15,11 @@ missing (ARCHITECTURE, which proposes and never judges, when its message says
 the template's proposals were applied); a missing tool shows as ``NOT_VERIFIED`` with "not available" /
 "not found" in the message. ERC / DRC verdicts are reported as recorded:
 whether KiCad's checks pass on this template is a fact about the design, not
-about the installation, so a ``FAIL`` there still means the tool ran.
+about the installation, so a ``FAIL`` there still means the tool ran - except
+the violation types of :data:`CONFIGURATION_VIOLATIONS`, which describe
+KiCad's own configuration (its global library tables, missing until KiCad's
+first start or ``ai-eda setup-kicad`` writes them), never the design: any of
+them fails the "KiCad finds its libraries" line.
 
 Exit status: 0 when every required check ran (``--skip-kicad`` drops the
 KiCad stages, ``--skip-ngspice`` the SPICE stage), 1 otherwise, 2 for a usage
@@ -44,6 +48,9 @@ FIRST_ANSWERS: tuple[str, ...] = (
 CONFIRM_ANSWER = "confirm_design=yes"
 #: words in a stage message that say a tool was missing rather than judged
 MISSING_MARKERS: tuple[str, ...] = ("not available", "not found", "no ngspice", "unavailable")
+#: ERC / DRC violation types that say KiCad's library tables do not name the libraries (measured in the install CI on
+#: fresh KiCad 10 installs, 2026-10-14: ERC lib_symbol_issues + footprint_link_issues, DRC lib_footprint_issues per part)
+CONFIGURATION_VIOLATIONS: frozenset[str] = frozenset({"lib_symbol_issues", "footprint_link_issues", "lib_footprint_issues"})
 
 
 @dataclass
@@ -61,6 +68,8 @@ class Check:
 
     @property
     def ran(self) -> bool:
+        if self.stage == "kicad-config":
+            return self.status == "PASS"
         if self.proposes:
             return self.status != "FAIL" and "proposal(s) applied" in self.message
         if self.status not in ("PASS", "FAIL"):
@@ -86,30 +95,54 @@ def _record(workdir: Path) -> dict:
         return {}
 
 
-def _violation_lines(workdir: Path) -> list[str]:
-    """``ERC: 6 warning(s): lib_symbol_mismatch x2, ...`` for the latest kicad.erc / kicad.drc result in ir.json (copied, not judged)."""
+def _violations(workdir: Path) -> dict[str, tuple[dict, dict[str, int]]]:
+    """``{"ERC" / "DRC": (latest kicad.erc / kicad.drc result in ir.json, {violation type: count})}`` (copied, not judged)."""
     try:
         ir = json.loads((workdir / "ir.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
+        return {}
     latest: dict[str, dict] = {}
     for r in (ir.get("validation") or {}).get("results") or []:
         if isinstance(r, dict) and r.get("check_id") in ("kicad.erc", "kicad.drc"):
-            latest[r["check_id"]] = r
-    out: list[str] = []
-    for check_id, r in sorted(latest.items()):
+            latest["ERC" if r["check_id"] == "kicad.erc" else "DRC"] = r
+    out: dict[str, tuple[dict, dict[str, int]]] = {}
+    for label, r in sorted(latest.items()):
         details = r.get("details") or {}
         counts: dict[str, int] = {}
         for key in ("errors", "warnings", "other_severity", "unconnected_items", "schematic_parity"):
             for v in details.get(key) or []:
                 kind = str(v.get("type", key)) if isinstance(v, dict) else key
                 counts[kind] = counts.get(kind, 0) + 1
-        label = "ERC" if check_id == "kicad.erc" else "DRC"
+        out[label] = (r, counts)
+    return out
+
+
+def _violation_lines(workdir: Path) -> list[str]:
+    """``ERC FAIL: lib_symbol_mismatch x2, ...`` for the latest kicad.erc / kicad.drc result in ir.json (copied, not judged)."""
+    out: list[str] = []
+    for label, (r, counts) in _violations(workdir).items():
         if counts:
             out.append(f"{label} {r.get('status')}: " + ", ".join(f"{k} x{n}" for k, n in sorted(counts.items())))
         else:
             out.append(f"{label} {r.get('status')}: {r.get('message', '')}")
     return out
+
+
+def _configuration_check(workdir: Path, required: bool) -> Check:
+    """``KiCad finds its libraries``: PASS when ERC / DRC ran without a :data:`CONFIGURATION_VIOLATIONS` type, else FAIL naming them."""
+    check = Check("KiCad finds its libraries", "kicad-config", required)
+    found = _violations(workdir)
+    if not found:
+        check.message = "no kicad-cli ERC / DRC result"
+        return check
+    bad = {k: n for _, counts in found.values() for k, n in counts.items() if k in CONFIGURATION_VIOLATIONS}
+    if bad:
+        check.status = "FAIL"
+        check.message = "run `ai-eda setup-kicad` (KiCad's global library tables): " + ", ".join(f"{k} x{n}" for k, n in sorted(bad.items()))
+    else:
+        check.status = "PASS"
+        check.message = "no library-table violation in " + " / ".join(found)
+    return check
 
 
 def _cli(args: list[str], log: Path) -> int:
@@ -164,6 +197,7 @@ def run_selftest(workdir: Path | None, *, skip_kicad: bool = False, skip_ngspice
     report_check.status = "PASS" if len(reports) == 4 else "NOT_VERIFIED"
     report_check.message = ", ".join(reports) if reports else "no reports/*.md"
     checks.append(report_check)
+    checks.append(_configuration_check(project, not skip_kicad))
     width = max(len(c.name) for c in checks)
     for c in checks:
         mark = "ok  " if c.ran else ("--  " if not c.required else "FAIL")
@@ -181,7 +215,7 @@ def run_selftest(workdir: Path | None, *, skip_kicad: bool = False, skip_ngspice
         for line in tail:
             print(f"    {line}")
     if failed:
-        print("selftest: NOT working - " + ", ".join(c.name for c in failed) + f" did not run (see {log}; ai-eda doctor names what is missing)")
+        print("selftest: NOT working - " + ", ".join(c.name for c in failed) + f" (see {log}; ai-eda doctor names what is missing)")
     else:
         print("selftest: every required tool ran - the installation works")
     if temp and not keep and not failed:
@@ -191,4 +225,4 @@ def run_selftest(workdir: Path | None, *, skip_kicad: bool = False, skip_ngspice
     return 1 if failed else 0
 
 
-__all__ = ["CONFIRM_ANSWER", "FIRST_ANSWERS", "REQUEST", "run_selftest"]
+__all__ = ["CONFIGURATION_VIOLATIONS", "CONFIRM_ANSWER", "FIRST_ANSWERS", "REQUEST", "run_selftest"]

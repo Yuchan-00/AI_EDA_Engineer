@@ -10,7 +10,8 @@
 #   2. Python     - uv (Astral) into ~/.local/bin, a uv-managed Python 3.12 and .venv with the package and its extras
 #   3. KiCad 10   - kicad-cli and the symbol / footprint libraries, plus ngspice's shared library (package manager)
 #   4. a browser  - for the PDF copies of the stage reports, where the system packages one (Arch, Fedora, Debian)
-#   5. ai-eda     - a link in ~/.local/bin, then `ai-eda doctor` and `ai-eda selftest` (designs a board end to end)
+#   5. ai-eda     - a link in ~/.local/bin, KiCad's global library tables (`ai-eda setup-kicad`, what KiCad's first
+#                   start writes), then `ai-eda doctor` and `ai-eda selftest` (designs a board end to end)
 # Re-running it updates the code (git checkouts) and repairs whatever is missing.
 #
 # Options (environment variables in brackets, for `curl ... | bash`):
@@ -288,6 +289,11 @@ fi
 # --------------------------------------------------------------------------- 7. check
 
 AI_EDA="$APP_DIR/.venv/bin/ai-eda"
+if [ "$WITH_KICAD" -eq 1 ]; then
+  # what KiCad's first start does: the global library tables, without which ERC / DRC warn about every part
+  say "KiCad's global library tables"
+  "$AI_EDA" setup-kicad || warn "ai-eda setup-kicad could not write KiCad's library tables (ai-eda doctor says what is missing)"
+fi
 say "ai-eda doctor"
 "$AI_EDA" doctor || true
 status=0
