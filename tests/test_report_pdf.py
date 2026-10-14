@@ -358,6 +358,14 @@ target = [a for a in sys.argv[1:] if a.startswith("--print-to-pdf=")][0][len("--
 open(target, "wb").close()
 """
 FAKE_SLEEPS = "import time\ntime.sleep(5)\n"
+FAKE_SAYS_THEN_HANGS = "import sys, time\nsys.stderr.write('waiting for the secret service\\n'); sys.stderr.flush()\ntime.sleep(5)\n"
+#: writes the PDF and exits at once, leaving a helper behind that keeps the inherited stderr open for 30 s (as a
+#: browser's crash handler can): the print is done when the browser exits, not when its stderr closes
+FAKE_LEAVES_A_HELPER = f"""import subprocess, sys
+target = [a for a in sys.argv[1:] if a.startswith("--print-to-pdf=")][0][len("--print-to-pdf="):]
+open(target, "wb").write({MINIMAL_PDF!r})
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+"""
 
 
 def _fake_browser(folder: Path, name: str, body: str) -> Path:
@@ -440,7 +448,27 @@ def test_html_to_pdf_removes_a_stale_pdf_first(tmp_path: Path, html_file: Path):
 def test_html_to_pdf_timeout(tmp_path: Path, html_file: Path):
     sleeps = _fake_browser(tmp_path / "fake", "sleeps", FAKE_SLEEPS)
     res = html_to_pdf(html_file, tmp_path / "o.pdf", browser=sleeps, timeout_s=1)
-    assert res == PdfResult(False, None, "timed out after 1 s", sleeps)
+    assert res == PdfResult(False, None, "timed out after 1 s", sleeps, timed_out=True)
+    says = _fake_browser(tmp_path / "fake", "says", FAKE_SAYS_THEN_HANGS)
+    res = html_to_pdf(html_file, tmp_path / "o.pdf", browser=says, timeout_s=2)
+    assert res.timed_out and res.reason == "timed out after 2 s: waiting for the secret service"
+
+
+def test_print_flags_keep_the_browser_off_the_desktop_secret_store():
+    """Measured in the install CI: without these the Ubuntu runners' Chromium never finished a print."""
+    assert {"--password-store=basic", "--use-mock-keychain", "--disable-breakpad"} <= set(PRINT_FLAGS)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the helper-process fake is a POSIX case (a crash handler holding the pipe)")
+def test_a_helper_left_behind_does_not_hold_the_print(tmp_path: Path, html_file: Path):
+    import time
+
+    helper = _fake_browser(tmp_path / "fake", "helper", FAKE_LEAVES_A_HELPER)
+    out = tmp_path / "o.pdf"
+    start = time.monotonic()
+    res = html_to_pdf(html_file, out, browser=helper, timeout_s=20)
+    assert res.ok and out.read_bytes() == MINIMAL_PDF
+    assert time.monotonic() - start < 15  # a pipe held by the helper would have waited 20 s for the timeout
 
 
 def test_html_to_pdf_without_browser_or_html(tmp_path: Path, html_file: Path, isolated: Path):

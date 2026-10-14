@@ -73,6 +73,7 @@ from ai_eda.report.stages import (
     NO_WAVEFORM,
     PARTIAL_ROUTING_RULE,
     PDF_NOT_REQUESTED,
+    PDF_SKIPPED_AFTER_TIMEOUT,
     SUBSTITUTES_HEADING,
     VALUE_COLUMN_NOTE,
     copper_resistance_ohm,
@@ -1152,6 +1153,29 @@ def test_write_stage_report_without_a_browser_or_with_no_pdf_leaves_no_pdf(astab
     assert result.pdf is None and result.pdf_reason == "exit code 1: boom" and not stale.exists()
 
 
+def test_after_one_print_times_out_the_runs_later_reports_get_no_pdf(astable_release, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A browser that hangs once is not asked again in the same run: each wait costs the whole timeout (Ubuntu CI)."""
+    import ai_eda.report.stages as stages_mod
+    from ai_eda.report.pdf import PdfResult
+
+    ir, lib, state = astable_release
+    calls: list[Path] = []
+
+    def hangs(html_path, pdf_path, browser=None, timeout_s=120.0):
+        calls.append(Path(html_path))
+        return PdfResult(False, None, "timed out after 120 s", Path(browser), timed_out=True)
+
+    monkeypatch.setattr(stages_mod, "html_to_pdf", hangs)
+    stale = tmp_path / "out" / REPORTS_DIR / STAGE_REPORTS[Stage.PCB].replace(".md", ".pdf")
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"%PDF-1.4 stale")
+    results = write_all_stage_reports(ir, lib, state, tmp_path / "out", browser=tmp_path / "chromium")
+    assert len(calls) == 1  # asked once
+    assert results[0].pdf_timed_out and results[0].pdf_reason == "timed out after 120 s"
+    assert all(r.pdf is None and r.pdf_reason == PDF_SKIPPED_AFTER_TIMEOUT and not r.pdf_timed_out for r in results[1:])
+    assert not stale.exists()  # a skipped report leaves no stale PDF beside it either
+
+
 FAKE_BROWSER = """import sys
 from pathlib import Path
 for a in sys.argv[1:]:
@@ -1225,3 +1249,32 @@ def test_stage_reports_are_printed_to_pdf_by_the_real_browser(astable_release, t
     assert ir.content_hash() == before and ir.artifacts == artifacts
     stems = {Path(name).stem for name in STAGE_REPORTS.values()}
     assert not any(Path(a.path).stem in stems for a in ir.artifacts.values())  # no report (.md / .html / .pdf) is an artifact
+
+
+def test_the_run_report_writer_stops_printing_after_a_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    """``ai-eda run`` writes reports after four stages and all four again after RELEASE: one hang must not cost seven timeouts."""
+    import ai_eda.report.stages as stages_mod
+    from ai_eda import cli
+    from ai_eda.report.stages import StageReportResult
+
+    asked: list[str | None] = []
+
+    def fake_write(stage, ir, library, state, workdir, *, browser=None, pdf=True, pdf_skip_reason=None, reports_dir=None):
+        asked.append(pdf_skip_reason)
+        md = Path(workdir) / REPORTS_DIR / STAGE_REPORTS[stage]
+        if pdf_skip_reason is not None:
+            return StageReportResult(stage, md, md.with_suffix(".html"), None, pdf_skip_reason, ())
+        return StageReportResult(stage, md, md.with_suffix(".html"), None, "timed out after 120 s", (), True)
+
+    monkeypatch.setattr(stages_mod, "write_stage_report", fake_write)
+
+    class _IR:
+        components = ["R1"]
+
+    written: list[Path] = []
+    after = cli._stage_report_writer(_IR(), None, tmp_path, written, browser=tmp_path / "chromium")
+    for stage in (Stage.ARCHITECTURE, Stage.COMPONENT_SELECTION, Stage.PCB, Stage.RELEASE):
+        after(stage, None)
+    assert asked == [None] + [PDF_SKIPPED_AFTER_TIMEOUT] * 6  # 3 per-stage writes + 4 after RELEASE, only the first printed
+    out = capsys.readouterr().out
+    assert out.count("pdf not produced: timed out after 120 s") == 1 and out.count(PDF_SKIPPED_AFTER_TIMEOUT) == 6

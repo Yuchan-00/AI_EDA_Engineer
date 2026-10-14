@@ -132,6 +132,9 @@ REPORT_SUFFIXES: tuple[str, ...] = (".md", ".html", ".pdf")
 NO_CHART_IN_PARTS = "이 보고서에는 그림이 없습니다: 부품 선정은 표와 라이브러리 기재로 설명하며 그릴 수치 곡선이 없습니다."
 #: the reason recorded when the caller asked for no PDF
 PDF_NOT_REQUESTED = "not requested (--no-pdf)"
+#: the reason recorded for the reports of a run after one print timed out: a browser that hangs once is not asked
+#: again in the same run (each wait costs the whole timeout; measured on the Ubuntu CI runners before the print flags)
+PDF_SKIPPED_AFTER_TIMEOUT = "skipped: the browser did not finish an earlier report of this run in time"
 #: header line for a design no template built
 NO_TEMPLATE = "템플릿 설계가 아님"
 #: what the parts report prints for a part its template says nothing about
@@ -1758,6 +1761,8 @@ class StageReportResult:
     pdf_reason: str | None
     #: the ids of the figures embedded in the HTML (the Markdown's placeholders)
     figure_ids: tuple[str, ...]
+    #: the browser did not finish this print within its timeout (the caller skips the PDFs after it)
+    pdf_timed_out: bool = False
 
     @property
     def paths(self) -> list[Path]:
@@ -1781,15 +1786,17 @@ def _remove_stale_pdf(path: Path) -> None:
 
 def write_stage_report(
     stage: Stage, ir: CircuitIR, library: KicadLibrary | None, record: RunRecord, workdir: Path, *,
-    reports_dir: Path | None = None, browser: Path | str | None = None, pdf: bool = True,
+    reports_dir: Path | None = None, browser: Path | str | None = None, pdf: bool = True, pdf_skip_reason: str | None = None,
 ) -> StageReportResult | None:
     """Write the report of ``stage`` as ``<workdir>/reports/<name>.md`` and ``.html`` (LF, UTF-8; ``reports_dir`` overrides the folder) and, when ``pdf`` and a browser is given or found, ``.pdf``.
 
-    ``None`` for a stage without a report. No browser (or ``pdf=False``)
-    means no PDF and a reason in the result, never an exception; a stale
-    ``.pdf`` from an earlier write is then removed so that a PDF on disk
-    always matches the ``.md`` / ``.html`` beside it. Nothing else is
-    touched: the IR is not saved, no artifact is registered.
+    ``None`` for a stage without a report. No browser (or ``pdf=False``, or
+    a ``pdf_skip_reason`` - :data:`PDF_SKIPPED_AFTER_TIMEOUT` once a print of
+    the same run timed out, ``pdf_timed_out`` in its result) means no PDF and
+    a reason in the result, never an exception; a stale ``.pdf`` from an
+    earlier write is then removed so that a PDF on disk always matches the
+    ``.md`` / ``.html`` beside it. Nothing else is touched: the IR is not
+    saved, no artifact is registered.
     """
     doc = build_stage_document(stage, ir, library, record)
     if doc is None:
@@ -1802,8 +1809,9 @@ def write_stage_report(
     html_path.write_text(doc.html, encoding="utf-8", newline="\n")
     written: Path | None = None
     reason: str | None = None
-    if not pdf:
-        reason = PDF_NOT_REQUESTED
+    timed_out = False
+    if not pdf or pdf_skip_reason is not None:
+        reason = PDF_NOT_REQUESTED if not pdf else pdf_skip_reason
         _remove_stale_pdf(pdf_path)
     else:
         exe = Path(browser) if browser is not None else find_browser()
@@ -1812,20 +1820,28 @@ def write_stage_report(
             _remove_stale_pdf(pdf_path)
         else:
             result = html_to_pdf(html_path, pdf_path, exe)  # removes a stale PDF itself; ok only when this run wrote one
-            written, reason = (pdf_path, None) if result.ok else (None, result.reason)
-    return StageReportResult(stage, md_path, html_path, written, reason, tuple(doc.figures.figures))
+            written, reason, timed_out = (pdf_path, None, False) if result.ok else (None, result.reason, result.timed_out)
+    return StageReportResult(stage, md_path, html_path, written, reason, tuple(doc.figures.figures), timed_out)
 
 
 def write_all_stage_reports(
     ir: CircuitIR, library: KicadLibrary | None, record: RunRecord, workdir: Path, *,
     reports_dir: Path | None = None, browser: Path | str | None = None, pdf: bool = True,
 ) -> list[StageReportResult]:
-    """Write the four reports from a saved IR and its run record (``ai-eda stage-reports``); returns the results in stage order."""
+    """Write the four reports from a saved IR and its run record (``ai-eda stage-reports``); returns the results in stage order.
+
+    Once a print times out the remaining reports get no PDF (:data:`PDF_SKIPPED_AFTER_TIMEOUT`).
+    """
     out: list[StageReportResult] = []
+    skip: str | None = None
     for stage in STAGE_REPORTS:
-        result = write_stage_report(stage, ir, library, record, workdir, reports_dir=reports_dir, browser=browser, pdf=pdf)
+        result = write_stage_report(
+            stage, ir, library, record, workdir, reports_dir=reports_dir, browser=browser, pdf=pdf, pdf_skip_reason=skip
+        )
         if result is not None:
             out.append(result)
+            if result.pdf_timed_out:
+                skip = PDF_SKIPPED_AFTER_TIMEOUT
     return out
 
 
@@ -1853,6 +1869,7 @@ __all__ = [
     "NO_WAVEFORM",
     "PARTIAL_ROUTING_RULE",
     "PDF_NOT_REQUESTED",
+    "PDF_SKIPPED_AFTER_TIMEOUT",
     "REPORTS_DIR",
     "REPORT_SUFFIXES",
     "REPORT_TITLES",

@@ -67,9 +67,16 @@ WINDOWS_SUFFIXES: tuple[str, ...] = ("Google/Chrome/Application/chrome.exe", "Mi
 #: macOS install path
 MACOS_CANDIDATES: tuple[Path, ...] = (Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),)
 #: the headless print command (the profile directory, the output file and the file URL are appended per run).
-#: The last two switch name resolution and the proxy off: a ``file:`` URL needs neither, and without them a
-#: headless Chromium 141 still contacted its own service hosts on every print in spite of the ``--disable-*`` flags
-#: (measured with strace: 9 non-loopback ``connect()`` calls per print; with them 0, same PDF bytes).
+#: ``--no-proxy-server`` / ``--host-resolver-rules`` switch name resolution and the proxy off: a ``file:`` URL needs
+#: neither, and without them a headless Chromium 141 still contacted its own service hosts on every print in spite
+#: of the ``--disable-*`` flags (measured with strace: 9 non-loopback ``connect()`` calls per print; with them 0,
+#: same PDF bytes). ``--password-store=basic`` / ``--use-mock-keychain`` keep the browser away from the desktop's
+#: secret store (libsecret on Linux, the Keychain on macOS) and ``--disable-breakpad`` stops its crash reporter
+#: (which otherwise keeps a crash database under the user's own browser folder): in the install CI (2026-10-14) the
+#: Ubuntu runners' Chromium 154 never finished a print with the flags above alone - its browser, GPU and renderer
+#: processes still running after 120 s, every print - and the macOS runner's first Chrome print timed out too, while
+#: the same Chromium build in an Arch container (no desktop session) printed in seconds; the three flags are the
+#: ones automation tools (Puppeteer) pass for that reason.
 PRINT_FLAGS: tuple[str, ...] = (
     "--headless=new",
     "--no-sandbox",
@@ -79,6 +86,9 @@ PRINT_FLAGS: tuple[str, ...] = (
     "--disable-background-networking",
     "--disable-component-update",
     "--disable-sync",
+    "--disable-breakpad",
+    "--password-store=basic",
+    "--use-mock-keychain",
     "--no-pdf-header-footer",
     "--no-proxy-server",
     "--host-resolver-rules=MAP * ~NOTFOUND",
@@ -485,6 +495,9 @@ class PdfResult:
     path: Path | None
     reason: str | None
     browser: Path | None
+    #: the browser did not finish within the timeout (a caller printing several pages stops asking it: see
+    #: :func:`ai_eda.report.stages.write_stage_report`)
+    timed_out: bool = False
 
 
 def _reason(prefix: str, stderr: str | None, limit: int = 3) -> str:
@@ -536,19 +549,33 @@ def html_to_pdf(html_path: Path | str, pdf_path: Path | str, browser: Path | str
             pdf_abs.unlink()
     except OSError as e:
         return PdfResult(False, None, f"cannot prepare {pdf.name}: {e.strerror or e}", exe)
-    with tempfile.TemporaryDirectory(prefix="ai-eda-pdf-", ignore_cleanup_errors=True) as profile:
+    with tempfile.TemporaryDirectory(prefix="ai-eda-pdf-", ignore_cleanup_errors=True) as tmp:
+        profile = Path(tmp) / "profile"
+        log = Path(tmp) / "stderr.txt"
         args = [str(exe), *PRINT_FLAGS, f"--user-data-dir={profile}", f"--print-to-pdf={pdf_abs}", html_abs.as_uri()]
+        # stderr goes to a file, not a pipe: a helper process the browser leaves behind (its crash handler) would hold
+        # a pipe open after the browser exits, and the wait would last until the timeout
         try:
-            proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout_s)
+            with log.open("wb") as err:
+                proc = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            return PdfResult(False, None, f"timed out after {timeout_s:g} s", exe)
+            prefix, said = f"timed out after {timeout_s:g} s", _read_text(log)
+            return PdfResult(False, None, _reason(prefix, said) if said.strip() else prefix, exe, timed_out=True)
         except OSError as e:
             return PdfResult(False, None, f"cannot run {exe.name}: {e.strerror or e}", exe)
+        stderr = _read_text(log)
     if proc.returncode != 0:
-        return PdfResult(False, None, _reason(f"exit code {proc.returncode}", proc.stderr), exe)
+        return PdfResult(False, None, _reason(f"exit code {proc.returncode}", stderr), exe)
     if not pdf_abs.is_file() or pdf_abs.stat().st_size == 0:
-        return PdfResult(False, None, _reason("no PDF written", proc.stderr), exe)
+        return PdfResult(False, None, _reason("no PDF written", stderr), exe)
     return PdfResult(True, pdf, None, exe)
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 __all__ = [

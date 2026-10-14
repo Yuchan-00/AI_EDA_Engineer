@@ -957,8 +957,10 @@ def _stage_report_writer(ir, library, workdir: Path, written: list[Path], *, bro
     a view of the run, never a reason to abort it. ``browser`` / ``pdf`` are
     the ``--browser`` / ``--no-pdf`` flags.
     """
-    from ai_eda.report.stages import REPORTS_DIR, STAGE_REPORTS, write_stage_report
+    from ai_eda.report.stages import PDF_SKIPPED_AFTER_TIMEOUT, REPORTS_DIR, STAGE_REPORTS, write_stage_report
     from ai_eda.workflow import Stage
+
+    skip: list[str] = []  # once a print times out, the run's later reports get no PDF (each wait costs the whole timeout)
 
     def after_stage(stage, state) -> None:
         if stage not in STAGE_REPORTS:
@@ -967,13 +969,17 @@ def _stage_report_writer(ir, library, workdir: Path, written: list[Path], *, bro
             if report_stage is Stage.ARCHITECTURE and not ir.components:
                 continue
             try:
-                result = write_stage_report(report_stage, ir, library, state, workdir, browser=browser, pdf=pdf)
+                result = write_stage_report(
+                    report_stage, ir, library, state, workdir, browser=browser, pdf=pdf, pdf_skip_reason=skip[0] if skip else None
+                )
             except Exception as e:  # noqa: BLE001 - a report must never abort a run; the reason is printed, the run goes on
                 print(f"  could not write {REPORTS_DIR}/{STAGE_REPORTS[report_stage]}: {type(e).__name__}: {e}", file=sys.stderr)
                 continue
             if result is not None:
                 written.append(result.markdown)
                 print(f"  report written: {_report_label(result.markdown, workdir)} {result.summary()}")  # leading spaces: not a stage line
+                if result.pdf_timed_out and not skip:
+                    skip.append(PDF_SKIPPED_AFTER_TIMEOUT)
 
     return after_stage
 
