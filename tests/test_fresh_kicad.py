@@ -28,7 +28,6 @@ from pathlib import Path
 import pytest
 
 import ai_eda.tools.kicad.install as kicad_install
-from ai_eda.errors import ToolExecutionError
 from ai_eda.ir import ValidationStatus
 from ai_eda.tools.kicad.cli import KicadCli, complaint_lines
 
@@ -42,6 +41,9 @@ WX_NOISE = (
     "(0x2012003) of Fontconfig. Please regenerate the cache with the latest version of Fontconfig to avoid any "
     "unexpected behavior. (current version: 0x2012002)\n"
     "Fontconfig error: Cannot load default config file\n"
+    # Fontconfig 2.13 on the ubuntu-22.04 runner (kicad-cli 10.0.7 run by a user who cannot write /usr/share/fonts)
+    "Unable to revert mtime: /usr/share/fonts\n"
+    "Unable to revert mtime: /usr/share/fonts/truetype/dejavu\n"
 )
 
 
@@ -77,15 +79,23 @@ def _fake_drc(stderr: str):
     return run
 
 
-def test_parity_survives_wx_log_noise_and_still_refuses_a_real_complaint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_parity_survives_library_noise_and_a_real_complaint_is_recorded_not_claimed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     pcb = _board(tmp_path)
     kicad = KicadCli(binary="kicad-cli")
     monkeypatch.setattr(kicad, "_run", _fake_drc(WX_NOISE))
     res = kicad.run_drc(pcb, tmp_path / "reports" / "drc.json", schematic_parity=True)
     assert res.status is ValidationStatus.PASS and res.details["schematic_parity_checked"] is True
-    monkeypatch.setattr(kicad, "_run", _fake_drc(WX_NOISE + "Failed to load schematic\n"))
-    with pytest.raises(ToolExecutionError, match="schematic parity did not run: Failed to load schematic$"):
-        kicad.run_drc(pcb, tmp_path / "reports" / "drc.json", schematic_parity=True)
+    assert "schematic_parity_reason" not in res.details
+    # any other stderr line: the board's verdict stands, parity is not claimed and the run goes on
+    monkeypatch.setattr(kicad, "_run", _fake_drc(WX_NOISE + "Failed to fetch schematic netlist for parity tests.\n"))
+    res = kicad.run_drc(pcb, tmp_path / "reports" / "drc.json", schematic_parity=True)
+    assert res.status is ValidationStatus.PASS and res.details["schematic_parity_checked"] is False
+    assert res.details["schematic_parity_reason"] == (
+        "kicad-cli wrote on stderr, so parity may not have run: Failed to fetch schematic netlist for parity tests."
+    )
+    assert res.details["schematic_hash"]  # which schematic was asked for is still recorded
+    # (the reviewer turns schematic_parity_checked False into NOT_VERIFIED naming the reason:
+    # tests/test_review_evidence.py::test_schematic_vs_pcb_reads_real_parity_evidence)
 
 
 # --------------------------------------------------------------------------- the global library tables
