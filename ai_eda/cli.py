@@ -492,12 +492,17 @@ def _claude_cli_line() -> str:
 
 
 def _browser_line() -> str:
-    """``browser (pdf): <path>  (<version>)`` or ``NOT FOUND`` with what would make one found (the stage reports are then .md + .html only)."""
+    """``browser (pdf): <path>  (<version>)`` or ``NOT FOUND`` with what would make one found (the stage reports are then
+    .md + .html only) and this system's install remedy, like the other ``doctor`` lines."""
     from ai_eda.report.pdf import BROWSER_ENV, browser_version, find_browser
+    from ai_eda.setup_help import remedy
 
     browser = find_browser()
     if browser is None:
-        return f"browser (pdf): NOT FOUND (chrome / edge / chromium on PATH, a Playwright install, or {BROWSER_ENV} set to its absolute path; stage reports are written as .md + .html only)"
+        return (
+            f"browser (pdf): NOT FOUND (chrome / edge / chromium on PATH, a Playwright install, or {BROWSER_ENV} set to its absolute path; "
+            f"stage reports are written as .md + .html only)  - {remedy('browser')}"
+        )
     version = browser_version(browser)
     return f"browser (pdf): {browser}" + (f"  ({version})" if version else "")
 

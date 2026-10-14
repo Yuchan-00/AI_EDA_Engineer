@@ -5,8 +5,11 @@
 # Invariants: it installs for the user who runs it (never under sudo: it calls sudo itself for the system
 # packages), asks the package manager only for what is missing, records only absolute paths, and never stops
 # because a shell profile cannot be edited. Its steps (`run`), Homebrew's installer and the ai-eda commands read
-# /dev/null as stdin, so that under `curl ... | bash` none of them can read the rest of this script.
+# /dev/null as stdin, so that under `curl ... | bash` none of them can read the rest of this script. The whole
+# file below is one { ... } block (usage(), main() and the call of main), so bash reads all of it before running
+# any of it: a download cut short anywhere is a syntax error that runs nothing.
 
+{
 usage() {
   cat <<'EOF'
 AI EDA ENGINEER - one-command installer for macOS and Linux (Ubuntu, Debian, Arch, Fedora).
@@ -16,22 +19,32 @@ AI EDA ENGINEER - one-command installer for macOS and Linux (Ubuntu, Debian, Arc
   ./install.sh [options]                      # from a checkout of the repository
 
 Run it as yourself, not with sudo: it calls sudo for the system packages, and sudo asks for your password
-where the system requires it (on macOS once, before Homebrew's installer, when Homebrew is missing).
+where the system requires it (on macOS once, before Homebrew's installer, when Homebrew is needed and missing).
 On a machine with nothing set up it installs, without asking:
-  1. the code   - this checkout, else the repository into ~/AI_EDA_Engineer (git clone; a tarball when git is
-                  missing or cannot clone, as on a Mac without the Command Line Tools)
+  1. the code   - this checkout, else the repository into ~/AI_EDA_Engineer or --dir (git clone; a tarball when
+                  git is missing or cannot clone, as on a Mac without the Command Line Tools; an empty folder is
+                  filled, never replaced)
   2. Python     - uv (Astral) into ~/.local/bin, a uv-managed Python 3.12 and .venv with the package and its extras
+                  (uv runs in the project folder: the folder you start the installer in does not configure it)
   3. KiCad 10   - kicad-cli and the symbol / footprint libraries, plus ngspice's shared library (the package
-                  manager; on macOS Homebrew, installed first when missing; an older KiCad is upgraded - on macOS a
-                  KiCad folder Homebrew did not install is kept, renamed /Applications/KiCad-<version>)
-  4. a browser  - for the PDF copies of the stage reports: Chromium where the system packages one (Arch, Fedora,
-                  Debian); on Ubuntu (amd64) Google Chrome's .deb, which adds Google's apt source for its updates
-                  - Ubuntu's Chromium is a snap, which cannot read a project outside your home folder (the
-                  fallback on other architectures)
+                  manager; on Ubuntu KiCad's PPA ppa:kicad/kicad-10.0-releases, added when a KiCad package is
+                  missing or the KiCad found is older than 10; an older KiCad is upgraded). macOS: when the
+                  KiCad.app ai-eda finds first (in /Applications/KiCad, /Applications, ~/Applications/KiCad,
+                  ~/Applications) is KiCad 10, Homebrew is not needed for it; otherwise Homebrew's kicad cask
+                  (Homebrew installed first when missing; a KiCad folder Homebrew did not install is kept, renamed
+                  /Applications/KiCad-<version>); Homebrew's libngspice only when that KiCad.app bundles no ngspice
+  4. a browser  - for the PDF copies of the stage reports, only when ai-eda finds none (an existing absolute
+                  $AI_EDA_BROWSER, Chrome / Edge / Chromium on PATH - not a snap - or in /Applications, a Playwright
+                  Chromium under $PLAYWRIGHT_BROWSERS_PATH or /opt/pw-browsers): Chromium where the system
+                  packages one (Arch, Fedora, Debian); on Ubuntu (amd64) Google Chrome's .deb, which adds Google's
+                  apt source for its updates - Ubuntu's Chromium is a snap, which cannot read a project outside
+                  your home folder (the fallback on other architectures)
   5. ai-eda     - a link in ~/.local/bin and a PATH line in the shell profiles, KiCad's global library tables
                   (`ai-eda setup-kicad`, what KiCad's first start writes; also with --no-kicad when a KiCad is
                   already installed), then `ai-eda doctor` and `ai-eda selftest` (designs a board end to end;
                   run only when setup-kicad found a KiCad and its tables are in place)
+It exits 1 when ai-eda itself does not run (`ai-eda doctor` fails) or the KiCad it was to install is not
+usable, with the selftest's status when the selftest fails, else 0.
 Re-running it updates a git copy it downloaded (git pull; a tarball copy, and a checkout you run it from, are
 yours to update) and installs only what is missing: the package manager is asked only for packages that are not
 installed.
@@ -42,7 +55,9 @@ installed.
            (`ai-eda doctor --strict` reports it): use --no-kicad and install KiCad 10 another way.
 
 Options (environment variables in brackets, for `curl ... | bash`; a switch's variable is set to 1):
-  --dir DIR        where to put the code when not run from a checkout [AI_EDA_DIR] (default ~/AI_EDA_Engineer)
+  --dir DIR        where to put the code [AI_EDA_DIR] (default: the checkout this script runs from, else
+                   ~/AI_EDA_Engineer); run from a checkout, --dir names another folder (naming the checkout
+                   itself keeps it as this checkout: never pulled)
   --branch NAME    branch to download [AI_EDA_BRANCH] (default main)
   --python VER     Python version for the virtual environment [AI_EDA_PYTHON] (default 3.12)
   --no-kicad       do not install KiCad / ngspice (without a KiCad the pipeline reports those checks
@@ -58,6 +73,11 @@ Options (environment variables in brackets, for `curl ... | bash`; a switch's va
 EOF
 }
 
+# The installer is this one function, called right after its closing brace, inside the block that holds the whole
+# file. Under `curl ... | bash` bash runs each top-level command as soon as it has read it, so a download cut short
+# would run a prefix of the installer and exit 0; the block is read to its closing brace before any of it runs, so a
+# cut-short download is a syntax error that runs nothing (exit 2).
+main() {
 set -euo pipefail
 unset CDPATH
 
@@ -189,6 +209,32 @@ kicad_app_version() {
   fi
   printf '%s\n' "$v"
 }
+# macOS: the KiCad.app ai-eda uses when no kicad-cli is on PATH (ai_eda/tools/kicad/install.py find_kicad_cli: the
+# first of MACOS_APP_LOCATIONS whose Contents/MacOS/kicad-cli is a file), else the first KiCad.app there (one too
+# old to have a kicad-cli); nothing when there is none
+macos_kicad_app() {
+  local a first="" places=(/Applications/KiCad/KiCad.app /Applications/KiCad.app)
+  case "${HOME:-}" in /*) places+=("$HOME/Applications/KiCad/KiCad.app" "$HOME/Applications/KiCad.app") ;; esac
+  for a in "${places[@]}"; do
+    [ -d "$a" ] || continue
+    if [ -f "$a/Contents/MacOS/kicad-cli" ]; then printf '%s\n' "$a"; return 0; fi
+    [ -n "$first" ] || first="$a"
+  done
+  printf '%s\n' "$first"
+}
+# the ngspice library KiCad.app $1 bundles, which ai-eda loads before any other (install.py bundled_ngspice: the
+# first libngspice*.dylib by name in Contents/Frameworks, then PlugIns, then SharedSupport); nothing without one
+bundled_ngspice() {
+  local d p
+  for d in Frameworks PlugIns SharedSupport; do
+    [ -d "$1/Contents/$d" ] || continue
+    # a pipe, not a process substitution: bash before 5.1 refuses that in POSIX mode (macOS's /bin/sh)
+    p="$(find "$1/Contents/$d" -name 'libngspice*.dylib' 2>/dev/null </dev/null | LC_ALL=C sort |
+      while IFS= read -r q; do if [ -f "$q" ]; then printf '%s\n' "$q"; break; fi; done)"
+    if [ -n "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  done
+  return 0
+}
 
 # Homebrew's installer runs non-interactively (NONINTERACTIVE=1 here, and by itself under `curl | bash`), so it
 # cannot ask for the administrator password it needs: sudo -v asks for it first, on the terminal, and Homebrew
@@ -206,9 +252,9 @@ ensure_brew() {
       if ( : </dev/tty ) 2>/dev/null; then
         say "Homebrew's installer needs administrator rights and cannot ask for them itself: sudo asks for your password once"
         # shellcheck disable=SC2024  # the terminal is sudo's own stdin on purpose (under `curl | bash` stdin is the pipe)
-        sudo -v </dev/tty || die "sudo -v failed: Homebrew's installer needs an administrator account; install Homebrew yourself (https://brew.sh), then run this installer again"
+        sudo -v </dev/tty || die "sudo -v failed: Homebrew's installer needs an administrator account; install Homebrew yourself (https://brew.sh), or KiCad 10 from https://www.kicad.org/download/macos/ (it bundles ngspice: no Homebrew is needed then), then run this installer again"
       else
-        die "Homebrew is not installed, and without a terminal nobody can give its installer the administrator password: install Homebrew first (https://brew.sh), then run this installer again"
+        die "Homebrew is not installed, and without a terminal nobody can give its installer the administrator password: install Homebrew first (https://brew.sh), or KiCad 10 from https://www.kicad.org/download/macos/ (it bundles ngspice: no Homebrew is needed then), then run this installer again"
       fi
     fi
     script="$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || die "could not download Homebrew's installer"
@@ -269,28 +315,25 @@ git_works() {
   git --version >/dev/null 2>&1 </dev/null
 }
 
-# the branch's tarball into $1, which does not exist or is an empty folder
+# the branch's tarball into $1, which does not exist or is an empty folder. The folder is filled, never removed or
+# replaced: it may be the current folder of the shell that started the installer (`--dir .`), a link to a folder,
+# or a folder whose parent you cannot write (a mount point, /opt/<name> made yours), and it keeps its owner and mode
 download_tarball() {
-  local tmp top
+  local tmp
+  mkdir -p "$1" || die "could not create $1"
+  [ -z "$(ls -A "$1" 2>/dev/null)" ] || die "$1 is not empty (left by a failed git clone?); remove it and run this installer again"
   tmp="$(mktemp -d)"
   run curl -fsSL "https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${BRANCH}" -o "$tmp/src.tar.gz"
-  run tar -xzf "$tmp/src.tar.gz" -C "$tmp"
-  top="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  [ -n "$top" ] || die "the downloaded archive holds no folder"
-  mkdir -p "$(dirname "$1")"
-  # an empty folder is replaced, not filled: mv would put the download inside it
-  if [ -d "$1" ]; then
-    rmdir "$1" 2>/dev/null || die "$1 is not empty (left by a failed git clone?); remove it and run this installer again"
-  fi
-  run mv "$top" "$1"
+  # the archive holds one folder (<repository>-<branch>/): its contents go into $1 (GNU tar and bsdtar alike)
+  run tar -xzf "$tmp/src.tar.gz" -C "$1" --strip-components=1
   rm -rf "$tmp"
-  # the folder replaced may have been the current one (`--dir .`): stand in the new one, not in the removed one
-  cd "$PWD" 2>/dev/null || cd /
 }
 
+# the folder of this script when it runs from a file. Inside a function bash names the source of a script read
+# from stdin (`curl ... | bash`) "main" while $0 is the shell: no folder then, whatever file ./main may be
 SCRIPT_DIR=""
-if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" = "$0" ] && [ -f "$0" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 fi
 if [ -n "$SCRIPT_DIR" ] && is_checkout "$SCRIPT_DIR" && [ -z "$DIR" ]; then
   APP_DIR="$SCRIPT_DIR"
@@ -299,8 +342,8 @@ else
   APP_DIR="${DIR:-$APP_DIR_DEFAULT}"
   # absolute from here on: the ai-eda link records this path, and a relative one would resolve from ~/.local/bin
   case "$APP_DIR" in /*) ;; *) APP_DIR="$PWD/$APP_DIR" ;; esac
-  # an existing folder by its own name (`--dir .` is the current folder, not "<it>/.", which rmdir and mv refuse);
-  # a new one without trailing "/." or "/"
+  # an existing folder by its own name (`--dir .` is the current folder, not "<it>/."); a new one without
+  # trailing "/." or "/"
   if [ -d "$APP_DIR" ]; then
     APP_DIR="$(cd "$APP_DIR" && pwd)"
   else
@@ -312,7 +355,16 @@ else
       esac
     done
   fi
-  if is_checkout "$APP_DIR"; then
+  # --dir / AI_EDA_DIR naming the checkout this script runs from (`./install.sh --dir .`, a link to it), compared
+  # by physical path: that checkout, which is yours to update - never pulled
+  same=""
+  if [ -n "$SCRIPT_DIR" ] && [ -d "$APP_DIR" ] && is_checkout "$SCRIPT_DIR"; then
+    same="$(cd -P "$APP_DIR" 2>/dev/null && pwd || true)"
+    if [ "$same" != "$(cd -P "$SCRIPT_DIR" 2>/dev/null && pwd || true)" ]; then same=""; fi
+  fi
+  if [ -n "$same" ]; then
+    say "code: this checkout ($APP_DIR; update it yourself with git pull)"
+  elif is_checkout "$APP_DIR"; then
     say "code: existing copy in $APP_DIR"
     if [ -d "$APP_DIR/.git" ] && git_works; then
       run git -C "$APP_DIR" pull --ff-only || warn "could not update $APP_DIR with git pull (local changes?); using it as it is"
@@ -345,14 +397,27 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 command -v uv >/dev/null 2>&1 || die "uv is not available after its installer ran"
 say "Python ${PYVER} environment in $APP_DIR/.venv"
-run uv venv --allow-existing --python "$PYVER" "$APP_DIR/.venv"
+# uv reads the first uv.toml / pyproject.toml with a [tool.uv] table in its current folder and the folders above
+# it: run in the project folder, whose pyproject.toml has one (empty), it stops there, so neither the folder the
+# installer was started in nor a folder above the project (another uv project) can steer it
+(cd "$APP_DIR" && run uv venv --allow-existing --python "$PYVER" "$APP_DIR/.venv")
 VENV_PY="$APP_DIR/.venv/bin/python"
-run uv pip install --python "$VENV_PY" -e "${APP_DIR}[llm,parts,dev]" cryptography
+(cd "$APP_DIR" && run uv pip install --python "$VENV_PY" -e "${APP_DIR}[llm,parts,dev]" cryptography)
 
 # --------------------------------------------------------------------------- 3. KiCad 10 + ngspice
 
+# Ubuntu: KiCad's own PPA, the only source of KiCad 10 there (adding it again changes nothing)
+add_kicad_ppa() {
+  local tools
+  tools="$(deb_missing software-properties-common gnupg)"
+  # shellcheck disable=SC2086  # a list of package names, one word each
+  [ -z "$tools" ] || apt_install $tools
+  as_root add-apt-repository -y ppa:kicad/kicad-10.0-releases
+  APT_UPDATED=0
+}
+
 install_kicad() {
-  local pkgs ver app a missing old
+  local pkgs ver app missing old brew_kicad dylib
   case "$FAMILY" in
     ubuntu)
       # libngspice0 is the shared library; its XSPICE code models (*.cm) come in the separate ngspice package
@@ -361,18 +426,20 @@ install_kicad() {
       ver="$(kicad_version "$(command -v kicad-cli || true)")"
       missing="$(deb_missing "${pkgs[@]}")"
       if [ "$(major_of "$ver")" -ge 10 ]; then
-        # KiCad 10 is there (from the PPA, or however it came): no repository is added, only what is missing
+        # KiCad 10 is there (from the PPA, or however it came): only what is missing is installed. A KiCad package
+        # (kicad, kicad-symbols, kicad-footprints, kicad-packages3d) comes from KiCad's PPA, added first: Ubuntu's
+        # own archive has KiCad 7.0 / 6.0, whose kicad-cli would replace or shadow the KiCad 10 found. libngspice0
+        # and ngspice alone need no repository.
         if [ -z "$missing" ]; then
           say "KiCad $ver, its libraries and ngspice are installed"
         else
+          case " $missing" in *" kicad"*) add_kicad_ppa ;; esac
           # shellcheck disable=SC2086  # a list of package names, one word each
           apt_install $missing
         fi
       else
         [ -z "$ver" ] || say "KiCad $ver is older than 10: KiCad's PPA upgrades it"
-        apt_install software-properties-common gnupg
-        as_root add-apt-repository -y ppa:kicad/kicad-10.0-releases
-        APT_UPDATED=0
+        add_kicad_ppa
         apt_install "${pkgs[@]}"
       fi
       ;;
@@ -418,40 +485,61 @@ install_kicad() {
       fi
       ;;
     macos)
-      ensure_brew
-      app=""
-      for a in /Applications/KiCad/KiCad.app /Applications/KiCad.app; do
-        if [ -d "$a" ]; then app="$a"; break; fi
-      done
+      # decided before Homebrew is touched: a KiCad 10 where ai-eda looks needs no Homebrew, and Homebrew is
+      # installed / asked only for what is missing (the kicad cask; libngspice when the KiCad.app has no ngspice)
+      app="$(macos_kicad_app)"
+      ver=""; [ -z "$app" ] || ver="$(kicad_app_version "$app")"
+      brew_kicad=0
       if [ -z "$app" ]; then
+        ensure_brew
         run brew install --cask kicad
+        brew_kicad=1
+      elif [ "$(major_of "$ver")" -ge 10 ]; then
+        say "KiCad $ver is already in $app"
       else
-        ver="$(kicad_app_version "$app")"
-        if [ "$(major_of "$ver")" -ge 10 ]; then
-          say "KiCad $ver is already in $app"
-        elif brew list --cask kicad >/dev/null 2>&1 </dev/null; then
+        ensure_brew
+        brew_kicad=1
+        if brew list --cask kicad >/dev/null 2>&1 </dev/null; then
           say "KiCad ${ver:-of unknown version} in $app is older than 10: upgrading Homebrew's kicad cask"
           run brew upgrade --cask kicad
-        elif [ "$app" = /Applications/KiCad/KiCad.app ]; then
+        elif [ -e /Applications/KiCad ]; then
           # Homebrew's cask installs the folder /Applications/KiCad: the KiCad there (not Homebrew's) is kept under
           # another name, never overwritten (`brew install --force` would delete it)
-          old="/Applications/KiCad-${ver:-old}"
+          old="$(kicad_app_version /Applications/KiCad/KiCad.app)"
+          old="/Applications/KiCad-${old:-old}"
           while [ -e "$old" ]; do old="${old}-old"; done
-          say "KiCad ${ver:-of unknown version} in /Applications/KiCad is older than 10 and not Homebrew's: keeping it as $old"
+          say "KiCad ${ver:-of unknown version} in $app is older than 10, and /Applications/KiCad is not Homebrew's: keeping it as $old"
           run mv /Applications/KiCad "$old" || die "could not rename /Applications/KiCad to $old (rename or remove it yourself, then run this installer again)"
           run brew install --cask kicad
         else
-          # a lone /Applications/KiCad.app does not collide with the cask's /Applications/KiCad folder, which is
-          # looked at first
+          # a KiCad.app elsewhere does not collide with the cask's /Applications/KiCad folder, which ai-eda looks
+          # at first
           say "KiCad ${ver:-of unknown version} in $app is older than 10: installing KiCad 10 into /Applications/KiCad beside it"
           run brew install --cask kicad
         fi
-        ver="$(kicad_app_version /Applications/KiCad/KiCad.app)"
-        if [ "$(major_of "$ver")" -lt 10 ]; then
-          warn "/Applications/KiCad/KiCad.app is ${ver:-missing or of unknown version}, not KiCad 10, after Homebrew ran: install KiCad 10 from https://www.kicad.org/download/macos/"
+      fi
+      if [ "$brew_kicad" -eq 1 ]; then
+        # what ai-eda finds now (the cask's /Applications/KiCad comes first)
+        app="$(macos_kicad_app)"
+        ver=""; [ -z "$app" ] || ver="$(kicad_app_version "$app")"
+        if [ -z "$app" ]; then
+          warn "no KiCad.app where ai-eda looks after Homebrew ran: install KiCad 10 from https://www.kicad.org/download/macos/"
+        elif [ "$(major_of "$ver")" -lt 10 ]; then
+          warn "$app is ${ver:-of unknown version}, not KiCad 10, after Homebrew ran: install KiCad 10 from https://www.kicad.org/download/macos/"
         fi
       fi
-      run brew install libngspice
+      # ai-eda loads the ngspice its KiCad.app bundles before any other: Homebrew's libngspice only without one
+      dylib=""; [ -z "$app" ] || dylib="$(bundled_ngspice "$app")"
+      if [ -n "$dylib" ]; then
+        say "ngspice: the one KiCad bundles ($dylib)"
+      else
+        ensure_brew
+        if brew list --formula libngspice >/dev/null 2>&1 </dev/null; then
+          say "ngspice: Homebrew's libngspice is installed"
+        else
+          run brew install libngspice
+        fi
+      fi
       ;;
   esac
 }
@@ -472,15 +560,38 @@ is_snap() {
   case "$(readlink -f "$p" 2>/dev/null || true)" in /snap/*|*/bin/snap) return 0 ;; esac
   [ -f "$p" ] && head -c 4096 "$p" 2>/dev/null | grep -q '/snap/bin/'
 }
-has_browser() {
-  local b p
-  for b in google-chrome google-chrome-stable chrome msedge chromium chromium-browser; do
-    p="$(command -v "$b" 2>/dev/null || true)"
-    case "$p" in /*) is_snap "$p" || return 0 ;; esac
+# $1 on PATH's absolute entries only, as ai-eda looks it up (install.which_absolute: an executable regular file;
+# an empty or relative entry is skipped); nothing when it is not there
+path_lookup() {
+  local d
+  printf '%s:' "$PATH" | while IFS= read -r -d: d; do
+    case "$d" in /*) if [ -f "$d/$1" ] && [ -x "$d/$1" ]; then printf '%s\n' "$d/$1"; break; fi ;; esac
   done
-  [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && return 0
-  [ -x "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" ] && return 0
-  [ -x "/Applications/Chromium.app/Contents/MacOS/Chromium" ] && return 0
+}
+# the browser ai-eda would print with, in ai_eda/report/pdf.py find_browser's order: $AI_EDA_BROWSER naming an
+# existing file by an absolute path, else the first of the PATH names - a snap there counts as none, since it
+# cannot read a project outside the home folder and would be the one used -, else Playwright's Chromium
+# ($PLAYWRIGHT_BROWSERS_PATH when absolute, then /opt/pw-browsers), else the macOS /Applications bundles
+has_browser() {
+  local b p roots=()
+  case "${AI_EDA_BROWSER:-}" in /*) if [ -f "$AI_EDA_BROWSER" ]; then return 0; fi ;; esac
+  for b in google-chrome google-chrome-stable chrome msedge chromium chromium-browser; do
+    p="$(path_lookup "$b")"
+    if [ -n "$p" ]; then
+      if is_snap "$p"; then return 1; fi
+      return 0
+    fi
+  done
+  case "${PLAYWRIGHT_BROWSERS_PATH:-}" in /*) roots+=("$PLAYWRIGHT_BROWSERS_PATH") ;; esac
+  roots+=(/opt/pw-browsers)
+  for b in "${roots[@]}"; do
+    for p in "$b"/chromium-*/chrome-linux/chrome; do
+      if [ -f "$p" ]; then return 0; fi
+    done
+  done
+  [ -f "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && return 0
+  [ -f "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" ] && return 0
+  [ -f "/Applications/Chromium.app/Contents/MacOS/Chromium" ] && return 0
   return 1
 }
 if [ "$WITH_BROWSER" -eq 1 ] && ! has_browser; then
@@ -510,7 +621,7 @@ if [ "$WITH_BROWSER" -eq 1 ] && ! has_browser; then
         warn "no browser for the PDF reports (Ubuntu packages Chromium only as a snap and snapd is not running here): the stage reports stay .md + .html (install Chrome or set AI_EDA_BROWSER for PDFs)"
       fi
       ;;
-    macos) warn "no Chrome / Edge / Chromium in /Applications: the stage reports stay .md + .html (install one for PDFs)" ;;
+    macos) warn "no browser for the PDF reports (Chrome / Edge / Chromium in /Applications or on PATH, or AI_EDA_BROWSER): the stage reports stay .md + .html (install one for PDFs)" ;;
   esac
 fi
 
@@ -565,8 +676,13 @@ else
   say "no usable KiCad (--no-kicad): after installing KiCad 10, run ai-eda setup-kicad"
 fi
 say "ai-eda doctor"
-"$AI_EDA" doctor </dev/null || true
 status=0
+# without --strict doctor exits 0 whatever it finds missing: any other exit means ai-eda itself does not run (an
+# import that fails, say), and setup-kicad above then failed for that reason too, not for KiCad's
+if ! "$AI_EDA" doctor </dev/null; then
+  warn "ai-eda doctor failed: ai-eda itself does not run (see the error above; a failed ai-eda setup-kicad above has the same cause)"
+  status=1
+fi
 # the KiCad this run was to install is not usable: the installation did not do what it was asked
 if [ "$KICAD_READY" -eq 0 ] && [ "$WITH_KICAD" -eq 1 ]; then status=1; fi
 if [ "$RUN_SELFTEST" -eq 1 ]; then
@@ -589,3 +705,6 @@ AI EDA ENGINEER is installed in $APP_DIR
 Open a new terminal (or run: export PATH="\$HOME/.local/bin:\$PATH") so that 'ai-eda' is found.
 EOF
 exit "$status"
+}
+main "$@"
+}

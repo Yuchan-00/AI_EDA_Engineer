@@ -39,6 +39,7 @@ one. No browser found means no PDF and a reason, never an exception.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -62,7 +63,7 @@ PATH_NAMES: tuple[str, ...] = ("google-chrome", "google-chrome-stable", "chrome"
 PLAYWRIGHT_DEFAULT_ROOTS: tuple[Path, ...] = (Path("/opt/pw-browsers"),)
 #: where a Playwright root keeps its Chromium binary (highest build number wins)
 PLAYWRIGHT_GLOBS: tuple[str, ...] = ("chromium-*/chrome-linux/chrome", "chromium-*/chrome-win/chrome.exe")
-#: Windows install roots (environment variables) and the Chrome / Edge paths under them
+#: Windows install roots (environment variables) and the Chrome / Edge paths under them (Chrome in any root first)
 WINDOWS_ROOT_ENVS: tuple[str, ...] = ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")
 WINDOWS_SUFFIXES: tuple[str, ...] = ("Google/Chrome/Application/chrome.exe", "Microsoft/Edge/Application/msedge.exe")
 #: macOS install paths, the vendors' stable browsers before Chromium (as :data:`PATH_NAMES`); none of them puts a
@@ -103,6 +104,12 @@ DEFAULT_TIMEOUT_S = 120.0
 #: what a snap program (Ubuntu packages Chromium only as a snap) may read and write: the home folder, except the
 #: hidden folders directly in it - the confinement of snapd's ``home`` interface; the snap has its own ``/tmp``
 SNAP_PREFIX = "/snap/"
+#: a snap browser's ``--user-data-dir``: a hidden folder made next to the PDF (inside a non-hidden home folder, which
+#: :func:`snap_confinement_problem` requires and the snap shares) and removed after the print. Under the system temp
+#: folder the browser would create the profile in its own private ``/tmp`` - about 3 MB per print, which only that
+#: snap can see and which the host-side cleanup never reaches (reported by the installer review: one leaked profile
+#: per print in a mount-namespace emulation; not measured with snapd here)
+SNAP_PROFILE_PREFIX = ".ai-eda-pdf-profile-"
 NO_BROWSER_REASON = f"no browser found (chromium / chrome / edge on PATH, a Playwright install, or {BROWSER_ENV})"
 #: browser stderr that says nothing about the print job (a headless Chromium logs these on every Linux run without a session bus)
 _NOISE_RE = re.compile(r"dbus/|Fontconfig")
@@ -436,10 +443,13 @@ def find_browser() -> Path | None:
     (:func:`~ai_eda.tools.kicad.install.which_absolute`), the Playwright
     roots (``$PLAYWRIGHT_BROWSERS_PATH`` when absolute, then
     :data:`PLAYWRIGHT_DEFAULT_ROOTS`; highest build first), the Windows
-    install paths under the absolute :data:`WINDOWS_ROOT_ENVS`, then
-    :data:`MACOS_CANDIDATES`. An empty or relative variable counts as unset
-    and the working directory is never searched, so a project folder (where
-    GUI runs start) cannot supply the program that is run.
+    install paths under the absolute :data:`WINDOWS_ROOT_ENVS` - Chrome
+    under any of them before Edge under any (:data:`WINDOWS_SUFFIXES`
+    order: a per-user Chrome in ``%LOCALAPPDATA%`` before the Edge every
+    Windows has in ``Program Files (x86)``) -, then :data:`MACOS_CANDIDATES`.
+    An empty or relative variable counts as unset and the working directory
+    is never searched, so a project folder (where GUI runs start) cannot
+    supply the program that is run.
     """
     from ai_eda.tools.kicad.install import _absolute_env, which_absolute
 
@@ -462,11 +472,11 @@ def find_browser() -> Path | None:
             matches = sorted((p for p in root.glob(pattern) if p.is_file()), key=_playwright_key, reverse=True)
             if matches:
                 return matches[0]
-    for env_name in WINDOWS_ROOT_ENVS:
-        base = _absolute_env(env_name)
-        if base is None:
-            continue
-        for suffix in WINDOWS_SUFFIXES:
+    for suffix in WINDOWS_SUFFIXES:  # Chrome under any root before Edge under any: a per-user Chrome beats Windows' own Edge
+        for env_name in WINDOWS_ROOT_ENVS:
+            base = _absolute_env(env_name)
+            if base is None:
+                continue
             candidate = base / suffix
             if candidate.is_file():
                 return candidate
@@ -585,7 +595,9 @@ def html_to_pdf(html_path: Path | str, pdf_path: Path | str, browser: Path | str
     so ``ok`` always means this run wrote the PDF. The browser gets a fresh
     temporary profile (``--user-data-dir``) so the print job never joins a
     desktop Chrome / Edge that is already running (which would swallow the
-    command and write nothing) and never reads the user's profile.
+    command and write nothing) and never reads the user's profile; a snap
+    browser's is a hidden folder next to the PDF (:data:`SNAP_PROFILE_PREFIX`),
+    removed after the print whatever its outcome.
 
     This launches a local program on a local file and opens no socket by
     our doing; the browser runs with name resolution disabled and no proxy
@@ -619,8 +631,15 @@ def html_to_pdf(html_path: Path | str, pdf_path: Path | str, browser: Path | str
     confined = snap_confinement_problem(exe, [html_abs, pdf_abs])
     if confined is not None:
         return PdfResult(False, None, confined, exe)
+    snap = is_snap(exe)
     with tempfile.TemporaryDirectory(prefix="ai-eda-pdf-", ignore_cleanup_errors=True) as tmp:
-        profile = Path(tmp) / "profile"
+        if snap:  # a snap has its own /tmp: the profile goes where the snap and this process see the same folder
+            try:
+                profile = Path(tempfile.mkdtemp(prefix=SNAP_PROFILE_PREFIX, dir=pdf_abs.parent))
+            except OSError as e:
+                return PdfResult(False, None, f"cannot prepare a browser profile next to {pdf.name}: {e.strerror or e}", exe)
+        else:
+            profile = Path(tmp) / "profile"
         log = Path(tmp) / "stderr.txt"
         args = [str(exe), *PRINT_FLAGS, f"--user-data-dir={profile}", f"--print-to-pdf={pdf_abs}", html_abs.as_uri()]
         # stderr goes to a file, not a pipe: a helper process the browser leaves behind (its crash handler) would hold
@@ -633,6 +652,9 @@ def html_to_pdf(html_path: Path | str, pdf_path: Path | str, browser: Path | str
             return PdfResult(False, None, _reason(prefix, said) if said.strip() else prefix, exe, timed_out=True)
         except OSError as e:
             return PdfResult(False, None, f"cannot run {exe.name}: {e.strerror or e}", exe)
+        finally:
+            if snap:
+                shutil.rmtree(profile, ignore_errors=True)
         stderr = _read_text(log)
     if proc.returncode != 0:
         return PdfResult(False, None, _reason(f"exit code {proc.returncode}", stderr), exe)
@@ -660,6 +682,7 @@ __all__ = [
     "PLAYWRIGHT_GLOBS",
     "PRINT_FLAGS",
     "SNAP_PREFIX",
+    "SNAP_PROFILE_PREFIX",
     "WINDOWS_ROOT_ENVS",
     "WINDOWS_SUFFIXES",
     "FigureLike",

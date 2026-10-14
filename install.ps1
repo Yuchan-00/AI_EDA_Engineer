@@ -5,9 +5,9 @@
 #
 # On a machine with nothing set up it installs, without asking (Windows shows its own UAC prompt where an
 # installer needs administrator rights):
-#   1. the code   - this checkout, else the repository into %USERPROFILE%\AI_EDA_Engineer (git clone; without git,
-#                   or when the clone fails, the branch's zip, unpacked in a folder beside the target so that it is
-#                   moved on one drive)
+#   1. the code   - this checkout (unless -Dir names another folder), else the repository into
+#                   %USERPROFILE%\AI_EDA_Engineer or -Dir (git clone; without git, or when the clone fails, the
+#                   branch's zip, unpacked in a folder beside the target so that it is moved on one drive)
 #   2. Python     - uv (Astral) into %USERPROFILE%\.local\bin, a uv-managed Python 3.12 and .venv with the package
 #   3. KiCad 10   - with winget (KiCad.KiCad), and with Chocolatey when winget is missing, fails or leaves no
 #                   KiCad 10; KiCad brings kicad-cli, the libraries and ngspice (bin\ngspice.dll)
@@ -15,13 +15,17 @@
 #   5. ai-eda     - %USERPROFILE%\.local\bin\ai-eda.cmd on the user PATH, KiCad's global library tables
 #                   (`ai-eda setup-kicad`, what KiCad's first start writes; also with -NoKicad when a KiCad is
 #                   already installed), then `ai-eda doctor` and `ai-eda selftest` (run only when setup-kicad
-#                   found a KiCad and its tables are in place)
-# Re-running it updates the code (git checkouts) and repairs whatever is missing.
+#                   found a KiCad and its tables are in place); a failing `ai-eda doctor` means ai-eda itself
+#                   does not run, and the installation check fails
+# Re-running it updates a git copy it downloaded (git pull; a zip copy, and the checkout it runs from - also when
+# -Dir names that checkout -, are yours to update) and repairs whatever is missing.
 #
 # Options (environment variables in brackets, for `irm ... | iex`, which passes no options; a switch's variable
 # is set to 1 - true and yes count too -, and either the switch or its variable turns it on):
-#   -Dir DIR        where to put the code when not run from a checkout [AI_EDA_DIR] (default
-#                   %USERPROFILE%\AI_EDA_Engineer; a relative DIR is taken from the current folder)
+#   -Dir DIR        where to put the code [AI_EDA_DIR] (default: the checkout this script runs from, else
+#                   %USERPROFILE%\AI_EDA_Engineer); it applies from a checkout too, and a DIR naming the folder
+#                   this script runs from is that checkout, never pulled; a relative DIR is taken from the
+#                   current folder
 #   -Branch NAME    branch to download [AI_EDA_BRANCH] (default main)
 #   -Python VER     Python version for the virtual environment [AI_EDA_PYTHON] (default 3.12)
 #   -NoKicad        do not install KiCad (without a KiCad the pipeline reports those checks NOT_VERIFIED)
@@ -35,13 +39,20 @@
 #
 # The same text runs as a file (install.cmd: powershell -File) and under `irm ... | iex` in Windows PowerShell
 # 5.1, where no parameter is bound, $PSCommandPath is empty and the text runs in the caller's own scope. So it
-# stays ASCII (5.1 reads a file without a BOM in the ANSI code page), uses nothing newer than PowerShell 5.1,
-# throws instead of exiting (an exit would close the user's window), keeps its other variables, functions and
-# preferences in a child scope (`& { ... }` below), and runs the uv / Claude Code installers in a child
-# powershell process, so that their own `exit`, parameters and strict mode stay there. Under `irm | iex` the
-# param block's variables ($Dir, $Branch, $Python, $NoKicad, $WithClaude, $NoPath, $SkipSelftest) are set in
-# the caller's scope, as any variable that text assigns there: a session variable of one of these names is
-# replaced.
+# stays ASCII (5.1 reads a file without a BOM in the ANSI code page), uses nothing newer than PowerShell 5.1 and
+# no script module (the default execution policy, Restricted, still runs `irm | iex` text but loads no .psm1 -
+# 5.1's Expand-Archive comes from one, so the zip is unpacked with .NET's ZipFile), throws instead of exiting (an
+# exit would close the user's window), keeps its other variables, functions and preferences in a child scope
+# (`& { ... }` below), and runs the uv / Claude Code installers in a child powershell process, so that their own
+# `exit`, parameters and strict mode stay there. Under `irm | iex` the param block's variables ($Dir, $Branch,
+# $Python, $NoKicad, $WithClaude, $NoPath, $SkipSelftest) are set in the caller's scope, as any variable that
+# text assigns there: a session variable of one of these names is replaced. The session's PATH is only appended
+# to (its entries keep their order, so an activated environment stays in front). The installation check's exit
+# status is left in $LASTEXITCODE, and one that is not 0 is also thrown: `powershell -c "irm ... | iex"` takes
+# its exit code from whether the command failed, never from $LASTEXITCODE, and so exits 1.
+# Native programs (git, uv, winget, choco, kicad-cli, ai-eda) are judged by their exit code alone: each runs with
+# $ErrorActionPreference "Continue", because where PowerShell captures their stderr (the ISE) every line of it is
+# an error record, which the script's "Stop" would turn into a terminating error.
 param(
     [string]$Dir = $env:AI_EDA_DIR,
     [string]$Branch = $(if ($env:AI_EDA_BRANCH) { $env:AI_EDA_BRANCH } else { "main" }),
@@ -69,29 +80,52 @@ param(
     function Die([string]$Text) { throw "error: $Text" }
     function Test-Flag([string]$Value) { return [bool]($Value -match '^(1|true|yes)$') }   # as install.sh's is_on
     function Test-Ascii([string]$Text) { return [bool]($Text -match '^[\x00-\x7F]*$') }
+    function Invoke-Native([string]$Exe, [string[]]$Arguments) {
+        # a native program, called as a statement (never assigned: its output would be captured with it); the
+        # caller judges it by $LASTEXITCODE alone. "Continue" here: where PowerShell captures a native program's
+        # stderr (the ISE) each line is an error record, which the script's "Stop" would make terminating (git's
+        # "Cloning into ...", uv's "Using CPython ..."); a program that cannot start still throws
+        $ErrorActionPreference = "Continue"
+        try { & $Exe @Arguments } catch { throw "$Exe could not be run: $_" }
+    }
     function Invoke-Step([string]$Exe, [string[]]$Arguments) {
         Write-Host "    + $Exe $($Arguments -join ' ')"
-        & $Exe @Arguments
+        Invoke-Native $Exe $Arguments
         if ($LASTEXITCODE -ne 0) { throw "$Exe exited $LASTEXITCODE" }
     }
     function Test-Command([string]$Name) { return [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+    function Get-Tool([string]$Name) {
+        # the copy in %USERPROFILE%\.local\bin (where uv's and Claude Code's installers put theirs) by its path,
+        # else whatever PATH finds: the session's PATH keeps its order (Update-SessionPath), so an activated
+        # environment's copy may come first there
+        $exe = Join-Path $LocalBin "$Name.exe"
+        if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
+        return $Name
+    }
     function Update-SessionPath {
-        # this session's PATH with %USERPROFILE%\.local\bin first and the registry's user and machine entries
-        # (what installers just added) appended where missing; never replaced, because under `irm | iex` it is the
-        # user's own window, whose activated environments must survive
-        $entries = @($LocalBin) + ($env:Path -split ";") +
+        # this session's PATH kept as it is - its entries, their order, duplicates and all - with
+        # %USERPROFILE%\.local\bin and the registry's user and machine entries (what installers just added)
+        # appended where missing: under `irm | iex` it is the user's own window, whose activated environments must
+        # stay in front (the installer runs its own uv by its path, Get-Tool, not by the order of PATH)
+        $current = [string]$env:Path
+        $seen = @{}
+        foreach ($entry in ($current -split ";")) {
+            if ($entry) { $seen[$entry.TrimEnd('\')] = $true }
+        }
+        $entries = @($LocalBin) +
             ([string][Environment]::GetEnvironmentVariable("Path", "User") -split ";") +
             ([string][Environment]::GetEnvironmentVariable("Path", "Machine") -split ";")
-        $seen = @{}
-        $kept = @()
+        $added = @()
         foreach ($entry in $entries) {
             if (-not $entry) { continue }
             $key = $entry.TrimEnd('\')
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
-            $kept += $entry
+            $added += $entry
         }
-        $env:Path = $kept -join ";"
+        if ($added.Count -eq 0) { return }
+        if ($current -and -not $current.EndsWith(";")) { $current += ";" }
+        $env:Path = $current + ($added -join ";")
     }
     function Resolve-FullPath([string]$Path) {
         # a relative path taken from the current folder, as git and uv would, so that what is written down (the
@@ -99,6 +133,24 @@ param(
         $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
         if ($full.Length -gt ([IO.Path]::GetPathRoot($full)).Length) { $full = $full.TrimEnd([char[]]@('\', '/')) }
         return $full
+    }
+    function Test-SameFolder([string]$First, [string]$Second) {
+        # one folder named twice: the full paths compared regardless of case, / against \ and trailing separators;
+        # else - a junction, a symbolic link or a subst drive naming it - an empty probe file made in the second
+        # folder (and removed at once) must be seen in the first. A folder that cannot be written is compared by
+        # its name only.
+        $one = Resolve-FullPath $First
+        $two = Resolve-FullPath $Second
+        if ($one.Replace('/', '\').TrimEnd('\') -ieq $two.Replace('/', '\').TrimEnd('\')) { return $true }
+        if (-not ((Test-Path -LiteralPath $one -PathType Container) -and (Test-Path -LiteralPath $two -PathType Container))) { return $false }
+        $name = ".ai-eda-same-folder-" + [Guid]::NewGuid().ToString("N")
+        $probe = [IO.Path]::Combine($two, $name)
+        try { [IO.File]::WriteAllBytes($probe, [byte[]]@()) } catch { return $false }
+        try {
+            return [bool](Test-Path -LiteralPath ([IO.Path]::Combine($one, $name)) -PathType Leaf)
+        } finally {
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        }
     }
     function Test-Checkout([string]$Path) {
         if (-not $Path) { return $false }
@@ -120,7 +172,10 @@ param(
             $zip = Join-Path $stage "src.zip"
             Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
             $tree = Join-Path $stage "x"
-            Expand-Archive -LiteralPath $zip -DestinationPath $tree
+            # .NET's ZipFile, not Expand-Archive: in 5.1 that comes from a script module
+            # (Microsoft.PowerShell.Archive.psm1), which the default Restricted policy refuses under `irm | iex`
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [IO.Compression.ZipFile]::ExtractToDirectory($zip, $tree)
             $top = Get-ChildItem -LiteralPath $tree -Directory | Select-Object -First 1
             if (-not $top) { Die "the zip from $url holds no folder" }
             if (Test-Path -LiteralPath $Target) {
@@ -153,7 +208,7 @@ param(
         try {
             $command = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; Invoke-RestMethod '$Url' | Invoke-Expression"
             Write-Host "    + powershell -NoProfile -ExecutionPolicy Bypass -Command `"irm $Url | iex`""
-            & (Get-WindowsPowerShell) -NoProfile -ExecutionPolicy Bypass -Command $command
+            Invoke-Native (Get-WindowsPowerShell) @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $command)
             if ($LASTEXITCODE -ne 0) { throw "the installer from $Url exited $LASTEXITCODE" }
         } finally {
             foreach ($name in @($saved.Keys)) { [Environment]::SetEnvironmentVariable($name, $saved[$name], "Process") }
@@ -174,9 +229,15 @@ param(
     # ----------------------------------------------------------------------- 1. the code
 
     $scriptDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { "" }
-    if ($scriptDir -and -not $Dir -and (Test-Checkout $scriptDir)) {
+    # -Dir replaces the checkout this script runs from, except when it names that very folder, which is then this
+    # checkout all the same: never pulled
+    $useScriptDir = $false
+    if ($scriptDir -and (Test-Checkout $scriptDir)) {
+        $useScriptDir = (-not $Dir) -or (Test-SameFolder $Dir $scriptDir)
+    }
+    if ($useScriptDir) {
         $AppDir = $scriptDir
-        Say "code: this checkout ($AppDir)"
+        Say "code: this checkout ($AppDir; update it yourself with git pull)"
     } else {
         $AppDir = if ($Dir) { Resolve-FullPath $Dir } else { Join-Path $env:USERPROFILE "AI_EDA_Engineer" }
         if (Test-Checkout $AppDir) {
@@ -217,11 +278,20 @@ param(
     if (-not (Test-Command uv)) {
         Die "uv is not available after its installer ran (looked on PATH and in $LocalBin); install uv as https://docs.astral.sh/uv/getting-started/installation/ says and run this installer again"
     }
+    $uv = Get-Tool uv
     Say "Python $Python environment in $AppDir\.venv"
     $venv = Join-Path $AppDir ".venv"
-    Invoke-Step uv @("venv", "--allow-existing", "--python", $Python, $venv)
     $venvPython = Join-Path $venv "Scripts\python.exe"
-    Invoke-Step uv @("pip", "install", "--python", $venvPython, "-e", "$AppDir[llm,parts,dev]", "cryptography")
+    # from the project folder: uv reads a uv.toml or a pyproject.toml's [tool.uv] in the current folder and its
+    # parents, so the folder the installer is started from must not steer how ai-eda's environment is built (the
+    # user's own uv settings still apply)
+    Push-Location -LiteralPath $AppDir
+    try {
+        Invoke-Step $uv @("venv", "--allow-existing", "--python", $Python, $venv)
+        Invoke-Step $uv @("pip", "install", "--python", $venvPython, "-e", "$AppDir[llm,parts,dev]", "cryptography")
+    } finally {
+        Pop-Location
+    }
 
     # ----------------------------------------------------------------------- 3. KiCad 10 (with its ngspice)
 
@@ -234,7 +304,8 @@ param(
         $seen = @{}
         foreach ($place in @(@{ Root = $env:LOCALAPPDATA; Sub = "Programs\KiCad" }, @{ Root = $env:ProgramW6432; Sub = "KiCad" }, @{ Root = $env:ProgramFiles; Sub = "KiCad" }, @{ Root = "C:\Program Files"; Sub = "KiCad" })) {
             if (-not ([string]$place.Root -match '^([A-Za-z]:[\\/]|[\\/][\\/][^\\/])')) { continue }
-            $base = Join-Path $place.Root $place.Sub
+            # joined as text: Join-Path resolves the drive and throws where it does not exist (Windows on D:, no C:)
+            $base = [IO.Path]::Combine([string]$place.Root, $place.Sub)
             $key = $base.TrimEnd('\')
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
@@ -271,10 +342,17 @@ param(
         if ($best) { return $best.Exe }
         return $null
     }
+    function Get-KicadVersion([string]$Cli) {
+        # the first line `kicad-cli version` prints ("10.0.6"), "" when it cannot start or exits non-zero; its
+        # stderr (library noise on some systems) is dropped, and with "Continue" it never stops the script
+        if (-not $Cli) { return "" }
+        $ErrorActionPreference = "Continue"
+        try { $lines = @(& $Cli version 2>$null) } catch { return "" }   # a kicad-cli that cannot start
+        if (($LASTEXITCODE -ne 0) -or ($lines.Count -eq 0)) { return "" }
+        return [string]$lines[0]
+    }
     function Get-KicadMajor([string]$Cli) {
-        if (-not $Cli) { return 0 }
-        try { $text = (& $Cli version) | Select-Object -First 1 } catch { return 0 }   # a kicad-cli that cannot start
-        if ([string]$text -match '^(\d+)\.') { return [int]$Matches[1] }
+        if ((Get-KicadVersion $Cli) -match '^(\d+)\.') { return [int]$Matches[1] }
         return 0
     }
 
@@ -283,7 +361,7 @@ param(
     } else {
         $cli = Find-KicadCli
         if ((Get-KicadMajor $cli) -ge 10) {
-            Say "KiCad $(& $cli version) is already installed ($cli)"
+            Say "KiCad $(Get-KicadVersion $cli) is already installed ($cli)"
         } else {
             Say "KiCad 10 (KiCad brings kicad-cli, the libraries and ngspice)"
             # winget first; Chocolatey when winget is missing, fails (App Installer disabled by policy, no network
@@ -311,7 +389,7 @@ param(
             if ((Get-KicadMajor $cli) -lt 10) {
                 Die "KiCad 10 was not found after trying $($managers -join ' and ') (looked in $((Get-KicadBases) -join ', ')); install it from https://www.kicad.org/download/windows/ and run this installer again"
             }
-            Say "KiCad $(& $cli version) installed ($cli)"
+            Say "KiCad $(Get-KicadVersion $cli) installed ($cli)"
         }
         # ai-eda takes a kicad-cli on PATH before the installed ones (ai_eda.tools.kicad.install)
         $onPath = Get-Command kicad-cli -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -424,7 +502,7 @@ param(
         # Also with -NoKicad, for a KiCad installed some other way; an existing table is never changed.
         Say "KiCad's global library tables (ai-eda setup-kicad)"
         $kicadReady = $false
-        & $aiEda setup-kicad
+        Invoke-Native $aiEda @("setup-kicad")
         if ($LASTEXITCODE -eq 0) {
             $kicadReady = $true
         } elseif (-not $NoKicad) {
@@ -433,15 +511,20 @@ param(
             Say "no usable KiCad (-NoKicad): after installing KiCad 10, run ai-eda setup-kicad"
         }
         Say "ai-eda doctor"
-        & $aiEda doctor
+        Invoke-Native $aiEda @("doctor")
+        # doctor without --strict exits 0 whenever it runs: anything else is ai-eda itself failing (an import error)
+        if ($LASTEXITCODE -ne 0) {
+            Warn "ai-eda doctor failed (exit status $LASTEXITCODE): ai-eda itself does not run (see the error above)"
+            $status = 1
+        }
         # the KiCad this run was to install is not usable: the installation did not do what it was asked
         if ((-not $kicadReady) -and (-not $NoKicad)) { $status = 1 }
         if ($SkipSelftest) {
             Say "ai-eda selftest skipped (-SkipSelftest / AI_EDA_SKIP_SELFTEST)"
         } elseif ($kicadReady) {
             Say "ai-eda selftest (designs the 12 V -> 5 V divider end to end)"
-            & $aiEda selftest
-            $status = $LASTEXITCODE
+            Invoke-Native $aiEda @("selftest")
+            if ($LASTEXITCODE -ne 0) { $status = $LASTEXITCODE }
         } elseif (-not $NoKicad) {
             Warn "ai-eda selftest not run: KiCad is not ready (ai-eda setup-kicad failed above)"
         } else {
@@ -456,8 +539,11 @@ param(
     Write-Host "  ai-eda doctor                     what was found"
     Write-Host "  ai-eda gui --open                 the local web GUI (Korean)"
     if (-not $NoPath) { Write-Host "Open a new terminal so that 'ai-eda' is found on PATH." }
-    if ($PSCommandPath) { exit $status }   # run as a file (install.cmd): the selftest's status is the exit code
-    # under `irm | iex` the window stays open; the status is left in $LASTEXITCODE for a calling script
-    if ($status -ne 0) { Write-Host "the installation check failed (exit status $status)" -ForegroundColor Yellow }
+    if ($PSCommandPath) { exit $status }   # run as a file (install.cmd): the check's status is the exit code
+    # under `irm | iex` the window stays open: the status is left in $LASTEXITCODE for a calling script, and one
+    # that is not 0 is also thrown, because `powershell -c "irm ... | iex"` exits 1 only when the command failed
+    # (with -Command, Windows PowerShell never reads $LASTEXITCODE for its exit code); a throw, like Die's, leaves
+    # the window open
     $global:LASTEXITCODE = $status
+    if ($status -ne 0) { throw "the installation check failed (exit status $status)" }
 }

@@ -12,6 +12,7 @@ import hashlib
 import math
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -173,6 +174,42 @@ def test_binary_runner_is_optional_and_unavailable_here(tmp_path: Path):
     assert NgspiceRunner.batch_deck("t\r\nR1 a 0 1k\r\n", "op") == "t\nR1 a 0 1k\n.op\n.end\n"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="a #! script stands in for the binary")
+def test_the_batch_binary_reads_no_spiceinit(tmp_path: Path):
+    """ngspice 45 and later read ``.spiceinit`` from the deck's folder (the output folder) before the working directory;
+    ``-n`` (``--no-spiceinit``) keeps every one out, and the binary still runs in an empty folder."""
+    log = tmp_path / "argv.log"
+    fake = tmp_path / "bin" / "ngspice"
+    fake.parent.mkdir()
+    fake.write_text(f"#!/bin/sh\necho \"$PWD|$*\" >> '{log}'\necho 'ngspice-99 : fake'\n", encoding="utf-8")
+    fake.chmod(0o755)
+    out = tmp_path / "out"
+    deck = write_deck(tmp_path, "divider", DIVIDER)
+    res = NgspiceRunner(binary=str(fake)).run(deck, SpiceAnalysis.OP, out)
+    assert not res.succeeded  # the fake writes no rawfile
+    run_line = next(ln for ln in log.read_text(encoding="utf-8").splitlines() if "--version" not in ln)
+    cwd, argv = run_line.split("|", 1)
+    assert argv.split()[:3] == ["-n", "-b", "-r"] and argv.endswith(str(out.resolve() / "divider.op.cir"))
+    assert Path(cwd).name.startswith("ai-eda-ngspice-") and not Path(cwd).exists()
+
+
+@pytest.mark.skipif(shutil.which("ngspice") is None, reason="no ngspice binary on PATH")
+def test_the_real_batch_binary_skips_the_users_and_the_output_folders_spiceinit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Without ``-n`` ngspice-42 sources ``~/.spiceinit`` (measured 2026-10-14: its ``echo`` line is in the log); 45 and
+    later also the deck folder's. With ``-n`` neither is read and ``spinit`` still loads the code models."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".spiceinit").write_text("echo ai_eda_home_spiceinit_probe\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / ".spiceinit").write_text("echo ai_eda_deckdir_spiceinit_probe\n", encoding="utf-8")
+    res = NgspiceRunner().run(write_deck(tmp_path, "gain", GAIN), SpiceAnalysis.OP, out)
+    assert res.succeeded, res.errors
+    assert "ai_eda_home_spiceinit_probe" not in res.log and "ai_eda_deckdir_spiceinit_probe" not in res.log
+    assert abs(res.vectors["out"][0] - 3.0) < 1e-9  # the XSPICE gain block: spinit's code models are loaded
+
+
 def test_bind_reset_is_optional_for_builds_without_ngspice_reset():
     """KiCad's ngspice-46 exports ``ngSpice_Reset``; Debian/Ubuntu ``libngspice0`` (ngspice-42) does not - the runner still loads it."""
     from ctypes import c_int
@@ -196,6 +233,103 @@ def test_recover_without_ngspice_reset_marks_the_engine_dead_with_the_reason():
     with pytest.raises(EngineDead, match="does not export ngSpice_Reset"):
         eng.recover()
     assert eng.dead and "restart the process" in eng.dead_reason
+
+
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="Windows does not delete a process's working directory")
+
+
+def test_the_engine_starts_in_an_empty_folder_and_returns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from ai_eda.tools.spice import ngspice_shared
+
+    home = tmp_path / "project"
+    home.mkdir()
+    (home / ".spiceinit").write_text("shell touch planted\n", encoding="utf-8")
+    monkeypatch.chdir(home)
+    with ngspice_shared._empty_working_directory():
+        inside = Path(os.getcwd())
+        assert inside != home and inside.name.startswith("ai-eda-ngspice-init-") and os.listdir(inside) == []
+    assert Path(os.getcwd()) == home and not inside.exists()
+    with pytest.raises(RuntimeError), ngspice_shared._empty_working_directory():
+        raise RuntimeError("back home on the way out too")
+    assert Path(os.getcwd()) == home
+
+
+@POSIX_ONLY
+def test_a_deleted_working_directory_is_no_reason_to_fail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """``os.getcwd()`` raises once the working directory is removed (a shell left in a deleted folder): that folder holds no
+    ``.spiceinit``, so the block runs in the empty folder all the same and the process stays there - nowhere to return to."""
+    from ai_eda.tools.spice import ngspice_shared
+
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    with pytest.raises(OSError):
+        os.getcwd()
+    with ngspice_shared._empty_working_directory():
+        inside = Path(os.getcwd())
+        assert inside.name.startswith("ai-eda-ngspice-init-") and os.listdir(inside) == []
+    assert not inside.exists()  # removed after the block, with the process still in it
+
+
+def test_an_empty_folder_that_cannot_be_made_or_entered_is_tool_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import contextlib
+
+    from ai_eda.tools.spice import ngspice_shared
+
+    def no_folder(**kwargs):
+        raise PermissionError(13, "Permission denied", str(tmp_path))
+
+    monkeypatch.setattr(ngspice_shared.tempfile, "TemporaryDirectory", no_folder)
+    with pytest.raises(ToolUnavailableError, match="cannot create an empty folder"):
+        with ngspice_shared._empty_working_directory():
+            pass
+    not_a_folder = tmp_path / "file"
+    not_a_folder.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(ngspice_shared.tempfile, "TemporaryDirectory", lambda **kwargs: contextlib.nullcontext(str(not_a_folder)))
+    with pytest.raises(ToolUnavailableError, match="cannot enter the empty folder"):
+        with ngspice_shared._empty_working_directory():
+            pass
+    with pytest.raises(ToolUnavailableError, match="cannot enter the empty folder"):  # at engine start: not a raw OSError
+        _Engine(tmp_path / "libngspice.so.0", None)
+
+
+def test_the_library_is_loaded_and_the_engine_started_in_the_empty_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The dynamic loader resolves an empty or relative ``LD_LIBRARY_PATH`` entry against the working directory when the
+    library's dependencies load, and ``ngSpice_Init`` / the code models read ``./.spiceinit``: both run in the empty folder."""
+    from unittest import mock
+
+    from ai_eda.tools.spice import ngspice_shared
+
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    seen: dict[str, Path] = {}
+
+    def fake_cdll(path: str):
+        seen["load"] = Path(os.getcwd())
+        assert os.listdir(".") == []
+        return mock.MagicMock()
+
+    def fake_init(self) -> None:
+        seen["init"] = Path(os.getcwd())
+
+    monkeypatch.setattr(ngspice_shared.ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(_Engine, "_init_engine", fake_init)
+    eng = _Engine(tmp_path / "libngspice.so.0", None)
+    assert seen["load"] == seen["init"] != project and seen["load"].name.startswith("ai-eda-ngspice-init-")
+    assert Path(os.getcwd()) == project
+    eng.lib.ngSpice_Reset.return_value = 0
+    eng.recover()  # ngSpice_Init again: in an empty folder again
+    assert seen["init"] != project and seen["init"].name.startswith("ai-eda-ngspice-init-") and Path(os.getcwd()) == project
+
+    def no_folder(**kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ngspice_shared.tempfile, "TemporaryDirectory", no_folder)
+    with pytest.raises(EngineDead, match="cannot restart ngspice"):
+        eng.recover()
+    assert eng.dead
 
 
 def test_informational_stderr_is_kept_in_the_transcript_but_is_not_an_error():
@@ -448,6 +582,89 @@ if sys.argv[1] == "unguarded":  # the control: what ngspice itself does with the
     ngspice_shared._empty_working_directory = contextlib.nullcontext
 print(json.dumps(ngspice_shared.NgspiceShared().engine_settings()))
 """
+
+
+_VERSION_PROBE = """
+from ai_eda.tools.spice.ngspice_shared import NgspiceShared
+print(NgspiceShared().version())
+"""
+
+
+def _needs_libgomp() -> bool:
+    import subprocess
+
+    dll = NgspiceShared().dll_path
+    ldd = shutil.which("ldd")
+    if dll is None or ldd is None or not sys.platform.startswith("linux"):
+        return False
+    out = subprocess.run([ldd, str(dll)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    return "libgomp.so.1" in out.stdout
+
+
+@needs_dll
+@pytest.mark.skipif(not sys.platform.startswith("linux") or shutil.which("gcc") is None, reason="builds a shared object with gcc (Linux)")
+def test_a_relative_ld_library_path_entry_cannot_lend_ngspice_a_dependency(tmp_path: Path):
+    """Reported by the installer review: with ``LD_LIBRARY_PATH=:/opt/x/lib`` (an empty entry: the working directory) the
+    loader took ``libgomp.so.1`` from the project folder while loading ngspice. The library is loaded in the empty folder.
+    Measured 2026-10-14 (ngspice-42): before the fix the planted file was taken - "undefined symbol: GOMP_single_start" -
+    and the engine was unusable; now the system's libgomp is."""
+    import subprocess
+
+    if not _needs_libgomp():
+        pytest.skip("this ngspice library does not need libgomp.so.1")
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = tmp_path / "planted-constructor-ran"
+    source = tmp_path / "planted.c"
+    source.write_text(
+        '#include <stdio.h>\n__attribute__((constructor)) static void planted(void) { FILE *f = fopen("%s", "a"); if (f) { fputs("ran", f); fclose(f); } }\n' % marker,
+        encoding="utf-8",
+    )
+    built = subprocess.run(
+        ["gcc", "-shared", "-fPIC", "-Wl,-soname,libgomp.so.1", "-o", str(project / "libgomp.so.1"), str(source)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+    )
+    if built.returncode != 0:
+        pytest.skip(f"gcc could not build the planted library: {built.stderr.strip()[:200]}")
+    repo = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(repo), os.environ.get("PYTHONPATH", "")]),
+        "LD_LIBRARY_PATH": os.pathsep + str(tmp_path / "opt" / "lib"),
+    }
+    out = subprocess.run(
+        [sys.executable, "-c", _VERSION_PROBE], cwd=project, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip().splitlines()[-1].startswith("ngspice-") and not marker.exists()
+
+
+_DELETED_CWD_PROBE = """
+import os, sys
+os.chdir(sys.argv[1])
+os.rmdir(sys.argv[1])
+from ai_eda.tools.spice.ngspice_shared import NgspiceShared
+print(NgspiceShared().version())
+"""
+
+
+@needs_dll
+@POSIX_ONLY
+def test_the_engine_starts_from_a_deleted_working_directory(tmp_path: Path):
+    """Reported by the installer review: ``ai-eda run`` started from a deleted folder died with a raw FileNotFoundError at
+    the SPICE stage (``os.getcwd()``); the engine starts (its own process: the engine is a process-wide singleton)."""
+    import subprocess
+    import sys
+
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    repo = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(repo), os.environ.get("PYTHONPATH", "")])}
+    out = subprocess.run(
+        [sys.executable, "-c", _DELETED_CWD_PROBE, str(gone)], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip().splitlines()[-1].startswith("ngspice-")
 
 
 @needs_dll

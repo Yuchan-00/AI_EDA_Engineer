@@ -50,7 +50,19 @@ Code login, PATH, never read or shown here - with these additions:
 ``PYTHONIOENCODING=utf-8`` (the log is UTF-8 even under a cp949 console)
 and ``PYTHONUNBUFFERED=1`` (stdout and stderr reach the log in the order
 they were written, while the run is going); on Windows a third,
-``NoDefaultCurrentDirectoryInExePath=1``. The CLI itself never finds a tool
+``NoDefaultCurrentDirectoryInExePath=1``. The dynamic loader's search
+paths (``LD_LIBRARY_PATH``, ``DYLD_LIBRARY_PATH``,
+``DYLD_FALLBACK_LIBRARY_PATH``) reach the child without their empty and
+relative entries (unset when none is left): the loader searches such an
+entry relative to the working directory, so ``LD_LIBRARY_PATH=:/opt/x/lib``
+(what ``export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/x/lib`` makes of an
+unset variable) let a project folder's ``libc.so.6`` or ``libgomp.so.1``
+into the child (reported by the installer review: a planted ``libgomp.so.1``
+ran its constructor in the CLI child), and ``PYTHONPATH`` likewise: Python
+puts an empty or relative entry on ``sys.path`` relative to the working
+directory, which ``-P`` does not remove, so ``PYTHONPATH=:/opt/x`` would
+let a project folder's ``ai_eda`` package or ``json.py`` run in the child
+(:data:`CHILD_PATH_VARS`). The CLI itself never finds a tool
 in the workdir on any system (``kicad-cli``, ``claude``, a browser, an
 ``ngspice`` binary are looked up on PATH's absolute entries only:
 :func:`ai_eda.tools.kicad.install.which_absolute`); the variable keeps
@@ -88,6 +100,7 @@ except ImportError:  # Windows: no flock (see the module docstring)
 
 from ai_eda.cli import RUN_OPTIONS, RunOption, build_parser, run_option_flags
 from ai_eda.gui.projects import ProjectInfo, openable_project_name
+from ai_eda.tools.kicad.install import LOADER_PATH_VARS, absolute_entries
 from ai_eda.workdir import WorkdirMismatchError, is_locked
 
 #: what a run can be: the CLI subcommands the GUI starts
@@ -112,6 +125,9 @@ CHILD_ENV_ADDITIONS: dict[str, str] = {
     "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1",
     **({"NoDefaultCurrentDirectoryInExePath": "1"} if os.name == "nt" else {}),
 }
+#: variables whose empty and relative entries the child does not get: an entry relative to the working directory (the
+#: project folder of a run) in the dynamic loader's search paths or in Python's module path
+CHILD_PATH_VARS: tuple[str, ...] = (*LOADER_PATH_VARS, "PYTHONPATH")
 #: what every run starts with: ``-P`` keeps the child's working directory (the workdir) off ``sys.path``
 CLI_PYTHON_ARGS: tuple[str, ...] = (sys.executable, "-P", "-m", "ai_eda.cli")
 
@@ -328,8 +344,19 @@ def form_args(kind: str, answers: Mapping[str, Any] | None = None, options: Mapp
 
 
 def child_env() -> dict[str, str]:
-    """The run's environment: the user's own, read when the run starts, plus :data:`CHILD_ENV_ADDITIONS`."""
-    return {**os.environ, **CHILD_ENV_ADDITIONS}
+    """The run's environment: the user's own, read when the run starts, plus :data:`CHILD_ENV_ADDITIONS` - without
+    the empty and relative entries of :data:`CHILD_PATH_VARS` (the dynamic loader's search paths and ``PYTHONPATH``;
+    a variable with none left is unset)."""
+    env = {**os.environ, **CHILD_ENV_ADDITIONS}
+    for name in CHILD_PATH_VARS:
+        if name not in env:
+            continue
+        kept = absolute_entries(env[name])
+        if kept:
+            env[name] = os.pathsep.join(kept)
+        else:
+            del env[name]
+    return env
 
 
 def command_line(argv: Sequence[str]) -> str:

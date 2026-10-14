@@ -317,6 +317,23 @@ def test_find_browser_windows_and_macos_paths(isolated: Path, monkeypatch: pytes
     assert find_browser() == mac
 
 
+def test_find_browser_windows_takes_chrome_in_any_root_before_edge_in_any(isolated: Path, monkeypatch: pytest.MonkeyPatch):
+    """Chrome installed without admin rights lives in ``%LOCALAPPDATA%``; every Windows has Edge in ``Program Files (x86)``.
+    README: Chrome, else Edge - so the browser loop is the outer one."""
+    assert pdf.WINDOWS_SUFFIXES[0].endswith("chrome.exe") and pdf.WINDOWS_SUFFIXES[1].endswith("msedge.exe")
+    edge = _executable(isolated / "pf86" / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+    monkeypatch.setenv("ProgramFiles(x86)", str(isolated / "pf86"))
+    assert find_browser() == edge
+    chrome = _executable(isolated / "lad" / "Google" / "Chrome" / "Application" / "chrome.exe")
+    monkeypatch.setenv("LOCALAPPDATA", str(isolated / "lad"))
+    assert find_browser() == chrome
+    machine_edge = _executable(isolated / "pf" / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+    monkeypatch.setenv("ProgramFiles", str(isolated / "pf"))
+    assert find_browser() == chrome  # Edge in the first root still loses to Chrome in the last
+    chrome.unlink()
+    assert find_browser() == machine_edge  # no Chrome anywhere: Edge, in root order
+
+
 def test_find_browser_never_takes_a_relative_variable_or_the_working_directory(isolated: Path, monkeypatch: pytest.MonkeyPatch):
     """A project folder (where GUI runs start) can not supply the program that is run: relative variables are unset, PATH is read
     through its absolute entries only."""
@@ -359,6 +376,20 @@ def test_find_browser_macos_knows_chrome_then_edge_then_chromium(isolated: Path,
 
     monkeypatch.setattr(kicad_install, "platform", lambda: "darwin")
     assert all(name in remedy("browser") for name in ("Google Chrome", "Microsoft Edge", "Chromium"))
+
+
+@pytest.mark.parametrize("system", ["darwin", "win32", "linux"])
+def test_doctor_names_this_systems_browser_remedy_when_none_is_found(isolated: Path, monkeypatch: pytest.MonkeyPatch, system: str):
+    """Like the KiCad and ngspice lines, the browser's NOT FOUND line of ``ai-eda doctor`` ends with the install remedy."""
+    from ai_eda.cli import _browser_line
+    from ai_eda.setup_help import remedy
+
+    monkeypatch.setattr(kicad_install, "platform", lambda: system)
+    line = _browser_line()
+    assert line.startswith(f"browser (pdf): NOT FOUND (chrome / edge / chromium on PATH, a Playwright install, or {pdf.BROWSER_ENV} set to")
+    assert line.endswith(f"stage reports are written as .md + .html only)  - {remedy('browser')}")
+    fake = _executable(isolated / "empty" / ("msedge.exe" if system == "win32" else "chromium"))
+    assert _browser_line().startswith(f"browser (pdf): {fake}") and "NOT FOUND" not in _browser_line()
 
 
 _PW_REAL = [p for root in pdf.PLAYWRIGHT_DEFAULT_ROOTS for pattern in pdf.PLAYWRIGHT_GLOBS for p in root.glob(pattern) if p.is_file()]
@@ -451,6 +482,8 @@ def test_html_to_pdf_ok_with_a_browser_that_writes(tmp_path: Path, html_file: Pa
     assert argv[-1] == html_file.resolve().as_uri() and argv[-1].startswith("file:///")
     assert argv[-2] == f"--print-to-pdf={out.resolve()}"
     assert sum(a.startswith("--user-data-dir=") for a in argv) == 1
+    profile = Path(next(a for a in argv if a.startswith("--user-data-dir="))[len("--user-data-dir="):])
+    assert out.parent.resolve() not in profile.parents  # not a snap: the system temp folder, as before
     assert browser_version(fake) == "FakeBrowser 1.0"
 
 
@@ -487,6 +520,50 @@ def test_a_snap_browser_is_not_started_on_a_file_it_cannot_read(tmp_path: Path, 
     assert pdf.snap_confinement_problem(wrapper, [home / "projects" / "r.html", home / "projects" / ".x" / "r.pdf"]) is None
     monkeypatch.setattr(kicad_install, "platform", lambda: "darwin")
     assert not pdf.is_snap(wrapper)
+
+#: a snap browser stand-in: the first line names ``/snap/bin/`` as Ubuntu's ``chromium-browser`` launcher does; it fills
+#: its profile as Chromium does and records what it saw next to the PDF
+FAKE_SNAP = f"""# as Ubuntu's chromium-browser: exec /snap/bin/chromium "$@"
+import json, os, sys, time
+arg = lambda name: [a for a in sys.argv[1:] if a.startswith(name)][0][len(name):]
+target, profile = arg("--print-to-pdf="), arg("--user-data-dir=")
+seen = {{"profile": profile, "was_a_folder": os.path.isdir(profile)}}
+os.makedirs(os.path.join(profile, "Default"), exist_ok=True)
+open(os.path.join(profile, "Default", "Preferences"), "w").write("{{}}")
+open(target + ".seen.json", "w", encoding="utf-8").write(json.dumps(seen))
+name = os.path.basename(sys.argv[0])
+if name == "chromium-fails":
+    sys.exit(1)
+if name == "chromium-hangs":
+    time.sleep(5)
+open(target, "wb").write({MINIMAL_PDF!r})
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a snap is Linux; the stand-in is a #! script")
+@pytest.mark.parametrize("name", ["chromium-browser", "chromium-fails", "chromium-hangs"])
+def test_a_snap_browsers_profile_is_made_next_to_the_pdf_and_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str):
+    """A snap has its own ``/tmp``: a profile under the system temp folder would be created there by the browser (about
+    3 MB per print) and never removed. It is a hidden folder next to the PDF - in a non-hidden home folder, which the
+    snap shares - removed after the print whatever happens."""
+    monkeypatch.setattr(kicad_install, "platform", lambda: "linux")
+    home = tmp_path / "home"
+    reports = home / "projects" / "demo" / "reports"
+    reports.mkdir(parents=True)
+    monkeypatch.setattr(pdf.Path, "home", staticmethod(lambda: home))
+    page = reports / "01.html"
+    page.write_text("<p>x</p>", encoding="utf-8")
+    snap = _fake_browser(tmp_path / "bin", name, FAKE_SNAP)
+    assert pdf.is_snap(snap)
+    out = reports / "01.pdf"
+    res = html_to_pdf(page, out, browser=snap, timeout_s=2)
+    assert res.ok is (name == "chromium-browser") and res.timed_out is (name == "chromium-hangs")
+    seen = json.loads(Path(str(out) + ".seen.json").read_text(encoding="utf-8"))
+    profile = Path(seen["profile"])
+    assert seen["was_a_folder"] and profile.parent == reports.resolve() and profile.name.startswith(pdf.SNAP_PROFILE_PREFIX)
+    assert not profile.exists()
+    assert sorted(p.name for p in reports.iterdir()) == sorted(["01.html", "01.pdf.seen.json"] + (["01.pdf"] if res.ok else []))
+
 
 def test_html_to_pdf_failure_reasons(tmp_path: Path, html_file: Path):
     out = tmp_path / "o.pdf"

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import ctypes.util
 import os
+import shutil
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -342,9 +344,47 @@ def test_absolute_path_only_drops_empty_and_relative_entries_for_the_block(tmp_p
         raise RuntimeError("restored on the way out too")
     assert os.environ["PATH"] == original
     monkeypatch.delenv("PATH")
-    with install.absolute_path_only():
-        assert os.environ["PATH"] == ""
+    with install.absolute_path_only():  # never empty: an empty PATH is the working directory to os.get_exec_path
+        assert os.environ["PATH"] == install.default_path() and os.environ["PATH"]
+        assert all(Path(e).is_absolute() for e in os.environ["PATH"].split(os.pathsep))
     assert "PATH" not in os.environ
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", "bin"]))
+    with install.absolute_path_only():
+        assert os.environ["PATH"] == install.default_path()
+        assert "" not in os.get_exec_path() and "." not in os.get_exec_path()
+    assert os.environ["PATH"] == os.pathsep.join(["", ".", "bin"])
+
+
+def test_the_default_path_is_the_systems_absolute_one():
+    default = install.default_path()
+    assert default and all(e and Path(e).is_absolute() for e in default.split(os.pathsep))
+    if hasattr(os, "confstr"):
+        try:
+            cs_path = os.confstr("CS_PATH")
+        except (ValueError, OSError):
+            cs_path = None
+        if cs_path and install.absolute_entries(cs_path):
+            assert default == os.pathsep.join(install.absolute_entries(cs_path))
+
+
+def test_absolute_path_only_cuts_the_library_search_paths_it_is_given(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    keep, link = str(tmp_path / "lib"), str(tmp_path / "link")
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    monkeypatch.setenv("LD_LIBRARY_PATH", os.pathsep.join(["", "lib", keep, "."]))
+    monkeypatch.setenv("LIBRARY_PATH", os.pathsep.join(["", link, "lib"]))
+    monkeypatch.setenv("COMPILER_PATH", ".")
+    monkeypatch.delenv("DYLD_LIBRARY_PATH", raising=False)
+    monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", "")
+    before = {name: os.environ.get(name) for name in install.FIND_LIBRARY_PATH_VARS}
+    with install.absolute_path_only(*install.FIND_LIBRARY_PATH_VARS):
+        assert os.environ["LD_LIBRARY_PATH"] == keep
+        assert "COMPILER_PATH" not in os.environ and "DYLD_LIBRARY_PATH" not in os.environ and "DYLD_FALLBACK_LIBRARY_PATH" not in os.environ
+        assert os.environ["LIBRARY_PATH"] == link
+        assert os.environ["PATH"] == str(tmp_path / "bin")
+    assert {name: os.environ.get(name) for name in install.FIND_LIBRARY_PATH_VARS} == before
+    with install.absolute_path_only():  # PATH alone unless named
+        assert os.environ["LD_LIBRARY_PATH"] == before["LD_LIBRARY_PATH"]
+    assert set(install.LOADER_PATH_VARS) < set(install.LIBRARY_PATH_VARS) < set(install.FIND_LIBRARY_PATH_VARS)
 
 
 @POSIX_ONLY
@@ -361,6 +401,99 @@ def test_the_system_ngspice_lookup_runs_no_tool_from_the_working_directory(tmp_p
         ctypes.util.find_library("ai-eda-no-such-library")
     find_system_ngspice()
     assert not marker.exists()
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize("path", [None, ".", os.pathsep, "bin"])
+def test_an_unset_or_relative_path_runs_no_tool_from_the_working_directory(tmp_path: Path, clean_env: pytest.MonkeyPatch, path: str | None):
+    """With no absolute PATH entry the guard falls back to the system default, never to an empty PATH: subprocess reads an
+    empty PATH as the working directory, where ``ctypes.util`` runs ``ld`` once the loader cache does not know the name."""
+    clean_env.setattr(install, "platform", lambda: "linux")
+    project = tmp_path / "project"
+    marker = tmp_path / "ran-from-the-working-directory"
+    for tool in ("gcc", "cc", "ld", "objdump", "ldconfig", "collect2", "x86_64-linux-gnu-gcc"):
+        planted = f"#!/bin/sh\necho \"$0 $*\" >> '{marker}'\nexit 1\n"  # shell builtins only: with PATH empty there is no touch
+        _executable(project / tool, planted)
+        _executable(project / "bin" / tool, planted)
+    clean_env.chdir(project)
+    if path is None:
+        clean_env.delenv("PATH", raising=False)
+    else:
+        clean_env.setenv("PATH", path)
+    for name in ("LIBRARY_PATH", "COMPILER_PATH"):
+        clean_env.setenv(name, ".")
+    with install.absolute_path_only(*install.FIND_LIBRARY_PATH_VARS):
+        assert os.environ["PATH"] and "" not in os.get_exec_path()
+        ctypes.util.find_library("ai-eda-no-such-library")
+    clean_env.setattr(ctypes.util, "_findSoname_ldconfig", lambda name: None, raising=False)  # as on a machine without ngspice
+    find_system_ngspice()
+    assert not marker.exists()
+    assert os.environ.get("PATH") == path  # restored, unset included
+
+
+@pytest.mark.parametrize("soname", ["../evil/libngspice.so", "evil/libngspice.so", "/proc/self/cwd/libngspice.so", "..", "."])
+def test_a_soname_that_is_not_a_bare_file_name_is_no_library(tmp_path: Path, clean_env: pytest.MonkeyPatch, soname: str):
+    """``find_library`` returns whatever SONAME the file it found carries: one with a folder in it would lead the
+    library-directory search into the working directory (``../../../proc/self/cwd/lib/libngspice.so``)."""
+    clean_env.setattr(install, "platform", lambda: "linux")
+    clean_env.setattr(ctypes.util, "find_library", lambda name: soname if name == "ngspice" else None)
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (tmp_path / "evil").mkdir()
+    (tmp_path / "evil" / "libngspice.so").write_bytes(b"")
+    (lib / "evil").mkdir()
+    (lib / "evil" / "libngspice.so").write_bytes(b"")
+    clean_env.chdir(tmp_path)
+    (tmp_path / "libngspice.so").write_bytes(b"")
+    clean_env.setenv("LD_LIBRARY_PATH", str(lib))
+    assert find_system_ngspice() is None
+    clean_env.setattr(ctypes.util, "find_library", lambda name: "libngspice.so" if name == "ngspice" else None)
+    (lib / "libngspice.so").write_bytes(b"")
+    assert find_system_ngspice() == (lib / "libngspice.so").resolve()  # a bare name in an absolute entry: found
+
+
+def test_on_macos_only_an_absolute_find_library_result_is_a_library(tmp_path: Path, clean_env: pytest.MonkeyPatch):
+    clean_env.setattr(install, "platform", lambda: "darwin")
+    clean_env.setattr(ngspice_shared, "_MACOS_HOMEBREW_LIBS", ())
+    clean_env.chdir(tmp_path)
+    (tmp_path / "libngspice.dylib").write_bytes(b"")
+    clean_env.setenv("LD_LIBRARY_PATH", str(tmp_path))
+    clean_env.setattr(ctypes.util, "find_library", lambda name: "libngspice.dylib" if name == "ngspice" else None)
+    assert find_system_ngspice() is None  # a relative result is the working directory's file
+    lib = tmp_path / "usr" / "lib" / "libngspice.0.dylib"
+    lib.parent.mkdir(parents=True)
+    lib.write_bytes(b"")
+    clean_env.setattr(ctypes.util, "find_library", lambda name: str(lib) if name == "ngspice" else None)
+    assert find_system_ngspice() == lib.resolve()
+    clean_env.setattr(ctypes.util, "find_library", lambda name: str(tmp_path / "missing.dylib") if name == "ngspice" else None)
+    assert find_system_ngspice() is None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or shutil.which("gcc") is None, reason="builds a shared object with gcc (Linux)")
+@pytest.mark.parametrize("variable", ["LD_LIBRARY_PATH", "LIBRARY_PATH"])
+def test_a_planted_library_with_a_path_soname_is_never_found(tmp_path: Path, clean_env: pytest.MonkeyPatch, variable: str):
+    """The verifier's reproduction: a project-folder ``lib/libngspice.so`` whose SONAME climbs to the working directory,
+    reached by ``ld -L lib`` (``LD_LIBRARY_PATH``) or ``gcc`` (``LIBRARY_PATH``) once the loader cache does not know
+    ``libngspice``. Neither route is offered to ``find_library`` and its answer must be a bare file name."""
+    import subprocess
+
+    clean_env.setattr(install, "platform", lambda: "linux")
+    project = tmp_path / "project"
+    (project / "lib").mkdir(parents=True)
+    source = tmp_path / "planted.c"
+    source.write_text("int ngSpice_Init(void) { return 0; }\n", encoding="utf-8")
+    soname = "../../../proc/self/cwd/lib/libngspice.so"
+    built = subprocess.run(
+        ["gcc", "-shared", "-fPIC", f"-Wl,-soname,{soname}", "-o", str(project / "lib" / "libngspice.so"), str(source)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+    )
+    if built.returncode != 0:
+        pytest.skip(f"gcc could not build the planted library: {built.stderr.strip()[:200]}")
+    clean_env.chdir(project)
+    clean_env.setenv(variable, "lib")
+    clean_env.setattr(ctypes.util, "_findSoname_ldconfig", lambda name: None, raising=False)  # no system libngspice
+    found = find_system_ngspice()
+    assert found is None or project.resolve() not in found.resolve().parents
 
 
 # --------------------------------------------------------------------------- relative environment overrides are unset

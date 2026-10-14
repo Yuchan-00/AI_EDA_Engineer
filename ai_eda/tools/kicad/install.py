@@ -117,25 +117,72 @@ def which_absolute(name: str) -> str | None:
     return None
 
 
+#: the dynamic loader's search path variables (Linux, macOS): an empty or relative entry is searched relative to the
+#: working directory when a library is loaded
+LOADER_PATH_VARS: tuple[str, ...] = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH")
+#: the library search path variables: the loader's and the linker's ``LIBRARY_PATH``
+LIBRARY_PATH_VARS: tuple[str, ...] = ("LD_LIBRARY_PATH", "LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH")
+#: what the programs ``ctypes.util.find_library`` runs read besides ``PATH``: ``ld -t -L <entry>`` gets every
+#: ``LD_LIBRARY_PATH`` entry, ``gcc`` reads ``LIBRARY_PATH`` (an empty entry there is the working directory too) and
+#: finds ``collect2`` / ``ld`` through ``COMPILER_PATH`` (measured 2026-10-14, gcc 13: an empty or relative
+#: ``COMPILER_PATH`` entry ran ``./collect2``), macOS' ``dyld`` search reads the ``DYLD_*`` variables
+FIND_LIBRARY_PATH_VARS: tuple[str, ...] = (*LIBRARY_PATH_VARS, "COMPILER_PATH")
+
+
+def absolute_entries(value: str | None) -> list[str]:
+    """The absolute entries of an ``os.pathsep``-separated search path, in order (empty and relative entries dropped)."""
+    return [e for e in (value or "").split(os.pathsep) if e and Path(e).is_absolute()]
+
+
+def default_path() -> str:
+    """The system's default command search path, absolute entries only - never empty.
+
+    ``os.confstr("CS_PATH")`` where the system has it (POSIX), else
+    ``os.defpath`` (what ``os.get_exec_path`` uses for an unset ``PATH``).
+    """
+    try:
+        cs_path: str | None = os.confstr("CS_PATH")
+    except (AttributeError, ValueError, OSError):  # Windows has no confstr; a system may not know the name
+        cs_path = None
+    for value in (cs_path, os.defpath):
+        kept = absolute_entries(value)
+        if kept:
+            return os.pathsep.join(kept)
+    return os.path.join(os.path.abspath(os.sep), "nonexistent")  # never reached with CPython's defpath; still absolute
+
+
 @contextmanager
-def absolute_path_only() -> Iterator[None]:
-    """``PATH`` without its empty and relative entries for the duration of the block (restored after it).
+def absolute_path_only(*names: str) -> Iterator[None]:
+    """``PATH`` and the search path variables ``names`` without their empty and relative entries for the block (restored after it).
 
     For library code that looks programs up itself with ``shutil.which`` -
     ``ctypes.util.find_library`` runs ``gcc`` / ``cc`` / ``ld`` / ``objdump``
-    on Linux when the loader cache does not know a name - so that a project
-    folder in the working directory cannot supply them either.
+    on Linux when the loader cache does not know a name, and hands them the
+    library search paths (:data:`FIND_LIBRARY_PATH_VARS`) - so that a
+    project folder in the working directory cannot supply them either.
+    ``PATH`` is never left empty: ``os.get_exec_path`` reads an empty
+    ``PATH`` as the working directory (``subprocess`` would run ``./ld``),
+    while an unset one means the system default, so with no absolute entry
+    left it is :func:`default_path`. A variable of ``names`` with no absolute
+    entry left is unset for the block.
     """
-    saved = os.environ.get("PATH")
-    entries = (saved or "").split(os.pathsep)
-    os.environ["PATH"] = os.pathsep.join(e for e in entries if e and Path(e).is_absolute())
+    saved = {name: os.environ.get(name) for name in ("PATH", *names)}
     try:
+        for name, value in saved.items():
+            kept = os.pathsep.join(absolute_entries(value))
+            if name == "PATH":
+                os.environ[name] = kept or default_path()
+            elif kept:
+                os.environ[name] = kept
+            else:
+                os.environ.pop(name, None)
         yield
     finally:
-        if saved is None:
-            os.environ.pop("PATH", None)
-        else:
-            os.environ["PATH"] = saved
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def version_key(path: Path) -> tuple[int, ...]:
@@ -471,7 +518,10 @@ __all__ = [
     "CODEMODEL_MARKER",
     "DEFAULT_PATHEXT",
     "DEFAULT_PROGRAM_FILES",
+    "FIND_LIBRARY_PATH_VARS",
+    "LIBRARY_PATH_VARS",
     "LIBRARY_TABLES",
+    "LOADER_PATH_VARS",
     "LibraryTable",
     "TEMPLATE_DIR",
     "MACOS_APP_LOCATIONS",
@@ -479,11 +529,13 @@ __all__ = [
     "MACOS_NGSPICE_DIRS",
     "MACOS_SHARE",
     "RELATIVE_CONFIG_HOME",
+    "absolute_entries",
     "absolute_path_only",
     "bundle_of",
     "bundled_codemodels",
     "bundled_ngspice",
     "config_dir_problem",
+    "default_path",
     "find_kicad_cli",
     "install_library_tables",
     "library_shares",

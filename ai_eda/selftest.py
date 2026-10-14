@@ -14,7 +14,9 @@ types.
 
 A required stage counts as "ran" only when its recorded status is a verdict
 (``PASS`` / ``FAIL``) whose message names no missing tool
-(:data:`MISSING_MARKERS`: "not available", "not found", ...); any other
+(:data:`MISSING_MARKERS`: "not available", "not found", ...) in its first
+clause (up to the first ``; ``: the DRC stage appends the schematic-parity
+reason there, which can quote kicad-cli's own stderr); any other
 status - ``NOT_VERIFIED`` for whatever reason, or ``NOT RUN`` when the
 pipeline stopped before the stage - fails the self-test. ARCHITECTURE, which
 proposes and never judges, counts when its message says the template's
@@ -54,7 +56,7 @@ FIRST_ANSWERS: tuple[str, ...] = (
     "output_voltage=5 V",
 )
 CONFIRM_ANSWER = "confirm_design=yes"
-#: words in a stage message that say a tool was missing rather than judged
+#: words in the first clause of a stage message that say a tool was missing rather than judged
 MISSING_MARKERS: tuple[str, ...] = ("not available", "not found", "no ngspice", "unavailable")
 #: ERC / DRC violation types that say KiCad's library tables do not name the libraries (measured in the install CI on
 #: fresh KiCad 10 installs, 2026-10-14: ERC lib_symbol_issues + footprint_link_issues, DRC lib_footprint_issues per part)
@@ -82,8 +84,10 @@ class Check:
             return self.status != "FAIL" and "proposal(s) applied" in self.message
         if self.status not in ("PASS", "FAIL"):
             return False
-        low = self.message.lower()
-        return not any(m in low for m in MISSING_MARKERS)
+        # the first clause only: the DRC message appends "; schematic parity not evaluated (<reason>)", and the reason
+        # quotes whatever kicad-cli wrote on stderr ("Font '...' not found") after the tool ran
+        first = self.message.split("; ", 1)[0].lower()
+        return not any(m in first for m in MISSING_MARKERS)
 
 
 def _outcomes(workdir: Path) -> dict[str, dict]:

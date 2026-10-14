@@ -203,12 +203,19 @@ def find_system_ngspice() -> Path | None:
     ``ctypes.util.find_library`` gives the soname, not a path, so the file is
     looked for on the absolute entries of ``$LD_LIBRARY_PATH`` (an empty or
     relative entry would name the working directory) and the usual library
-    directories.
+    directories; a soname that is not a bare file name (one with a folder in
+    it, ``../../proc/self/cwd/lib/libngspice.so``, would lead out of them) is
+    no library. ``find_library`` runs with ``PATH`` and the search paths it
+    hands the programs it runs (:data:`~ai_eda.tools.kicad.install.FIND_LIBRARY_PATH_VARS`:
+    ``ld -L`` gets every ``LD_LIBRARY_PATH`` entry, ``gcc`` reads
+    ``LIBRARY_PATH`` and ``COMPILER_PATH``) cut to their absolute entries, so
+    neither a program nor a library in the working directory takes part.
     macOS: Homebrew's library by name (:data:`_MACOS_HOMEBREW_LIBS`), then
-    whatever ``find_library`` returns (a full path there). Windows KiCad
+    whatever ``find_library`` returns when it is an absolute path (``dyld``'s
+    search there, its ``DYLD_*`` variables cut the same way). Windows KiCad
     installs are handled by :func:`find_ngspice_dll`.
     """
-    from ai_eda.tools.kicad.install import absolute_path_only, platform
+    from ai_eda.tools.kicad.install import FIND_LIBRARY_PATH_VARS, absolute_entries, absolute_path_only, platform
 
     system = platform()
     if system == "win32":
@@ -218,11 +225,16 @@ def find_system_ngspice() -> Path | None:
             p = Path(candidate)
             if p.is_file():
                 return p.resolve()
-    with absolute_path_only():  # find_library may run gcc / ld found on PATH: never one in the working directory
+    with absolute_path_only(*FIND_LIBRARY_PATH_VARS):  # find_library may run gcc / ld: never with the working directory
         name = ctypes.util.find_library("ngspice")
     if not name:
         return None
-    dirs = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if d and Path(d).is_absolute()] + list(_SYSTEM_LIB_DIRS)
+    if system == "darwin":
+        found = Path(name)
+        return found.resolve() if found.is_absolute() and found.is_file() else None
+    if os.path.basename(name) != name or name in (".", ".."):
+        return None
+    dirs = absolute_entries(os.environ.get("LD_LIBRARY_PATH")) + list(_SYSTEM_LIB_DIRS)
     for d in dirs:
         p = Path(d) / name
         if p.is_file():
@@ -488,24 +500,47 @@ def _sha256(path: Path) -> str:
 
 @contextmanager
 def _empty_working_directory() -> Iterator[None]:
-    """The process in a new empty folder for the duration of the block (``ngSpice_Init``), then back where it was.
+    """The process in a new empty folder for the duration of the block (loading the library, ``ngSpice_Init``, the
+    code models), then back where it was.
 
     ``ngSpice_Init`` sources ``.spiceinit`` from the working directory and
     runs its control commands, ``shell`` included (measured 2026-10-14 with
     ngspice-42: a ``.spiceinit`` holding ``shell touch <file>`` in the
-    working directory created the file). ``ai-eda run`` and GUI runs work in
-    the project folder, so a copied project could run any command; an empty
-    folder leaves only the user's own ``~/.spiceinit`` and ``spinit``.
+    working directory created the file), and the dynamic loader searches an
+    empty or relative ``LD_LIBRARY_PATH`` entry relative to the working
+    directory for the library's dependencies (``libgomp.so.1``: reported by
+    the installer review with ``LD_LIBRARY_PATH=:/opt/x/lib``). ``ai-eda
+    run`` and GUI runs work in the project folder, so a copied project could
+    run any command; an empty folder leaves only the user's own
+    ``~/.spiceinit`` and ``spinit`` and the absolute search paths. A working
+    directory that no longer exists (``getcwd`` fails) holds no
+    ``.spiceinit`` either: the block runs in the empty folder all the same
+    and the process stays there (it has nowhere to return to). A folder
+    that cannot be created or entered is :class:`ToolUnavailableError`.
     Called only by the process that drives ngspice (the CLI), where nothing
     else runs while the engine starts.
     """
-    previous = os.getcwd()
-    with tempfile.TemporaryDirectory(prefix="ai-eda-ngspice-init-") as empty:
-        os.chdir(empty)
+    try:
+        previous: str | None = os.getcwd()
+    except OSError:  # a deleted (or unreadable) working directory
+        previous = None
+    try:
+        holder = tempfile.TemporaryDirectory(prefix="ai-eda-ngspice-init-", ignore_cleanup_errors=True)
+    except OSError as e:
+        raise ToolUnavailableError(f"cannot create an empty folder to start ngspice in: {e}") from e
+    with holder as empty:
+        try:
+            os.chdir(empty)
+        except OSError as e:
+            raise ToolUnavailableError(f"cannot enter the empty folder {empty} to start ngspice in: {e}") from e
         try:
             yield
         finally:
-            os.chdir(previous)
+            if previous is not None:
+                try:
+                    os.chdir(previous)
+                except OSError:  # removed while the engine started: as above, nowhere to return to
+                    pass
 
 
 def bind_reset(lib) -> bool:
@@ -542,11 +577,23 @@ class _Engine:
         self.settings: list[str] = []
         self.self_test: dict = {}
         self._dll_dir = os.add_dll_directory(str(dll.parent)) if hasattr(os, "add_dll_directory") else None
+        # loaded and started in an empty folder: the dynamic loader resolves an empty or relative LD_LIBRARY_PATH entry,
+        # and ngSpice_Init a .spiceinit, against the working directory (:func:`_empty_working_directory`)
+        with _empty_working_directory():
+            self.lib = self._load(dll)
+            self.reset_supported = bind_reset(self.lib)
+            try:
+                self._init_engine()
+            except EngineDead as e:
+                raise ToolUnavailableError(f"ngspice.dll at {dll} failed to initialise: {e}") from e
+
+    @staticmethod
+    def _load(dll: Path):
+        """The library with the shared-library API's signatures bound; :class:`ToolUnavailableError` when it cannot be loaded or lacks them."""
         try:
-            self.lib = ctypes.CDLL(str(dll))
+            lib = ctypes.CDLL(str(dll))
         except OSError as e:
             raise ToolUnavailableError(f"cannot load {dll}: {e}") from e
-        lib = self.lib
         try:
             lib.ngSpice_Init.restype = c_int
             lib.ngSpice_Init.argtypes = [SendChar, SendStat, ControlledExit, SendData, SendInitData, BGThreadRunning, c_void_p]
@@ -566,11 +613,7 @@ class _Engine:
             lib.ngSpice_running.restype = c_bool
         except AttributeError as e:
             raise ToolUnavailableError(f"{dll} does not export the ngspice shared-library API: {e}") from e
-        self.reset_supported = bind_reset(lib)
-        try:
-            self._init_engine()
-        except EngineDead as e:
-            raise ToolUnavailableError(f"ngspice.dll at {dll} failed to initialise: {e}") from e
+        return lib
 
     # -- callbacks and low-level calls -------------------------------------------------------------------------
 
@@ -619,8 +662,7 @@ class _Engine:
             return 0
 
         self._callbacks = [_send_char, _send_stat, _controlled_exit, _send_data, _send_init_data, _bg_running]
-        with _empty_working_directory():
-            return self.lib.ngSpice_Init(*self._callbacks, None)
+        return self.lib.ngSpice_Init(*self._callbacks, None)
 
     def _mark_dead(self, reason: str) -> EngineDead:
         self.dead = True
@@ -689,6 +731,7 @@ class _Engine:
     # -- lifecycle -----------------------------------------------------------------------------------------------
 
     def _init_engine(self) -> None:
+        """``ngSpice_Init`` + settings + code models + self-test; its callers run it in :func:`_empty_working_directory`."""
         self.cap.clear()
         rc = self._install_callbacks()
         if rc != 0:
@@ -794,7 +837,11 @@ class _Engine:
             raise self._mark_dead(f"ngSpice_Reset faulted: {e}")
         if rc != 0:
             raise self._mark_dead(f"ngSpice_Reset returned {rc}")
-        self._init_engine()
+        try:
+            with _empty_working_directory():  # ngSpice_Init reads ./.spiceinit again and the code models load again
+                self._init_engine()
+        except ToolUnavailableError as e:
+            raise self._mark_dead(f"cannot restart ngspice after ngSpice_Reset: {e}") from e
 
     # -- running ------------------------------------------------------------------------------------------------
 

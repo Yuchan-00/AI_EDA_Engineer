@@ -41,6 +41,7 @@ from ai_eda.gui.projects import (
 from ai_eda.gui.runs import (
     ANSWER_KEY_PATTERN,
     CHILD_ENV_ADDITIONS,
+    CHILD_PATH_VARS,
     CLI_PYTHON_ARGS,
     COMMAND_PREFIX,
     EXIT_PREFIX,
@@ -599,6 +600,8 @@ def test_status_knows_only_run_log_names(root: ProjectsRoot):
 
 def test_the_child_environment_is_the_users_own_plus_utf8_and_unbuffered(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("AI_EDA_GUI_TEST_MARKER", "present")
+    for name in CHILD_PATH_VARS:  # the one change to the user's own variables: next test
+        monkeypatch.delenv(name, raising=False)
     env = child_env()
     assert env["AI_EDA_GUI_TEST_MARKER"] == "present"
     assert {k: v for k, v in env.items() if k not in CHILD_ENV_ADDITIONS} == {k: v for k, v in os.environ.items() if k not in CHILD_ENV_ADDITIONS}
@@ -607,9 +610,31 @@ def test_the_child_environment_is_the_users_own_plus_utf8_and_unbuffered(monkeyp
     assert all(env[k] == v for k, v in CHILD_ENV_ADDITIONS.items())
 
 
-def test_a_run_never_imports_code_from_the_project_folder(root: ProjectsRoot):
+@pytest.mark.parametrize("name", CHILD_PATH_VARS)
+def test_the_child_gets_no_empty_or_relative_search_path_entry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str):
+    """The dynamic loader (and Python, for ``PYTHONPATH``) reads an empty or relative entry relative to the working
+    directory - the project folder of a run - so ``LD_LIBRARY_PATH=:/opt/x/lib`` (``export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/x/lib`` with the variable
+    unset) let a project's ``libgomp.so.1`` into the CLI child. Absolute entries are kept, in order; none left: unset."""
+    keep = [str(tmp_path / "opt" / "lib"), str(tmp_path / "usr" / "lib")]
+    monkeypatch.setenv(name, os.pathsep.join(["", keep[0], ".", "lib", keep[1], ""]))
+    env = child_env()
+    assert env[name] == os.pathsep.join(keep)
+    assert os.environ[name] == os.pathsep.join(["", keep[0], ".", "lib", keep[1], ""])  # the GUI's own environment untouched
+    for value in ("", ".", os.pathsep, os.pathsep.join(["lib", "../x"])):
+        monkeypatch.setenv(name, value)
+        assert name not in child_env()
+    monkeypatch.delenv(name)
+    assert name not in child_env()
+    monkeypatch.setenv("LIBRARY_PATH", "lib")  # the linker's, not the loader's: the CLI cuts it where it runs a linker
+    assert child_env()["LIBRARY_PATH"] == "lib"
+
+
+def test_a_run_never_imports_code_from_the_project_folder(root: ProjectsRoot, monkeypatch: pytest.MonkeyPatch):
     """The child runs with cwd = the workdir, but ``-P`` keeps it off sys.path: a planted ``ai_eda`` package or a
-    ``csv.py`` shadowing the stdlib in the project folder never runs; the installed CLI does."""
+    ``csv.py`` shadowing the stdlib in the project folder never runs; the installed CLI does - also when the user's
+    ``PYTHONPATH`` has an empty entry (``export PYTHONPATH=$PYTHONPATH:/x`` with it unset), which Python would read as
+    the working directory: the child gets it without that entry."""
+    monkeypatch.setenv("PYTHONPATH", os.pathsep + os.environ.get("PYTHONPATH", ""))
     assert list(CLI_PYTHON_ARGS) == CLI_PREFIX and RunManager().python_args == CLI_PREFIX
     info = root.create("victim", REQUEST)
     marker = info.workdir / "PLANTED_CODE_RAN.txt"

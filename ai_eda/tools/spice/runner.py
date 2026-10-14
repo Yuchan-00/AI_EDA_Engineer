@@ -353,12 +353,16 @@ _VERSION_RE = re.compile(r"ngspice-\d+")
 
 
 class NgspiceRunner(SpiceRunner):
-    """ngspice *batch binary* runner (``ngspice -b -r <raw> <deck>``); optional, used only when an
+    """ngspice *batch binary* runner (``ngspice -n -b -r <raw> <deck>``); optional, used only when an
     ``ngspice`` executable is on an absolute PATH entry (or given). Prefer :class:`ai_eda.tools.spice.NgspiceShared`.
 
     The PATH lookup is :func:`ai_eda.tools.kicad.install.which_absolute`: the working directory (an empty or
-    relative PATH entry, or Windows' implicit current folder) never supplies the binary. The binary runs in a new
-    empty folder, so a ``.spiceinit`` in the output folder (whose ``shell`` lines would run) is never read.
+    relative PATH entry, or Windows' implicit current folder) never supplies the binary. A ``.spiceinit`` runs its
+    ``shell`` lines, and ngspice reads one from its working directory and - from ngspice 45 on - first from the
+    folder of the deck it is given, the output folder here (checked in the ngspice-45 / 46 sources and on Ubuntu's
+    ngspice 45.2 binary by the installer review): the binary runs with ``-n`` (``--no-spiceinit``, in ngspice 42
+    too), which reads no ``.spiceinit`` at all - for this batch binary the user's own ``~/.spiceinit`` is skipped
+    too, unlike :class:`~ai_eda.tools.spice.NgspiceShared` (``spinit`` is still read) - and in a new empty folder.
 
     Batch mode runs the analysis cards inside the deck, so the analysis command
     is written as a card into a copy of the netlist
@@ -415,9 +419,9 @@ class NgspiceRunner(SpiceRunner):
         raw = workdir / f"{netlist_path.stem}.{analysis.value}.raw"
         if raw.exists():
             raw.unlink()
-        with tempfile.TemporaryDirectory(prefix="ai-eda-ngspice-") as empty:  # ngspice sources ./.spiceinit at start
+        with tempfile.TemporaryDirectory(prefix="ai-eda-ngspice-") as empty:  # -n: no .spiceinit, here or beside the deck
             proc = subprocess.run(
-                [self.binary, "-b", "-r", str(raw), str(deck)],
+                [self.binary, "-n", "-b", "-r", str(raw), str(deck)],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

@@ -20,6 +20,10 @@ dev = ["pytest>=8"]
 [project.scripts]
 ai-eda = "ai_eda.cli:main"
 
+# empty on purpose: uv reads the first uv.toml / [tool.uv] it finds from its current folder upwards, and the installers
+# run uv in this folder, so a uv configuration of a folder above the project never applies to its install
+[tool.uv]
+
 [tool.setuptools.packages.find]
 include = ["ai_eda*"]
 

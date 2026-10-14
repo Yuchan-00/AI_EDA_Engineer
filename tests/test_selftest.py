@@ -32,6 +32,20 @@ def test_a_check_ran_only_on_a_tool_verdict():
     assert not Check("x", "architecture", True, status="NOT_VERIFIED", message="no template", proposes=True).ran
 
 
+def test_a_drc_that_ran_counts_whatever_kicad_cli_wrote_on_stderr():
+    """The DRC stage appends ``; schematic parity not evaluated (<reason>)`` and the reason quotes kicad-cli's stderr lines:
+    a font warning saying "not found" there is not a missing tool. The markers are read in the first clause only."""
+    parity = (
+        "schematic parity not evaluated (kicad-cli wrote on stderr, so parity may not have run: "
+        "12:00:01: Warning: Font 'Noto Sans CJK KR' not found; substituting 'KiCad Font'.)"
+    )
+    assert Check("x", "drc", True, status="PASS", message=f"0 error(s), 0 warning(s); {parity}").ran
+    assert Check("x", "drc", True, status="FAIL", message=f"2 error(s), 0 warning(s); {parity}").ran
+    assert Check("x", "drc", True, status="PASS", message="0 error(s), 0 warning(s); schematic parity: 0 issue(s)").ran
+    assert not Check("x", "drc", True, status="FAIL", message=f"kicad-cli not found; {parity}").ran  # the first clause still counts
+    assert not Check("x", "drc", True, status="NOT_VERIFIED", message="kicad-cli not available").ran
+
+
 def test_library_table_violations_fail_the_configuration_line(tmp_path: Path):
     """The fresh-install picture of the CI (2026-10-14): 3 parts, each missing from the global library tables."""
     _ir(
