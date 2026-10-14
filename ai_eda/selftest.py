@@ -79,6 +79,39 @@ def _outcomes(workdir: Path) -> dict[str, dict]:
     return {o.get("stage"): o for o in outcomes if isinstance(o, dict)}
 
 
+def _record(workdir: Path) -> dict:
+    try:
+        return json.loads((workdir / "pipeline.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _violation_lines(workdir: Path) -> list[str]:
+    """``ERC: 6 warning(s): lib_symbol_mismatch x2, ...`` for the latest kicad.erc / kicad.drc result in ir.json (copied, not judged)."""
+    try:
+        ir = json.loads((workdir / "ir.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    latest: dict[str, dict] = {}
+    for r in (ir.get("validation") or {}).get("results") or []:
+        if isinstance(r, dict) and r.get("check_id") in ("kicad.erc", "kicad.drc"):
+            latest[r["check_id"]] = r
+    out: list[str] = []
+    for check_id, r in sorted(latest.items()):
+        details = r.get("details") or {}
+        counts: dict[str, int] = {}
+        for key in ("errors", "warnings", "other_severity", "unconnected_items", "schematic_parity"):
+            for v in details.get(key) or []:
+                kind = str(v.get("type", key)) if isinstance(v, dict) else key
+                counts[kind] = counts.get(kind, 0) + 1
+        label = "ERC" if check_id == "kicad.erc" else "DRC"
+        if counts:
+            out.append(f"{label} {r.get('status')}: " + ", ".join(f"{k} x{n}" for k, n in sorted(counts.items())))
+        else:
+            out.append(f"{label} {r.get('status')}: {r.get('message', '')}")
+    return out
+
+
 def _cli(args: list[str], log: Path) -> int:
     """Run ``python -m ai_eda.cli <args>`` with this interpreter, appending its output to ``log``."""
     cmd = [sys.executable, "-m", "ai_eda.cli", *args]
@@ -137,6 +170,16 @@ def run_selftest(workdir: Path | None, *, skip_kicad: bool = False, skip_ngspice
         print(f"  [{mark}] {c.name:<{width}}  {c.status:<13} {c.message[:110]}")
     failed = [c for c in checks if c.required and not c.ran]
     print(f"selftest: first run exited {rc_first} (questions expected), confirm run exited {rc_confirm}")
+    for line in _violation_lines(project):
+        print(f"selftest: {line}")
+    record = _record(project)
+    if record.get("aborted"):
+        print(f"selftest: the pipeline stopped in stage {record.get('aborted_stage')!r} (a defect, not a verdict)")
+    if failed:
+        tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]
+        print("selftest: last lines of the log:")
+        for line in tail:
+            print(f"    {line}")
     if failed:
         print("selftest: NOT working - " + ", ".join(c.name for c in failed) + f" did not run (see {log}; ai-eda doctor names what is missing)")
     else:

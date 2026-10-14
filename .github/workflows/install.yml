@@ -6,7 +6,7 @@ name: install
 
 on:
   push:
-    branches: [main, "claude/**"]
+    branches: [main]
     paths:
       - "install.sh"
       - "install.ps1"

@@ -189,12 +189,14 @@ install_kicad() {
       apt_install software-properties-common gnupg
       run $SUDO add-apt-repository -y ppa:kicad/kicad-10.0-releases
       APT_UPDATED=0
-      local pkgs=(kicad kicad-symbols kicad-footprints libngspice0)
+      # libngspice0 is the shared library; its XSPICE code models (*.cm) come in the separate ngspice package
+      local pkgs=(kicad kicad-symbols kicad-footprints libngspice0 ngspice)
       [ "$WITH_3D" -eq 1 ] && pkgs+=(kicad-packages3d)
       apt_install "${pkgs[@]}"
       ;;
     debian)
-      local pkgs=(kicad kicad-symbols kicad-footprints libngspice0)
+      warn "Debian 12 / 13 package KiCad 9, not 10 (KiCad 10 is only in testing / unstable): installing what Debian has; ai-eda doctor says whether it is new enough"
+      local pkgs=(kicad kicad-symbols kicad-footprints libngspice0 ngspice)
       [ "$WITH_3D" -eq 1 ] && pkgs+=(kicad-packages3d)
       apt_install "${pkgs[@]}"
       ;;
