@@ -1,0 +1,151 @@
+"""``ai-eda selftest``: prove an installation works by designing the divider end to end.
+
+Invariant: the self-test only *reports* what the pipeline recorded - every
+status it prints is copied from the run's ``pipeline.json``; it judges
+nothing about the design. It answers one question: did each external tool
+the installation is supposed to provide actually run? It runs the documented
+command-line sequence (``ai-eda new``, ``ai-eda run`` with the answers that
+select the ``divider`` template, ``ai-eda run --answer confirm_design=yes``)
+as subprocesses of this interpreter in a folder of its own, so it exercises
+exactly what a user types.
+
+A stage counts as "ran" when its recorded status is a verdict the tool
+produced (``PASS`` / ``FAIL``) and its message does not say the tool was
+missing (ARCHITECTURE, which proposes and never judges, when its message says
+the template's proposals were applied); a missing tool shows as ``NOT_VERIFIED`` with "not available" /
+"not found" in the message. ERC / DRC verdicts are reported as recorded:
+whether KiCad's checks pass on this template is a fact about the design, not
+about the installation, so a ``FAIL`` there still means the tool ran.
+
+Exit status: 0 when every required check ran (``--skip-kicad`` drops the
+KiCad stages, ``--skip-ngspice`` the SPICE stage), 1 otherwise, 2 for a usage
+or setup error.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+#: the request and answers that select the ``divider`` template (README, 사용)
+REQUEST = "12V 입력을 5V로 변환하는 회로"
+FIRST_ANSWERS: tuple[str, ...] = (
+    "application=bench supply",
+    "jurisdiction=EU",
+    "input_voltage=12 V",
+    "output_voltage=5 V",
+)
+CONFIRM_ANSWER = "confirm_design=yes"
+#: words in a stage message that say a tool was missing rather than judged
+MISSING_MARKERS: tuple[str, ...] = ("not available", "not found", "no ngspice", "unavailable")
+
+
+@dataclass
+class Check:
+    """One line of the self-test: what was expected to run and what the run record says."""
+
+    name: str
+    stage: str
+    required: bool
+    status: str = "NOT RUN"
+    message: str = ""
+    #: a stage that proposes rather than judges (ARCHITECTURE: a proposal is never evidence, so it stays NOT_VERIFIED)
+    #: counts as ran when its message says the proposals were applied
+    proposes: bool = False
+
+    @property
+    def ran(self) -> bool:
+        if self.proposes:
+            return self.status != "FAIL" and "proposal(s) applied" in self.message
+        if self.status not in ("PASS", "FAIL"):
+            return False
+        low = self.message.lower()
+        return not any(m in low for m in MISSING_MARKERS)
+
+
+def _outcomes(workdir: Path) -> dict[str, dict]:
+    path = workdir / "pipeline.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    outcomes = (data.get("state") or {}).get("outcomes") or []
+    return {o.get("stage"): o for o in outcomes if isinstance(o, dict)}
+
+
+def _cli(args: list[str], log: Path) -> int:
+    """Run ``python -m ai_eda.cli <args>`` with this interpreter, appending its output to ``log``."""
+    cmd = [sys.executable, "-m", "ai_eda.cli", *args]
+    env = {**os.environ, "PYTHONUTF8": "1"}  # the log is UTF-8 on every system (Windows pipes default to the legacy code page)
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n$ ai-eda {' '.join(args)}\n")
+        fh.flush()
+        proc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env, check=False)
+        fh.write(f"[exit {proc.returncode}]\n")
+    return proc.returncode
+
+
+def run_selftest(workdir: Path | None, *, skip_kicad: bool = False, skip_ngspice: bool = False, keep: bool = False) -> int:
+    """Design the divider in ``workdir`` (a new temporary folder when ``None``), print the checks, return the exit status."""
+    temp = workdir is None
+    root = Path(tempfile.mkdtemp(prefix="ai-eda-selftest-")) if temp else Path(workdir)
+    root.mkdir(parents=True, exist_ok=True)
+    project = root / "selftest"
+    if (project / "ir.json").exists():
+        print(f"selftest: {project / 'ir.json'} already exists; choose an empty --dir", file=sys.stderr)
+        return 2
+    log = root / "selftest.log"
+    print(f"selftest: designing the 12 V -> 5 V divider in {project} (log: {log})")
+    rc_new = _cli(["new", "selftest", "--dir", str(project), "--request", REQUEST], log)
+    if rc_new != 0:
+        print(f"selftest: 'ai-eda new' exited {rc_new}; see {log}", file=sys.stderr)
+        return 1
+    ir = str(project / "ir.json")
+    first = ["run", ir, "--no-pdf"] + [x for a in FIRST_ANSWERS for x in ("--answer", a)]
+    rc_first = _cli(first, log)
+    rc_confirm = _cli(["run", ir, "--answer", CONFIRM_ANSWER], log)
+    found = _outcomes(project)
+    checks = [
+        Check("circuit template applied", "architecture", True, proposes=True),
+        Check("calculators re-derived", "calculation", True),
+        Check("ngspice simulation", "spice", not skip_ngspice),
+        Check("schematic compiled", "schematic", True),
+        Check("board placed / routed / compiled", "pcb", True),
+        Check("KiCad ERC (kicad-cli)", "erc", not skip_kicad),
+        Check("KiCad DRC (kicad-cli)", "drc", not skip_kicad),
+        Check("BOM / CPL / gerbers", "manufacturing_outputs", False),
+    ]
+    for c in checks:
+        o = found.get(c.stage)
+        if o is not None:
+            c.status = str(o.get("status", "?"))
+            c.message = str(o.get("message", ""))
+    reports = sorted(p.name for p in (project / "reports").glob("*.md")) if (project / "reports").is_dir() else []
+    report_check = Check("Korean stage reports written", "reports", True)
+    report_check.status = "PASS" if len(reports) == 4 else "NOT_VERIFIED"
+    report_check.message = ", ".join(reports) if reports else "no reports/*.md"
+    checks.append(report_check)
+    width = max(len(c.name) for c in checks)
+    for c in checks:
+        mark = "ok  " if c.ran else ("--  " if not c.required else "FAIL")
+        print(f"  [{mark}] {c.name:<{width}}  {c.status:<13} {c.message[:110]}")
+    failed = [c for c in checks if c.required and not c.ran]
+    print(f"selftest: first run exited {rc_first} (questions expected), confirm run exited {rc_confirm}")
+    if failed:
+        print("selftest: NOT working - " + ", ".join(c.name for c in failed) + f" did not run (see {log}; ai-eda doctor names what is missing)")
+    else:
+        print("selftest: every required tool ran - the installation works")
+    if temp and not keep and not failed:
+        shutil.rmtree(root, ignore_errors=True)
+    elif temp:
+        print(f"selftest: kept {root}")
+    return 1 if failed else 0
+
+
+__all__ = ["CONFIRM_ANSWER", "FIRST_ANSWERS", "REQUEST", "run_selftest"]

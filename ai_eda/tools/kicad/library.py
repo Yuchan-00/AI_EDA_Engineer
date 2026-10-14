@@ -243,25 +243,27 @@ class FootprintDef:
 
 
 def _default_library_roots() -> list[Path]:
-    """``share/kicad`` roots to search: ``$KICAD*_SYMBOL_DIR``'s parent, then the installed versions.
+    """KiCad library roots to search: ``$KICAD*_SYMBOL_DIR``'s parent, then the installed KiCads.
 
-    Versions are ordered numerically (``10.0`` before ``9.0``) and the
-    installation whose ``kicad-cli`` this project actually runs
-    (:func:`~ai_eda.tools.kicad.cli.find_kicad_cli`) comes first, so the
+    The installed KiCads come from :mod:`ai_eda.tools.kicad.install` (each
+    operating system's own install locations; Windows versions ordered
+    numerically, ``10.0`` before ``9.0``), and the installation whose
+    ``kicad-cli`` this project actually runs
+    (:func:`~ai_eda.tools.kicad.install.find_kicad_cli`) comes first, so the
     libraries embedded in our files are the ones that binary compares them
-    with (otherwise ERC/DRC report ``lib_*_mismatch``).
+    with (otherwise ERC/DRC report ``lib_*_mismatch``). A root is a folder
+    holding ``symbols`` / ``footprints`` / ``3dmodels``: ``<root>/share/kicad``
+    on Windows and Linux, ``KiCad.app/Contents/SharedSupport`` on macOS.
     """
-    from ai_eda.tools.kicad.cli import find_kicad_cli, install_root, version_dirs
+    from ai_eda.tools.kicad.install import find_kicad_cli, library_shares, share_dir
 
     roots: list[Path] = []
     env = os.environ.get("KICAD10_SYMBOL_DIR") or os.environ.get("KICAD_SYMBOL_DIR")
     if env:
         roots.append(Path(env).parent)
-    base = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "KiCad"
-    shares = [ver / "share" / "kicad" for ver in version_dirs(base) if (ver / "share" / "kicad").exists()]
-    cli_root = install_root(find_kicad_cli())
-    if cli_root is not None:
-        cli_share = cli_root / "share" / "kicad"
+    shares = library_shares()
+    cli_share = share_dir(find_kicad_cli())
+    if cli_share is not None:
         shares = [cli_share] + [s for s in shares if s.resolve() != cli_share.resolve()]
     roots.extend(shares)
     return roots

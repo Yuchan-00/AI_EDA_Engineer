@@ -183,17 +183,37 @@ class EngineDead(RuntimeError):
 
 #: where a Linux / macOS system ngspice shared library lives (Debian multiarch first), besides ``$LD_LIBRARY_PATH``
 _SYSTEM_LIB_DIRS: tuple[str, ...] = ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/lib", "/opt/homebrew/lib", "/usr/local/opt/ngspice/lib")
+#: Homebrew's ngspice library on macOS (Apple Silicon prefix first, then Intel): ``ctypes.util.find_library`` does not
+#: search ``/opt/homebrew/lib`` without ``DYLD_*`` variables, so these files are looked for by name
+_MACOS_HOMEBREW_LIBS: tuple[str, ...] = (
+    "/opt/homebrew/lib/libngspice.dylib",
+    "/opt/homebrew/lib/libngspice.0.dylib",
+    "/usr/local/lib/libngspice.dylib",
+    "/usr/local/lib/libngspice.0.dylib",
+)
 
 
 def find_system_ngspice() -> Path | None:
-    """The ngspice shared library the system's loader knows (``libngspice.so.0`` from Debian's ``libngspice0``), else None.
+    """The ngspice shared library of the system, else None.
 
-    ``ctypes.util.find_library`` gives the soname, not a path; the file is
+    Linux: the library the loader knows (``libngspice.so.0`` from Debian's
+    ``libngspice0``, Arch's / Fedora's ``ngspice`` package):
+    ``ctypes.util.find_library`` gives the soname, not a path, so the file is
     looked for on ``$LD_LIBRARY_PATH`` and the usual library directories.
-    Windows KiCad installs are handled by :func:`find_ngspice_dll`.
+    macOS: Homebrew's library by name (:data:`_MACOS_HOMEBREW_LIBS`), then
+    whatever ``find_library`` returns (a full path there). Windows KiCad
+    installs are handled by :func:`find_ngspice_dll`.
     """
-    if os.name == "nt":
+    from ai_eda.tools.kicad.install import platform
+
+    system = platform()
+    if system == "win32":
         return None
+    if system == "darwin":
+        for candidate in _MACOS_HOMEBREW_LIBS:
+            p = Path(candidate)
+            if p.is_file():
+                return p.resolve()
     name = ctypes.util.find_library("ngspice")
     if not name:
         return None
@@ -206,29 +226,30 @@ def find_system_ngspice() -> Path | None:
 
 
 def find_ngspice_dll() -> Path | None:
-    """``$NGSPICE_DLL`` if set (must exist), else ``ngspice.dll`` next to the ``kicad-cli`` that
-    :func:`ai_eda.tools.kicad.cli.find_kicad_cli` finds, else the system library (:func:`find_system_ngspice`), else None."""
+    """``$NGSPICE_DLL`` if set (must exist), else the ngspice library that ships with the KiCad
+    :func:`ai_eda.tools.kicad.install.find_kicad_cli` finds (``ngspice.dll`` beside ``kicad-cli.exe`` on Windows,
+    the bundle's ``libngspice*.dylib`` in ``KiCad.app`` on macOS), else the system library (:func:`find_system_ngspice`), else None."""
     env = os.environ.get("NGSPICE_DLL")
     if env:
         p = Path(env)
         return p.resolve() if p.is_file() else None
-    from ai_eda.tools.kicad.cli import find_kicad_cli  # lazy: kicad.cli imports ai_eda.ir, which imports this package
+    from ai_eda.tools.kicad.install import bundled_ngspice, find_kicad_cli  # lazy: the kicad package imports ai_eda.ir, which imports this package
 
-    cli = find_kicad_cli()
-    if cli:
-        p = Path(cli).resolve().parent / "ngspice.dll"
-        if p.is_file():
-            return p
+    bundled = bundled_ngspice(find_kicad_cli())
+    if bundled is not None:
+        return bundled
     return find_system_ngspice()
 
 
 def find_codemodel_dir(dll: Path | None) -> Path | None:
-    """``$NGSPICE_CODEMODEL_DIR`` if set, else the code model directory next to the library.
+    """``$NGSPICE_CODEMODEL_DIR`` if set, else the code model directory that belongs to the library.
 
-    Two layouts are known: KiCad's ``<root>/lib/ngspice`` for a DLL at
-    ``<root>/bin/ngspice.dll``, and Debian/Ubuntu's ``<libdir>/ngspice`` for
-    ``<libdir>/libngspice.so.0`` (measured 2026-09-23 on Ubuntu 24.04:
-    ``/usr/lib/x86_64-linux-gnu/ngspice/*.cm``).
+    Known layouts: KiCad's ``<root>/lib/ngspice`` for a DLL at
+    ``<root>/bin/ngspice.dll`` (Windows), Debian/Ubuntu's, Arch's and
+    Homebrew's ``<libdir>/ngspice`` for ``<libdir>/libngspice.*`` (measured
+    2026-09-23 on Ubuntu 24.04: ``/usr/lib/x86_64-linux-gnu/ngspice/*.cm``),
+    and inside a macOS ``KiCad.app`` the folder holding ``analog.cm``
+    (:func:`ai_eda.tools.kicad.install.bundled_codemodels`).
     """
     env = os.environ.get("NGSPICE_CODEMODEL_DIR")
     if env:
@@ -239,7 +260,9 @@ def find_codemodel_dir(dll: Path | None) -> Path | None:
     for p in (dll.parent.parent / "lib" / "ngspice", dll.parent / "ngspice"):
         if p.is_dir():
             return p
-    return None
+    from ai_eda.tools.kicad.install import bundled_codemodels
+
+    return bundled_codemodels(dll)
 
 
 def check_path_for_command(path: Path) -> None:

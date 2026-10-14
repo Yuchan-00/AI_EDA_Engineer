@@ -23,6 +23,10 @@ ai-eda = "ai_eda.cli:main"
 [tool.setuptools.packages.find]
 include = ["ai_eda*"]
 
+# non-Python files the package reads at run time (a wheel / non-editable install leaves out anything not listed here)
+[tool.setuptools.package-data]
+"ai_eda.regulatory" = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

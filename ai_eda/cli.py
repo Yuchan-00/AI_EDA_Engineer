@@ -325,11 +325,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from ai_eda.tools.kicad import KicadCli, KicadLibrary
     from ai_eda.tools.spice import NgspiceRunner, NgspiceShared
 
+    from ai_eda.errors import ToolExecutionError
+    from ai_eda.setup_help import remedy, system_label
+
+    missing: list[str] = []
     kicad = KicadCli()
-    print(f"ai-eda {__version__}")
-    print(f"kicad-cli : {kicad.binary or 'NOT FOUND'}" + (f"  (v{kicad.version()})" if kicad.available() else ""))
+    print(f"ai-eda {__version__}  (Python {sys.version.split()[0]}, {system_label()})")
+    if kicad.available():
+        try:
+            version = kicad.version()
+        except (ToolUnavailableError, ToolExecutionError) as e:
+            print(f"kicad-cli : {kicad.binary}  (UNUSABLE: {e})")
+            missing.append("kicad-cli")
+        else:
+            major = _major_version(version)
+            note = "" if major is None or major >= MIN_KICAD_MAJOR else f"  - KiCad {MIN_KICAD_MAJOR} or newer is needed (the compiled files are KiCad {MIN_KICAD_MAJOR} format)"
+            print(f"kicad-cli : {kicad.binary}  (v{version}){note}")
+            if note:
+                missing.append(f"KiCad {MIN_KICAD_MAJOR}")
+    else:
+        print(f"kicad-cli : NOT FOUND  - {remedy('kicad')}")
+        missing.append("kicad-cli")
     lib = KicadLibrary()
-    print(f"kicad libs: {[str(r) for r in lib.roots] or 'NOT FOUND'}")
+    if lib.roots:
+        print(f"kicad libs: {[str(r) for r in lib.roots]}")
+    else:
+        print(f"kicad libs: NOT FOUND (no KiCad symbol / footprint library: the circuit templates cannot build)  - {remedy('kicad')}")
+        missing.append("KiCad libraries")
     shared = NgspiceShared()
     if shared.available():
         try:
@@ -337,9 +359,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             info = f"  ({shared.version()}, build {shared.build()}, code models {'loaded' if shared.codemodels_loaded else 'NOT loaded'}{reset})"
         except ToolUnavailableError as e:
             info = f"  (UNUSABLE: {e})"
+            missing.append("ngspice")
         print(f"ngspice dll: {shared.dll_path}{info}")
     else:
-        print("ngspice dll: NOT FOUND (set NGSPICE_DLL or install KiCad, whose bin/ngspice.dll is used)")
+        print(f"ngspice dll: NOT FOUND (set NGSPICE_DLL)  - {remedy('ngspice')}")
+        missing.append("ngspice")
     batch = NgspiceRunner()
     print(f"ngspice exe: {batch.binary or 'not on PATH (optional; the shared library is the engine used)'}")
     print(_browser_line())
@@ -372,7 +396,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             client.close()
     elif getattr(args, "online", False):
         print("LLM account: not fetched (no key)")
-    return 0
+    if missing:
+        print(f"missing   : {', '.join(missing)} (the pipeline still runs, and reports every check that needs them as NOT_VERIFIED)")
+    else:
+        print("missing   : nothing required (ai-eda selftest designs a board end to end to prove it)")
+    return 1 if (missing and getattr(args, "strict", False)) else 0
+
+
+#: the oldest KiCad whose kicad-cli reads the files the compilers write (board format 20260206)
+MIN_KICAD_MAJOR = 10
+
+
+def _major_version(version: str) -> int | None:
+    """The major number of a ``kicad-cli version`` string (``10.0.6`` -> 10), else ``None``."""
+    head = version.strip().split(".", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    from ai_eda.selftest import run_selftest
+
+    return run_selftest(Path(args.dir) if args.dir else None, skip_kicad=args.skip_kicad, skip_ngspice=args.skip_ngspice, keep=args.keep)
 
 
 def _claude_cli_line() -> str:
@@ -1156,7 +1200,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("doctor", help="check external tools")
     d.add_argument("--online", action="store_true", help="with a key set, fetch the OpenRouter key's limit/usage (one GET; the key is never printed)")
+    d.add_argument("--strict", action="store_true", help="exit 1 when kicad-cli (KiCad 10+), the KiCad libraries or ngspice is missing")
     d.set_defaults(fn=cmd_doctor)
+
+    st = sub.add_parser("selftest", help="design the 12 V -> 5 V divider end to end and report which tools ran (proves an installation works)")
+    st.add_argument("--dir", help="folder to design in (default: a new temporary folder, removed when everything ran)")
+    st.add_argument("--keep", action="store_true", help="keep the temporary folder")
+    st.add_argument("--skip-kicad", action="store_true", help="do not require kicad-cli's ERC / DRC to run")
+    st.add_argument("--skip-ngspice", action="store_true", help="do not require the SPICE stage to run")
+    st.set_defaults(fn=cmd_selftest)
 
     n = sub.add_parser("new", help="create an empty project")
     n.add_argument("name")
@@ -1210,7 +1262,25 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _tolerant_output() -> None:
+    """Never crash on a character the output encoding lacks.
+
+    A console gets UTF-8 from Python itself, but a pipe or a file on Windows is
+    written in the legacy code page (cp949 on a Korean system, cp1252 on many
+    others), which cannot hold every Korean report name this tool prints; an
+    unencodable character is replaced instead of raising.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if encoding != "utf8" and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (AttributeError, ValueError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _tolerant_output()
     args = build_parser().parse_args(argv)
     return args.fn(args)
 

@@ -51,6 +51,7 @@ from ai_eda.repair.strategies import RerunTool
 from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.tools.kicad import KicadCli, KicadLibrary, sexpr
 from ai_eda.tools.kicad import cli as kicad_cli
+from ai_eda.tools.kicad import install as kicad_install
 from ai_eda.tools.kicad import library as kicad_library
 from ai_eda.tools.kicad.board import read_board_footprints
 from ai_eda.tools.manufacturing.outputs import check_gerber_set, check_output_artifact, required_functions
@@ -366,18 +367,22 @@ def test_kicad_version_directories_sort_numerically_and_cli_install_comes_first(
         (base / ver / "bin").mkdir(parents=True)
         (base / ver / "bin" / "kicad-cli.exe").write_bytes(b"")
         (base / ver / "share" / "kicad").mkdir(parents=True)
+        (base / ver / "share" / "kicad" / "symbols").mkdir()
+    # the Windows layout is searched only on Windows: simulate it (ai_eda.tools.kicad.install.platform is the one OS reader)
+    monkeypatch.setattr(kicad_install, "platform", lambda: "win32")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "no-program-files"))
     monkeypatch.delenv("KICAD10_SYMBOL_DIR", raising=False)
     monkeypatch.delenv("KICAD_SYMBOL_DIR", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    assert [p.name for p in kicad_cli.version_dirs(base)] == ["10.0", "9.0", "8.0", "junk"]
+    assert [p.name for p in kicad_install.version_dirs(base)] == ["10.0", "9.0", "8.0", "junk"]
     assert kicad_cli.find_kicad_cli() == str(base / "10.0" / "bin" / "kicad-cli.exe")
     assert [str(r) for r in kicad_library._default_library_roots()] == [str(base / v / "share" / "kicad") for v in ("10.0", "9.0", "8.0", "junk")]
     # kicad-cli 9 on PATH: its libraries are the ones its ERC/DRC compares against, so they come first
     monkeypatch.setattr(shutil, "which", lambda name: str(base / "9.0" / "bin" / "kicad-cli.exe"))
     assert kicad_library._default_library_roots()[0] == base / "9.0" / "share" / "kicad"
-    assert kicad_cli.install_root(str(base / "9.0" / "bin" / "kicad-cli.exe")) == base / "9.0"
-    assert kicad_cli.install_root(str(tmp_path / "elsewhere" / "kicad-cli.exe")) is None
+    assert kicad_install.share_dir(str(base / "9.0" / "bin" / "kicad-cli.exe")) == (base / "9.0" / "share" / "kicad").resolve()
+    assert kicad_install.share_dir(str(tmp_path / "elsewhere" / "kicad-cli.exe")) is None
 
 
 # --------------------------------------------------------------------------- findings 6 / 11: proposals are not evidence

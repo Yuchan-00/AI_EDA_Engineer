@@ -1,0 +1,112 @@
+# Installs AI EDA ENGINEER on a fresh machine of every supported system with the repository's own installers
+# (install.sh / install.cmd), exactly as a user would, then checks that it works: `ai-eda doctor --strict`
+# (KiCad 10, its libraries and ngspice found) and `ai-eda selftest` (the divider designed end to end, with
+# kicad-cli's ERC / DRC run). The selftest's output is the record of what each system's tools did.
+name: install
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - "install.sh"
+      - "install.ps1"
+      - "install.cmd"
+      - "pyproject.toml"
+      - "ai_eda/**"
+      - ".github/workflows/install.yml"
+  pull_request:
+    paths:
+      - "install.sh"
+      - "install.ps1"
+      - "install.cmd"
+      - "pyproject.toml"
+      - "ai_eda/**"
+      - ".github/workflows/install.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unix:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh
+        run: ./install.sh
+      - name: ai-eda on PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: ai-eda doctor --strict
+        run: ai-eda doctor --strict
+      - name: ai-eda selftest (kept for the artifact)
+        if: always()
+        run: ai-eda selftest --dir "$RUNNER_TEMP/selftest"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-${{ matrix.os }}
+          path: ${{ runner.temp }}/selftest
+          if-no-files-found: ignore
+
+  arch:
+    name: archlinux
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    timeout-minutes: 60
+    steps:
+      - name: git (for actions/checkout)
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v4
+      - name: install.sh
+        run: ./install.sh
+      - name: ai-eda doctor --strict
+        run: ~/.local/bin/ai-eda doctor --strict
+      - name: ai-eda selftest (kept for the artifact)
+        if: always()
+        run: ~/.local/bin/ai-eda selftest --dir "$RUNNER_TEMP/selftest"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-archlinux
+          path: ${{ runner.temp }}/selftest
+          if-no-files-found: ignore
+
+  windows:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.cmd (Windows PowerShell 5.1)
+        shell: cmd
+        run: install.cmd
+      - name: ai-eda on PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
+      - name: ai-eda doctor --strict
+        shell: cmd
+        run: ai-eda doctor --strict
+      - name: ai-eda selftest (kept for the artifact)
+        if: always()
+        shell: cmd
+        run: ai-eda selftest --dir "%RUNNER_TEMP%\selftest"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-${{ matrix.os }}
+          path: ${{ runner.temp }}/selftest
+          if-no-files-found: ignore

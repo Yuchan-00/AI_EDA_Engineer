@@ -80,12 +80,12 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable
 
 from ai_eda.errors import ToolExecutionError, ToolUnavailableError
+from ai_eda.tools.kicad.install import find_kicad_cli  # where KiCad is installed, per OS
 from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, Evidence, ValidationResult, ValidationStatus
 
 #: Non-copper plots a fab needs (KiCad 10 canonical names). Courtyard / fab /
@@ -138,51 +138,6 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 def gerber_layers(copper: Iterable[str]) -> tuple[str, ...]:
     """The plot list for a board with the given copper layers (``F.Cu, In1.Cu .., B.Cu``) plus the fab set."""
     return (*copper, *NON_COPPER_GERBER_LAYERS)
-
-
-def _windows_candidates() -> list[Path]:
-    return [Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "KiCad", Path("C:/Program Files/KiCad")]
-
-
-def version_key(path: Path) -> tuple[int, ...]:
-    """Numeric sort key for a KiCad version directory: ``10.0`` > ``9.0`` (lexicographic sorting gets this wrong)."""
-    parts = path.name.split(".")
-    if parts and all(p.isdigit() for p in parts):
-        return tuple(int(p) for p in parts)
-    return (-1,)  # non-version directories sort last
-
-
-def version_dirs(base: Path) -> list[Path]:
-    """Version directories under ``base`` (``.../Programs/KiCad``), highest version first."""
-    if not base.is_dir():
-        return []
-    return sorted((p for p in base.iterdir() if p.is_dir()), key=version_key, reverse=True)
-
-
-def find_kicad_cli() -> str | None:
-    found = shutil.which("kicad-cli")
-    if found:
-        return found
-    for base in _windows_candidates():
-        for ver in version_dirs(base):
-            exe = ver / "bin" / "kicad-cli.exe"
-            if exe.exists():
-                return str(exe)
-    return None
-
-
-def install_root(binary: str | None) -> Path | None:
-    """``<root>`` of a KiCad installation whose ``<root>/bin/kicad-cli(.exe)`` is ``binary``, if it has ``share/kicad``."""
-    if not binary:
-        return None
-    exe = Path(binary)
-    if not exe.is_absolute():
-        resolved = shutil.which(binary)
-        if not resolved:
-            return None
-        exe = Path(resolved)
-    root = exe.resolve().parent.parent
-    return root if (root / "share" / "kicad").is_dir() else None
 
 
 def _file_hash(path: Path) -> str:
