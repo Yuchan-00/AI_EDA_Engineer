@@ -61,14 +61,53 @@
 
 ## 설치
 
+아무것도 설치되지 않은 컴퓨터에서 명령 한 줄로 설치하고 바로 쓸 수 있습니다. 설치 스크립트는 **묻지 않고** Python 환경, KiCad 10(라이브러리 포함)과 ngspice까지 설치하고, KiCad를 처음 실행할 때 만들어지는 전역 라이브러리 표(`sym-lib-table`, `fp-lib-table`)를 `ai-eda setup-kicad`로 써 둔 뒤 `ai-eda doctor`로 찾은 도구를 보여 주고 `ai-eda selftest`로 12 V → 5 V 분배기를 처음부터 끝까지 설계해 실제로 동작하는지 확인합니다(관리자 권한이 필요한 단계에서는 운영체제가 암호/UAC를 물을 수 있습니다).
+
+**macOS / Linux (Ubuntu, Debian, Arch, Fedora 및 그 파생 배포판)** — 터미널에서:
+
 ```bash
-python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -e ".[dev,llm,parts]"                  # AES 암호화 PDF까지 읽으려면 pip install cryptography
-sudo apt-get install libngspice0 ngspice           # Linux: ngspice-42 공유 라이브러리(자동 탐색) + 선택적 배치 실행 파일; Windows는 KiCad 번들 ngspice.dll
+curl -fsSL https://raw.githubusercontent.com/Yuchan-00/AI_EDA_Engineer/main/install.sh | bash
+```
+
+**Windows 10 / 11** — PowerShell에서:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/Yuchan-00/AI_EDA_Engineer/main/install.ps1 | iex"
+```
+
+이미 저장소를 받아 둔 경우에는 그 폴더에서 `./install.sh`(macOS/Linux) 또는 `install.cmd`(Windows)를 실행합니다. 다시 실행하면 코드가 갱신되고(git으로 받은 경우) 빠진 것만 다시 설치됩니다.
+
+| 단계 | macOS | Ubuntu / Debian | Arch | Fedora | Windows |
+|---|---|---|---|---|---|
+| 코드 | 저장소 폴더, 없으면 `~/AI_EDA_Engineer`에 git clone(git이 없으면 압축 파일) | 같음 | 같음 | 같음 | `%USERPROFILE%\AI_EDA_Engineer` |
+| Python | uv(`~/.local/bin`)가 관리하는 Python 3.12의 `.venv` + `.[llm,parts,dev]` + `cryptography` | 같음 | 같음 | 같음 | 같음 |
+| KiCad 10 + ngspice | Homebrew(없으면 설치) `brew install --cask kicad` + `brew install libngspice` | Ubuntu: `ppa:kicad/kicad-10.0-releases`의 `kicad kicad-symbols kicad-footprints` + `libngspice0 ngspice`(코드 모델은 `ngspice` 패키지); Debian: 배포판 패키지 | `kicad kicad-library ngspice` | `kicad libngspice` | `winget install KiCad.KiCad`(ngspice는 KiCad의 `bin\ngspice.dll`) |
+| KiCad 전역 라이브러리 표 | `ai-eda setup-kicad`: KiCad 설정 폴더(`~/Library/Preferences/kicad/10.0`)에 없을 때만 KiCad의 `template` 표를 복사 | 같음(`~/.config/kicad/10.0`) | 같음 | 같음 | 같음(`%APPDATA%\kicad\10.0`) |
+| PDF용 브라우저 | Chrome/Edge가 있으면 사용 | Ubuntu: snap `chromium`(snapd가 있을 때), Debian: `chromium` | `chromium` | `chromium` | Edge(기본 포함) |
+| 명령 | `~/.local/bin/ai-eda` + 셸 프로필에 PATH 추가 | 같음 | 같음 | 같음 | `%USERPROFILE%\.local\bin\ai-eda.cmd` + 사용자 PATH |
+
+옵션(`./install.sh --help`): `--no-kicad`(KiCad/ngspice 생략 — 해당 검사는 `NOT_VERIFIED`가 되고 템플릿은 라이브러리가 없어 회로를 만들지 못함), `--with-3d`(KiCad 3D 모델 라이브러리, 수 GB — 3D 미리보기의 부품 높이에만 쓰임), `--no-browser`, `--with-claude`(Claude Code CLI; 설치 뒤 `claude`로 로그인하면 `--llm claude` 사용 가능), `--no-path`, `--skip-selftest`, `--dir DIR`, `--branch NAME`, `--python 3.12`. Windows는 같은 이름의 `-NoKicad`, `-WithClaude`, `-NoPath`, `-SkipSelftest`, `-Dir`, `-Branch`, `-Python`. `curl ... | bash` / `irm ... | iex`로 실행할 때는 환경 변수 `AI_EDA_DIR`, `AI_EDA_BRANCH`, `AI_EDA_PYTHON`으로 지정합니다.
+
+설치 확인:
+
+```bash
+ai-eda doctor            # 찾은 도구(kicad-cli와 버전, 라이브러리, ngspice, PDF용 브라우저, LLM)와 빠진 것의 설치 명령
+ai-eda doctor --strict   # KiCad 10 / 라이브러리 / 라이브러리 표 / ngspice 중 하나라도 없으면 exit 1
+ai-eda setup-kicad       # KiCad 전역 라이브러리 표가 없을 때만 씀(있는 표는 절대 고치지 않음)
+ai-eda selftest          # 분배기를 끝까지 설계해 템플릿·계산기·SPICE·회로도·PCB·ERC/DRC·보고서가 실제로 돌았는지 표로 출력
+```
+
+`selftest`는 각 단계가 기록한 상태를 그대로 옮길 뿐 판정하지 않습니다. ERC/DRC가 FAIL이어도 도구가 실행되었다면 설치는 정상이며(그 판정은 설계에 대한 사실), 도구가 없어서 `NOT_VERIFIED`가 된 단계만 실패로 셉니다. 예외는 KiCad 설정을 뜻하는 위반 종류(`lib_symbol_issues`, `footprint_link_issues`, `lib_footprint_issues`: 전역 라이브러리 표에 라이브러리가 없음)로, 이것이 하나라도 있으면 "KiCad finds its libraries" 줄이 실패하고 `ai-eda setup-kicad`를 안내합니다. KiCad GUI를 한 번도 실행하지 않은 새 설치에서는 이 표가 없어 모든 부품마다 이 경고가 나왔습니다(설치 CI에서 측정). 도구 탐색은 운영체제별 설치 위치만 봅니다: Windows는 `%LOCALAPPDATA%\Programs\KiCad\<ver>`와 `%ProgramFiles%\KiCad\<ver>`, macOS는 `/Applications/KiCad/KiCad.app`(또는 `/Applications`, `~/Applications`)의 `Contents/MacOS/kicad-cli`와 `Contents/SharedSupport`의 라이브러리, 번들 또는 Homebrew의 `libngspice`, Linux는 PATH의 `kicad-cli`와 `<prefix>/share/kicad`(`ai_eda/tools/kicad/install.py`). 상대 경로나 비어 있는 환경 변수로 만든 위치는 찾지 않으므로 프로젝트 폴더가 `kicad-cli`나 라이브러리를 공급할 수 없습니다.
+
+개발용 수동 설치(설치 스크립트가 하는 일과 같음):
+
+```bash
+uv venv --python 3.12 .venv && uv pip install --python .venv -e ".[dev,llm,parts]" cryptography
 python -m pytest -q -p no:cacheprovider -rs        # 도구가 없으면 도구 테스트는 skip으로 표시된다(-rs가 이유를 나열)
 NGSPICE_DLL=/nonexistent python -m pytest -q -p no:cacheprovider   # ngspice 없는 구성을 재현
-ai-eda doctor                                      # 무엇을 찾았는지(kicad-cli, 라이브러리, ngspice 라이브러리·실행 파일, PDF용 브라우저, LLM 키 유무) 출력
 ```
+
+### 테스트 결과 기록
 
 | 환경 | 결과 |
 |---|---|
