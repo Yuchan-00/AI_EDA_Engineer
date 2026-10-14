@@ -406,13 +406,20 @@ VENV_PY="$APP_DIR/.venv/bin/python"
 
 # --------------------------------------------------------------------------- 3. KiCad 10 + ngspice
 
-# Ubuntu: KiCad's own PPA, the only source of KiCad 10 there (adding it again changes nothing)
+# Ubuntu: KiCad's own PPA, the only source of KiCad 10 there (adding it again changes nothing). add-apt-repository
+# asks Launchpad's API (api.launchpad.net) for the PPA's signing key, and that API does not always answer: on the
+# install CI of 2026-10-14 one connection timed out after 2.5 minutes while the other runners got through - so a
+# failure is tried once more before the installer stops
 add_kicad_ppa() {
   local tools
   tools="$(deb_missing software-properties-common gnupg)"
   # shellcheck disable=SC2086  # a list of package names, one word each
   [ -z "$tools" ] || apt_install $tools
-  as_root add-apt-repository -y ppa:kicad/kicad-10.0-releases
+  if ! as_root add-apt-repository -y ppa:kicad/kicad-10.0-releases; then
+    warn "add-apt-repository failed (it fetches the PPA's signing key from Launchpad, api.launchpad.net): trying once more"
+    as_root add-apt-repository -y ppa:kicad/kicad-10.0-releases ||
+      die "could not add KiCad's PPA ppa:kicad/kicad-10.0-releases (see above; Launchpad may be unreachable): run this installer again later, or install KiCad 10 another way and run it with --no-kicad"
+  fi
   APT_UPDATED=0
 }
 
