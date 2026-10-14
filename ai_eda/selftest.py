@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -148,12 +149,14 @@ def _configuration_check(workdir: Path, required: bool) -> Check:
 def _cli(args: list[str], log: Path) -> int:
     """Run ``python -m ai_eda.cli <args>`` with this interpreter, appending its output to ``log``."""
     cmd = [sys.executable, "-m", "ai_eda.cli", *args]
-    env = {**os.environ, "PYTHONUTF8": "1"}  # the log is UTF-8 on every system (Windows pipes default to the legacy code page)
+    # the log is UTF-8 on every system (Windows pipes default to the legacy code page) and unbuffered, so a run that
+    # hangs or is killed still shows how far it got
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
     with log.open("a", encoding="utf-8") as fh:
-        fh.write(f"\n$ ai-eda {' '.join(args)}\n")
+        fh.write(f"\n$ ai-eda {' '.join(args)}    [started {time.strftime('%H:%M:%S')}]\n")
         fh.flush()
         proc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env, check=False)
-        fh.write(f"[exit {proc.returncode}]\n")
+        fh.write(f"[exit {proc.returncode} at {time.strftime('%H:%M:%S')}]\n")
     return proc.returncode
 
 

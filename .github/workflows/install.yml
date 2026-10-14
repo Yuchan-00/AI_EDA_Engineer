@@ -1,7 +1,10 @@
 # Installs AI EDA ENGINEER on a fresh machine of every supported system with the repository's own installers
 # (install.sh / install.cmd), exactly as a user would, then checks that it works: `ai-eda doctor --strict`
-# (KiCad 10, its libraries and ngspice found) and `ai-eda selftest` (the divider designed end to end, with
-# kicad-cli's ERC / DRC run). The selftest's output is the record of what each system's tools did.
+# (KiCad 10, its libraries and library tables and ngspice found) and `ai-eda selftest` (the divider designed end
+# to end, with kicad-cli's ERC / DRC run). The installers run the selftest themselves at the end; here it is
+# skipped there (--skip-selftest / -SkipSelftest) and run as its own step into a kept folder, under a watchdog
+# that lists the running processes if it hangs, and its log is always printed - a hung job that is cancelled
+# keeps no log.
 name: install
 
 on:
@@ -14,6 +17,7 @@ on:
       - "pyproject.toml"
       - "ai_eda/**"
       - ".github/workflows/install.yml"
+      - ".github/selftest-watchdog.sh"
   pull_request:
     paths:
       - "install.sh"
@@ -22,6 +26,7 @@ on:
       - "pyproject.toml"
       - "ai_eda/**"
       - ".github/workflows/install.yml"
+      - ".github/selftest-watchdog.sh"
   workflow_dispatch:
 
 permissions:
@@ -43,14 +48,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install.sh
-        run: ./install.sh
+        timeout-minutes: 30
+        run: ./install.sh --skip-selftest
       - name: ai-eda on PATH
         run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: ai-eda doctor --strict
         run: ai-eda doctor --strict
       - name: ai-eda selftest (kept for the artifact)
         if: always()
-        run: ai-eda selftest --dir "$RUNNER_TEMP/selftest"
+        timeout-minutes: 20
+        run: ./.github/selftest-watchdog.sh ai-eda
+      - name: selftest log
+        if: always()
+        run: cat "$RUNNER_TEMP/selftest/selftest.log" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -68,12 +78,17 @@ jobs:
         run: pacman -Syu --noconfirm --needed git
       - uses: actions/checkout@v4
       - name: install.sh
-        run: ./install.sh
+        timeout-minutes: 30
+        run: ./install.sh --skip-selftest
       - name: ai-eda doctor --strict
         run: ~/.local/bin/ai-eda doctor --strict
       - name: ai-eda selftest (kept for the artifact)
         if: always()
-        run: ~/.local/bin/ai-eda selftest --dir "$RUNNER_TEMP/selftest"
+        timeout-minutes: 20
+        run: ./.github/selftest-watchdog.sh ~/.local/bin/ai-eda
+      - name: selftest log
+        if: always()
+        run: cat "$RUNNER_TEMP/selftest/selftest.log" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -92,8 +107,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install.cmd (Windows PowerShell 5.1)
+        timeout-minutes: 30
         shell: cmd
-        run: install.cmd
+        run: install.cmd -SkipSelftest
       - name: ai-eda on PATH
         shell: pwsh
         run: Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
@@ -102,8 +118,13 @@ jobs:
         run: ai-eda doctor --strict
       - name: ai-eda selftest (kept for the artifact)
         if: always()
+        timeout-minutes: 20
         shell: cmd
         run: ai-eda selftest --dir "%RUNNER_TEMP%\selftest"
+      - name: selftest log
+        if: always()
+        shell: pwsh
+        run: Get-Content -Path "$env:RUNNER_TEMP\selftest\selftest.log" -Encoding UTF8 -ErrorAction SilentlyContinue
       - uses: actions/upload-artifact@v4
         if: always()
         with:
