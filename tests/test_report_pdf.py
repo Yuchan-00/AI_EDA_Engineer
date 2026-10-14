@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 import ai_eda.report.pdf as pdf
+import ai_eda.tools.kicad.install as kicad_install
 from ai_eda.report import theory_report
 from ai_eda.report.pdf import (
     MISSING_FIGURE,
@@ -380,7 +381,8 @@ def html_file(tmp_path: Path) -> Path:
     return path
 
 
-def test_html_to_pdf_ok_with_a_browser_that_writes(tmp_path: Path, html_file: Path):
+def test_html_to_pdf_ok_with_a_browser_that_writes(tmp_path: Path, html_file: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(kicad_install, "platform", lambda: "linux")  # browser_version asks --version off Windows only
     fake = _fake_browser(tmp_path / "fake", "writes", FAKE_WRITES)
     out = tmp_path / "out" / "sub" / "01_이론_보고서.pdf"  # the folder does not exist yet
     res = html_to_pdf(html_file, out, browser=fake)
@@ -396,6 +398,18 @@ def test_html_to_pdf_ok_with_a_browser_that_writes(tmp_path: Path, html_file: Pa
     assert argv[-2] == f"--print-to-pdf={out.resolve()}"
     assert sum(a.startswith("--user-data-dir=") for a in argv) == 1
     assert browser_version(fake) == "FakeBrowser 1.0"
+
+
+def test_browser_version_never_starts_the_browser_on_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Chrome / Edge on Windows print nothing for ``--version`` and start the browser: doctor waited the whole timeout."""
+    marker = tmp_path / "ran"
+    fake = _fake_browser(tmp_path / "fake", "version", f"import pathlib\npathlib.Path({str(marker)!r}).write_text('x')\nprint('FakeBrowser 1.0')\n")
+    monkeypatch.setattr(kicad_install, "platform", lambda: "win32")
+    assert browser_version(fake) is None
+    assert not marker.exists()
+    monkeypatch.setattr(kicad_install, "platform", lambda: "darwin")
+    assert browser_version(fake) == "FakeBrowser 1.0"
+    assert marker.exists()
 
 
 def test_html_to_pdf_failure_reasons(tmp_path: Path, html_file: Path):

@@ -452,7 +452,16 @@ def find_browser() -> Path | None:
 
 
 def browser_version(path: Path | str, timeout_s: float = 30.0) -> str | None:
-    """``<name> <version>`` as ``--version`` prints it, or ``None`` (best effort: Chrome on Windows prints nothing)."""
+    """``<name> <version>`` as ``--version`` prints it, or ``None`` (best effort).
+
+    Never asked on Windows: Chrome and Edge there print nothing for ``--version`` and
+    start the browser instead, so the call only ended at the timeout (30 s of
+    ``ai-eda doctor`` on the windows-2025 CI runner).
+    """
+    from ai_eda.tools.kicad.install import platform
+
+    if platform() == "win32":
+        return None
     try:
         proc = subprocess.run(
             [str(path), "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout_s
