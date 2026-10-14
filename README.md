@@ -4,6 +4,34 @@
 
 핵심 원칙: **LLM은 설계의 진실을 결정하지 않는다.** LLM은 제안·조율(orchestration)만 하고, 사실은 IR + provenance + 결정론적 도구(계산기, SPICE, KiCad ERC/DRC, 제조파일 검사) + 독립 리뷰어가 결정합니다.
 
+## 빠른 설치
+
+**macOS / Linux (Ubuntu, Debian, Arch, Fedora)** — 터미널에서:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Yuchan-00/AI_EDA_Engineer/main/install.sh | bash
+```
+
+**Windows 10 / 11** — PowerShell에서:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/Yuchan-00/AI_EDA_Engineer/main/install.ps1 | iex"
+```
+
+저장소를 이미 받아 두었다면 그 폴더에서 `./install.sh`(macOS/Linux) 또는 `install.cmd`(Windows)를 실행합니다.
+
+- 설치 스크립트는 묻지 않고 Python 3.12 환경과 KiCad 10(라이브러리 포함), ngspice를 설치합니다. PDF 보고서용 브라우저는 Linux에서 없을 때만 설치하고, macOS·Windows는 있는 Chrome·Edge를 씁니다.
+- 이어서 `ai-eda`를 PATH에 올리고, 마지막에 `ai-eda selftest`로 실제 동작을 확인합니다.
+- `sudo`로 실행하지 마세요. 관리자 권한이 필요할 때 스크립트가 직접 암호를 묻습니다(Windows는 UAC 창).
+- 설치가 끝나면 새 터미널을 열고 아래를 실행합니다.
+
+```bash
+ai-eda doctor       # 찾은 도구(KiCad, ngspice, 브라우저)와 빠진 것의 설치 방법
+ai-eda gui --open   # 로컬 웹 GUI(한국어)
+```
+
+옵션(`--no-kicad`, `--dir` 등), 운영체제별 동작, Debian stable 주의점(KiCad 10 패키지가 없음)은 아래 [설치](#설치) 절에 있습니다.
+
 ## 현재 상태 (2026‑09‑27)
 
 | 계층 | 상태 |
