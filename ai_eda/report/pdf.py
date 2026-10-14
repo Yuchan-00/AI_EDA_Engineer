@@ -55,8 +55,11 @@ MISSING_FIGURE = "그림 없음"
 BROWSER_ENV = "AI_EDA_BROWSER"
 #: Playwright's browser root override (its own convention)
 PLAYWRIGHT_ENV = "PLAYWRIGHT_BROWSERS_PATH"
-#: binary names looked up on PATH, in order
-PATH_NAMES: tuple[str, ...] = ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome", "msedge")
+#: binary names looked up on PATH, in order: the vendors' stable browsers before Chromium, whose builds vary (on the
+#: GitHub ubuntu-24.04 image, 2026-10-14, the preinstalled ``/usr/bin/chromium`` - a Chromium 154.0.8037.0 snapshot -
+#: never finished a headless print with any flag set or session bus tried, while ``/usr/bin/google-chrome`` 154.0.8037.97
+#: printed the same page in 1 s; an Arch Linux ``chromium`` package and Playwright's Chromium print in about 1 s)
+PATH_NAMES: tuple[str, ...] = ("google-chrome", "google-chrome-stable", "chrome", "msedge", "chromium", "chromium-browser")
 #: Playwright roots searched after ``$PLAYWRIGHT_BROWSERS_PATH``
 PLAYWRIGHT_DEFAULT_ROOTS: tuple[Path, ...] = (Path("/opt/pw-browsers"),)
 #: where a Playwright root keeps its Chromium binary (highest build number wins)

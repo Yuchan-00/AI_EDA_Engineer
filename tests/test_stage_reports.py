@@ -1170,7 +1170,7 @@ def test_after_one_print_times_out_the_runs_later_reports_get_no_pdf(astable_rel
     stale.parent.mkdir(parents=True)
     stale.write_bytes(b"%PDF-1.4 stale")
     results = write_all_stage_reports(ir, lib, state, tmp_path / "out", browser=tmp_path / "chromium")
-    assert len(calls) == 1  # asked once
+    assert len(calls) == 2 and calls[0] == calls[1]  # the first report is tried twice, then the browser is not asked again
     assert results[0].pdf_timed_out and results[0].pdf_reason == "timed out after 120 s"
     assert all(r.pdf is None and r.pdf_reason == PDF_SKIPPED_AFTER_TIMEOUT and not r.pdf_timed_out for r in results[1:])
     assert not stale.exists()  # a skipped report leaves no stale PDF beside it either
@@ -1249,6 +1249,27 @@ def test_stage_reports_are_printed_to_pdf_by_the_real_browser(astable_release, t
     assert ir.content_hash() == before and ir.artifacts == artifacts
     stems = {Path(name).stem for name in STAGE_REPORTS.values()}
     assert not any(Path(a.path).stem in stems for a in ir.artifacts.values())  # no report (.md / .html / .pdf) is an artifact
+
+
+def test_a_print_that_times_out_once_is_tried_again(astable_release, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A browser's first start can outlast the timeout (Chrome on the macOS runner); the second try prints."""
+    import ai_eda.report.stages as stages_mod
+    from ai_eda.report.pdf import PdfResult
+
+    ir, lib, state = astable_release
+    calls: list[Path] = []
+
+    def slow_first(html_path, pdf_path, browser=None, timeout_s=120.0):
+        calls.append(Path(html_path))
+        if len(calls) == 1:
+            return PdfResult(False, None, "timed out after 120 s", Path(browser), timed_out=True)
+        Path(pdf_path).write_bytes(b"%PDF-1.4 printed")
+        return PdfResult(True, Path(pdf_path), None, Path(browser))
+
+    monkeypatch.setattr(stages_mod, "html_to_pdf", slow_first)
+    results = write_all_stage_reports(ir, lib, state, tmp_path / "out", browser=tmp_path / "chrome")
+    assert len(calls) == len(results) + 1  # one retry, then every report printed
+    assert all(r.pdf is not None and r.pdf_reason is None and not r.pdf_timed_out for r in results)
 
 
 def test_the_run_report_writer_stops_printing_after_a_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):

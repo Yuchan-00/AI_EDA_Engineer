@@ -272,11 +272,13 @@ def test_find_browser_env_var_existing_or_missing(isolated: Path, monkeypatch: p
 
 def test_find_browser_on_path_in_name_order(isolated: Path, monkeypatch: pytest.MonkeyPatch):
     bindir = isolated / "bin"
-    chrome = _executable(bindir / _exe_name("google-chrome"))
-    monkeypatch.setenv("PATH", str(bindir))
-    assert find_browser() == chrome
     chromium = _executable(bindir / _exe_name("chromium"))
-    assert find_browser() == chromium  # PATH_NAMES order, not directory order
+    monkeypatch.setenv("PATH", str(bindir))
+    assert find_browser() == chromium
+    edge = _executable(bindir / _exe_name("msedge"))
+    assert find_browser() == edge  # a vendor's stable browser before Chromium
+    chrome = _executable(bindir / _exe_name("google-chrome"))
+    assert find_browser() == chrome  # PATH_NAMES order, not directory order
     explicit = _executable(isolated / "x" / "edge")
     monkeypatch.setenv(pdf.BROWSER_ENV, str(explicit))
     assert find_browser() == explicit  # the explicit variable wins

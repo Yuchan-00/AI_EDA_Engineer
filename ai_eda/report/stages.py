@@ -132,8 +132,8 @@ REPORT_SUFFIXES: tuple[str, ...] = (".md", ".html", ".pdf")
 NO_CHART_IN_PARTS = "이 보고서에는 그림이 없습니다: 부품 선정은 표와 라이브러리 기재로 설명하며 그릴 수치 곡선이 없습니다."
 #: the reason recorded when the caller asked for no PDF
 PDF_NOT_REQUESTED = "not requested (--no-pdf)"
-#: the reason recorded for the reports of a run after one print timed out: a browser that hangs once is not asked
-#: again in the same run (each wait costs the whole timeout; measured on the Ubuntu CI runners before the print flags)
+#: the reason recorded for the reports of a run after a print timed out twice: a browser that hangs is not asked again
+#: in the same run (each wait costs the whole timeout; a Chromium snapshot on the Ubuntu CI image never printed)
 PDF_SKIPPED_AFTER_TIMEOUT = "skipped: the browser did not finish an earlier report of this run in time"
 #: header line for a design no template built
 NO_TEMPLATE = "템플릿 설계가 아님"
@@ -1790,9 +1790,11 @@ def write_stage_report(
 ) -> StageReportResult | None:
     """Write the report of ``stage`` as ``<workdir>/reports/<name>.md`` and ``.html`` (LF, UTF-8; ``reports_dir`` overrides the folder) and, when ``pdf`` and a browser is given or found, ``.pdf``.
 
-    ``None`` for a stage without a report. No browser (or ``pdf=False``, or
-    a ``pdf_skip_reason`` - :data:`PDF_SKIPPED_AFTER_TIMEOUT` once a print of
-    the same run timed out, ``pdf_timed_out`` in its result) means no PDF and
+    ``None`` for a stage without a report. A print that times out is tried
+    once more; when that times out too, ``pdf_timed_out`` is set and the
+    caller passes :data:`PDF_SKIPPED_AFTER_TIMEOUT` as ``pdf_skip_reason``
+    for the run's later reports. No browser (or ``pdf=False``, or a
+    ``pdf_skip_reason``) means no PDF and
     a reason in the result, never an exception; a stale ``.pdf`` from an
     earlier write is then removed so that a PDF on disk always matches the
     ``.md`` / ``.html`` beside it. Nothing else is touched: the IR is not
@@ -1820,6 +1822,10 @@ def write_stage_report(
             _remove_stale_pdf(pdf_path)
         else:
             result = html_to_pdf(html_path, pdf_path, exe)  # removes a stale PDF itself; ok only when this run wrote one
+            if result.timed_out:
+                # once more: a browser's first start can outlast the timeout and the next one print at once (Chrome on
+                # the macOS CI runner: the first print of a run timed out, the following ones printed)
+                result = html_to_pdf(html_path, pdf_path, exe)
             written, reason, timed_out = (pdf_path, None, False) if result.ok else (None, result.reason, result.timed_out)
     return StageReportResult(stage, md_path, html_path, written, reason, tuple(doc.figures.figures), timed_out)
 
