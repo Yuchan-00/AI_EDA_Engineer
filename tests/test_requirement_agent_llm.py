@@ -89,8 +89,12 @@ def test_extraction_enters_ir_as_llm_generated_and_blocks_on_confirmation(tmp_pa
     ir = _ir(tmp_path)
     state = _run(ir, svc, tmp_path)
     assert state.blocked and state.current == Stage.REQUIREMENT_ANALYSIS
-    # application / jurisdiction were extracted (not asked); the model's required question and the confirmation block
-    assert [q.key for q in state.open_questions] == ["isolation", CONFIRM_KEY]
+    # application / jurisdiction were extracted (not asked); only the confirmation blocks: the model marked "isolation" required, but
+    # no template reads that key, so it is asked as optional (a model question is still only a question - its answer would be a
+    # design requirement every template's closed world refuses; tests/test_leave_out.py)
+    assert [q.key for q in state.open_questions] == [CONFIRM_KEY]
+    [isolation] = [q for q in state.optional_questions if q.key == "isolation"]
+    assert isolation.source == "llm" and not isolation.required and "leave_out=isolation" in isolation.rationale
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call.model == DEFAULT_PRIMARY_MODEL and call.response_schema is not None and call.temperature == 0.0
@@ -222,7 +226,7 @@ def test_correction_is_appended_and_re_extracted(tmp_path: Path):
     text = ir.requirements.request_text()
     assert text.startswith(RAW) and text.endswith(f"{CORRECTION_LABEL} output current is 3A, not 2A")
     assert text in client.calls[1].user_text
-    assert state.blocked and [q.key for q in state.open_questions] == ["isolation", CONFIRM_KEY]
+    assert state.blocked and [q.key for q in state.open_questions] == [CONFIRM_KEY]  # "isolation" is optional (no template reads it)
     r = ir.requirements.get("output_current")
     assert r.value.value == 3.0 and r.value.provenance.kind == ProvenanceKind.LLM_GENERATED  # not confirmed yet
     assert ir.requirements.get("output_current.alt2") is None and [x for x in ir.requirements.requirements if x.key == "output_current"] == [r]
@@ -256,7 +260,7 @@ def test_user_answer_precedence_is_reported(tmp_path: Path):
     ctx = AgentContext(workdir=tmp_path, llm=svc, answers={"application": "bench supply"})
     result = RequirementAgent().run(ir, ctx)
     assert "application: the user's answer takes precedence over the extraction" in result.notes
-    assert result.blocked_on_user and [q.key for q in result.questions if q.required] == ["isolation", CONFIRM_KEY]
+    assert result.blocked_on_user and [q.key for q in result.questions if q.required] == [CONFIRM_KEY]  # "isolation": optional, no template reads it
 
 
 def test_conflicting_extraction_blocks_confirmation(tmp_path: Path):
@@ -268,7 +272,7 @@ def test_conflicting_extraction_blocks_confirmation(tmp_path: Path):
     assert len(ir.requirements.conflicts) == 1 and "output_voltage" in ir.requirements.conflicts[0].description
     assert {r.id for r in ir.requirements.requirements if r.key == "output_voltage"} == {"req.output_voltage", "req.output_voltage.alt2"}
     state = _run(ir, svc, tmp_path, answers={CONFIRM_KEY: "yes"})
-    assert state.blocked and [q.key for q in state.open_questions] == ["isolation", CONFIRM_KEY]
+    assert state.blocked and [q.key for q in state.open_questions] == [CONFIRM_KEY]  # "isolation": optional, no template reads it
     assert "confirmation refused" in state.outcome(Stage.REQUIREMENT_ANALYSIS).message
     assert ir.requirements.get("input_voltage").value.provenance.kind == ProvenanceKind.LLM_GENERATED
     assert len(client.calls) == 1

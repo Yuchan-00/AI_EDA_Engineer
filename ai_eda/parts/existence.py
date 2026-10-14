@@ -224,8 +224,13 @@ def _archived_document(pointer: DatasheetPointer, archive: DocumentArchive, *, f
 
 
 def find_mpn(doc: ArchivedDocument, mpn: str) -> list[QuoteHit]:
-    """Every page's first hit of ``mpn`` in the archived text (control characters as spaces, ASCII case ignored, token boundary)."""
-    return searchable_document(doc).find_quote(mpn, ignore_case=True)
+    """Every page's first hit of ``mpn`` in the archived text (control characters as spaces, ASCII case ignored, whole identifier).
+
+    Whole identifier: ``LM2596S-5`` is not found in ``LM2596S-5.0/NOPB`` - a
+    part number cut before its ``.x`` fraction or ``-suffix`` names another
+    (or no) orderable code and must not be grounded on the longer one.
+    """
+    return searchable_document(doc).find_quote(mpn, ignore_case=True, identifier=True)
 
 
 def _mpn_check(mpn: str | None, doc: ArchivedDocument | None) -> tuple[QuoteHit | None, SubCheck]:
@@ -240,7 +245,7 @@ def _mpn_check(mpn: str | None, doc: ArchivedDocument | None) -> tuple[QuoteHit 
     hits = find_mpn(doc, mpn)
     if not hits:
         return None, SubCheck(name=name, status=S.NOT_VERIFIED,
-                              message=f"MPN {mpn!r} not found in datasheet ({doc.page_count} page(s) searched; whitespace-insensitive, ASCII case-insensitive, token boundaries)",
+                              message=f"MPN {mpn!r} not found in datasheet ({doc.page_count} page(s) searched; whitespace-insensitive, ASCII case-insensitive, whole identifier)",
                               details={"pages_searched": doc.page_count})
     first = hits[0]
     return first, SubCheck(name=name, status=S.PASS, message=f"MPN {mpn!r} found verbatim on page {first.page}: {first.context}",
@@ -257,18 +262,27 @@ def _catalog_check(mpn: str | None, catalog: CatalogSource | None, component: Co
         return None, SubCheck(name=name, status=S.NOT_APPLICABLE, message="no catalog loaded")
     if not mpn:
         return None, SubCheck(name=name, status=S.NOT_VERIFIED, message="no MPN in the IR: nothing to look up")
-    row = catalog.lookup(mpn)
-    if row is None:
+    rows = catalog.rows_for(mpn)
+    if not rows:
         return None, SubCheck(name=name, status=S.NOT_VERIFIED, message=f"not in catalog: MPN {mpn!r} has no row in {catalog.path.name} ({len(catalog.rows)} rows, {catalog.supplier})")
+
+    def _mismatches(row: CatalogRow) -> list[str]:
+        out: list[str] = []
+        if component is not None:
+            for label, ir_value, row_value in (("manufacturer", component.manufacturer, row.manufacturer), ("package", component.package, row.package)):
+                if ir_value is not None and ir_value.value not in (None, "") and row_value.strip() and not _same_text(str(ir_value.value), row_value):
+                    out.append(f"catalog {label} {row_value!r} differs from IR {label} {ir_value.value!r} ({ir_value.provenance.kind})")
+        return out
+
+    # a community dump lists one MPN under several brands / packages: the row that agrees with the IR backs the
+    # sourcing, whatever its position; none agreeing is said with every row's disagreement
+    judged = [(row, _mismatches(row)) for row in rows]
+    row, mismatches = next(((r, m) for r, m in judged if not m), judged[0])
     details = {"line": row.line, "supplier_part_number": row.supplier_part_number, "stock": row.stock, "unit_price": row.unit_price, "currency": row.currency,
-               "assembly_class": row.assembly_class, "manufacturer": row.manufacturer, "package": row.package}
-    mismatches: list[str] = []
-    if component is not None:
-        for label, ir_value, row_value in (("manufacturer", component.manufacturer, row.manufacturer), ("package", component.package, row.package)):
-            if ir_value is not None and ir_value.value not in (None, "") and row_value.strip() and not _same_text(str(ir_value.value), row_value):
-                mismatches.append(f"catalog {label} {row_value!r} differs from IR {label} {ir_value.value!r} ({ir_value.provenance.kind})")
+               "assembly_class": row.assembly_class, "manufacturer": row.manufacturer, "package": row.package, "rows": [r.line for r in rows]}
     if mismatches:
-        return row, SubCheck(name=name, status=S.NOT_VERIFIED, message=f"MPN {mpn!r} found in {catalog.supplier} catalog row {row.line} but " + "; ".join(mismatches)
+        others = "; ".join(f"row {r.line}: " + ", ".join(m) for r, m in judged)
+        return row, SubCheck(name=name, status=S.NOT_VERIFIED, message=f"MPN {mpn!r} found in {catalog.supplier} catalog ({len(rows)} row(s)) but none agrees with the IR: {others}"
                                                                         + " - a same-numbered part of another brand / package backs no sourcing", details={**details, "mismatches": mismatches})
     return row, SubCheck(name=name, status=S.PASS, message=f"MPN {mpn!r} found in {catalog.supplier} catalog row {row.line} (supplier part {row.supplier_part_number or '-'}, stock {row.stock if row.stock is not None else '-'})",
                          details=details)

@@ -33,6 +33,7 @@ converted to numbers at parse time.
 from __future__ import annotations
 
 import copy
+import math
 import re
 from pathlib import Path
 from typing import Any, Iterator
@@ -163,6 +164,8 @@ def fmt_num(x: float | int, decimals: int = 6) -> str:
         raise TypeError("bool is not a number here; it serialises as yes/no")
     if isinstance(x, int):
         return str(x)
+    if not math.isfinite(x):
+        raise SExprError(f"{x!r} is not a finite number; KiCad cannot read it")
     s = f"{x:.{decimals}f}".rstrip("0").rstrip(".")
     return "0" if s in ("", "-0") else s
 

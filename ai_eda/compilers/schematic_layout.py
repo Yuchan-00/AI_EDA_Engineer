@@ -22,8 +22,10 @@ For the same reason two symbols must never be placed so that a pin, a wire
 stub end or a label anchor of one lands on one of the other's: KiCad would
 silently merge the nets. :func:`symbol_extent` measures each symbol
 (graphics, pins, stubs, label text) from the library data and
-:func:`layout_positions` spaces the grid so extents cannot touch; the compiler
-additionally refuses any coinciding connection points.
+:func:`layout_positions` spaces a table of symbols (per-column widths and
+per-row heights) so extents cannot touch; :func:`layout_paper` picks the
+smallest ISO sheet that holds them. The compiler additionally refuses any
+coinciding connection points.
 """
 
 from __future__ import annotations
@@ -59,7 +61,11 @@ __all__ = [
     "symbol_graphic_points",
     "symbol_extent",
     "layout_pitch",
+    "layout_columns",
     "layout_positions",
+    "LAYOUT_PAPERS",
+    "LAYOUT_SHEET_MARGIN_MM",
+    "layout_paper",
     "point_on_segment",
 ]
 
@@ -71,7 +77,7 @@ GRID_MM = 1.27
 SYMBOL_PITCH_MM = 25.4
 #: origin of the first symbol (40 grid steps in from the top-left corner)
 LAYOUT_ORIGIN_MM: Vec = (50.8, 50.8)
-#: symbols per row before wrapping
+#: symbols per row before wrapping (the minimum: :func:`layout_columns` widens the table for more than 16 symbols)
 LAYOUT_COLUMNS = 4
 #: free space kept between the extents of neighbouring symbols (4 grid steps)
 LAYOUT_GAP_MM = 5.08
@@ -147,8 +153,13 @@ _REF_SPLIT = re.compile(r"(\d+)")
 
 
 def natural_ref_key(ref: str) -> tuple:
-    """Sort key so that ``R2 < R10`` and ``J1 < R1``: alternating text / integer chunks."""
-    return tuple(int(part) if part.isdigit() else part for part in _REF_SPLIT.split(ref) if part)
+    """Sort key so that ``R2 < R10`` and ``J1 < R1``: alternating text / integer chunks.
+
+    Every chunk is a ``(0, int)`` or ``(1, str)`` pair, so a list that mixes
+    numeric and alphabetic pin numbers (``1``, ``2``, ``CD``, ``SH``, ``A1``)
+    sorts instead of raising ``TypeError``.
+    """
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in _REF_SPLIT.split(ref) if part)
 
 
 def grid_positions(
@@ -302,15 +313,75 @@ def layout_pitch(extents: Iterable[Extent], gap: float = LAYOUT_GAP_MM, min_pitc
     return (px, py)
 
 
+def layout_columns(count: int, columns: int = LAYOUT_COLUMNS) -> int:
+    """Columns of the symbol table: ``columns`` (4) up to 16 symbols, ``ceil(sqrt(count))`` beyond, so a large board stays roughly square."""
+    return max(columns, math.ceil(math.sqrt(count))) if count > 0 else columns
+
+
 def layout_positions(
     extents: Mapping[str, Extent],
     origin: Vec = LAYOUT_ORIGIN_MM,
-    columns: int = LAYOUT_COLUMNS,
+    columns: int | None = None,
     gap: float = LAYOUT_GAP_MM,
     min_pitch: float = SYMBOL_PITCH_MM,
 ) -> dict[str, Vec]:
-    """Symbol origins on a grid whose pitch is derived from the symbols' measured extents."""
-    return grid_positions(extents.keys(), origin, layout_pitch(extents.values(), gap, min_pitch), columns)
+    """Symbol origins in a table whose column widths and row heights are derived from the symbols' measured extents.
+
+    Refs go row-major in natural order over ``columns`` columns
+    (:func:`layout_columns` when ``None``). The distance from column ``c``
+    to column ``c + 1`` is the right-most extent edge of column ``c`` minus
+    the left-most extent edge of column ``c + 1`` plus ``gap`` (every row),
+    rounded up to 2.54 mm and never below ``min_pitch``; rows likewise with
+    the bottom / top edges. Edges only grow along a row or a column, so no
+    two extents can touch - whatever their sizes - while one tall symbol (a
+    64-pin microcontroller) makes only its own row tall and its own column
+    wide instead of every cell (the uniform :func:`layout_pitch` grid did).
+    Every origin stays a multiple of 2.54 mm from ``origin``, so library pin
+    ends (multiples of 1.27 mm) stay on KiCad's connection grid.
+    """
+    refs = sorted(extents, key=natural_ref_key)
+    if not refs:
+        return {}
+    cols = layout_columns(len(refs)) if columns is None else columns
+    if cols < 1:
+        raise ValueError("columns must be >= 1")
+    rows = [refs[i : i + cols] for i in range(0, len(refs), cols)]
+    xs = [snap(origin[0])]
+    for c in range(min(cols, len(refs)) - 1):
+        right = max(extents[row[c]].xmax for row in rows if c < len(row))
+        left = min(extents[row[c + 1]].xmin for row in rows if c + 1 < len(row))
+        xs.append(snap(xs[-1] + max(min_pitch, _ceil_grid(right - left + gap))))
+    ys = [snap(origin[1])]
+    for r in range(len(rows) - 1):
+        bottom = max(extents[ref].ymax for ref in rows[r])
+        top = min(extents[ref].ymin for ref in rows[r + 1])
+        ys.append(snap(ys[-1] + max(min_pitch, _ceil_grid(bottom - top + gap))))
+    return {ref: (xs[c], ys[r]) for r, row in enumerate(rows) for c, ref in enumerate(row)}
+
+
+#: the ISO sheets (landscape, mm) a schematic may use, smallest first: KiCad's own page sizes
+LAYOUT_PAPERS: tuple[tuple[str, float, float], ...] = (
+    ("A4", 297.0, 210.0), ("A3", 420.0, 297.0), ("A2", 594.0, 420.0), ("A1", 841.0, 594.0), ("A0", 1189.0, 841.0),
+)
+#: free sheet kept right of and below the drawn extents (the origin's 50.8 mm on the other two sides; the title block sits bottom right)
+LAYOUT_SHEET_MARGIN_MM = LAYOUT_ORIGIN_MM[0]
+
+
+def layout_paper(extents: Iterable[Extent], margin: float = LAYOUT_SHEET_MARGIN_MM) -> tuple[str, float, float]:
+    """``(name, width, height)`` of the smallest :data:`LAYOUT_PAPERS` sheet that holds every placed extent plus ``margin`` right and below.
+
+    The extents are absolute (already shifted to their symbol origins).
+    Beyond A0 the sheet is ``User`` sized to the extents plus the margin,
+    rounded up to whole millimetres; KiCad draws its frame and title block on
+    the sheet, so a symbol outside it is off the page, never lost.
+    """
+    boxes = list(extents)
+    need_w = max((e.xmax for e in boxes), default=0.0) + margin
+    need_h = max((e.ymax for e in boxes), default=0.0) + margin
+    for name, w, h in LAYOUT_PAPERS:
+        if need_w <= w and need_h <= h:
+            return name, w, h
+    return "User", float(math.ceil(need_w)), float(math.ceil(need_h))
 
 
 def point_on_segment(p: Vec, a: Vec, b: Vec, tol: float = 1e-6) -> bool:

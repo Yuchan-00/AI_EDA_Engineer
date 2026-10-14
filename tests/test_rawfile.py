@@ -11,6 +11,7 @@ import pytest
 
 from ai_eda.tools.spice import NgspiceShared, SpiceAnalysis, rawfile, result_from_rawfile
 from ai_eda.tools.spice.rawfile import PLOTNAMES, RawPlot, canonical_name, complex_convention, parse, parse_all, raw_variable_name
+from tests.conftest import rawfile_command_ok
 
 DLL_PRESENT = NgspiceShared().available()
 needs_dll = pytest.mark.skipif(not DLL_PRESENT, reason="ngspice.dll (KiCad's bundled ngspice shared library) not found")
@@ -210,7 +211,7 @@ def test_dll_written_rawfiles_round_trip(tmp_path: Path, analysis: SpiceAnalysis
     assert plot.binary == (raw_format == "binary")
     assert plot.plotname == PLOTNAMES[analysis.value] == res.plot_type
     assert plot.title == lines[0]
-    assert plot.command.startswith(runner.version() + ", Build ")
+    assert rawfile_command_ok(plot.command, runner.version()), plot.command
     assert plot.date
     assert plot.n_points == res.n_points and plot.n_variables == len(res.vector_types)
     assert plot.scale == EXPECTED_SCALE[analysis]

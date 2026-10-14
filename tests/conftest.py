@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+import ai_eda.llm.claude_cli as _claude_cli
+import ai_eda.report.stages as _stages
 from ai_eda.ir import (
     CircuitDomain,
     CircuitIR,
@@ -25,7 +27,57 @@ from ai_eda.ir import (
 )
 
 DS = SourceRef(title="Generic resistor datasheet", authority="Vendor", content_hash="sha256:abc")
+
+
+def rawfile_command_ok(command: str, version: str) -> bool:
+    """KiCad's ngspice-46 stamps ``Command: ngspice-46, Build ...`` into every rawfile; Debian/Ubuntu ``libngspice0``
+    (ngspice-42) writes no ``Command:`` line at all, so the parsed command is empty (measured 2026-09-23). The line is
+    evidence of the writer, not data."""
+    if version == "ngspice-42":
+        return command == ""
+    return command.startswith(version + ", Build ")
 AUTH = Provenance(kind=ProvenanceKind.AUTHORITATIVE, source=DS)
+
+
+@pytest.fixture(autouse=True)
+def stage_reports_find_no_browser(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stage-report writer discovers no browser in a test unless the test is marked ``browser``.
+
+    A headless print costs about 1.5 s per report and every ``ai-eda run``
+    that reaches RELEASE writes seven; the runs across the suite are not
+    about PDFs. Only the writer's discovery (``ai_eda.report.stages.find_browser``)
+    is disabled: ``ai_eda.report.pdf.find_browser`` itself, ``doctor`` and an
+    explicit ``browser=`` / ``--browser`` are untouched, and a test marked
+    ``@pytest.mark.browser`` gets the real discovery.
+    """
+    if request.node.get_closest_marker("browser") is None:
+        monkeypatch.setattr(_stages, "find_browser", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def claude_cli_discovery_finds_only_the_fake(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``find_claude_cli`` finds only the fake ``claude`` of ``tests/fake_claude_cli.py`` unless the test is marked ``real_claude_cli``.
+
+    ``doctor`` and ``describe_providers`` probe whatever discovery returns
+    (``claude --version``, ``claude auth status``), so without this a test
+    that runs them without installing the fake would spawn the machine's real
+    CLI and read its credential store. Discovery itself runs unchanged; a
+    result that is not a fake (no :data:`~tests.fake_claude_cli.FAKE_MARKER`
+    beside it) reads as "not found". An explicit ``ClaudeCodeClient(cli=...)``
+    / ``--llm-claude-cli`` is untouched, and only
+    ``tests/test_claude_cli_live.py`` is marked ``real_claude_cli``.
+    """
+    if request.node.get_closest_marker("real_claude_cli") is not None:
+        return
+    from tests.fake_claude_cli import is_fake_claude_cli
+
+    real = _claude_cli.find_claude_cli
+
+    def fake_only() -> str | None:
+        found = real()
+        return found if found is not None and is_fake_claude_cli(found) else None
+
+    monkeypatch.setattr(_claude_cli, "find_claude_cli", fake_only)
 
 
 def _pin(n: str) -> Pin:

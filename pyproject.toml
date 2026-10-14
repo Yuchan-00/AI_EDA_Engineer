@@ -20,8 +20,20 @@ dev = ["pytest>=8"]
 [project.scripts]
 ai-eda = "ai_eda.cli:main"
 
+# empty on purpose: uv reads the first uv.toml / [tool.uv] it finds from its current folder upwards, and the installers
+# run uv in this folder, so a uv configuration of a folder above the project never applies to its install
+[tool.uv]
+
 [tool.setuptools.packages.find]
 include = ["ai_eda*"]
 
+# non-Python files the package reads at run time (a wheel / non-editable install leaves out anything not listed here)
+[tool.setuptools.package-data]
+"ai_eda.regulatory" = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "browser: the test may discover and run the real headless browser for stage-report PDFs (tests/conftest.py disables that discovery otherwise)",
+    "real_claude_cli: the test may discover and run the real Claude Code CLI (tests/conftest.py lets discovery find only the fake otherwise)",
+]

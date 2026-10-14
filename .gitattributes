@@ -10,3 +10,5 @@
 *.kicad_pcb text eol=lf
 *.kicad_sym text eol=lf
 *.kicad_mod text eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

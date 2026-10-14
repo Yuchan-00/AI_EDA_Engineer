@@ -5,22 +5,57 @@ geometry is *not* stored here - it comes from the verified KiCad footprint at
 compile time.
 
 Traceability (spec 26): every layout item (``Placement``, ``Track``, ``Via``,
-``Zone``) carries a :class:`~ai_eda.ir.provenance.Provenance` so copper can be
-traced to the tool run, the user or the model that produced it. An item that
-was constructed without saying where it came from gets
-:data:`UNRECORDED_ORIGIN` - an *assumption* that ``needs_verification`` - and
-the reviewer reports the board as NOT_VERIFIED until someone records the
-origin. A tool that generates layout (``ai_eda.tools.routing``) stamps
-``derived`` provenance with its id and version.
+``Zone``, ``SilkText``, ``Keepout``) carries a :class:`~ai_eda.ir.provenance.Provenance` so
+copper and silkscreen can be traced to the tool run, the user or the model
+that produced it. An item that was constructed without saying where it came
+from gets :data:`UNRECORDED_ORIGIN` - an *assumption* that
+``needs_verification`` - and the reviewer reports the board as NOT_VERIFIED
+until someone records the origin. A tool that generates layout
+(``ai_eda.tools.routing``, ``ai_eda.tools.silkscreen``) stamps ``derived``
+provenance with its id and version.
+
+Silkscreen (:class:`SilkText`, ``PCBDesign.silkscreen``) is designed content:
+where a footprint's reference designator goes (a ``reference`` text replaces
+the position / layer / size of that footprint's ``Reference`` property in the
+compiled board - on ``F.Fab`` / ``B.Fab`` when it could not be placed on the
+silk without a collision) and the board texts (``title`` / ``pin_label`` /
+``user``, compiled to ``gr_text`` on ``F.SilkS`` / ``B.SilkS``). The
+footprints' own silk graphics come from the library, never from here. Fields
+added after IRs were saved (``PCBDesign.silkscreen``, the two silk limits of
+:class:`ManufacturingConstraints`) are left out of the design view while
+empty (:func:`~ai_eda.ir.provenance.drop_empty_in_design_view`), so an IR
+saved before they existed keeps its ``content_hash``.
+
+The layer stack (:class:`Stackup`, ``PCBDesign.stackup``) is design content
+added the same way (out of the design view while ``None``): copper layers
+top to bottom (thickness, and the net of a reference plane on a plane
+layer), the dielectric between each pair (thickness, relative permittivity
+at a stated frequency, optional loss tangent) and an optional solder mask,
+every number ``Traced``. Impedance and propagation delay are only defined
+over a reference plane; :mod:`ai_eda.tools.calc.tline` reads the geometry of
+a routed layer from the stack (``line_geometry``) and says why when it
+cannot.
+
+Keep-outs (:class:`Keepout`, ``PCBDesign.keepouts``) are design content added
+the same way (out of the design view while empty): an area of one or more
+copper layers (a rectangle or a polygon, mm, every number ``Traced``) where
+tracks, vias, pads, zones and / or footprints are forbidden, with the refs /
+nets that are the named exceptions (an antenna's feed pad and its feed
+track in an otherwise empty band) and the reason. A keep-out is a rule for
+the placer, the router, the plane zones and the ``pcb.keepout`` geometry
+check; it carries a provenance like every other layout item.
 """
 
 from __future__ import annotations
 
+import math
+import re
 from enum import StrEnum
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from ai_eda.ir.provenance import Provenance, ProvenanceKind, Traced
+from ai_eda.ir.provenance import Provenance, ProvenanceKind, Traced, drop_empty_in_design_view
 
 #: note of the placeholder provenance a layout item gets when nobody said where it came from
 UNRECORDED_ORIGIN = "origin not recorded"
@@ -88,9 +123,53 @@ class Zone(BaseModel):
     provenance: Provenance = Field(default_factory=unrecorded_origin)
 
 
+class SilkKind(StrEnum):
+    """What a :class:`SilkText` is: a footprint's reference designator, the board title, a connector pin label, anything else."""
+
+    REFERENCE = "reference"
+    TITLE = "title"
+    PIN_LABEL = "pin_label"
+    USER = "user"
+
+
+class SilkText(BaseModel):
+    """One designed silkscreen text (board frame, mm, Y down).
+
+    ``x_mm`` / ``y_mm`` is the text position KiCad stores (the anchor the
+    justification refers to; vertically the text is centred on it),
+    ``rotation_deg`` the stored text angle (counter-clockwise on screen),
+    ``size_mm`` the glyph height = width, ``thickness_mm`` the stroke width
+    (KiCad's stroke font). A text on a ``B.*`` layer is written mirrored.
+    ``kind="reference"`` names the footprint in ``component_ref`` and its
+    ``text`` is that reference; its layer is the silk or fab layer of the
+    footprint's side (``F.Fab`` = placed on the fab drawing because no silk
+    position was free). ``pin_label`` names the connector in
+    ``component_ref``. The compiler refuses anything else (a layer the board
+    lacks, a non-finite number, a reference to no component).
+    """
+
+    text: str
+    x_mm: float
+    y_mm: float
+    rotation_deg: float = 0.0
+    layer: str = "F.SilkS"
+    size_mm: float = 1.0
+    thickness_mm: float = 0.15
+    justify: Literal["center", "left", "right"] = "center"
+    kind: SilkKind = SilkKind.USER
+    component_ref: str | None = None
+    #: the placer / user / model that put the text here; unrecorded = assumption
+    provenance: Provenance = Field(default_factory=unrecorded_origin)
+
+
 class ManufacturingConstraints(BaseModel):
     """Fab limits. Every value is Traced so a JLCPCB limit that was never
-    confirmed stays visibly NOT_VERIFIED instead of silently becoming a rule."""
+    confirmed stays visibly NOT_VERIFIED instead of silently becoming a rule.
+
+    ``min_silk_text_height_mm`` / ``min_silk_line_width_mm`` (judged by
+    ``pcb.silk.size``, IR geometry) were added after IRs were saved: they are
+    left out of the design view while unset, so an existing IR keeps its hash.
+    """
 
     fab: str | None = None  # "JLCPCB"
     min_track_width_mm: Traced[float] | None = None
@@ -101,6 +180,371 @@ class ManufacturingConstraints(BaseModel):
     layer_count_options: Traced[list[int]] | None = None
     copper_weight_oz: Traced[float] | None = None
     board_thickness_mm: Traced[float] | None = None
+    min_silk_text_height_mm: Traced[float] | None = None
+    min_silk_line_width_mm: Traced[float] | None = None
+
+    _design = drop_empty_in_design_view("min_silk_text_height_mm", "min_silk_line_width_mm")
+
+
+# --------------------------------------------------------------------------- stackup
+
+
+class DielectricKind(StrEnum):
+    """What a dielectric layer of the stackup is made of: a laminated core or a prepreg (bonding) sheet."""
+
+    CORE = "core"
+    PREPREG = "prepreg"
+
+
+class CopperRole(StrEnum):
+    """What a copper layer of the stackup carries: routed signals, or one net's reference plane."""
+
+    SIGNAL = "signal"
+    PLANE = "plane"
+
+
+#: the unit each dimensional stackup number must carry (a number in another unit would be misread, so it is refused)
+STACKUP_UNITS: dict[str, str] = {"copper.thickness_um": "um", "dielectric.thickness_mm": "mm", "dielectric.er_frequency_hz": "Hz", "solder_mask.thickness_um": "um"}
+
+
+def _check_traced(traced: Traced | None, what: str, *, unit: str | None, minimum: float, strict: bool, upper: float | None = None) -> None:
+    """``ValueError`` when a stackup number carries the wrong unit or lies outside its physical range."""
+    if traced is None:
+        return
+    if traced.unit != unit:
+        want = f"unit {unit!r}" if unit is not None else "no unit (a dimensionless ratio)"
+        raise ValueError(f"{what} must carry {want}, got {traced.unit!r}")
+    v = traced.value
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"{what} must be a number, got {v!r}")
+    if (strict and not v > minimum) or (not strict and not v >= minimum):
+        raise ValueError(f"{what} must be {'>' if strict else '>='} {minimum:g}, got {v!r}")
+    if upper is not None and not v < upper:
+        raise ValueError(f"{what} must be < {upper:g}, got {v!r}")
+
+
+class StackupCopper(BaseModel):
+    """One copper layer of the stackup, top (``F.Cu``) to bottom (``B.Cu``).
+
+    ``thickness_um`` is the finished copper thickness in micrometres.
+    ``plane_net`` names the net of a reference plane on this layer (a plane
+    layer: the PCB agent fills it with a zone of that net, the router does not
+    route on it); ``None`` is a signal layer. The plane assignment is a design
+    decision, never a fab fact: a stackup grounded on a fab page carries no
+    plane until the design adds one.
+    """
+
+    name: str
+    thickness_um: Traced[float]
+    plane_net: Traced[str] | None = None
+
+    @property
+    def role(self) -> CopperRole:
+        return CopperRole.PLANE if self.plane_net is not None else CopperRole.SIGNAL
+
+
+class StackupDielectric(BaseModel):
+    """One dielectric layer between two copper layers.
+
+    ``er`` is the relative permittivity (Dk) at ``er_frequency_hz`` when the
+    source states the frequency (a Dk without its frequency is kept, and a
+    report says the frequency is not recorded); ``loss_tangent`` is optional
+    (the lossless calculators do not use it).
+    """
+
+    kind: DielectricKind
+    thickness_mm: Traced[float]
+    er: Traced[float]
+    er_frequency_hz: Traced[float] | None = None
+    loss_tangent: Traced[float] | None = None
+
+
+class SolderMask(BaseModel):
+    """The solder mask over the outer layers (thickness over the copper, relative permittivity)."""
+
+    thickness_um: Traced[float]
+    er: Traced[float]
+
+
+class Stackup(BaseModel):
+    """The board's layer stack: copper layers top to bottom with the dielectric between each pair.
+
+    ``dielectrics[i]`` lies between ``copper[i]`` and ``copper[i + 1]``.
+    Every number is :class:`~ai_eda.ir.provenance.Traced`: grounded on a fab
+    page (``--fab-capability`` with a ``stackup`` block,
+    :mod:`ai_eda.tools.manufacturing.capability_file`), a template's
+    confirmed choice (:mod:`ai_eda.design.stackup`) or the user's. The model
+    refuses what it cannot mean: fewer than two copper layers, names other
+    than ``F.Cu``, ``In1.Cu`` .. ``In<n>.Cu``, ``B.Cu`` in that order, a
+    dielectric count that is not the copper count minus one, a dimensional
+    number without its unit (:data:`STACKUP_UNITS`), a thickness that is not
+    positive, a permittivity below 1 or a loss tangent outside [0, 1).
+    ``provenance`` records who decided the stack as a whole (layer count,
+    plane assignment).
+
+    Every traced number has an id (:meth:`traced_items`), e.g.
+    ``pcb.stackup.dielectrics[0].er`` or
+    ``pcb.stackup.copper[F.Cu].thickness_um``: a calculator that reads a
+    stackup number records that id as its input, and
+    :func:`~ai_eda.tools.calc.recompute.recompute_parameters` resolves it
+    through :meth:`lookup`.
+    """
+
+    copper: list[StackupCopper]
+    dielectrics: list[StackupDielectric]
+    solder_mask: SolderMask | None = None
+    provenance: Provenance = Field(default_factory=unrecorded_origin)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Stackup:
+        names = [c.name for c in self.copper]
+        if len(names) < 2:
+            raise ValueError(f"a stackup needs at least two copper layers, got {names}")
+        expected = ["F.Cu", *[f"In{i}.Cu" for i in range(1, len(names) - 1)], "B.Cu"]
+        if names != expected:
+            raise ValueError(f"copper layers must be {expected} top to bottom, got {names}")
+        if len(self.dielectrics) != len(self.copper) - 1:
+            raise ValueError(f"{len(self.copper)} copper layers need {len(self.copper) - 1} dielectric(s) between them, got {len(self.dielectrics)}")
+        for c in self.copper:
+            _check_traced(c.thickness_um, f"copper {c.name} thickness_um", unit="um", minimum=0.0, strict=True)
+            if c.plane_net is not None and (not isinstance(c.plane_net.value, str) or not c.plane_net.value.strip()):
+                raise ValueError(f"copper {c.name}: plane_net must name a net, got {c.plane_net.value!r}")
+        for i, d in enumerate(self.dielectrics):
+            what = f"dielectric {i} ({self.copper[i].name} / {self.copper[i + 1].name})"
+            _check_traced(d.thickness_mm, f"{what} thickness_mm", unit="mm", minimum=0.0, strict=True)
+            _check_traced(d.er, f"{what} er", unit=None, minimum=1.0, strict=False)
+            _check_traced(d.er_frequency_hz, f"{what} er_frequency_hz", unit="Hz", minimum=0.0, strict=True)
+            _check_traced(d.loss_tangent, f"{what} loss_tangent", unit=None, minimum=0.0, strict=False, upper=1.0)
+        if self.solder_mask is not None:
+            _check_traced(self.solder_mask.thickness_um, "solder_mask thickness_um", unit="um", minimum=0.0, strict=True)
+            _check_traced(self.solder_mask.er, "solder_mask er", unit=None, minimum=1.0, strict=False)
+        return self
+
+    @property
+    def layer_count(self) -> int:
+        return len(self.copper)
+
+    def copper_names(self) -> list[str]:
+        return [c.name for c in self.copper]
+
+    def copper_layer(self, name: str) -> StackupCopper | None:
+        for c in self.copper:
+            if c.name == name:
+                return c
+        return None
+
+    def index(self, name: str) -> int:
+        """Position of copper layer ``name`` (0 = ``F.Cu``); ``ValueError`` for a layer the stack does not have."""
+        for i, c in enumerate(self.copper):
+            if c.name == name:
+                return i
+        raise ValueError(f"copper layer {name!r} is not in the stackup {self.copper_names()}")
+
+    def plane_layers(self) -> list[StackupCopper]:
+        return [c for c in self.copper if c.plane_net is not None]
+
+    def signal_layers(self) -> list[str]:
+        return [c.name for c in self.copper if c.plane_net is None]
+
+    def board_thickness_mm(self) -> float:
+        """Copper plus dielectric thickness, outer copper face to outer copper face (the solder mask is not counted)."""
+        return sum(float(d.thickness_mm.value) for d in self.dielectrics) + sum(float(c.thickness_um.value) for c in self.copper) / 1000.0
+
+    def span_mm(self, upper: str, lower: str) -> float:
+        """Distance from the top face of copper layer ``upper`` to the bottom face of ``lower`` (the plated barrel a via between them spans).
+
+        For ``F.Cu`` to ``B.Cu`` that is :meth:`board_thickness_mm`. The two
+        names may be given in either order; the same layer twice gives its own
+        copper thickness.
+        """
+        a, b = sorted((self.index(upper), self.index(lower)))
+        copper = sum(float(c.thickness_um.value) for c in self.copper[a:b + 1]) / 1000.0
+        return copper + sum(float(d.thickness_mm.value) for d in self.dielectrics[a:b])
+
+    def traced_items(self, prefix: str = "pcb.stackup") -> list[tuple[str, Traced]]:
+        """``(id, traced)`` of every traced value of the stack, in stack order (the ids :meth:`lookup` resolves)."""
+        out: list[tuple[str, Traced]] = []
+        for c in self.copper:
+            out.append((f"{prefix}.copper[{c.name}].thickness_um", c.thickness_um))
+            if c.plane_net is not None:
+                out.append((f"{prefix}.copper[{c.name}].plane_net", c.plane_net))
+        for i, d in enumerate(self.dielectrics):
+            for field in ("thickness_mm", "er", "er_frequency_hz", "loss_tangent"):
+                t = getattr(d, field)
+                if t is not None:
+                    out.append((f"{prefix}.dielectrics[{i}].{field}", t))
+        if self.solder_mask is not None:
+            out.append((f"{prefix}.solder_mask.thickness_um", self.solder_mask.thickness_um))
+            out.append((f"{prefix}.solder_mask.er", self.solder_mask.er))
+        return out
+
+    def served_requirements(self) -> list[str]:
+        """The requirement ids the stack as a whole serves (``provenance.derived_from``: a layer count the user stated, ``req.pcb_layers``)."""
+        return [rid for rid in self.provenance.derived_from if rid.startswith("req.")]
+
+    def lookup(self, key: str, prefix: str = "pcb.stackup") -> Traced | None:
+        """The traced value with id ``key`` (see :meth:`traced_items`), else ``None``."""
+        if not key.startswith(prefix + "."):
+            return None
+        for k, t in self.traced_items(prefix):
+            if k == key:
+                return t
+        return None
+
+
+# --------------------------------------------------------------------------- keep-outs
+
+
+#: what a :class:`Keepout` may forbid (a KiCad rule area calls the ``zones`` ban ``copperpour``)
+KEEPOUT_ITEMS: tuple[str, ...] = ("tracks", "vias", "pads", "zones", "footprints")
+#: the items a ref exception applies to, and the items a net exception applies to
+_REF_ITEMS = frozenset({"footprints", "pads"})
+_NET_ITEMS = frozenset({"tracks", "vias", "zones", "pads"})
+#: every copper layer of the board
+ALL_COPPER = "*.Cu"
+_COPPER_LAYER_RE = re.compile(r"^(F\.Cu|B\.Cu|In[1-9][0-9]*\.Cu)$")
+_KEEPOUT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class Keepout(BaseModel):
+    """An area of copper layers where tracks / vias / pads / zones / footprints are forbidden (board frame, mm, Y down).
+
+    ``layers`` names copper layers (``F.Cu``, ``In1.Cu`` .. ``In<n>.Cu``,
+    ``B.Cu``) or is exactly ``["*.Cu"]`` (every copper layer of the board).
+    The area is exactly one of ``rect`` - ``[x, y, w, h]`` in mm, the corner
+    with the smallest coordinates first, ``w`` / ``h`` > 0 - and ``polygon``
+    - at least three ``[x, y]`` points in mm enclosing a non-zero area; the
+    traced value carries unit ``mm``. ``forbids`` lists what may not lie in
+    the area (:data:`KEEPOUT_ITEMS`, no repeats). ``allowed_refs`` names the
+    footprints exempt from a ``footprints`` / ``pads`` ban (the antenna in a
+    no-parts band) and ``allowed_nets`` the nets exempt from a ``tracks`` /
+    ``vias`` / ``zones`` / ``pads`` ban (its feed track); an exception for an
+    item the keep-out does not forbid is refused. ``reason`` says why the
+    area is kept out. ``id`` is a plain identifier (it names the check row
+    and the compiled rule area).
+    """
+
+    id: str
+    layers: list[str]
+    rect: Traced[list[float]] | None = None
+    polygon: Traced[list[list[float]]] | None = None
+    forbids: list[Literal["tracks", "vias", "pads", "zones", "footprints"]]
+    allowed_refs: list[str] = Field(default_factory=list)
+    allowed_nets: list[str] = Field(default_factory=list)
+    reason: str
+    #: the template / user / tool that decided the keep-out; unrecorded = assumption
+    provenance: Provenance = Field(default_factory=unrecorded_origin)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Keepout:
+        what = f"keep-out {self.id}"
+        if not _KEEPOUT_ID_RE.match(self.id):
+            raise ValueError(f"keep-out id {self.id!r} must be a plain identifier (a letter, then letters, digits or _)")
+        if not self.layers:
+            raise ValueError(f"{what}: needs at least one copper layer")
+        if ALL_COPPER in self.layers and self.layers != [ALL_COPPER]:
+            raise ValueError(f"{what}: {ALL_COPPER!r} means every copper layer and stands alone, got {self.layers}")
+        for layer in self.layers:
+            if layer != ALL_COPPER and not _COPPER_LAYER_RE.match(layer):
+                raise ValueError(f"{what}: {layer!r} is not a copper layer (F.Cu, In<n>.Cu, B.Cu or {ALL_COPPER})")
+        if len(set(self.layers)) != len(self.layers):
+            raise ValueError(f"{what}: a layer is listed twice in {self.layers}")
+        if (self.rect is None) == (self.polygon is None):
+            raise ValueError(f"{what}: give exactly one of rect ([x, y, w, h] mm) or polygon ([[x, y], ...] mm)")
+        area = self.rect if self.rect is not None else self.polygon
+        if area.unit != "mm":  # type: ignore[union-attr]
+            raise ValueError(f"{what}: the area must carry unit 'mm', got {area.unit!r}")  # type: ignore[union-attr]
+        if self.rect is not None:
+            r = self.rect.value
+            if len(r) != 4 or any(not math.isfinite(float(v)) for v in r):
+                raise ValueError(f"{what}: rect must be [x, y, w, h] (four finite numbers), got {r!r}")
+            if not (r[2] > 0 and r[3] > 0):
+                raise ValueError(f"{what}: rect width and height must be > 0, got {r[2]!r} x {r[3]!r}")
+        else:
+            pts = self.polygon.value  # type: ignore[union-attr]
+            if len(pts) < 3 or any(len(p) != 2 or any(not math.isfinite(float(v)) for v in p) for p in pts):
+                raise ValueError(f"{what}: polygon needs at least three [x, y] points of finite numbers, got {pts!r}")
+            if _shoelace([(float(p[0]), float(p[1])) for p in pts]) == 0.0:
+                raise ValueError(f"{what}: polygon encloses no area")
+        if not self.forbids:
+            raise ValueError(f"{what}: forbids nothing ({list(KEEPOUT_ITEMS)})")
+        if len(set(self.forbids)) != len(self.forbids):
+            raise ValueError(f"{what}: an item is listed twice in forbids {self.forbids}")
+        for label, names, items in (("allowed_refs", self.allowed_refs, _REF_ITEMS), ("allowed_nets", self.allowed_nets, _NET_ITEMS)):
+            if any(not isinstance(n, str) or not n.strip() for n in names):
+                raise ValueError(f"{what}: {label} entries must name something, got {names!r}")
+            if len(set(names)) != len(names):
+                raise ValueError(f"{what}: a name is listed twice in {label} {names}")
+            if names and not (set(self.forbids) & items):
+                raise ValueError(f"{what}: {label} are exceptions to a {' / '.join(sorted(items))} ban, which this keep-out does not state (forbids {self.forbids})")
+        if not self.reason.strip():
+            raise ValueError(f"{what}: reason must say why the area is kept out")
+        return self
+
+    def outline(self) -> list[tuple[float, float]]:
+        """The area's corner points in mm (a rect as its four corners, from ``(x, y)`` clockwise on screen)."""
+        if self.rect is not None:
+            x, y, w, h = (float(v) for v in self.rect.value)
+            return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        return [(float(p[0]), float(p[1])) for p in self.polygon.value]  # type: ignore[union-attr]
+
+    def bbox(self) -> tuple[float, float, float, float]:
+        """``(x0, y0, x1, y1)`` of the area in mm."""
+        pts = self.outline()
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def covers_layer(self, layer: str) -> bool:
+        """Whether the keep-out applies on copper layer ``layer`` (``*.Cu`` covers every copper layer)."""
+        if self.layers == [ALL_COPPER]:
+            return bool(_COPPER_LAYER_RE.match(layer))
+        return layer in self.layers
+
+
+def _shoelace(pts: list[tuple[float, float]]) -> float:
+    """Twice the signed area of the polygon ``pts``."""
+    return sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]))
+
+
+class PackRegion(BaseModel):
+    """A rectangle of the board (board frame, mm, Y down) a placer packs the named parts into.
+
+    ``rect`` is ``[x, y, w, h]`` (traced, unit ``mm``, ``w`` / ``h`` > 0),
+    ``refs`` the parts packed there (no ref twice), ``side`` the side they go
+    on. Used with :attr:`PCBDesign.fixed`: the fixed parts are where the
+    design put them and the parts named here are packed around them by the
+    ``placement.fixed`` placer, never moved outside the region.
+    """
+
+    id: str
+    rect: Traced[list[float]]
+    refs: list[str]
+    side: BoardSide = BoardSide.TOP
+    #: the template / user that decided the region; unrecorded = assumption
+    provenance: Provenance = Field(default_factory=unrecorded_origin)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> PackRegion:
+        what = f"pack region {self.id}"
+        if not _KEEPOUT_ID_RE.match(self.id):
+            raise ValueError(f"pack region id {self.id!r} must be a plain identifier (a letter, then letters, digits or _)")
+        if self.rect.unit != "mm":
+            raise ValueError(f"{what}: rect must carry unit 'mm', got {self.rect.unit!r}")
+        r = self.rect.value
+        if len(r) != 4 or any(not math.isfinite(float(v)) for v in r):
+            raise ValueError(f"{what}: rect must be [x, y, w, h] (four finite numbers), got {r!r}")
+        if not (r[2] > 0 and r[3] > 0):
+            raise ValueError(f"{what}: rect width and height must be > 0, got {r[2]!r} x {r[3]!r}")
+        if not self.refs:
+            raise ValueError(f"{what}: names no part")
+        if len(set(self.refs)) != len(self.refs):
+            raise ValueError(f"{what}: a ref is listed twice in {self.refs}")
+        return self
+
+    def box(self) -> tuple[float, float, float, float]:
+        """``(x0, y0, x1, y1)`` of the region in mm."""
+        x, y, w, h = (float(v) for v in self.rect.value)
+        return x, y, x + w, y + h
 
 
 class PCBDesign(BaseModel):
@@ -111,6 +555,44 @@ class PCBDesign(BaseModel):
     vias: list[Via] = Field(default_factory=list)
     zones: list[Zone] = Field(default_factory=list)
     manufacturing: ManufacturingConstraints = Field(default_factory=ManufacturingConstraints)
+    #: designed silkscreen texts (references, title, pin labels, user texts); empty = the library default positions
+    silkscreen: list[SilkText] = Field(default_factory=list)
+    #: the layer stack (thicknesses, permittivities, plane layers); ``None`` = not stated, and every impedance / delay
+    #: number is NOT_VERIFIED "no stackup"
+    stackup: Stackup | None = None
+    #: areas where tracks / vias / pads / zones / footprints are forbidden (:class:`Keepout`); empty = none
+    keepouts: list[Keepout] = Field(default_factory=list)
+    #: parts whose position, rotation and side the design fixes (a keyboard's keys and their diodes, edge connectors):
+    #: the ``placement.fixed`` placer copies them into ``placements`` verbatim; empty = no part is fixed
+    fixed: list[Placement] = Field(default_factory=list)
+    #: rectangles the ``placement.fixed`` placer packs the named non-fixed parts into (:class:`PackRegion`)
+    pack_regions: list[PackRegion] = Field(default_factory=list)
+
+    _design = drop_empty_in_design_view("silkscreen", "stackup", "keepouts", "fixed", "pack_regions")
+
+    @model_validator(mode="after")
+    def _unique_keepouts(self) -> PCBDesign:
+        ids = [k.id for k in self.keepouts]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"keep-out ids must be unique, got {ids}")
+        fixed = [p.component_ref for p in self.fixed]
+        if len(set(fixed)) != len(fixed):
+            raise ValueError(f"a part is fixed twice: {sorted({r for r in fixed if fixed.count(r) > 1})}")
+        region_ids = [r.id for r in self.pack_regions]
+        if len(set(region_ids)) != len(region_ids):
+            raise ValueError(f"pack region ids must be unique, got {region_ids}")
+        packed: dict[str, str] = {}
+        for r in self.pack_regions:
+            for ref in r.refs:
+                if ref in packed:
+                    raise ValueError(f"ref {ref!r} is in two pack regions ({packed[ref]}, {r.id})")
+                if ref in fixed:
+                    raise ValueError(f"ref {ref!r} is both fixed and packed in region {r.id}")
+                packed[ref] = r.id
+        return self
+
+    def keepout(self, id: str) -> Keepout | None:
+        return next((k for k in self.keepouts if k.id == id), None)
 
     def placement(self, ref: str) -> Placement | None:
         for p in self.placements:
@@ -119,9 +601,13 @@ class PCBDesign(BaseModel):
         return None
 
     def layout_items(self) -> list[tuple[str, Provenance]]:
-        """``(label, provenance)`` of every placement / track / via / zone, for traceability review."""
+        """``(label, provenance)`` of every placement / track / via / zone / silkscreen text / keep-out, for traceability review."""
         out: list[tuple[str, Provenance]] = [(f"placement[{p.component_ref}]", p.provenance) for p in self.placements]
         out += [(f"track[{i}:{t.net}]", t.provenance) for i, t in enumerate(self.tracks)]
         out += [(f"via[{i}:{v.net}]", v.provenance) for i, v in enumerate(self.vias)]
         out += [(f"zone[{i}:{z.net}]", z.provenance) for i, z in enumerate(self.zones)]
+        out += [(f"silk[{i}:{t.kind}:{t.text}]", t.provenance) for i, t in enumerate(self.silkscreen)]
+        out += [(f"keepout[{i}:{k.id}]", k.provenance) for i, k in enumerate(self.keepouts)]
+        out += [(f"fixed[{p.component_ref}]", p.provenance) for p in self.fixed]
+        out += [(f"pack_region[{i}:{r.id}]", r.provenance) for i, r in enumerate(self.pack_regions)]
         return out

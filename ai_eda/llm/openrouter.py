@@ -47,6 +47,7 @@ import logging
 import os
 import ssl
 import time
+from urllib.parse import urlsplit
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterator
 
@@ -69,6 +70,28 @@ ERROR_TEXT_LIMIT = 2000
 def default_base_url() -> str:
     """``OPENROUTER_BASE_URL`` when set (non-blank), else the public endpoint."""
     return os.environ.get(ENV_BASE_URL, "").strip() or OPENROUTER_BASE_URL
+
+
+#: hosts a plain-http base URL may point at (the local fake server of the tests); everything else must be https
+LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def check_base_url(url: str) -> str:
+    """``url`` without its trailing slash, or :class:`~ai_eda.errors.ToolUnavailableError` when the key would travel in clear.
+
+    Every request carries ``Authorization: Bearer <key>``, so the endpoint
+    must be ``https://`` - except a loopback host (``http://127.0.0.1:<port>``),
+    which is how the tests point the client at ``tests/fake_openrouter.py``.
+    The offending URL is named in the error; the key never is.
+    """
+    base = (url or "").strip().rstrip("/")
+    parts = urlsplit(base)
+    host = (parts.hostname or "").lower()
+    if parts.scheme == "https" and host:
+        return base
+    if parts.scheme == "http" and host in LOOPBACK_HOSTS:
+        return base
+    raise ToolUnavailableError(f"{ENV_BASE_URL} / base_url must be https:// (or http:// on a loopback host for a local fake): got {base!r}")
 
 log = logging.getLogger("ai_eda.llm.openrouter")
 
@@ -131,7 +154,7 @@ class OpenRouterClient(LLMClient):
         if not key or not key.strip():
             raise ToolUnavailableError(f"{ENV_KEY} is not set (pass api_key= or export {ENV_KEY})")
         self._api_key = key.strip()
-        self.base_url = (base_url if base_url is not None else default_base_url()).rstrip("/")
+        self.base_url = check_base_url(base_url if base_url is not None else default_base_url())
         self.app_url = app_url
         self.app_title = app_title
         self.timeout = float(timeout)
@@ -316,6 +339,7 @@ class OpenRouterClient(LLMClient):
             data = None
         if isinstance(data, dict) and "error" in data:
             code, message, meta = self._error_fields(data["error"])
+            code = self._redact(code) if isinstance(code, str) else code
         elif isinstance(data, dict) and isinstance(data.get("message"), str):
             message = data["message"]
         return LLMError(
@@ -353,6 +377,7 @@ class OpenRouterClient(LLMClient):
         """
         if isinstance(data.get("error"), dict) or isinstance(data.get("error"), str):
             code, message, meta = self._error_fields(data["error"])
+            code = self._redact(code) if isinstance(code, str) else code
             return LLMError(self._redact(message), kind=kind, status=200, code=code, metadata=self._redact(meta), model=model, usage=usage, sent=True)
         choices = data.get("choices")
         if isinstance(choices, list):
@@ -361,6 +386,7 @@ class OpenRouterClient(LLMClient):
                     continue
                 if ch.get("error") is not None:
                     code, message, meta = self._error_fields(ch["error"])
+                    code = self._redact(code) if isinstance(code, str) else code
                     return LLMError(self._redact(message), kind=kind, status=200, code=code, metadata=self._redact(meta), model=model, usage=usage, sent=True)
                 if ch.get("finish_reason") == "error":
                     return LLMError("provider reported finish_reason 'error'", kind=kind, status=200, model=model, usage=usage, sent=True)
@@ -491,12 +517,15 @@ class OpenRouterClient(LLMClient):
             structured=structured,
             usage=usage or Usage(),
             raw=self._redact(data),
-            model_used=data.get("model") if isinstance(data.get("model"), str) else None,
-            finish_reason=choice.get("finish_reason") if isinstance(choice.get("finish_reason"), str) else None,
-            native_finish_reason=choice.get("native_finish_reason") if isinstance(choice.get("native_finish_reason"), str) else None,
-            id=data.get("id") if isinstance(data.get("id"), str) else None,
-            generation_id=headers.get("X-Generation-Id"),
-            provider_name=headers.get("X-Provider-Name"),
+            # every string field is redacted, not only ``raw`` / ``content``: a provider (or a proxy behind
+            # OPENROUTER_BASE_URL) that echoes the key in ``model`` / ``id`` / a header would otherwise
+            # put it into the INFO log, the usage records and the IR's validation details
+            model_used=self._redact(data.get("model")) if isinstance(data.get("model"), str) else None,
+            finish_reason=self._redact(choice.get("finish_reason")) if isinstance(choice.get("finish_reason"), str) else None,
+            native_finish_reason=self._redact(choice.get("native_finish_reason")) if isinstance(choice.get("native_finish_reason"), str) else None,
+            id=self._redact(data.get("id")) if isinstance(data.get("id"), str) else None,
+            generation_id=self._redact(headers.get("X-Generation-Id")),
+            provider_name=self._redact(headers.get("X-Provider-Name")),
             raw_error=self._redact("; ".join(problems)) if problems else None,
             reasoning=self._redact(reasoning) if isinstance(reasoning, str) else None,
         )
@@ -596,8 +625,8 @@ class OpenRouterClient(LLMClient):
 
         try:
             with self._http.stream("POST", url, json=body) as r:
-                header_gen_id = r.headers.get("X-Generation-Id")
-                provider_name = r.headers.get("X-Provider-Name")
+                header_gen_id = self._redact(r.headers.get("X-Generation-Id"))
+                provider_name = self._redact(r.headers.get("X-Provider-Name"))
                 if r.status_code != 200:
                     raise self._http_error(model, r.status_code, r.headers, r.read())
                 ctype = r.headers.get("Content-Type", "")
@@ -648,10 +677,10 @@ class OpenRouterClient(LLMClient):
                     ch = choices[0]
                     fr = ch.get("finish_reason")
                     if isinstance(fr, str) and fr:
-                        finish_reason = fr
+                        finish_reason = self._redact(fr)
                     nfr = ch.get("native_finish_reason")
                     if isinstance(nfr, str) and nfr:
-                        native_finish = nfr
+                        native_finish = self._redact(nfr)
                     delta = ch.get("delta") if isinstance(ch.get("delta"), dict) else {}
                     calls = delta.get("tool_calls")
                     if isinstance(calls, list):

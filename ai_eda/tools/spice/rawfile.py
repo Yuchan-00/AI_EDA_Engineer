@@ -10,7 +10,9 @@ KiCad 10.0.6's ``ngspice.dll`` (ngspice-46) writes, see
 ``docs/ARCHITECTURE.md`` and the SPICE stage notes):
 
 * Header lines, in order: ``Title:``, ``Date:``, ``Command:``
-  (``ngspice-46, Build ...`` - the engine version), ``Plotname:``
+  (``ngspice-46, Build ...`` - the engine version; Debian's ngspice-42 writes
+  no ``Command:`` line at all, so it is optional and ``RawPlot.command`` is
+  then empty), ``Plotname:``
   (``Operating Point`` / ``DC transfer characteristic`` /
   ``Transient Analysis`` / ``AC Analysis``), ``Flags: real|complex``,
   ``No. Variables:``, ``No. Points:``, then ``Variables:`` followed by one

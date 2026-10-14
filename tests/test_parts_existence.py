@@ -186,8 +186,10 @@ def test_mpn_case_and_whitespace_insensitive_but_token_bounded(fake, tmp_path, l
     assert spaced.status is S.PASS
     family = check_component_existence(make_part(ref="R3", mpn="VR1-0603-200"), lib, archive)  # continued by a letter in the text: not a hit
     assert family.status is S.NOT_VERIFIED and "MPN 'VR1-0603-200' not found in datasheet" in family.message
-    # the shared boundary rule treats a hyphen as a token boundary: a hyphen-delimited prefix *is* a hit (documented, not hidden)
-    assert check_component_existence(make_part(ref="R4", mpn="VR1-0603"), lib, archive).status is S.PASS
+    # a part number is a whole identifier: a hyphen-delimited prefix of the orderable code is NOT a hit (it names a
+    # family or another code, not this part; 2026-09-23 review finding)
+    prefix = check_component_existence(make_part(ref="R4", mpn="VR1-0603"), lib, archive)
+    assert prefix.status is S.NOT_VERIFIED and "MPN 'VR1-0603' not found in datasheet" in prefix.message
     assert fake.hits(VR1_URL) == 1  # one attempt per URL per run, however many parts share the datasheet
 
 

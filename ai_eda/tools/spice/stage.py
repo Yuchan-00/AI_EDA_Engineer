@@ -28,7 +28,8 @@ Invariants:
   deterministic artifacts.
 * **An expectation is judged, never interpreted.** ``measured`` comes from
   the reduction the IR asked for (``value`` / ``at`` / ``final`` / ``max`` /
-  ``min``) and the verdict is ``|measured - nominal| <= max(tol_abs,
+  ``min`` / ``frequency`` / ``db_at`` / ``rms`` / ``db_rms`` /
+  ``harmonic_dbc`` / ``am_depth``) and the verdict is ``|measured - nominal| <= max(tol_abs,
   tol_rel * |nominal|)`` (the limit actually used is in
   ``details["tolerance"]``). ``at`` between two samples is an interpolation
   (:meth:`~ai_eda.tools.spice.SpiceResult.interpolate`): the two bracketing
@@ -36,9 +37,48 @@ Invariants:
   when *both* neighbours are within tolerance too, FAIL only when both are
   outside on the same side, and otherwise UNRESOLVED ("the sweep grid is too
   coarse for this tolerance") - an interpolation error is never reported as
-  a design deviation. No tolerance at all is UNRESOLVED; so is ``tol_rel``
-  alone on a nominal of 0 (a relative tolerance on zero is no tolerance). A
-  vector the plot does not contain is FAIL ("vector not produced"); an
+  a design deviation. ``frequency`` is the mean rising-edge frequency of the
+  saved transient window (:func:`ai_eda.tools.spice.measure.rising_edge_frequency`):
+  the edge count, the first and last edge time, the thresholds, vmin /
+  vmax and the flatness floor go into ``details["frequency"]`` so the verdict
+  is auditable, and a waveform without three countable edges, or whose swing
+  is within the engine's own resolution (``reltol`` * level + ``vntol`` for a
+  voltage, + ``abstol`` for a current: numerical ripple is not an
+  oscillation), is FAIL ("no oscillation detected"), never PASS. The level
+  and window reductions (``db_at`` / ``rms`` / ``db_rms`` / ``harmonic_dbc``
+  / ``am_depth``, :mod:`ai_eda.tools.spice.measure`) put their audit data -
+  the window, the largest sample step and its limit, the amplitudes, the
+  reference level, the bias bounds - into ``details[<reduce value>]`` (the
+  same rule as ``details["frequency"]``), and the expectation's ``params`` /
+  ``reference_vector`` into ``details["params"]`` / ``details["reference_vector"]``;
+  ``db_at`` is judged on the dB bracket of the two samples its magnitudes were
+  read between, like ``at``; ``rms`` / ``db_rms`` / ``harmonic_dbc`` /
+  ``am_depth`` are judged on the bracket their documented bias bounds leave
+  (the grid's read-low bound up to ``f_max``, the harmonic's grid attenuation
+  and leakage bound, the AM crest and envelope bounds; ``details["bias_bracket"]``)
+  the same way - PASS only when all of it is inside the tolerance, FAIL only
+  when all of it is outside on one side, UNRESOLVED otherwise, naming the
+  bounds and the remedy: a measurement bias is never reported as a design
+  deviation, nor a biased number as a PASS. A number they cannot give (a
+  grid too coarse, a zero reference, no fundamental, a waveform that does not
+  repeat at ``f0``, a window outside the saved samples) is
+  FAIL for a human with the reason; a harmonic level at or below the
+  engine's resolution is measured but never PASS (NOT_VERIFIED, "not
+  resolved", ``details["unresolved"]``). No tolerance
+  at all is UNRESOLVED; so is ``tol_rel`` alone on a nominal of 0 (a relative
+  tolerance on zero is no tolerance). A one-sided expectation
+  (``Expectation.bound`` ``at_least`` / ``at_most``, no tolerance) is PASS
+  when the measured value is on the passing side of ``nominal`` and FAIL on
+  the failing side; an interpolated or biased value is judged on its whole
+  bracket - PASS only when all of it passes, FAIL only when all of it fails,
+  UNRESOLVED when it straddles ``nominal`` - and the result records
+  ``details["bound"]``, ``details["tolerance"]`` ``None`` and the signed
+  ``details["deviation"]`` (measured - nominal). :func:`judge` reads only
+  ``nominal`` / ``tol_abs`` / ``tol_rel`` / ``bound``, so the RF fixture
+  runner judges an :class:`~ai_eda.ir.RFExpectation` with it too. A vector the plot does not contain is
+  FAIL ("vector not produced"; a plot without its own scale vector is
+  "scale vector not produced", naming the scale, never the expectation's
+  vector); an
   analysis that did not succeed makes the ``spice`` summary FAIL with
   ngspice's own lines and leaves its expectations NOT_VERIFIED - unless the
   *environment* prevented the run (``SpiceResult.unverifiable``: no place
@@ -59,15 +99,19 @@ Invariants:
 * **Retired expectations do not haunt the release.** Every ``spice.<id>``
   recorded earlier for an expectation that is no longer in the setup gets a
   superseding NOT_APPLICABLE result (:func:`retire_expectation_results`), so
-  ``ir.validation.overall()`` reflects the current setup.
+  ``ir.validation.overall()`` reflects the current setup. The SI transients
+  (``spice.si.*``, :data:`SI_CHECK_PREFIX`) and the RF fixture networks
+  (``spice.rf.*``, :data:`RF_CHECK_PREFIX`) are not design-deck
+  expectations: their own runners retire them, never this stage.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -80,14 +124,22 @@ from ai_eda.ir import (
     Evidence,
     Expectation,
     Reduce,
+    RFExpectation,
     ValidationResult,
     ValidationStatus,
     worst_status,
 )
+from ai_eda.ir.simulation import EXPECTATION_BOUNDS
 from ai_eda.tools.kicad.cli import fresh_artifact
-from ai_eda.tools.spice.runner import Interpolation, SpiceResult, SpiceRunner
+from ai_eda.tools.spice.measure import ABSTOL, VNTOL, am_depth, harmonic_level, rising_edge_frequency, window_rms
+from ai_eda.tools.spice.runner import Interpolation, SpiceAnalysis, SpiceResult, SpiceRunner
 
 CHECK_ID = "spice"
+#: the SI transients' check ids (``spice.si.<net>``): not expectations, never retired here
+SI_CHECK_PREFIX = "spice.si"
+#: the RF fixture networks' check ids (``spice.rf.<network>`` summaries and ``spice.rf.<network>[.<state>].<expectation>``):
+#: not design-deck expectations, never retired here (the fixture runner retires its own)
+RF_CHECK_PREFIX = "spice.rf"
 #: subdirectory of the workdir that holds ``results.json`` and one rawfile directory per analysis id
 RESULTS_DIR = "spice"
 RESULTS_FILE = "results.json"
@@ -128,11 +180,158 @@ class Reduction:
     measured: float | None
     problem: str | None
     interpolation: Interpolation | None = None
+    #: what a ``frequency`` / level / window reduction measured besides the number (edge count and times, thresholds,
+    #: vmin / vmax; the window, the grid, the amplitudes, the bias bounds); the stage copies it into
+    #: ``details[<reduce value>]`` (``details["frequency"]``, ``details["harmonic_dbc"]`` ...)
+    extra: dict[str, Any] = field(default_factory=dict)
+    #: why the number, though measured, is not resolved well enough to be evidence (a harmonic at the engine's
+    #: resolution floor): the stage never turns such a reduction into a PASS - NOT_VERIFIED with this reason instead
+    unresolved: str | None = None
+    #: ``(low, high)``: where the true value lies given the measurement's documented one-sided biases (the grid's
+    #: attenuation, a crest between samples, the envelope smear, leakage); ``None`` for an unbounded edge. The
+    #: stage judges this bracket like the ``at`` bracket (:func:`judge`), never the bare number
+    bias: tuple[float | None, float | None] | None = None
+    #: the bounds behind ``bias`` and the remedy, for the UNRESOLVED message
+    bias_note: str | None = None
 
 
-def reduce_expectation(res: SpiceResult, exp: Expectation, vector: str) -> Reduction:
-    """The number ``exp.reduce`` picks from ``vector`` of ``res`` (with its bracket for ``at``), or why there is none."""
+def _frequency_details(edges: list[float], **scalars: float | None) -> dict[str, Any]:
+    return {
+        "edges": len(edges),
+        "first_edge_s": edges[0] if edges else None,
+        "last_edge_s": edges[-1] if edges else None,
+        **scalars,
+    }
+
+
+#: reductions that read the result's scale (``time`` / ``frequency``)
+_SCALE_REDUCES = frozenset({Reduce.AT, Reduce.FREQUENCY, Reduce.DB_AT, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH})
+#: the level / window reductions (:func:`_level`)
+_LEVEL_REDUCES = frozenset({Reduce.DB_AT, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH})
+
+
+def _param(exp: Expectation, key: str) -> float:
+    return float(exp.params[key].value)
+
+
+def _abs_floor(vector_expr: str) -> float:
+    """The absolute part of the engine's resolution for a vector expression: ``abstol`` for ``i(...)``, ``vntol`` otherwise."""
+    return ABSTOL if vector_expr.strip().lower().startswith("i") else VNTOL
+
+
+def _audit(obj: Any, *drop: str) -> dict[str, Any]:
+    return {k: v for k, v in dataclasses.asdict(obj).items() if k not in ("problem", *drop)}
+
+
+def _level(res: SpiceResult, exp: Expectation, vector: str, reference: str | None) -> Reduction:
+    """``db_at`` / ``rms`` / ``db_rms`` / ``harmonic_dbc`` / ``am_depth`` of ``vector`` (module docstring of :mod:`ai_eda.tools.spice.measure`)."""
+    kind = exp.reduce
+    want = SpiceAnalysis.AC if kind == Reduce.DB_AT else SpiceAnalysis.TRAN
+    if res.analysis != want:
+        return Reduction(None, f"reduce={kind.value} needs a{'n' if want == SpiceAnalysis.AC else ''} {want.value} result, this is {res.analysis.value}")
+    if reference is not None:
+        try:
+            ref_samples = res.vector(reference)
+        except KeyError:
+            return Reduction(None, f"reference vector not produced: {reference!r} is not in the {res.analysis.value} plot (vectors: {sorted(res.vectors)})")
+        if any(not math.isfinite(x) for x in ref_samples):
+            return Reduction(None, f"{reference} contains non-finite samples (the simulation did not produce a usable reference)")
+    ref_level = _param(exp, "ref") if "ref" in exp.params else None
+    reference_text = exp.reference_vector if reference is not None else (None if ref_level is None else f"ref {ref_level:.6g}")
+    if kind == Reduce.DB_AT:
+        at = float(exp.at.value)  # type: ignore[union-attr]
+        iv = res.interpolate(vector, at)
+        if reference is not None:
+            ir_ = res.interpolate(reference, at)
+            refs = (ir_.y0, ir_.y1, ir_.value)
+        else:
+            refs = (float(ref_level), float(ref_level), float(ref_level))  # type: ignore[arg-type]
+        mags = (iv.y0, iv.y1, iv.value)
+        extra: dict[str, Any] = {"at": at, "magnitude": iv.value, "reference": reference_text, "reference_magnitude": refs[2],
+                                 "bracket_magnitudes": {"x0": iv.x0, "vector": [iv.y0, iv.y1], "reference": [refs[0], refs[1]]}}
+        if any(not math.isfinite(m) or m <= 0.0 for m in (*mags, *refs)):
+            return Reduction(None, f"a magnitude of 0 (or not finite) has no level in dB: |{exp.vector}| = {iv.value:.6g}, reference {refs[2]:.6g} at {res.scale}={at:g}", extra=extra)
+        db = [20.0 * math.log10(m / r) for m, r in zip(mags, refs)]
+        interp = Interpolation(value=db[2], exact=iv.exact, x0=iv.x0, y0=db[0], x1=iv.x1, y1=db[1], method=iv.method)
+        return Reduction(db[2], None, interp, extra)
+    times, values = res.scale_values(), res.vector(vector)
+    t0, t1 = _param(exp, "t_start"), _param(exp, "t_stop")
+    window = {"t_start": t0, "t_stop": t1}
+    if kind in (Reduce.RMS, Reduce.DB_RMS):
+        if "f_max" not in exp.params:  # the compiler refuses it; a hand-built expectation says so here, never "vector not produced"
+            return Reduction(None, f"reduce={kind.value} needs params['f_max'] (the highest frequency the RMS must include): no grid guard without it")
+        f_max = _param(exp, "f_max")
+        rms = window_rms(times, values, t0, t1, f_max)
+        extra = {**window, "rms": rms.value, "samples": rms.samples, "max_step": rms.max_step, "f_max": f_max,
+                 "step_limit": rms.step_limit, "bias_bound_rel": rms.bias_bound_rel}
+        if rms.problem is not None or rms.value is None:
+            return Reduction(None, rms.problem or "no RMS measured", extra=extra)
+        b = float(rms.bias_bound_rel or 0.0)
+        note = (f"a component up to f_max = {f_max:g} Hz reads up to {100.0 * b:.3g} % low on the largest step {rms.max_step:.3g} s; "
+                "lower the tran step or widen the tolerance")
+        if kind == Reduce.RMS:
+            return Reduction(rms.value, None, extra=extra, bias=(rms.value, rms.value / (1.0 - b)), bias_note=note)
+        if reference is not None:
+            ref = window_rms(times, ref_samples, t0, t1, f_max)
+            if ref.problem is not None or ref.value is None:
+                return Reduction(None, f"reference {exp.reference_vector}: {ref.problem or 'no RMS measured'}", extra=extra)
+            ref_rms = ref.value
+        else:
+            ref_rms = float(ref_level)  # type: ignore[arg-type]
+        extra.update(reference=reference_text, reference_rms=ref_rms)
+        if ref_rms <= 0.0:
+            return Reduction(None, "reference RMS is zero: no level in dB", extra=extra)
+        if rms.value <= 0.0:
+            return Reduction(None, f"the RMS of {exp.vector} over the window is zero: no level in dB", extra=extra)
+        db = 20.0 * math.log10(rms.value / ref_rms)
+        shift = -20.0 * math.log10(1.0 - b)
+        # the vector's RMS reads low by up to b; a reference vector on the same grid too (a params["ref"] level does not)
+        return Reduction(db, None, extra=extra, bias=(db - shift if reference is not None else db, db + shift), bias_note=note)
+    if kind == Reduce.HARMONIC_DBC:
+        k = int(round(_param(exp, "k")))
+        h = harmonic_level(times, values, _param(exp, "f0"), k, t0, t1, abs_floor=_abs_floor(exp.vector))
+        extra = {**window, "f0": _param(exp, "f0"), "k": k, **_audit(h, "dbc")}
+        if h.problem is not None or h.dbc is None:
+            return Reduction(None, h.problem or "no harmonic level measured", extra=extra)
+        unresolved = None
+        if h.ak_below_floor:
+            unresolved = (f"harmonic {k} ({h.ak:.3g}) is at or below the engine's resolution {h.floor:.3g} (reltol * peak + the absolute tolerance): "
+                          "its level is not resolved, so it is no evidence")
+        note = (f"the grid attenuates harmonic {k} by up to {h.grid_attenuation_k_db:.3g} dB and the fundamental by up to {h.grid_attenuation_1_db:.3g} dB "
+                f"on the largest step {h.max_step:.3g} s, and the periodicity residual ({100.0 * (h.periodicity_residual_rel or 0.0):.3g} % of the "
+                f"fundamental) allows a leakage of {h.leakage_bound:.3g} into each bin; lower the tran step, or window whole periods of the steady state")
+        return Reduction(h.dbc, None, extra=extra, unresolved=unresolved, bias=(h.dbc_low, h.dbc_high), bias_note=note)
+    # AM_DEPTH
+    d = am_depth(times, values, _param(exp, "f_carrier"), _param(exp, "f_mod"), t0, t1, abs_floor=_abs_floor(exp.vector))
+    extra = {**window, "f_carrier": _param(exp, "f_carrier"), "f_mod": _param(exp, "f_mod"), "depth_percent": d.depth, **_audit(d, "depth")}
+    if d.problem is not None or d.depth is None:
+        return Reduction(None, d.problem or "no modulation depth measured", extra=extra)
+    note = (f"each sampled crest reads up to {100.0 * (d.crest_bias_bound_rel or 0.0):.3g} % low on the largest step {d.max_step:.3g} s and the "
+            f"envelope smear at f_carrier / f_mod = {_param(exp, 'f_carrier') / _param(exp, 'f_mod'):.6g} moves A_max / A_min by up to "
+            f"{100.0 * d.envelope_bias_bound_rel:.3g} % of the envelope's swing; use a faster carrier or a lower tran step, or widen the tolerance")
+    return Reduction(d.depth, None, extra=extra, bias=(d.depth_low, d.depth_high), bias_note=note)
+
+
+def reduce_expectation(res: SpiceResult, exp: Expectation, vector: str, reference: str | None = None) -> Reduction:
+    """The number ``exp.reduce`` picks from ``vector`` of ``res`` (with its bracket for ``at`` / ``db_at``), or why there is none.
+
+    ``reference`` is ngspice's name of ``exp.reference_vector``
+    (:func:`~ai_eda.compilers.spice.spice_vector_name`, which needs the IR -
+    the stage maps it next to ``vector``); ``None`` when the expectation
+    compares with ``params["ref"]`` or has no reference.
+    """
     interpolation: Interpolation | None = None
+    extra: dict[str, Any] = {}
+    unresolved: str | None = None
+    bias: tuple[float | None, float | None] | None = None
+    bias_note: str | None = None
+    if exp.reduce in _SCALE_REDUCES and res.scale is not None:
+        # these reductions read the scale first: a plot without its scale vector is reported as such, never as the
+        # expectation's vector being absent (that KeyError would name a vector that is present)
+        try:
+            res.scale_values()
+        except KeyError:
+            return Reduction(None, f"scale vector not produced: {res.scale!r} is not in the {res.analysis.value} plot (vectors: {sorted(res.vectors)})")
     try:
         if exp.reduce == Reduce.VALUE:
             measured = res.final(vector)
@@ -147,32 +346,131 @@ def reduce_expectation(res: SpiceResult, exp: Expectation, vector: str) -> Reduc
             measured = res.max(vector)
         elif exp.reduce == Reduce.MIN:
             measured = res.min(vector)
+        elif exp.reduce == Reduce.FREQUENCY:
+            if res.analysis != SpiceAnalysis.TRAN:
+                return Reduction(None, f"reduce=frequency needs a tran result, this is {res.analysis.value}")
+            # the flatness floor's absolute part is the engine's resolution for the vector's kind: a current vector
+            # (``i(...)``) is measured in amperes
+            abs_floor = ABSTOL if exp.vector.strip().lower().startswith("i") else VNTOL
+            edge = rising_edge_frequency(res.scale_values(), res.vector(vector), abs_floor=abs_floor)
+            extra = _frequency_details(edge.edges, low=edge.low, mid=edge.mid, high=edge.high, vmin=edge.vmin, vmax=edge.vmax, floor=edge.floor)
+            if edge.problem is not None or edge.frequency is None:
+                return Reduction(None, edge.problem or "no frequency measured", extra=extra)
+            measured = edge.frequency
+        elif exp.reduce in _LEVEL_REDUCES:
+            # the window measurements check their own samples (finite, a time axis that never steps back); the
+            # generic checks below still apply to the vector as a whole
+            level = _level(res, exp, vector, reference)
+            if level.problem is not None or level.measured is None:
+                return level
+            measured, interpolation, extra, unresolved = level.measured, level.interpolation, level.extra, level.unresolved
+            bias, bias_note = level.bias, level.bias_note
         else:  # pragma: no cover - the enum is closed
             return Reduction(None, f"unknown reduce {exp.reduce!r}")
     except KeyError:
         return Reduction(None, f"vector not produced: {vector!r} is not in the {res.analysis.value} plot (vectors: {sorted(res.vectors)})")
     except ValueError as e:
-        return Reduction(None, str(e))
+        return Reduction(None, str(e), extra=extra)
+    # every sample must be a number: builtins.max/min skip a NaN that is not first, and a waveform with a NaN or
+    # an infinity in it is not a usable result wherever the bad sample sits
+    try:
+        samples = res.vector(vector)
+    except KeyError:
+        samples = []
+    if any(not math.isfinite(x) for x in samples):
+        return Reduction(None, f"{vector} contains non-finite samples (the simulation did not produce a usable waveform)")
+    if exp.reduce in (Reduce.AT, Reduce.DB_AT) and any(not math.isfinite(x) for x in res.scale_values()):
+        return Reduction(None, "the scale vector contains non-finite samples")
     if not math.isfinite(measured):
         return Reduction(None, f"{vector} {exp.reduce.value} is not finite ({measured!r})")
-    return Reduction(float(measured), None, interpolation)
+    return Reduction(float(measured), None, interpolation, extra, unresolved, bias, bias_note)
 
 
-def reduce_result(res: SpiceResult, exp: Expectation, vector: str) -> tuple[float | None, str | None]:
+def _label_suffix(exp: Expectation, res: SpiceResult) -> str:
+    """What a result message names besides ``<vector> <reduce>``: the sweep point, the reference, the window, f0 / k, the carrier."""
+    if exp.reduce in (Reduce.AT, Reduce.DB_AT) and exp.at is not None:
+        text = f" {res.scale}={float(exp.at.value):g}"
+    else:
+        text = ""
+    if exp.reduce in (Reduce.DB_AT, Reduce.DB_RMS):
+        text += f" re {exp.reference_vector}" if exp.reference_vector is not None else (f" re {_param(exp, 'ref'):g}" if "ref" in exp.params else "")
+    if exp.reduce == Reduce.HARMONIC_DBC:
+        text += f" k={int(round(_param(exp, 'k')))} of f0={_param(exp, 'f0'):g} Hz"
+    if exp.reduce == Reduce.AM_DEPTH:
+        text += f" (f_carrier={_param(exp, 'f_carrier'):g} Hz, f_mod={_param(exp, 'f_mod'):g} Hz)"
+    if "t_start" in exp.params and "t_stop" in exp.params:
+        text += f" over [{_param(exp, 't_start'):g}, {_param(exp, 't_stop'):g}] s"
+    return text
+
+
+def reduce_result(res: SpiceResult, exp: Expectation, vector: str, reference: str | None = None) -> tuple[float | None, str | None]:
     """``(measured, problem)`` of :func:`reduce_expectation`."""
-    r = reduce_expectation(res, exp, vector)
+    r = reduce_expectation(res, exp, vector, reference)
     return r.measured, r.problem
 
 
-def judge(measured: float, exp: Expectation, interpolation: Interpolation | None = None) -> tuple[ValidationStatus, float | None, float]:
+def _bracket(measured: float, interpolation: Interpolation | None, bias: tuple[float | None, float | None] | None) -> tuple[float, float] | None:
+    """``(low, high)`` the true value may lie in: the bias bracket (``None`` edges unbounded), else the interpolation's samples; ``None`` for an exact value."""
+    if bias is not None:
+        lo = min(measured, bias[0]) if bias[0] is not None else -math.inf
+        hi = max(measured, bias[1]) if bias[1] is not None else math.inf
+        return lo, hi
+    if interpolation is None or interpolation.exact:
+        return None
+    return interpolation.low, interpolation.high
+
+
+def _judge_bound(measured: float, exp: Expectation | RFExpectation, interpolation: Interpolation | None,
+                 bias: tuple[float | None, float | None] | None) -> tuple[ValidationStatus, None, float]:
+    """The one-sided branch of :func:`judge` (``exp.bound`` is set): ``(status, None, measured - nominal)``."""
+    nominal = float(exp.nominal.value)
+    signed = measured - nominal
+    if exp.tol_abs is not None or exp.tol_rel is not None or exp.bound not in EXPECTATION_BOUNDS or not math.isfinite(nominal):
+        # a bound and a tolerance say two different things (the compiler and RFExpectation refuse it); an unknown bound
+        # or a nominal that is not a number is nothing to judge against
+        return ValidationStatus.UNRESOLVED, None, signed
+    bracket = _bracket(measured, interpolation, bias)
+    lo, hi = bracket if bracket is not None else (measured, measured)
+    if exp.bound == "at_least":
+        if lo >= nominal:
+            return ValidationStatus.PASS, None, signed
+        if hi < nominal:
+            return ValidationStatus.FAIL, None, signed
+    else:
+        if hi <= nominal:
+            return ValidationStatus.PASS, None, signed
+        if lo > nominal:
+            return ValidationStatus.FAIL, None, signed
+    return ValidationStatus.UNRESOLVED, None, signed
+
+
+def judge(measured: float, exp: Expectation | RFExpectation, interpolation: Interpolation | None = None,
+          bias: tuple[float | None, float | None] | None = None) -> tuple[ValidationStatus, float | None, float]:
     """``(status, tolerance limit, deviation)`` for ``measured`` against ``exp.nominal``.
+
+    Reads only ``exp.nominal``, ``exp.tol_abs``, ``exp.tol_rel`` and
+    ``exp.bound``, so it judges a design-deck :class:`~ai_eda.ir.Expectation`
+    and an RF fixture :class:`~ai_eda.ir.RFExpectation` alike.
 
     UNRESOLVED without a usable tolerance (none given, or only ``tol_rel``
     on a nominal of 0). With an ``interpolation`` between two samples, the
     whole bracket ``[min(y0, y1), max(y0, y1)]`` is judged: PASS when all of
     it is within the limit, FAIL when all of it is outside on one side,
-    UNRESOLVED in between (the grid cannot resolve the tolerance).
+    UNRESOLVED in between (the grid cannot resolve the tolerance). A ``bias``
+    bracket ``(low, high)`` (a window measurement's documented bias bounds;
+    ``None`` is an unbounded edge) is judged the same way: a measurement
+    error is never reported as a design deviation, nor a biased number as a PASS.
+
+    A one-sided ``bound`` (``at_least`` / ``at_most``) replaces the
+    tolerance: PASS when the value - the whole bracket, if interpolated or
+    biased - is on the passing side of ``nominal`` (equal passes), FAIL when
+    all of it is on the failing side, UNRESOLVED when the bracket straddles
+    ``nominal``; the result is ``(status, None, measured - nominal)`` (a
+    signed deviation, no tolerance limit). A bound together with a tolerance
+    is UNRESOLVED (two different claims; the compiler refuses it).
     """
+    if getattr(exp, "bound", None) is not None:
+        return _judge_bound(measured, exp, interpolation, bias)
     nominal = float(exp.nominal.value)
     deviation = abs(measured - nominal)
     limits = []
@@ -180,17 +478,49 @@ def judge(measured: float, exp: Expectation, interpolation: Interpolation | None
         limits.append(abs(float(exp.tol_abs.value)))
     if exp.tol_rel is not None and nominal != 0.0:
         limits.append(abs(float(exp.tol_rel.value)) * abs(nominal))
-    if not limits:
+    if not limits or any(not math.isfinite(x) for x in limits) or not math.isfinite(nominal):
+        # a tolerance that is not a number is no tolerance (inf would pass anything, nan nothing)
         return ValidationStatus.UNRESOLVED, None, deviation
     limit = max(limits)
-    if interpolation is None or interpolation.exact:
+    bracket = _bracket(measured, interpolation, bias)
+    if bracket is None:
         return (ValidationStatus.PASS if deviation <= limit else ValidationStatus.FAIL), limit, deviation
-    lo, hi = interpolation.low, interpolation.high
+    lo, hi = bracket
     if hi - nominal <= limit and nominal - lo <= limit:
         return ValidationStatus.PASS, limit, deviation
     if lo - nominal > limit or nominal - hi > limit:
         return ValidationStatus.FAIL, limit, deviation
     return ValidationStatus.UNRESOLVED, limit, deviation
+
+
+def bound_message(label: str, measured: float, exp: Expectation | RFExpectation, status: ValidationStatus, unit: str = "",
+                  interpolation: Interpolation | None = None, bias: tuple[float | None, float | None] | None = None,
+                  bias_note: str | None = None) -> str:
+    """The result message of a one-sided expectation (``exp.bound`` set) that :func:`judge` gave ``status``.
+
+    ``label`` names what was measured, ``unit`` is ``" <unit>"`` or ``""``.
+    PASS / FAIL state the value, the bound and ``measured - nominal``; an
+    UNRESOLVED one says why nothing was judged - a tolerance given beside
+    the bound, a bias bracket or an interpolation bracket that straddles
+    ``nominal`` (with the remedy).
+    """
+    nominal = float(exp.nominal.value)
+    side = str(exp.bound).replace("_", " ")
+    limit = f"the one-sided bound {side} {nominal:.6g}{unit}"
+    if exp.tol_abs is not None or exp.tol_rel is not None:
+        return f"{label} = {measured:.6g}{unit}: a one-sided bound and a tolerance (tol_abs / tol_rel) say two different things - nothing judged against {limit}"
+    if exp.bound not in EXPECTATION_BOUNDS or not math.isfinite(nominal):
+        return f"{label} = {measured:.6g}{unit}: nothing to judge against (bound {exp.bound!r}, nominal {nominal!r})"
+    if status is ValidationStatus.UNRESOLVED and bias is not None:
+        lo_b, hi_b = bias
+        span = f"[{'-inf' if lo_b is None else f'{lo_b:.6g}'}, {'+inf' if hi_b is None else f'{hi_b:.6g}'}]{unit}"
+        return (f"{label} = {measured:.6g}{unit}, but the true value lies anywhere in {span} given the measurement's bias bounds, "
+                f"which straddles {limit}: not judged - {bias_note}")
+    if status is ValidationStatus.UNRESOLVED and interpolation is not None:
+        return (f"{label} = {measured:.6g}{unit} interpolated ({interpolation.method}) between ({interpolation.x0:g}, {interpolation.y0:.6g}) and "
+                f"({interpolation.x1:g}, {interpolation.y1:.6g}), which lie on both sides of {limit}: the sweep grid is too coarse to judge this; "
+                "put 'at' on a sweep point or refine the sweep")
+    return f"{label} = {measured:.6g}{unit}, {limit} (measured - nominal {measured - nominal:+.3g}{unit})"
 
 
 def retire_expectation_results(ir: CircuitIR, keep: set[str], status: ValidationStatus, why: str, **stamp: Any) -> list[ValidationResult]:
@@ -199,12 +529,22 @@ def retire_expectation_results(ir: CircuitIR, keep: set[str], status: Validation
     ``ValidationState`` never forgets a check id, so an expectation that was
     removed or renamed would otherwise keep its last verdict in
     ``overall()`` forever. Returns the results (the caller appends them).
+    ``spice.si.<net>`` (:data:`SI_CHECK_PREFIX`, the SI transients) is not an
+    expectation and is left to :func:`ai_eda.tools.spice.si_check.spice_si_results`;
+    nor is ``spice.rf.<network>[.<state>].<expectation>`` (:data:`RF_CHECK_PREFIX`,
+    the RF fixture networks of ``ir.rf``), which the fixture runner retires
+    itself. An expectation id is a plain identifier without a dot, so a
+    design expectation named ``rf`` (``spice.rf``) is still retired here.
     """
     out: list[ValidationResult] = []
     prefix = f"{CHECK_ID}."
     for check_id, last in ir.validation.latest_by_check().items():
         if not check_id.startswith(prefix) or check_id[len(prefix):] in keep:
             continue
+        if check_id == SI_CHECK_PREFIX or check_id.startswith(SI_CHECK_PREFIX + "."):
+            continue  # the SI transients (ai_eda.tools.spice.si_check) retire their own results
+        if check_id.startswith(RF_CHECK_PREFIX + "."):
+            continue  # the RF fixture networks (ai_eda.tools.spice.rf_fixture) retire their own results
         if last.status is status or last.status is ValidationStatus.NOT_APPLICABLE:
             continue  # already superseded
         out.append(ValidationResult(check_id=check_id, status=status, message=why, details={"superseded": last.status.value}, **stamp))
@@ -303,7 +643,8 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
         return Evidence(description=f"ngspice rawfile of analysis {analysis_id} ({res.command})", path=res.raw_output_path, content_hash=res.raw_output_hash)
 
     failed_analyses: dict[str, list[str]] = {aid: list(r.errors) for aid, r in results.items() if not r.succeeded}
-    # each result may only claim the hash the runner itself computed for the file it loaded
+    # each result may only claim the hash the runner itself computed for the file it loaded (the batch runner
+    # loads a copy with the analysis card and reports the original's hash plus ``deck_hash`` of the copy)
     for aid, r in results.items():
         if r.netlist_hash != art.content_hash:
             failed_analyses.setdefault(aid, []).append(f"runner loaded a file with hash {r.netlist_hash}, the artifact records {art.content_hash}")
@@ -329,11 +670,15 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
             "tol_abs": _num(exp.tol_abs),
             "tol_rel": _num(exp.tol_rel),
             "requirement_id": exp.requirement_id,
-            "provenance_kinds_used": sorted({k for k in (_kind(exp.nominal), _kind(exp.tol_abs), _kind(exp.tol_rel), _kind(exp.at)) if k}),
+            "provenance_kinds_used": sorted({k for k in (_kind(exp.nominal), _kind(exp.tol_abs), _kind(exp.tol_rel), _kind(exp.at), *(_kind(t) for t in exp.params.values())) if k}),
             "conditions": conditions,
             "engine": engine_stamp,
             "assumptions": assumptions,
         }
+        if exp.params:
+            details["params"] = {k: _num(t) for k, t in sorted(exp.params.items())}
+        if exp.reference_vector is not None:
+            details["reference_vector"] = exp.reference_vector
         evidence = [e for e in (results_evidence, netlist_evidence) if e]
         if res is None:
             status, message = ValidationStatus.FAIL, f"expectation {exp.id} names analysis {exp.analysis_id!r}, which is not in the simulation setup"
@@ -352,11 +697,17 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
             else:
                 try:
                     vector = spice_vector_name(exp.vector, ir)
+                    reference = None if exp.reference_vector is None else spice_vector_name(exp.reference_vector, ir)
                 except CompileError as e:
                     vector, reduction = "", Reduction(None, str(e))
                 else:
                     details["spice_vector"] = vector
-                    reduction = reduce_expectation(res, exp, vector)
+                    if reference is not None:
+                        details["spice_reference_vector"] = reference
+                    reduction = reduce_expectation(res, exp, vector, reference)
+                if reduction.extra:
+                    # the audit trail of a frequency / level / window reduction, under the reduction's own name
+                    details[exp.reduce.value] = dict(reduction.extra)
                 if reduction.problem is not None:
                     status, message = ValidationStatus.FAIL, reduction.problem
                     details["repair"] = "human"
@@ -366,16 +717,29 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
                     details["measured"] = measured
                     if interp is not None:
                         details["bracket"] = {"x0": interp.x0, "y0": interp.y0, "x1": interp.x1, "y1": interp.y1, "method": interp.method, "exact": interp.exact}
-                    status, limit, deviation = judge(measured, exp, interp)  # type: ignore[arg-type]
+                    if reduction.bias is not None:
+                        details["bias_bracket"] = {"low": reduction.bias[0], "high": reduction.bias[1], "why": reduction.bias_note}
+                    status, limit, deviation = judge(measured, exp, interp, reduction.bias)  # type: ignore[arg-type]
                     details["tolerance"] = limit
                     details["deviation"] = deviation
-                    label = f"{exp.vector} {exp.reduce.value}" + (f" {res.scale}={details['at']:g}" if exp.reduce == Reduce.AT else "")
+                    label = f"{exp.vector} {exp.reduce.value}" + _label_suffix(exp, res)
                     unit = f" {exp.nominal.unit}" if exp.nominal.unit else ""
-                    if status is ValidationStatus.UNRESOLVED and limit is None:
+                    judged = status is not ValidationStatus.UNRESOLVED
+                    if exp.bound is not None:
+                        details["bound"] = exp.bound
+                        message = bound_message(label, measured, exp, status, unit, interp, reduction.bias, reduction.bias_note)
+                    elif status is ValidationStatus.UNRESOLVED and limit is None:
                         if exp.tol_rel is not None and float(exp.nominal.value) == 0.0:
                             message = f"no usable tolerance: nominal is 0 and only tol_rel is given (a relative tolerance on zero is no tolerance); {label} = {measured:.6g}{unit}"
                         else:
                             message = f"no tolerance: {label} = {measured:.6g}{unit} vs nominal {details['nominal']:.6g}{unit}, nothing to judge against"
+                    elif status is ValidationStatus.UNRESOLVED and reduction.bias is not None:
+                        lo_b, hi_b = reduction.bias
+                        span = f"[{'-inf' if lo_b is None else f'{lo_b:.6g}'}, {'+inf' if hi_b is None else f'{hi_b:.6g}'}]{unit}"
+                        message = (
+                            f"{label} = {measured:.6g}{unit}, but the true value lies anywhere in {span} given the measurement's bias bounds, "
+                            f"which straddles the tolerance +/- {limit:.3g}{unit} around nominal {details['nominal']:.6g}{unit}: not judged - {reduction.bias_note}"
+                        )
                     elif status is ValidationStatus.UNRESOLVED:
                         message = (
                             f"{label} = {measured:.6g}{unit} interpolated ({interp.method}) between ({interp.x0:g}, {interp.y0:.6g}) and ({interp.x1:g}, {interp.y1:.6g}), "  # type: ignore[union-attr]
@@ -387,8 +751,13 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
                             f"{label} = {measured:.6g}{unit}, nominal {details['nominal']:.6g}{unit} "
                             f"+/- {limit:.3g}{unit} (deviation {deviation:.3g}{unit})"
                         )
+                    if judged:
                         if status is ValidationStatus.FAIL:
                             details["repair"] = "human"
+                        elif reduction.unresolved is not None and status is ValidationStatus.PASS:
+                            status = ValidationStatus.NOT_VERIFIED
+                            details["unresolved"] = reduction.unresolved
+                            message += f"; not evidence: {reduction.unresolved}"
                         elif assumptions:
                             status = ValidationStatus.NOT_VERIFIED
                             message += f"; not evidence: the netlist rests on {len(assumptions)} assumption(s) {assumptions} that nobody confirmed"
@@ -483,7 +852,10 @@ __all__ = [
     "RESULTS_DIR",
     "RESULTS_FILE",
     "RESULTS_FORMAT",
+    "RF_CHECK_PREFIX",
     "Reduction",
+    "SI_CHECK_PREFIX",
+    "bound_message",
     "judge",
     "read_results",
     "reduce_expectation",

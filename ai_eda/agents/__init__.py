@@ -13,12 +13,12 @@ from ai_eda.agents.circuit import CircuitDesignAgent
 from ai_eda.agents.simulation import SimulationAgent
 from ai_eda.agents.pcb import PCBAgent
 from ai_eda.agents.regulatory import RegulatoryAgent
-from ai_eda.agents.manufacturing import ManufacturingAgent
+from ai_eda.agents.manufacturing import FabCapabilityAgent, ManufacturingAgent
 from ai_eda.agents.review import ReviewAgent
 from ai_eda.agents.repair import RepairAgent
 
 __all__ = [
     "Agent", "AgentContext", "AgentResult", "IRProposal",
     "RequirementAgent", "ComponentAgent", "CircuitDesignAgent", "SimulationAgent",
-    "PCBAgent", "RegulatoryAgent", "ManufacturingAgent", "ReviewAgent", "RepairAgent",
+    "PCBAgent", "RegulatoryAgent", "FabCapabilityAgent", "ManufacturingAgent", "ReviewAgent", "RepairAgent",
 ]

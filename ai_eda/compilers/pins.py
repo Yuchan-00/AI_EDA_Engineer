@@ -55,7 +55,11 @@ def pad_pin_types(c: Component, symbol: SymbolDef) -> dict[str, str]:
     if len(set(numbers)) != len(numbers):
         raise CompileError(f"{c.ref}: duplicate pin numbers in IR: {sorted(numbers, key=natural_pin_key)}")
     ir_pins = set(numbers)
-    lib_pins = {p.number for p in symbol.pins}
+    lib_numbers = [p.number for p in symbol.pins]
+    if len(set(lib_numbers)) != len(lib_numbers):
+        repeated = sorted({n for n in lib_numbers if lib_numbers.count(n) > 1}, key=natural_pin_key)
+        raise CompileError(f"{c.ref}: library symbol {symbol.lib_id!r} repeats pin number(s) {repeated} (stacked pins); unsupported - one physical pin per number")
+    lib_pins = set(lib_numbers)
     if ir_pins != lib_pins:
         raise CompileError(
             f"{c.ref}: IR pins {sorted(ir_pins, key=natural_pin_key)} do not match library symbol {symbol.lib_id!r} "

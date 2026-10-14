@@ -77,6 +77,8 @@ S = ValidationStatus
 LIB = KicadLibrary()
 runner = NgspiceShared()
 needs_dll = pytest.mark.skipif(not runner.available(), reason="ngspice.dll (KiCad's bundled ngspice shared library) not found")
+HAS_LIBS = LIB.footprint_file("Resistor_SMD", "R_0603_1608Metric") is not None and LIB.symbol_file("Device") is not None
+needs_libs = pytest.mark.skipif(not HAS_LIBS, reason="KiCad libraries not installed (Device:R / R_0603_1608Metric)")
 ANSWERS = {"application": "bench", "jurisdiction": "EU"}
 
 
@@ -379,13 +381,14 @@ def test_no_writable_rawfile_location_is_not_verified_not_a_design_failure(tmp_p
 
 
 @needs_dll
+@needs_libs
 def test_results_record_the_engine_configuration_and_the_run_conditions(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, LIB)
     ctx = _context(tmp_path)
     _spice_stage(ir, ctx)
     data = read_results(ir.artifacts[ArtifactKind.SPICE_RESULT].path)
     info = data["engine_info"]
-    assert info["version"] == "ngspice-46" and info["build"] == runner.build() and info["dll_path"] == str(runner.dll_path)
+    assert info["version"] == runner.version() and info["build"] == runner.build() and info["dll_path"] == str(runner.dll_path)
     assert info["codemodels_loaded"] is True and info["codemodel_errors"] == [] and info["self_test"]["ok"] is True
     assert "sharedmode" in info["settings"] and info["settings_hash"].startswith("sha256:")
     assert data["conditions"] == {
@@ -494,6 +497,7 @@ def test_connected_pin_the_element_does_not_use_must_be_declared_ignored(tmp_pat
 
 
 @needs_dll
+@needs_libs
 def test_recalculated_nominals_do_not_pass_review_while_the_requirement_is_unchanged(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, LIB)
     ctx = _context(tmp_path)
@@ -630,6 +634,8 @@ def test_bias_is_not_verified_when_the_op_expectation_fails(tmp_path: Path):
 
 @needs_dll
 def test_controlled_exit_is_recovered_and_the_engine_keeps_working(tmp_path: Path):
+    if not runner.engine_info()["reset_supported"]:
+        pytest.skip(f"{runner.version()} does not export ngSpice_Reset: a ControlledExit cannot be recovered on this build (the engine would stay dead for the process)")
     eng = runner._engine()
     deck = tmp_path / "divider.cir"
     deck.write_text("divider\nV1 VIN 0 DC 12\nR1 VIN VOUT 10k\nR2 VOUT 0 10k\n.end\n", encoding="utf-8", newline="\n")
