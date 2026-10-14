@@ -50,10 +50,13 @@ Code login, PATH, never read or shown here - with these additions:
 ``PYTHONIOENCODING=utf-8`` (the log is UTF-8 even under a cp949 console)
 and ``PYTHONUNBUFFERED=1`` (stdout and stderr reach the log in the order
 they were written, while the run is going); on Windows a third,
-``NoDefaultCurrentDirectoryInExePath=1``, so the bare tool names the CLI
-looks up (``kicad-cli``, ``claude``, a browser; Python 3.12's
-``shutil.which`` consults it) are never found in the workdir either (not
-measured on Windows yet). The log
+``NoDefaultCurrentDirectoryInExePath=1``. The CLI itself never finds a tool
+in the workdir on any system (``kicad-cli``, ``claude``, a browser, an
+``ngspice`` binary are looked up on PATH's absolute entries only:
+:func:`ai_eda.tools.kicad.install.which_absolute`); the variable keeps
+Windows' own search of the current folder (``CreateProcess`` and
+``SearchPath`` for a bare name) out of the programs those tools start in
+turn (not measured on Windows yet). The log
 ``<workdir>/gui/runs/<NNN>-<kind>.log`` holds the command line (``$ ...``;
 no secret is ever on it - the CLI takes keys from the environment only),
 stdout and stderr merged, and a closing ``# exit code N`` line. It is the

@@ -317,6 +317,50 @@ def test_find_browser_windows_and_macos_paths(isolated: Path, monkeypatch: pytes
     assert find_browser() == mac
 
 
+def test_find_browser_never_takes_a_relative_variable_or_the_working_directory(isolated: Path, monkeypatch: pytest.MonkeyPatch):
+    """A project folder (where GUI runs start) can not supply the program that is run: relative variables are unset, PATH is read
+    through its absolute entries only."""
+    project = isolated / "project"
+    planted = _executable(project / _exe_name("google-chrome"))
+    _executable(project / "pw" / "chromium-1194" / "chrome-linux" / "chrome")
+    _executable(project / "Google" / "Chrome" / "Application" / "chrome.exe")
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(pdf.BROWSER_ENV, _exe_name("google-chrome"))
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", str(isolated / "empty")]))
+    monkeypatch.setenv(pdf.PLAYWRIGHT_ENV, "pw")
+    for name in pdf.WINDOWS_ROOT_ENVS:
+        monkeypatch.setenv(name, ".")
+    assert find_browser() is None
+    monkeypatch.setenv(pdf.BROWSER_ENV, str(planted))  # the same file named by an absolute path is the user's own choice
+    assert find_browser() == planted
+    monkeypatch.setenv(pdf.BROWSER_ENV, "")
+    monkeypatch.setenv("PATH", os.pathsep.join(["", str(project)]))  # an absolute entry naming the folder: found
+    assert find_browser() == planted
+
+
+#: the real macOS paths (``isolated`` empties the constant)
+_REAL_MACOS = pdf.MACOS_CANDIDATES
+
+
+def test_find_browser_macos_knows_chrome_then_edge_then_chromium(isolated: Path, monkeypatch: pytest.MonkeyPatch):
+    """Edge for Mac and a Chromium.app put nothing on PATH; they are found in /Applications after Google Chrome."""
+    assert [p.name for p in _REAL_MACOS] == ["Google Chrome", "Microsoft Edge", "Chromium"]
+    assert all(p.parts[1] == "Applications" and p.parent.name == "MacOS" for p in _REAL_MACOS)
+    rebased = tuple(isolated / Path(*p.parts[1:]) for p in _REAL_MACOS)
+    monkeypatch.setattr(pdf, "MACOS_CANDIDATES", rebased)
+    assert find_browser() is None
+    chromium = _executable(rebased[2])
+    assert find_browser() == chromium
+    edge = _executable(rebased[1])
+    assert find_browser() == edge  # a vendor's stable browser before Chromium
+    chrome = _executable(rebased[0])
+    assert find_browser() == chrome
+    from ai_eda.setup_help import remedy
+
+    monkeypatch.setattr(kicad_install, "platform", lambda: "darwin")
+    assert all(name in remedy("browser") for name in ("Google Chrome", "Microsoft Edge", "Chromium"))
+
+
 _PW_REAL = [p for root in pdf.PLAYWRIGHT_DEFAULT_ROOTS for pattern in pdf.PLAYWRIGHT_GLOBS for p in root.glob(pattern) if p.is_file()]
 
 
@@ -421,6 +465,28 @@ def test_browser_version_never_starts_the_browser_on_windows(tmp_path: Path, mon
     assert browser_version(fake) == "FakeBrowser 1.0"
     assert marker.exists()
 
+
+
+def test_a_snap_browser_is_not_started_on_a_file_it_cannot_read(tmp_path: Path, html_file: Path, monkeypatch: pytest.MonkeyPatch):
+    """Ubuntu's Chromium is a snap: it reads only the non-hidden folders of the home folder, so a print elsewhere is refused."""
+    monkeypatch.setattr(kicad_install, "platform", lambda: "linux")
+    marker = tmp_path / "started"
+    wrapper = _executable(tmp_path / "bin" / "chromium-browser", f"#!/bin/sh\n# as Ubuntu's: exec /snap/bin/chromium \"$@\"\ntouch '{marker}'\n")
+    assert pdf.is_snap(wrapper) and pdf.is_snap("/snap/bin/chromium")
+    assert not pdf.is_snap(_fake_browser(tmp_path / "fake", "writes", FAKE_WRITES))
+    home = tmp_path / "home"
+    (home / "projects").mkdir(parents=True)
+    (home / ".cache").mkdir()
+    monkeypatch.setattr(pdf.Path, "home", staticmethod(lambda: home))
+    res = html_to_pdf(html_file, tmp_path / "o.pdf", browser=wrapper)  # the page is outside the home folder
+    assert not res.ok and res.reason is not None and "chromium-browser is a snap" in res.reason and html_file.name in res.reason
+    hidden = home / ".cache" / "r.html"
+    hidden.write_text("<p>x</p>", encoding="utf-8")
+    res = html_to_pdf(hidden, home / "projects" / "r.pdf", browser=wrapper)
+    assert not res.ok and "is a snap" in (res.reason or "") and not marker.exists()
+    assert pdf.snap_confinement_problem(wrapper, [home / "projects" / "r.html", home / "projects" / ".x" / "r.pdf"]) is None
+    monkeypatch.setattr(kicad_install, "platform", lambda: "darwin")
+    assert not pdf.is_snap(wrapper)
 
 def test_html_to_pdf_failure_reasons(tmp_path: Path, html_file: Path):
     out = tmp_path / "o.pdf"

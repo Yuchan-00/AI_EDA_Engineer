@@ -6,7 +6,9 @@ a reference that does not resolve to a file under the 3D library is *no
 body*, with the reason - never a guessed height.
 
 * :func:`find_3dmodel_dir`: ``$KICAD10_3DMODEL_DIR`` (used only when it is an
-  existing directory), else ``$KICAD_3DMODEL_DIR`` (same rule), else
+  absolute path to an existing directory - an empty or relative value counts
+  as unset, so the working directory never supplies the part heights), else
+  ``$KICAD_3DMODEL_DIR`` (same rule), else
   ``<root>/3dmodels`` next to the ``symbols`` / ``footprints`` of the
   :class:`~ai_eda.tools.kicad.library.KicadLibrary` roots (``share/kicad`` of
   an installation). ``None`` when none exists.
@@ -25,12 +27,12 @@ body*, with the reason - never a guessed height.
 from __future__ import annotations
 
 import math
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from ai_eda.tools.kicad import sexpr
+from ai_eda.tools.kicad.install import _absolute_env
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary
 from ai_eda.tools.model3d.step_bbox import Box3
 
@@ -100,9 +102,9 @@ def footprint_models(fp: FootprintDef) -> list[ModelRef]:
 def find_3dmodel_dir(library: KicadLibrary | None = None) -> Path | None:
     """The KiCad 3D model library directory (module docstring), or ``None`` when none exists."""
     for var in _ENV_VARIABLES:
-        value = os.environ.get(var)
-        if value and Path(value).is_dir():
-            return Path(value)
+        value = _absolute_env(var)
+        if value is not None and value.is_dir():
+            return value
     roots = library.roots if library is not None else KicadLibrary().roots
     for root in roots:
         candidate = root / "3dmodels"

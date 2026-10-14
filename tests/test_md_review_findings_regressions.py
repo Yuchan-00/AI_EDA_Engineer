@@ -117,7 +117,6 @@ import json
 from datetime import datetime, timezone
 import logging
 import math
-import os
 from pathlib import Path
 
 import pytest
@@ -1108,9 +1107,13 @@ def test_48_the_batch_runner_reports_the_original_netlist_and_passes_the_stage(t
     results = {r.check_id: r for r in run_spice_for(ir, {"spice": NgspiceRunner()}, tmp_path)}
     assert results["spice"].status is S.PASS, results["spice"].message
     assert results["spice.vout"].status is S.PASS
-    res = NgspiceRunner().run(Path(ir.artifacts[ArtifactKind.SPICE_NETLIST].path), SpiceAnalysis.OP, tmp_path / "again")
+    again = tmp_path / "again"
+    again.mkdir()
+    (again / ".spiceinit").write_text("echo ai_eda_cwd_probe\n", encoding="utf-8")  # read from the working directory by ngspice itself
+    res = NgspiceRunner().run(Path(ir.artifacts[ArtifactKind.SPICE_NETLIST].path), SpiceAnalysis.OP, again)
     assert res.succeeded and res.netlist_hash == ir.artifacts[ArtifactKind.SPICE_NETLIST].content_hash and res.deck_hash and res.deck_hash != res.netlist_hash
     assert Path(res.deck_path).read_text(encoding="utf-8").endswith(".op\n.end\n")
+    assert "ai_eda_cwd_probe" not in res.log  # the binary runs in an empty folder
 
 
 # --------------------------------------------------------------------------- 49: ignored_pins is for connected pins
@@ -1186,14 +1189,17 @@ def test_53_a_non_finite_tolerance_or_nominal_is_no_tolerance():
 def test_55_the_system_ngspice_library_is_found_without_the_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import ctypes.util
 
+    import ai_eda.tools.kicad.install as kicad_install
+
     lib = tmp_path / "libngspice.so.0"
     lib.write_bytes(b"")
     monkeypatch.setattr(ctypes.util, "find_library", lambda name: "libngspice.so.0" if name == "ngspice" else None)
     monkeypatch.setenv("LD_LIBRARY_PATH", str(tmp_path))
     monkeypatch.delenv("NGSPICE_DLL", raising=False)
-    monkeypatch.setattr("ai_eda.tools.kicad.cli.find_kicad_cli", lambda: None)
-    if os.name != "nt":
-        assert find_system_ngspice() == lib.resolve() and find_ngspice_dll() == lib.resolve()
+    # the Linux rule on every OS: no KiCad (find_ngspice_dll reads install.find_kicad_cli), no Homebrew lookup first
+    monkeypatch.setattr(kicad_install, "platform", lambda: "linux")
+    monkeypatch.setattr(kicad_install, "find_kicad_cli", lambda: None)
+    assert find_system_ngspice() == lib.resolve() and find_ngspice_dll() == lib.resolve()
     monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
     assert find_system_ngspice() is None
 

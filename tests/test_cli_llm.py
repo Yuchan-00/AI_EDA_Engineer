@@ -128,7 +128,7 @@ def test_doctor_never_prints_the_key_and_fetches_nothing_offline(monkeypatch):
     code, out, _ = _cli("doctor")
     assert code == 0 and "LLM key   : set" in out and "sk-or-v1-never-printed" not in out and "LLM account" not in out
     # tests/conftest.py lets discovery find only the fake `claude`: no real CLI is probed here, whatever the machine has
-    assert "claude cli : NOT FOUND (install Claude Code and run `claude login`, or set AI_EDA_CLAUDE_CLI)" in out
+    assert "claude cli : NOT FOUND (install Claude Code and run `claude login`, or set AI_EDA_CLAUDE_CLI to its absolute path)" in out
     monkeypatch.delenv("OPENROUTER_API_KEY")
     code, out, _ = _cli("doctor", "--online")
     assert code == 0 and "OPENROUTER_API_KEY not set" in out and "LLM account: not fetched (no key)" in out
@@ -391,7 +391,7 @@ def test_doctor_reports_the_claude_cli_with_the_fake_and_never_calls_the_model(f
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty))
     code, out, _ = _cli("doctor")
-    assert code == 0 and "claude cli : NOT FOUND (install Claude Code and run `claude login`, or set AI_EDA_CLAUDE_CLI)" in out
+    assert code == 0 and "claude cli : NOT FOUND (install Claude Code and run `claude login`, or set AI_EDA_CLAUDE_CLI to its absolute path)" in out
 
 
 def test_describe_providers_reads_the_real_client_against_the_fake(fake: FakeClaudeCli):

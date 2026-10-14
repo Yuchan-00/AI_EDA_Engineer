@@ -826,23 +826,31 @@ def test_non_utf8_bytes_on_stdout_and_stderr_are_replaced_never_raised(fake: Fak
 
 
 def test_a_relative_cli_path_is_made_absolute_so_calls_run_from_the_empty_temp_cwd(fake: FakeClaudeCli, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """An explicit ``cli`` (``--llm-claude-cli``) is the user's own choice and is made absolute; a relative
+    ``AI_EDA_CLAUDE_CLI`` and an empty or relative PATH entry name the working directory (a project folder, for a GUI
+    run) and are never read."""
     monkeypatch.chdir(tmp_path)
     rel = os.path.relpath(fake.exe, tmp_path)  # bin/claude
-    fake.queue(success("one"), success("two"), success("three"), success("four"))
-    monkeypatch.setenv(ENV_CLI, rel)
-    assert find_claude_cli() == str(fake.exe)
-    via_env = ClaudeCodeClient(timeout=10.0)
-    assert via_env.cli == str(fake.exe) and via_env.complete(MODEL, _msgs()).content == "one"
+    fake.queue(success("one"), success("two"), success("three"))
     explicit = ClaudeCodeClient(cli=rel, timeout=10.0)
-    assert explicit.cli == str(fake.exe) and explicit.complete(MODEL, _msgs()).content == "two"
+    assert explicit.cli == str(fake.exe) and explicit.complete(MODEL, _msgs()).content == "one"
     dotted = ClaudeCodeClient(cli=os.path.join(".", rel), timeout=10.0)
-    assert dotted.cli == str(fake.exe) and dotted.complete(MODEL, _msgs()).content == "three"
+    assert dotted.cli == str(fake.exe) and dotted.complete(MODEL, _msgs()).content == "two"
     bare = ClaudeCodeClient(cli=fake.exe.name, timeout=10.0)  # a bare name resolves on PATH, not against the temp cwd
-    assert Path(bare.cli) == fake.exe and bare.complete(MODEL, _msgs()).content == "four"
-    monkeypatch.delenv(ENV_CLI)
-    monkeypatch.setenv("PATH", "bin")  # a relative PATH entry
+    assert Path(bare.cli) == fake.exe and bare.complete(MODEL, _msgs()).content == "three"
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    monkeypatch.setenv(ENV_CLI, rel)  # relative: counts as unset
+    assert find_claude_cli() is None
+    with pytest.raises(ToolUnavailableError):
+        ClaudeCodeClient()
+    monkeypatch.setenv(ENV_CLI, str(fake.exe))  # the same file by an absolute path is used
     assert find_claude_cli() == str(fake.exe)
-    assert len(fake.prompt_calls()) == 4
+    monkeypatch.delenv(ENV_CLI)
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", "bin"]))  # an empty and two relative PATH entries
+    assert find_claude_cli() is None
+    assert len(fake.prompt_calls()) == 3
 
 
 def test_a_batch_file_is_refused_on_windows_and_passed_elsewhere():

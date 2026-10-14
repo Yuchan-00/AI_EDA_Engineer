@@ -89,6 +89,8 @@ import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from ctypes import CFUNCTYPE, POINTER, Structure, c_bool, c_char_p, c_double, c_int, c_short, c_void_p
 from dataclasses import dataclass
 from pathlib import Path
@@ -197,14 +199,16 @@ def find_system_ngspice() -> Path | None:
     """The ngspice shared library of the system, else None.
 
     Linux: the library the loader knows (``libngspice.so.0`` from Debian's
-    ``libngspice0``, Arch's / Fedora's ``ngspice`` package):
+    ``libngspice0``, Arch's ``ngspice`` or Fedora's ``libngspice`` package):
     ``ctypes.util.find_library`` gives the soname, not a path, so the file is
-    looked for on ``$LD_LIBRARY_PATH`` and the usual library directories.
+    looked for on the absolute entries of ``$LD_LIBRARY_PATH`` (an empty or
+    relative entry would name the working directory) and the usual library
+    directories.
     macOS: Homebrew's library by name (:data:`_MACOS_HOMEBREW_LIBS`), then
     whatever ``find_library`` returns (a full path there). Windows KiCad
     installs are handled by :func:`find_ngspice_dll`.
     """
-    from ai_eda.tools.kicad.install import platform
+    from ai_eda.tools.kicad.install import absolute_path_only, platform
 
     system = platform()
     if system == "win32":
@@ -214,10 +218,11 @@ def find_system_ngspice() -> Path | None:
             p = Path(candidate)
             if p.is_file():
                 return p.resolve()
-    name = ctypes.util.find_library("ngspice")
+    with absolute_path_only():  # find_library may run gcc / ld found on PATH: never one in the working directory
+        name = ctypes.util.find_library("ngspice")
     if not name:
         return None
-    dirs = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if d] + list(_SYSTEM_LIB_DIRS)
+    dirs = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if d and Path(d).is_absolute()] + list(_SYSTEM_LIB_DIRS)
     for d in dirs:
         p = Path(d) / name
         if p.is_file():
@@ -226,15 +231,17 @@ def find_system_ngspice() -> Path | None:
 
 
 def find_ngspice_dll() -> Path | None:
-    """``$NGSPICE_DLL`` if set (must exist), else the ngspice library that ships with the KiCad
+    """``$NGSPICE_DLL`` if set to an absolute path (it must exist), else the ngspice library that ships with the KiCad
     :func:`ai_eda.tools.kicad.install.find_kicad_cli` finds (``ngspice.dll`` beside ``kicad-cli.exe`` on Windows,
-    the bundle's ``libngspice*.dylib`` in ``KiCad.app`` on macOS), else the system library (:func:`find_system_ngspice`), else None."""
-    env = os.environ.get("NGSPICE_DLL")
-    if env:
-        p = Path(env)
-        return p.resolve() if p.is_file() else None
-    from ai_eda.tools.kicad.install import bundled_ngspice, find_kicad_cli  # lazy: the kicad package imports ai_eda.ir, which imports this package
+    the bundle's ``libngspice*.dylib`` in ``KiCad.app`` on macOS), else the system library (:func:`find_system_ngspice`), else None.
 
+    An empty or relative ``$NGSPICE_DLL`` counts as unset: a library relative to the working directory (a project
+    folder, for a GUI run) would be loaded into this process."""
+    from ai_eda.tools.kicad.install import _absolute_env, bundled_ngspice, find_kicad_cli  # lazy: the kicad package imports ai_eda.ir, which imports this package
+
+    env = _absolute_env("NGSPICE_DLL")
+    if env is not None:
+        return env.resolve() if env.is_file() else None
     bundled = bundled_ngspice(find_kicad_cli())
     if bundled is not None:
         return bundled
@@ -242,7 +249,7 @@ def find_ngspice_dll() -> Path | None:
 
 
 def find_codemodel_dir(dll: Path | None) -> Path | None:
-    """``$NGSPICE_CODEMODEL_DIR`` if set, else the code model directory that belongs to the library.
+    """``$NGSPICE_CODEMODEL_DIR`` if set to an absolute path (empty or relative counts as unset), else the code model directory that belongs to the library.
 
     Known layouts: KiCad's ``<root>/lib/ngspice`` for a DLL at
     ``<root>/bin/ngspice.dll`` (Windows), Debian/Ubuntu's, Arch's and
@@ -251,17 +258,16 @@ def find_codemodel_dir(dll: Path | None) -> Path | None:
     and inside a macOS ``KiCad.app`` the folder holding ``analog.cm``
     (:func:`ai_eda.tools.kicad.install.bundled_codemodels`).
     """
-    env = os.environ.get("NGSPICE_CODEMODEL_DIR")
-    if env:
-        p = Path(env)
-        return p if p.is_dir() else None
+    from ai_eda.tools.kicad.install import _absolute_env, bundled_codemodels
+
+    env = _absolute_env("NGSPICE_CODEMODEL_DIR")
+    if env is not None:
+        return env if env.is_dir() else None
     if dll is None:
         return None
     for p in (dll.parent.parent / "lib" / "ngspice", dll.parent / "ngspice"):
         if p.is_dir():
             return p
-    from ai_eda.tools.kicad.install import bundled_codemodels
-
     return bundled_codemodels(dll)
 
 
@@ -480,6 +486,28 @@ def _sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@contextmanager
+def _empty_working_directory() -> Iterator[None]:
+    """The process in a new empty folder for the duration of the block (``ngSpice_Init``), then back where it was.
+
+    ``ngSpice_Init`` sources ``.spiceinit`` from the working directory and
+    runs its control commands, ``shell`` included (measured 2026-10-14 with
+    ngspice-42: a ``.spiceinit`` holding ``shell touch <file>`` in the
+    working directory created the file). ``ai-eda run`` and GUI runs work in
+    the project folder, so a copied project could run any command; an empty
+    folder leaves only the user's own ``~/.spiceinit`` and ``spinit``.
+    Called only by the process that drives ngspice (the CLI), where nothing
+    else runs while the engine starts.
+    """
+    previous = os.getcwd()
+    with tempfile.TemporaryDirectory(prefix="ai-eda-ngspice-init-") as empty:
+        os.chdir(empty)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
+
+
 def bind_reset(lib) -> bool:
     """Bind ``ngSpice_Reset`` if the library exports it (KiCad's ngspice-46 does; Debian/Ubuntu ``libngspice0`` 42 does not).
 
@@ -591,7 +619,8 @@ class _Engine:
             return 0
 
         self._callbacks = [_send_char, _send_stat, _controlled_exit, _send_data, _send_init_data, _bg_running]
-        return self.lib.ngSpice_Init(*self._callbacks, None)
+        with _empty_working_directory():
+            return self.lib.ngSpice_Init(*self._callbacks, None)
 
     def _mark_dead(self, reason: str) -> EngineDead:
         self.dead = True
@@ -1104,7 +1133,7 @@ class NgspiceShared(SpiceRunner):
         return [*eng.init_log, *(f"codemodel error: {e}" for e in eng.codemodel_errors), f"self-test: {eng.self_test}"]
 
     def engine_settings(self) -> list[str]:
-        """The ``set`` listing after init (a ``.spiceinit`` in the cwd or ``$SPICE_SCRIPTS/spinit`` would show up here)."""
+        """The ``set`` listing after init (``~/.spiceinit`` or ``$SPICE_SCRIPTS/spinit`` would show up here; a ``.spiceinit`` in the working directory is never read)."""
         return list(self._engine().settings)
 
     def self_test(self) -> dict:
@@ -1115,8 +1144,9 @@ class NgspiceShared(SpiceRunner):
 
         ``dll_path``, ``version``, ``build``, ``codemodel_dir``,
         ``codemodels_loaded`` (+ ``codemodel_errors``), the ``set`` listing
-        after init (``settings``, where a ``.spiceinit`` in the cwd or
-        ``$SPICE_SCRIPTS/spinit`` would show) and its sha256
+        after init (``settings``, where ``~/.spiceinit`` or
+        ``$SPICE_SCRIPTS/spinit`` would show - a ``.spiceinit`` in the working
+        directory is never read: :func:`_empty_working_directory`) and its sha256
         (``settings_hash``), the self-test result and the notes of the init
         log - so a PASS can be traced to the engine configuration that
         produced it and two runs on differently configured engines never

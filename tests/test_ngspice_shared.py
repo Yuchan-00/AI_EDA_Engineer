@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import shutil
 from pathlib import Path
 
@@ -438,3 +439,42 @@ def test_caller_errors_raise_instead_of_failing_silently(runner: NgspiceShared, 
         runner.run(deck, SpiceAnalysis.TRAN, work)  # tran has no default command
     with pytest.raises(ValueError):
         runner.run(deck, SpiceAnalysis.OP, work, raw_format="csv")  # type: ignore[arg-type]
+
+
+_PROBE = """
+import contextlib, json, sys
+from ai_eda.tools.spice import ngspice_shared
+if sys.argv[1] == "unguarded":  # the control: what ngspice itself does with the working directory's .spiceinit
+    ngspice_shared._empty_working_directory = contextlib.nullcontext
+print(json.dumps(ngspice_shared.NgspiceShared().engine_settings()))
+"""
+
+
+@needs_dll
+def test_a_spiceinit_in_the_working_directory_is_never_read(tmp_path: Path):
+    """``ngSpice_Init`` sources ``./.spiceinit`` (its ``shell`` lines run commands): the engine starts in an empty folder.
+
+    Measured 2026-10-14 with ngspice-42: a ``.spiceinit`` holding ``shell touch <file>`` created the file. The probe
+    here only ``set``s a variable, so the control (the unguarded init) runs nothing; each init is its own process
+    because the engine is a process-wide singleton.
+    """
+    import json
+    import subprocess
+    import sys
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".spiceinit").write_text("set ai_eda_cwd_probe=planted\n", encoding="utf-8")
+    repo = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(repo), os.environ.get("PYTHONPATH", "")])}
+
+    def settings(mode: str) -> str:
+        out = subprocess.run(
+            [sys.executable, "-c", _PROBE, mode], cwd=project, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120
+        )
+        assert out.returncode == 0, out.stderr
+        return "\n".join(json.loads(out.stdout.strip().splitlines()[-1]))
+
+    assert "ai_eda_cwd_probe" in settings("unguarded")  # the file is read when nothing prevents it
+    assert "ai_eda_cwd_probe" not in settings("guarded")
+    assert Path.cwd() != project

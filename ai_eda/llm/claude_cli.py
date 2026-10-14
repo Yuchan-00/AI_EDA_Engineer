@@ -208,7 +208,7 @@ from pydantic import BaseModel
 from ai_eda.errors import ToolUnavailableError
 from ai_eda.llm.client import LLMClient, LLMError, LLMMessage, LLMResponse, ToolSpec, Usage
 
-#: environment variable naming the CLI binary explicitly (used when it names an existing file)
+#: environment variable naming the CLI binary explicitly (used when it names an existing file by an absolute path)
 ENV_CLI = "AI_EDA_CLAUDE_CLI"
 #: the executable looked up on PATH (on Windows ``claude.exe`` is looked up first; ``claude`` then resolves through PATHEXT)
 CLI_NAME = "claude"
@@ -259,12 +259,18 @@ def absolute_cli_path(path: str) -> str:
     A model call runs with ``cwd`` = an empty temporary directory, where a
     relative executable path would no longer resolve; a bare name that PATH
     does not know is returned unchanged (the call then fails as a missing
-    binary).
+    binary). The PATH lookup reads only PATH's absolute entries
+    (:func:`~ai_eda.tools.kicad.install.which_absolute`), so a bare name is
+    never found in the working directory; a path with a folder in it (``bin/claude``,
+    ``./claude`` - what the user typed for ``--llm-claude-cli``) is the
+    user's own choice and is made absolute against the cwd.
     """
+    from ai_eda.tools.kicad.install import which_absolute
+
     if os.path.isabs(path):
         return path
     if not os.path.dirname(path):
-        found = shutil.which(path)
+        found = which_absolute(path)
         return os.path.abspath(found) if found else path
     return os.path.abspath(path)
 
@@ -292,18 +298,25 @@ def refuse_batch_file(path: str, *, windows: bool | None = None) -> str:
 
 
 def find_claude_cli() -> str | None:
-    """The CLI binary as an absolute path: ``$AI_EDA_CLAUDE_CLI`` when it names an existing file, else ``claude`` on PATH, else ``None``.
+    """The CLI binary as an absolute path: ``$AI_EDA_CLAUDE_CLI`` when it names an existing file by an absolute path, else ``claude`` on PATH, else ``None``.
 
     Like ``AI_EDA_BROWSER`` for the report printer, an explicit path that does
-    not exist falls through to the PATH lookup rather than aborting. On
-    Windows ``claude.exe`` is looked up before ``claude`` (which PATHEXT may
-    resolve to the npm ``claude.cmd`` shim - :func:`refuse_batch_file` refuses
-    that at construction, and says so in ``doctor``).
+    not exist falls through to the PATH lookup rather than aborting, and an
+    empty or relative one counts as unset (a path relative to the working
+    directory would let a project folder - GUI runs start there - supply the
+    program). PATH is read through its absolute entries only
+    (:func:`~ai_eda.tools.kicad.install.which_absolute`: never the working
+    directory). On Windows ``claude.exe`` is looked up before ``claude``
+    (which PATHEXT may resolve to the npm ``claude.cmd`` shim -
+    :func:`refuse_batch_file` refuses that at construction, and says so in
+    ``doctor``).
     """
+    from ai_eda.tools.kicad.install import which_absolute
+
     explicit = os.environ.get(ENV_CLI, "").strip()
-    if explicit and Path(explicit).is_file():
-        return absolute_cli_path(explicit)
-    found = (shutil.which(WINDOWS_CLI_NAME) if _is_windows() else None) or shutil.which(CLI_NAME)
+    if explicit and Path(explicit).is_absolute() and Path(explicit).is_file():
+        return explicit
+    found = (which_absolute(WINDOWS_CLI_NAME) if _is_windows() else None) or which_absolute(CLI_NAME)
     return absolute_cli_path(found) if found else None
 
 

@@ -57,8 +57,8 @@
                                          ir.requirements.llm_model_spec (bookkeeping, outside the design hash);
                                          a later run with another primary spec is refused (exit 2, before any
                                          call) unless this flag is given, which re-pins after a served call
-        --llm-claude-cli PATH            the claude binary (default $AI_EDA_CLAUDE_CLI when it exists, then
-                                         `claude` on PATH); needs --llm claude
+        --llm-claude-cli PATH            the claude binary (default $AI_EDA_CLAUDE_CLI when it is an absolute
+                                         path to an existing file, then `claude` on PATH); needs --llm claude
         --llm-claude-fallback-model LIST passthrough to the CLI's own --fallback-model (its cross-model
                                          fallback; off by default); needs --llm claude
         --llm-budget-usd X / --llm-budget-tokens N   the budget you grant (= the PAID_API_CALL approval);
@@ -252,7 +252,7 @@ RUN_OPTIONS: tuple[RunOption, ...] = (
         "--llm-allow-model-change", "llm_allow_model_change", "flag", None,
         "run with a primary model spec other than the project's pin (ir.requirements.llm_model_spec) and re-pin it after a served call",
     ),
-    RunOption("--llm-claude-cli", "llm_claude_cli", "str", "PATH", "the claude binary (default $AI_EDA_CLAUDE_CLI when it exists, else claude on PATH); needs --llm claude"),
+    RunOption("--llm-claude-cli", "llm_claude_cli", "str", "PATH", "the claude binary (default $AI_EDA_CLAUDE_CLI when it is an absolute path to an existing file, else claude on PATH); needs --llm claude"),
     RunOption("--llm-claude-fallback-model", "llm_claude_fallback_model", "str", "LIST", "passthrough to the Claude Code CLI's own --fallback-model (off by default); needs --llm claude"),
     RunOption(
         "--llm-budget-usd", "llm_budget_usd", "float", "X",
@@ -367,7 +367,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             missing.append("ngspice")
         print(f"ngspice dll: {shared.dll_path}{info}")
     else:
-        print(f"ngspice dll: NOT FOUND (set NGSPICE_DLL)  - {remedy('ngspice')}")
+        print(f"ngspice dll: NOT FOUND (set NGSPICE_DLL to its absolute path)  - {remedy('ngspice')}")
         missing.append("ngspice")
     batch = NgspiceRunner()
     print(f"ngspice exe: {batch.binary or 'not on PATH (optional; the shared library is the engine used)'}")
@@ -419,15 +419,23 @@ def _major_version(version: str) -> int | None:
 
 
 def _library_tables_line(binary: str | None, version: str) -> tuple[str, bool]:
-    """``kicad tables: <folder>`` when KiCad's global library tables exist, else what is missing and the remedy; and whether they exist."""
-    from ai_eda.tools.kicad.install import library_tables
+    """``kicad tables: <folder>`` when KiCad's global library tables exist, else what is missing and the remedy; and whether they exist.
+
+    No settings folder counts as missing tables; for a relative
+    ``KICAD_CONFIG_HOME`` (which KiCad reads relative to its own working
+    directory) the remedy is the variable, not ``ai-eda setup-kicad``.
+    """
+    from ai_eda.tools.kicad.install import RELATIVE_CONFIG_HOME, config_dir_problem, library_tables
 
     tables = library_tables(binary, version)
     folder = tables[0].path.parent if tables and tables[0].path is not None else None
     absent = [t.name for t in tables if not t.present]
     if not absent:
         return f"kicad tables: {folder} ({', '.join(t.name for t in tables)})", True
-    where = f" in {folder}" if folder is not None else " (no KiCad settings folder: HOME / APPDATA unset)"
+    problem = config_dir_problem(version) if folder is None else ""
+    if problem == RELATIVE_CONFIG_HOME:
+        return f"kicad tables: MISSING {', '.join(absent)} (no KiCad settings folder: {problem})", False
+    where = f" in {folder}" if folder is not None else f" (no KiCad settings folder: {problem})"
     return (
         f"kicad tables: MISSING {', '.join(absent)}{where} - run `ai-eda setup-kicad` (KiCad writes them on its first start; "
         "without them ERC / DRC warn about every part and FAIL)",
@@ -478,7 +486,7 @@ def _claude_cli_line() -> str:
     from ai_eda.llm.providers import describe_providers
 
     if find_claude_cli() is None:
-        return f"claude cli : NOT FOUND (install Claude Code and run `claude login`, or set {ENV_CLI})"
+        return f"claude cli : NOT FOUND (install Claude Code and run `claude login`, or set {ENV_CLI} to its absolute path)"
     row = next(r for r in describe_providers() if r.name == "claude")
     return f"claude cli : {row.reason}"
 
@@ -489,7 +497,7 @@ def _browser_line() -> str:
 
     browser = find_browser()
     if browser is None:
-        return f"browser (pdf): NOT FOUND (chromium / chrome / edge on PATH, a Playwright install, or {BROWSER_ENV}; stage reports are written as .md + .html only)"
+        return f"browser (pdf): NOT FOUND (chrome / edge / chromium on PATH, a Playwright install, or {BROWSER_ENV} set to its absolute path; stage reports are written as .md + .html only)"
     version = browser_version(browser)
     return f"browser (pdf): {browser}" + (f"  ({version})" if version else "")
 

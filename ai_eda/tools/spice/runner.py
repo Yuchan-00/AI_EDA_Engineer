@@ -43,8 +43,8 @@ import builtins
 import hashlib
 import math
 import re
-import shutil
 import subprocess
+import tempfile
 from abc import ABC, abstractmethod
 from enum import StrEnum
 from pathlib import Path
@@ -284,7 +284,7 @@ class SpiceRunner(ABC):
         """How the engine is set up, for the evidence of every run: at least ``engine`` and ``version``.
 
         Engines with more state (a build date, code models, an init-time
-        settings listing where a ``.spiceinit`` / ``spinit`` would show, a
+        settings listing where ``~/.spiceinit`` / ``spinit`` would show, a
         self-test) add it here; the stage persists the whole dict in
         ``results.json`` and the ``spice`` result details.
         """
@@ -354,7 +354,11 @@ _VERSION_RE = re.compile(r"ngspice-\d+")
 
 class NgspiceRunner(SpiceRunner):
     """ngspice *batch binary* runner (``ngspice -b -r <raw> <deck>``); optional, used only when an
-    ``ngspice`` executable is on PATH (or given). Prefer :class:`ai_eda.tools.spice.NgspiceShared`.
+    ``ngspice`` executable is on an absolute PATH entry (or given). Prefer :class:`ai_eda.tools.spice.NgspiceShared`.
+
+    The PATH lookup is :func:`ai_eda.tools.kicad.install.which_absolute`: the working directory (an empty or
+    relative PATH entry, or Windows' implicit current folder) never supplies the binary. The binary runs in a new
+    empty folder, so a ``.spiceinit`` in the output folder (whose ``shell`` lines would run) is never read.
 
     Batch mode runs the analysis cards inside the deck, so the analysis command
     is written as a card into a copy of the netlist
@@ -366,7 +370,9 @@ class NgspiceRunner(SpiceRunner):
     engine = "ngspice"
 
     def __init__(self, binary: str | None = None) -> None:
-        self.binary = binary or shutil.which("ngspice")
+        from ai_eda.tools.kicad.install import which_absolute  # lazy: the kicad package imports ai_eda.ir, which imports this package
+
+        self.binary = binary or which_absolute("ngspice")
 
     def available(self) -> bool:
         return self.binary is not None
@@ -402,22 +408,23 @@ class NgspiceRunner(SpiceRunner):
             raise ToolExecutionError(f"netlist {netlist_path} does not exist")
         analysis = SpiceAnalysis(analysis)
         cmd = normalise_command(command, analysis)
-        workdir = Path(workdir)
+        workdir = Path(workdir).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
         deck = workdir / f"{netlist_path.stem}.{analysis.value}.cir"
         deck.write_text(self.batch_deck(netlist_path.read_text(encoding="utf-8"), cmd), encoding="utf-8", newline="\n")
         raw = workdir / f"{netlist_path.stem}.{analysis.value}.raw"
         if raw.exists():
             raw.unlink()
-        proc = subprocess.run(
-            [self.binary, "-b", "-r", str(raw), str(deck)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=workdir,
-            timeout=timeout_s,
-        )
+        with tempfile.TemporaryDirectory(prefix="ai-eda-ngspice-") as empty:  # ngspice sources ./.spiceinit at start
+            proc = subprocess.run(
+                [self.binary, "-b", "-r", str(raw), str(deck)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=empty,
+                timeout=timeout_s,
+            )
         from ai_eda.tools.spice.ngspice_shared import INFORMATIONAL_STDERR_RE  # the same informational lines as the shared runner
 
         log = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")

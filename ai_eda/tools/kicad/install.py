@@ -3,15 +3,22 @@
 Invariant: only the absolute locations an operating system's own KiCad
 installer uses are searched, each only on that operating system, and the
 ``kicad-cli`` on ``PATH`` always wins. A path is never built from an empty or
-relative environment variable: a location relative to the working directory
-would let a project folder (GUI runs start in the project folder) supply a
-``kicad-cli`` binary or library files.
+relative environment variable, and ``PATH`` is searched only through its
+absolute entries (:func:`which_absolute`): a location relative to the working
+directory would let a project folder (GUI runs start in the project folder)
+supply a ``kicad-cli`` binary or library files. ``shutil.which`` is not used
+for that reason - it searches the working directory for an empty ``PATH``
+entry (POSIX) and, on Windows, before ``PATH`` itself.
 
 * Windows - ``%LOCALAPPDATA%\\Programs\\KiCad\\<ver>`` (the per-user
-  installer) and ``%ProgramFiles%\\KiCad\\<ver>`` (all users; also what
-  ``winget install KiCad.KiCad`` uses), highest version first:
-  ``bin\\kicad-cli.exe``, the libraries in ``share\\kicad``, ngspice as
-  ``bin\\ngspice.dll`` with its code models in ``lib\\ngspice``.
+  installer; also where ``winget install KiCad.KiCad`` put KiCad 10.0.6 on
+  the windows-2025 CI runner) and ``<Program Files>\\KiCad\\<ver>`` (all
+  users; ``%ProgramW6432%``, then
+  ``%ProgramFiles%`` - the ``(x86)`` folder for a 32-bit Python, where the
+  64-bit-only KiCad 10 never is -, then ``C:\\Program Files``): the version
+  folders of all of them together, highest version first (the per-user one
+  on a tie): ``bin\\kicad-cli.exe``, the libraries in ``share\\kicad``,
+  ngspice as ``bin\\ngspice.dll`` with its code models in ``lib\\ngspice``.
 * macOS - ``KiCad.app`` in ``/Applications/KiCad`` (where the DMG and the
   Homebrew cask put it), ``/Applications``, ``~/Applications/KiCad`` or
   ``~/Applications``: ``Contents/MacOS/kicad-cli``, the libraries in
@@ -39,6 +46,8 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,6 +81,63 @@ def _absolute_env(name: str) -> Path | None:
     return path if path.is_absolute() else None
 
 
+#: what Windows runs for a bare command name when ``PATHEXT`` is unset (CPython's ``shutil`` default)
+DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS;.MSC"
+
+
+def which_absolute(name: str) -> str | None:
+    """The executable ``name`` (a bare file name) in the first *absolute* ``PATH`` entry holding it, else ``None``.
+
+    Never the working directory: an empty entry (which POSIX shells and
+    ``shutil.which`` read as the current folder) and a relative one are
+    skipped, and the current folder that ``shutil.which`` - like Windows'
+    own command search - tries before ``PATH`` on Windows is never tried. On
+    Windows (:func:`platform`) a name that already ends in a ``PATHEXT``
+    extension is looked for as is, any other name with each extension in
+    ``PATHEXT`` order (spelled in lower case); a hit is a file. Elsewhere a
+    hit is a regular file this user may execute. The result is the entry
+    joined with the file name, as ``shutil.which`` spells it.
+    """
+    if not name or os.path.dirname(name):
+        raise ValueError(f"which_absolute takes a bare file name, not {name!r}")
+    if platform() == "win32":
+        exts = [e.lower() for e in (os.environ.get("PATHEXT") or DEFAULT_PATHEXT).split(";") if e]
+        files = [name] if os.path.splitext(name)[1].lower() in exts else [name + e for e in exts]
+    else:
+        files = [name]
+    for entry in os.environ.get("PATH", os.defpath).split(os.pathsep):  # unset PATH: the OS default, as shutil.which
+        if not entry or not Path(entry).is_absolute():
+            continue
+        for file in files:
+            candidate = os.path.join(entry, file)
+            if not os.path.isfile(candidate):
+                continue
+            if platform() == "win32" or os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+@contextmanager
+def absolute_path_only() -> Iterator[None]:
+    """``PATH`` without its empty and relative entries for the duration of the block (restored after it).
+
+    For library code that looks programs up itself with ``shutil.which`` -
+    ``ctypes.util.find_library`` runs ``gcc`` / ``cc`` / ``ld`` / ``objdump``
+    on Linux when the loader cache does not know a name - so that a project
+    folder in the working directory cannot supply them either.
+    """
+    saved = os.environ.get("PATH")
+    entries = (saved or "").split(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join(e for e in entries if e and Path(e).is_absolute())
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+
+
 def version_key(path: Path) -> tuple[int, ...]:
     """Numeric sort key for a KiCad version directory: ``10.0`` > ``9.0`` (lexicographic sorting gets this wrong)."""
     parts = path.name.split(".")
@@ -87,17 +153,42 @@ def version_dirs(base: Path) -> list[Path]:
     return sorted((p for p in base.iterdir() if p.is_dir()), key=version_key, reverse=True)
 
 
+#: the all-users program folder when no variable names one (the hard-coded location before ``%ProgramW6432%`` was read)
+DEFAULT_PROGRAM_FILES = Path("C:/Program Files")
+
+
 def windows_install_bases() -> list[Path]:
-    """``<base>`` folders holding ``<ver>`` KiCad installs on Windows (per-user first); empty on any other system."""
+    """``<base>`` folders holding ``<ver>`` KiCad installs on Windows (per-user first); empty on any other system.
+
+    The all-users folders come from ``%ProgramW6432%`` (the 64-bit program
+    folder, set for 32- and 64-bit processes alike on 64-bit Windows), then
+    ``%ProgramFiles%`` (``Program Files (x86)`` for a 32-bit Python), then
+    :data:`DEFAULT_PROGRAM_FILES` - each only when absolute, each once.
+    """
     if platform() != "win32":
         return []
     bases: list[Path] = []
     local = _absolute_env("LOCALAPPDATA")
     if local is not None:
         bases.append(local / "Programs" / "KiCad")
-    program_files = _absolute_env("ProgramFiles") or Path("C:/Program Files")
-    bases.append(program_files / "KiCad")
+    for program_files in (_absolute_env("ProgramW6432"), _absolute_env("ProgramFiles"), DEFAULT_PROGRAM_FILES):
+        if program_files is None or not program_files.is_absolute():
+            continue
+        base = program_files / "KiCad"
+        if base not in bases:
+            bases.append(base)
     return bases
+
+
+def windows_installs() -> list[Path]:
+    """Every ``<base>\\<ver>`` KiCad folder of :func:`windows_install_bases` together, highest version first.
+
+    One order over all bases, so an older per-user KiCad never hides a newer
+    all-users one; on equal versions the earlier base (per-user) comes first.
+    Empty on any other system.
+    """
+    found = [ver for base in windows_install_bases() for ver in version_dirs(base)]
+    return sorted(found, key=version_key, reverse=True)  # stable: a tie keeps the base order
 
 
 def macos_bundles() -> list[Path]:
@@ -119,15 +210,14 @@ def macos_bundles() -> list[Path]:
 
 
 def find_kicad_cli() -> str | None:
-    """``kicad-cli`` on ``PATH``, else the newest Windows install, else the first macOS bundle (module docstring); ``None`` when absent."""
-    found = shutil.which("kicad-cli")
+    """``kicad-cli`` on ``PATH`` (:func:`which_absolute`), else the newest Windows install, else the first macOS bundle (module docstring); ``None`` when absent."""
+    found = which_absolute("kicad-cli")
     if found:
         return found
-    for base in windows_install_bases():
-        for ver in version_dirs(base):
-            exe = ver / "bin" / "kicad-cli.exe"
-            if exe.is_file():
-                return str(exe)
+    for ver in windows_installs():
+        exe = ver / "bin" / "kicad-cli.exe"
+        if exe.is_file():
+            return str(exe)
     for bundle in macos_bundles():
         exe = bundle / MACOS_CLI
         if exe.is_file():
@@ -136,11 +226,12 @@ def find_kicad_cli() -> str | None:
 
 
 def _executable(binary: str | None) -> Path | None:
+    """``binary`` as a resolved absolute path: kept when absolute, a bare name looked up by :func:`which_absolute`; a relative path is none."""
     if not binary:
         return None
     exe = Path(binary)
     if not exe.is_absolute():
-        resolved = shutil.which(binary)
+        resolved = which_absolute(binary) if not os.path.dirname(binary) else None
         if not resolved:
             return None
         exe = Path(resolved)
@@ -181,10 +272,9 @@ def share_dir(binary: str | None) -> Path | None:
 
 
 def library_shares() -> list[Path]:
-    """Every installed KiCad's library folder this system's installers use (Windows versions, newest first; macOS bundles)."""
+    """Every installed KiCad's library folder this system's installers use (Windows versions in :func:`windows_installs` order; macOS bundles)."""
     out: list[Path] = []
-    for base in windows_install_bases():
-        out.extend(ver / "share" / "kicad" for ver in version_dirs(base) if (ver / "share" / "kicad").is_dir())
+    out.extend(ver / "share" / "kicad" for ver in windows_installs() if (ver / "share" / "kicad").is_dir())
     for bundle in macos_bundles():
         share = bundle / MACOS_SHARE
         if share.is_dir() and _has_libraries(share):
@@ -250,17 +340,32 @@ def settings_version(version: str) -> str | None:
     return f"{int(parts[0])}.{int(minor)}" if minor else None
 
 
+#: why :func:`user_config_dir` names no folder when ``KICAD_CONFIG_HOME`` is relative (KiCad would read it relative to
+#: its own working directory, which is no folder this package can check or write)
+RELATIVE_CONFIG_HOME = "KICAD_CONFIG_HOME is a relative path: set it to an absolute path"
+
+
+def _relative_config_home() -> bool:
+    """``KICAD_CONFIG_HOME`` is set, non-empty and not absolute (KiCad uses any non-empty value)."""
+    value = os.environ.get("KICAD_CONFIG_HOME", "")
+    return bool(value) and not Path(value).is_absolute()
+
+
 def user_config_dir(version: str) -> Path | None:
     """The folder KiCad ``version`` reads its settings and global library tables from, else ``None``.
 
-    ``$KICAD_CONFIG_HOME/<major.minor>`` when that variable is an absolute path
-    (KiCad appends the version to it too), else ``%APPDATA%\\kicad\\<v>``
-    (Windows), ``~/Library/Preferences/kicad/<v>`` (macOS),
-    ``$XDG_CONFIG_HOME/kicad/<v>`` or ``~/.config/kicad/<v>`` (Linux and other
-    POSIX systems); never a path built from an empty or relative variable.
+    ``$KICAD_CONFIG_HOME/<major.minor>`` when that variable is set (KiCad
+    appends the version to it too, and uses any non-empty value): an
+    absolute path is used, a relative one gives ``None``
+    (:data:`RELATIVE_CONFIG_HOME`) - KiCad reads it relative to its own
+    working directory, so the default folder would be the wrong one. Unset or
+    empty: ``%APPDATA%\\kicad\\<v>`` (Windows),
+    ``~/Library/Preferences/kicad/<v>`` (macOS), ``$XDG_CONFIG_HOME/kicad/<v>``
+    or ``~/.config/kicad/<v>`` (Linux and other POSIX systems); never a path
+    built from an empty or relative variable.
     """
     ver = settings_version(version)
-    if ver is None:
+    if ver is None or _relative_config_home():
         return None
     root = _absolute_env("KICAD_CONFIG_HOME")
     if root is None:
@@ -277,6 +382,15 @@ def user_config_dir(version: str) -> Path | None:
             return None
         root = base / "kicad"
     return root / ver
+
+
+def config_dir_problem(version: str) -> str:
+    """Why :func:`user_config_dir` names no folder for ``version`` (the text the table lines print)."""
+    if _relative_config_home():
+        return RELATIVE_CONFIG_HOME
+    if settings_version(version) is None:
+        return f"kicad-cli printed no major.minor version ({version!r})"
+    return "HOME / APPDATA unset"
 
 
 @dataclass(frozen=True)
@@ -335,7 +449,7 @@ def install_library_tables(binary: str | None, version: str) -> list[str]:
     lines: list[str] = []
     for table in library_tables(binary, version):
         if table.path is None:
-            lines.append(f"{table.name}: no KiCad settings folder for version {version!r} (HOME / APPDATA unset)")
+            lines.append(f"{table.name}: no KiCad settings folder for version {version!r} ({config_dir_problem(version)})")
         elif table.present:
             lines.append(f"{table.name}: kept {table.path} (already there)")
         elif table.template is not None:
@@ -355,6 +469,8 @@ def install_library_tables(binary: str | None, version: str) -> list[str]:
 
 __all__ = [
     "CODEMODEL_MARKER",
+    "DEFAULT_PATHEXT",
+    "DEFAULT_PROGRAM_FILES",
     "LIBRARY_TABLES",
     "LibraryTable",
     "TEMPLATE_DIR",
@@ -362,9 +478,12 @@ __all__ = [
     "MACOS_CLI",
     "MACOS_NGSPICE_DIRS",
     "MACOS_SHARE",
+    "RELATIVE_CONFIG_HOME",
+    "absolute_path_only",
     "bundle_of",
     "bundled_codemodels",
     "bundled_ngspice",
+    "config_dir_problem",
     "find_kicad_cli",
     "install_library_tables",
     "library_shares",
@@ -377,5 +496,7 @@ __all__ = [
     "version_dirs",
     "user_config_dir",
     "version_key",
+    "which_absolute",
     "windows_install_bases",
+    "windows_installs",
 ]

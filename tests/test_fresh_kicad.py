@@ -41,7 +41,7 @@ WX_NOISE = (
     "(0x2012003) of Fontconfig. Please regenerate the cache with the latest version of Fontconfig to avoid any "
     "unexpected behavior. (current version: 0x2012002)\n"
     "Fontconfig error: Cannot load default config file\n"
-    # Fontconfig 2.13 on the ubuntu-22.04 runner (kicad-cli 10.0.7 run by a user who cannot write /usr/share/fonts)
+    # Fontconfig 2.13 on the ubuntu-22.04 runner (kicad-cli 10.0.6 run by a user who cannot write /usr/share/fonts)
     "Unable to revert mtime: /usr/share/fonts\n"
     "Unable to revert mtime: /usr/share/fonts/truetype/dejavu\n"
 )
@@ -222,3 +222,56 @@ def test_setup_kicad_command_and_the_doctor_line(tmp_path: Path, linux_home: Pat
     monkeypatch.setattr("ai_eda.tools.kicad.cli.find_kicad_cli", lambda: None)
     assert cli.main(["setup-kicad"]) == 1
     assert "kicad-cli NOT FOUND" in capsys.readouterr().out
+
+
+def test_a_relative_kicad_config_home_names_no_settings_folder(tmp_path: Path, linux_home: Path, monkeypatch: pytest.MonkeyPatch):
+    """KiCad reads a relative KICAD_CONFIG_HOME relative to its own working directory: never the default folder instead."""
+    from ai_eda import cli
+
+    kicad = _kicad_root(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KICAD_CONFIG_HOME", "kicad-cfg")
+    assert kicad_install.user_config_dir("10.0.6") is None  # not ~/.config/kicad/10.0
+    assert kicad_install.config_dir_problem("10.0.6") == kicad_install.RELATIVE_CONFIG_HOME
+    tables = kicad_install.library_tables(kicad, "10.0.6")
+    assert [t.path for t in tables] == [None, None] and not any(t.present for t in tables)
+    reason = "KICAD_CONFIG_HOME is a relative path: set it to an absolute path"
+    assert kicad_install.install_library_tables(kicad, "10.0.6") == [
+        f"sym-lib-table: no KiCad settings folder for version '10.0.6' ({reason})",
+        f"fp-lib-table: no KiCad settings folder for version '10.0.6' ({reason})",
+    ]
+    assert not (linux_home / ".config").exists() and not (tmp_path / "kicad-cfg").exists()  # nothing written anywhere
+    # doctor counts the tables as missing and names the variable, not `ai-eda setup-kicad`
+    assert cli._library_tables_line(kicad, "10.0.6") == (f"kicad tables: MISSING sym-lib-table, fp-lib-table (no KiCad settings folder: {reason})", False)
+    # an absolute value is used as KiCad uses it; no HOME is still its own reason
+    monkeypatch.setenv("KICAD_CONFIG_HOME", str(tmp_path / "kicad-cfg"))
+    assert kicad_install.user_config_dir("10.0.6") == tmp_path / "kicad-cfg" / "10.0"
+    monkeypatch.setenv("KICAD_CONFIG_HOME", "")
+    monkeypatch.delenv("HOME")
+    assert kicad_install.config_dir_problem("10.0.6") == "HOME / APPDATA unset"
+    assert kicad_install.config_dir_problem("garbage") == "kicad-cli printed no major.minor version ('garbage')"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="an executable file the OS refuses to start (ENOEXEC) is a POSIX construction")
+def test_a_kicad_cli_that_cannot_start_is_unusable_not_a_traceback(tmp_path: Path, linux_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    """A wrong-architecture / non-binary kicad-cli (OSError: Exec format error) gives doctor's UNUSABLE line and setup-kicad's message."""
+    from ai_eda import cli
+    from ai_eda.errors import ToolUnavailableError
+
+    exe = Path(_kicad_root(tmp_path))
+    exe.write_text("this is not a program\n", encoding="utf-8")  # no #! line: execve says ENOEXEC
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(exe.parent))
+    monkeypatch.setenv("NGSPICE_DLL", str(tmp_path / "no-ngspice.so"))
+    monkeypatch.setattr("ai_eda.report.pdf.find_browser", lambda: None)
+    with pytest.raises(ToolUnavailableError, match="cannot be started: "):
+        KicadCli().version()
+    assert cli.main(["doctor", "--strict"]) == 1
+    out = capsys.readouterr().out
+    assert f"kicad-cli : {exe}  (UNUSABLE: kicad-cli {exe} cannot be started: " in out
+    assert "ngspice dll:" in out and "browser (pdf):" in out  # doctor went on to the other tools
+    assert "missing   : kicad-cli" in out
+    assert cli.main(["setup-kicad"]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith(f"setup-kicad: kicad-cli {exe} is unusable: kicad-cli {exe} cannot be started: ")
+    assert "Traceback" not in out

@@ -7,24 +7,48 @@ Linux rules are all exercised on any machine. Nothing is executed.
 
 from __future__ import annotations
 
+import ctypes.util
 import os
-import shutil
+import stat
 from pathlib import Path
 
 import pytest
 
 from ai_eda.tools.kicad import install
 from ai_eda.tools.kicad import library as kicad_library
+from ai_eda.tools.kicad.library import KicadLibrary
+from ai_eda.tools.model3d.models import find_3dmodel_dir
 from ai_eda.tools.spice import ngspice_shared
 from ai_eda.tools.spice.ngspice_shared import find_codemodel_dir, find_ngspice_dll, find_system_ngspice
+from ai_eda.tools.spice.runner import NgspiceRunner
+
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX PATH semantics (an empty entry, the execute bit)")
+#: the real PATH lookup (``clean_env`` replaces it with "nothing on PATH")
+REAL_WHICH = install.which_absolute
 
 
 @pytest.fixture
-def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
-    for name in ("KICAD10_SYMBOL_DIR", "KICAD_SYMBOL_DIR", "NGSPICE_DLL", "NGSPICE_CODEMODEL_DIR", "LD_LIBRARY_PATH"):
+def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> pytest.MonkeyPatch:
+    """No variable, no PATH hit and no all-users program folder of the machine running the tests reaches discovery."""
+    for name in ("KICAD10_SYMBOL_DIR", "KICAD_SYMBOL_DIR", "NGSPICE_DLL", "NGSPICE_CODEMODEL_DIR", "LD_LIBRARY_PATH", "LOCALAPPDATA", "ProgramW6432", "ProgramFiles"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(install, "which_absolute", lambda name: None)
+    monkeypatch.setattr(install, "DEFAULT_PROGRAM_FILES", tmp_path / "default-program-files")
     return monkeypatch
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as e:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {e}")
+
+
+def _executable(path: Path, text: str = "#!/bin/sh\nexit 0\n") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
 
 
 def _windows_install(base: Path, version: str) -> Path:
@@ -60,7 +84,11 @@ def test_windows_per_user_and_all_users_installs(tmp_path: Path, clean_env: pyte
     clean_env.setenv("LOCALAPPDATA", str(local))
     clean_env.setenv("ProgramFiles", str(program_files))
     _windows_install(program_files / "KiCad", "10.0")
-    assert install.windows_install_bases() == [local / "Programs" / "KiCad", program_files / "KiCad"]
+    assert install.windows_install_bases() == [
+        local / "Programs" / "KiCad",
+        program_files / "KiCad",
+        tmp_path / "default-program-files" / "KiCad",
+    ]
     cli = install.find_kicad_cli()
     assert cli == str(program_files / "KiCad" / "10.0" / "bin" / "kicad-cli.exe")
     assert install.share_dir(cli) == (program_files / "KiCad" / "10.0" / "share" / "kicad").resolve()
@@ -68,9 +96,53 @@ def test_windows_per_user_and_all_users_installs(tmp_path: Path, clean_env: pyte
     dll = find_ngspice_dll()
     assert dll == (program_files / "KiCad" / "10.0" / "bin" / "ngspice.dll").resolve()
     assert find_codemodel_dir(dll) == (program_files / "KiCad" / "10.0" / "lib" / "ngspice").resolve()
-    # a per-user install is searched first
+    # a per-user install of the same version comes first
     _windows_install(local / "Programs" / "KiCad", "10.0")
     assert install.find_kicad_cli() == str(local / "Programs" / "KiCad" / "10.0" / "bin" / "kicad-cli.exe")
+
+
+def test_windows_newest_version_wins_across_per_user_and_all_users(tmp_path: Path, clean_env: pytest.MonkeyPatch):
+    """An older per-user KiCad 9 never hides an all-users KiCad 10 (winget's location): one version order over all bases."""
+    clean_env.setattr(install, "platform", lambda: "win32")
+    local = tmp_path / "local"
+    program_files = tmp_path / "pf"
+    clean_env.setenv("LOCALAPPDATA", str(local))
+    clean_env.setenv("ProgramFiles", str(program_files))
+    old = _windows_install(local / "Programs" / "KiCad", "9.0")
+    new = _windows_install(program_files / "KiCad", "10.0")
+    assert install.windows_installs() == [new, old]
+    assert install.find_kicad_cli() == str(new / "bin" / "kicad-cli.exe")
+    assert install.library_shares() == [new / "share" / "kicad", old / "share" / "kicad"]
+    assert kicad_library._default_library_roots() == [(new / "share" / "kicad").resolve(), old / "share" / "kicad"]
+    assert find_ngspice_dll() == (new / "bin" / "ngspice.dll").resolve()
+    # the same version in both: the per-user one first, in both lists
+    tie = _windows_install(local / "Programs" / "KiCad", "10.0")
+    assert install.windows_installs() == [tie, new, old]
+    assert install.find_kicad_cli() == str(tie / "bin" / "kicad-cli.exe")
+    assert install.library_shares() == [tie / "share" / "kicad", new / "share" / "kicad", old / "share" / "kicad"]
+
+
+def test_windows_program_files_from_programw6432_then_programfiles_then_the_default(tmp_path: Path, clean_env: pytest.MonkeyPatch):
+    """A 32-bit Python sees ProgramFiles = 'Program Files (x86)'; the 64-bit-only KiCad 10 is under %ProgramW6432%."""
+    clean_env.setattr(install, "platform", lambda: "win32")
+    pf64 = tmp_path / "Program Files"
+    pf86 = tmp_path / "Program Files (x86)"
+    clean_env.setenv("ProgramW6432", str(pf64))
+    clean_env.setenv("ProgramFiles", str(pf86))
+    kicad = _windows_install(pf64 / "KiCad", "10.0")
+    assert install.windows_install_bases() == [pf64 / "KiCad", pf86 / "KiCad", tmp_path / "default-program-files" / "KiCad"]
+    assert install.find_kicad_cli() == str(kicad / "bin" / "kicad-cli.exe")
+    # a 64-bit Python: both variables name the same folder, the default too - searched once
+    clean_env.setenv("ProgramFiles", str(pf64))
+    clean_env.setattr(install, "DEFAULT_PROGRAM_FILES", pf64)
+    assert install.windows_install_bases() == [pf64 / "KiCad"]
+    # relative or empty variables are never searched; the default is used only when absolute
+    clean_env.chdir(tmp_path)
+    for value in ("", "relative"):
+        clean_env.setenv("ProgramW6432", value)
+        clean_env.setenv("ProgramFiles", value)
+        clean_env.setattr(install, "DEFAULT_PROGRAM_FILES", Path("relative-default"))
+        assert install.windows_install_bases() == []
 
 
 @pytest.mark.parametrize("value", ["", "relative/dir"])
@@ -133,8 +205,8 @@ def test_macos_home_applications_and_kicad_cli_on_path(tmp_path: Path, clean_env
     link_dir = tmp_path / "bin"
     link_dir.mkdir()
     link = link_dir / "kicad-cli"
-    os.symlink(app / "Contents" / "MacOS" / "kicad-cli", link)
-    clean_env.setattr(shutil, "which", lambda name: str(link) if name == "kicad-cli" else None)
+    _symlink_or_skip(link, app / "Contents" / "MacOS" / "kicad-cli")
+    clean_env.setattr(install, "which_absolute", lambda name: str(link) if name == "kicad-cli" else None)
     assert install.find_kicad_cli() == str(link)
     assert install.share_dir(str(link)) == (app / "Contents" / "SharedSupport").resolve()
 
@@ -173,8 +245,181 @@ def test_linux_distribution_layout(tmp_path: Path, clean_env: pytest.MonkeyPatch
     (prefix / "bin").mkdir(parents=True)
     (prefix / "bin" / "kicad-cli").write_bytes(b"")
     (prefix / "share" / "kicad" / "footprints").mkdir(parents=True)
-    clean_env.setattr(shutil, "which", lambda name: str(prefix / "bin" / "kicad-cli") if name == "kicad-cli" else None)
+    clean_env.setattr(install, "which_absolute", lambda name: str(prefix / "bin" / "kicad-cli") if name == "kicad-cli" else None)
     assert install.find_kicad_cli() == str(prefix / "bin" / "kicad-cli")
     assert install.share_dir(install.find_kicad_cli()) == (prefix / "share" / "kicad").resolve()
     assert kicad_library._default_library_roots() == [(prefix / "share" / "kicad").resolve()]
     assert install.bundled_ngspice(install.find_kicad_cli()) is None
+
+
+# --------------------------------------------------------------------------- PATH: only its absolute entries
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize(
+    "path_of",
+    [lambda abs_dir: os.pathsep + abs_dir, lambda abs_dir: abs_dir + os.pathsep, lambda abs_dir: "." + os.pathsep + "bin" + os.pathsep + abs_dir, lambda abs_dir: ""],
+    ids=["leading-empty-entry", "trailing-empty-entry", "relative-entries", "empty-PATH"],
+)
+def test_a_kicad_cli_in_the_working_directory_is_never_found(tmp_path: Path, clean_env: pytest.MonkeyPatch, path_of):
+    """An empty PATH entry (shutil.which: the current folder) or a relative one never lets a project folder supply kicad-cli."""
+    clean_env.setattr(install, "which_absolute", REAL_WHICH)
+    clean_env.setattr(install, "platform", lambda: "linux")
+    project = tmp_path / "project"
+    planted = _executable(project / "kicad-cli", "#!/bin/sh\necho PLANTED 10.0.99\n")
+    _executable(project / "bin" / "kicad-cli")
+    _executable(project / "ngspice")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    clean_env.chdir(project)
+    clean_env.setenv("PATH", path_of(str(empty)))
+    assert install.which_absolute("kicad-cli") is None
+    assert install.find_kicad_cli() is None
+    assert install.share_dir("kicad-cli") is None and install.bundled_ngspice("kicad-cli") is None
+    assert install.share_dir("bin/kicad-cli") is None  # a relative path is never resolved against the working directory
+    assert install.share_dir("./kicad-cli") is None
+    assert NgspiceRunner().binary is None
+    # the same file reached through an absolute entry is found, spelled as entry + name
+    clean_env.setenv("PATH", os.pathsep.join(["", ".", str(project)]))
+    assert install.which_absolute("kicad-cli") == str(planted)
+    assert install.find_kicad_cli() == str(planted)
+    assert NgspiceRunner().binary == str(project / "ngspice")
+
+
+@POSIX_ONLY
+def test_which_absolute_posix_needs_an_executable_regular_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(install, "platform", lambda: "linux")
+    first, second = tmp_path / "a", tmp_path / "b"
+    (first / "tool").mkdir(parents=True)  # a directory is no executable
+    (second).mkdir()
+    (second / "tool").write_text("#!/bin/sh\n", encoding="utf-8")  # not executable
+    monkeypatch.setenv("PATH", os.pathsep.join([str(first), str(second)]))
+    assert install.which_absolute("tool") is None
+    third = _executable(tmp_path / "c" / "tool")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(first), str(second), str(tmp_path / "c")]))
+    assert install.which_absolute("tool") == str(third)
+    with pytest.raises(ValueError, match="bare file name"):
+        install.which_absolute("c/tool")
+
+
+def test_which_absolute_windows_tries_pathext_and_never_the_current_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Windows rules (simulated): PATHEXT order, a name already ending in one as is, no execute bit, no implicit current folder."""
+    monkeypatch.setattr(install, "platform", lambda: "win32")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    (cwd / "kicad-cli.exe").write_bytes(b"MZ")  # what shutil.which on Windows would try first
+    (cwd / "claude.exe").write_bytes(b"MZ")
+    monkeypatch.chdir(cwd)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", str(bindir)]))
+    assert install.which_absolute("kicad-cli") is None and install.which_absolute("claude.exe") is None
+    bat = bindir / "kicad-cli.bat"
+    bat.write_bytes(b"@echo off\r\n")  # Windows needs no execute bit
+    assert install.which_absolute("kicad-cli") == str(bat)
+    exe = bindir / "kicad-cli.exe"
+    exe.write_bytes(b"MZ")
+    assert install.which_absolute("kicad-cli") == str(exe)  # .EXE before .BAT: PATHEXT order
+    (bindir / "claude.exe").write_bytes(b"MZ")
+    (bindir / "claude.exe.com").write_bytes(b"MZ")
+    assert install.which_absolute("claude.exe") == str(bindir / "claude.exe")  # already a PATHEXT name: as is
+    (bindir / "kicad-cli").write_bytes(b"")  # an extensionless file is not what Windows runs
+    exe.unlink()
+    bat.unlink()
+    assert install.which_absolute("kicad-cli") is None
+
+
+
+def test_absolute_path_only_drops_empty_and_relative_entries_for_the_block(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    keep = [str(tmp_path / "a"), str(tmp_path / "b")]
+    original = os.pathsep.join(["", keep[0], ".", "bin", keep[1], ""])
+    monkeypatch.setenv("PATH", original)
+    with install.absolute_path_only():
+        assert os.environ["PATH"] == os.pathsep.join(keep)
+    assert os.environ["PATH"] == original
+    with pytest.raises(RuntimeError), install.absolute_path_only():
+        raise RuntimeError("restored on the way out too")
+    assert os.environ["PATH"] == original
+    monkeypatch.delenv("PATH")
+    with install.absolute_path_only():
+        assert os.environ["PATH"] == ""
+    assert "PATH" not in os.environ
+
+
+@POSIX_ONLY
+def test_the_system_ngspice_lookup_runs_no_tool_from_the_working_directory(tmp_path: Path, clean_env: pytest.MonkeyPatch):
+    """``ctypes.util.find_library`` may run gcc / cc / ld / objdump from PATH: an empty PATH entry would mean the project folder."""
+    clean_env.setattr(install, "platform", lambda: "linux")
+    project = tmp_path / "project"
+    marker = tmp_path / "ran-from-the-working-directory"
+    for tool in ("gcc", "cc", "ld", "objdump", "ldconfig", "x86_64-linux-gnu-gcc"):
+        _executable(project / tool, f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+    clean_env.chdir(project)
+    clean_env.setenv("PATH", os.pathsep + os.environ.get("PATH", ""))
+    with install.absolute_path_only():
+        ctypes.util.find_library("ai-eda-no-such-library")
+    find_system_ngspice()
+    assert not marker.exists()
+
+
+# --------------------------------------------------------------------------- relative environment overrides are unset
+
+
+@pytest.mark.parametrize("value", ["", "kicad-symbols/symbols"])
+def test_a_relative_or_empty_symbol_dir_is_no_library_root(tmp_path: Path, clean_env: pytest.MonkeyPatch, value: str):
+    clean_env.setattr(install, "platform", lambda: "linux")
+    clean_env.chdir(tmp_path)
+    (tmp_path / "kicad-symbols" / "symbols").mkdir(parents=True)
+    (tmp_path / "kicad-symbols" / "symbols" / "Device.kicad_sym").write_text("(kicad_symbol_lib)", encoding="utf-8")
+    for name in ("KICAD10_SYMBOL_DIR", "KICAD_SYMBOL_DIR"):
+        clean_env.setenv(name, value)
+    assert kicad_library._default_library_roots() == []
+    absolute = tmp_path / "abs" / "symbols"
+    absolute.mkdir(parents=True)
+    clean_env.setenv("KICAD_SYMBOL_DIR", str(absolute))
+    assert kicad_library._default_library_roots() == [absolute.parent]  # the fallback variable, when absolute
+    clean_env.setenv("KICAD10_SYMBOL_DIR", str(tmp_path / "kicad-symbols" / "symbols"))
+    assert kicad_library._default_library_roots() == [tmp_path / "kicad-symbols"]
+
+
+@pytest.mark.parametrize("value", ["", "libngspice-planted.so"])
+def test_a_relative_or_empty_ngspice_override_is_unset(tmp_path: Path, clean_env: pytest.MonkeyPatch, value: str):
+    clean_env.setattr(install, "platform", lambda: "linux")
+    clean_env.setattr(ctypes.util, "find_library", lambda name: None)  # no system library on any machine
+    clean_env.chdir(tmp_path)
+    (tmp_path / "libngspice-planted.so").write_bytes(b"")
+    (tmp_path / "codemodels").mkdir()
+    clean_env.setenv("NGSPICE_DLL", value)
+    clean_env.setenv("NGSPICE_CODEMODEL_DIR", value and "codemodels")
+    assert find_ngspice_dll() is None
+    assert find_codemodel_dir(None) is None
+    clean_env.setenv("NGSPICE_DLL", str(tmp_path / "libngspice-planted.so"))
+    clean_env.setenv("NGSPICE_CODEMODEL_DIR", str(tmp_path / "codemodels"))
+    assert find_ngspice_dll() == (tmp_path / "libngspice-planted.so").resolve()
+    assert find_codemodel_dir(None) == tmp_path / "codemodels"
+
+
+def test_a_relative_ld_library_path_entry_is_not_searched(tmp_path: Path, clean_env: pytest.MonkeyPatch):
+    clean_env.setattr(install, "platform", lambda: "linux")
+    clean_env.setattr(ctypes.util, "find_library", lambda name: "libngspice-planted.so.0" if name == "ngspice" else None)
+    clean_env.chdir(tmp_path)
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "libngspice-planted.so.0").write_bytes(b"")
+    (tmp_path / "libngspice-planted.so.0").write_bytes(b"")
+    clean_env.setenv("LD_LIBRARY_PATH", os.pathsep.join(["", ".", "lib"]))
+    assert find_system_ngspice() is None
+    clean_env.setenv("LD_LIBRARY_PATH", str(tmp_path / "lib"))
+    assert find_system_ngspice() == (tmp_path / "lib" / "libngspice-planted.so.0").resolve()
+
+
+@pytest.mark.parametrize("value", ["", "3d"])
+def test_a_relative_or_empty_3dmodel_dir_is_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "3d").mkdir()
+    for name in ("KICAD10_3DMODEL_DIR", "KICAD_3DMODEL_DIR"):
+        monkeypatch.setenv(name, value)
+    nothing = KicadLibrary(roots=[tmp_path / "nothing"])
+    assert find_3dmodel_dir(nothing) is None
+    monkeypatch.setenv("KICAD_3DMODEL_DIR", str(tmp_path / "3d"))
+    assert find_3dmodel_dir(nothing) == tmp_path / "3d"

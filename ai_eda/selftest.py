@@ -1,25 +1,32 @@
 """``ai-eda selftest``: prove an installation works by designing the divider end to end.
 
-Invariant: the self-test only *reports* what the pipeline recorded - every
-status it prints is copied from the run's ``pipeline.json``; it judges
-nothing about the design. It answers one question: did each external tool
-the installation is supposed to provide actually run? It runs the documented
-command-line sequence (``ai-eda new``, ``ai-eda run`` with the answers that
-select the ``divider`` template, ``ai-eda run --answer confirm_design=yes``)
-as subprocesses of this interpreter in a folder of its own, so it exercises
-exactly what a user types.
+Invariant: the self-test judges nothing about the design. It answers one
+question: did each external tool the installation is supposed to provide
+actually run? Every stage line copies the status and message the run
+recorded in its ``pipeline.json``; the self-test computes exactly two lines
+itself - "Korean stage reports written" (``PASS`` when the four
+``reports/*.md`` are on disk, else ``NOT_VERIFIED``) and "KiCad finds its
+libraries" (below). It runs the documented command-line sequence (``ai-eda
+new``, ``ai-eda run`` with the answers that select the ``divider`` template,
+``ai-eda run --answer confirm_design=yes``) as subprocesses of this
+interpreter in a folder of its own, so it exercises exactly what a user
+types.
 
-A stage counts as "ran" when its recorded status is a verdict the tool
-produced (``PASS`` / ``FAIL``) and its message does not say the tool was
-missing (ARCHITECTURE, which proposes and never judges, when its message says
-the template's proposals were applied); a missing tool shows as ``NOT_VERIFIED`` with "not available" /
-"not found" in the message. ERC / DRC verdicts are reported as recorded:
-whether KiCad's checks pass on this template is a fact about the design, not
-about the installation, so a ``FAIL`` there still means the tool ran - except
-the violation types of :data:`CONFIGURATION_VIOLATIONS`, which describe
-KiCad's own configuration (its global library tables, missing until KiCad's
-first start or ``ai-eda setup-kicad`` writes them), never the design: any of
-them fails the "KiCad finds its libraries" line.
+A required stage counts as "ran" only when its recorded status is a verdict
+(``PASS`` / ``FAIL``) whose message names no missing tool
+(:data:`MISSING_MARKERS`: "not available", "not found", ...); any other
+status - ``NOT_VERIFIED`` for whatever reason, or ``NOT RUN`` when the
+pipeline stopped before the stage - fails the self-test. ARCHITECTURE, which
+proposes and never judges, counts when its message says the template's
+proposals were applied. ERC / DRC verdicts are copied as recorded: whether
+KiCad's checks pass on this template is a fact about the design, not about
+the installation, so a ``FAIL`` there still means the tool ran. The "KiCad
+finds its libraries" line is ``PASS`` / ``FAIL`` from the violation types of
+the latest ERC / DRC results in ``ir.json`` (``NOT RUN`` without one): any of
+:data:`CONFIGURATION_VIOLATIONS`, which describe KiCad's own configuration
+(its global library tables - missing until KiCad's first start or ``ai-eda
+setup-kicad`` writes them - or a library they name that is not installed),
+never the design, fails it.
 
 Exit status: 0 when every required check ran (``--skip-kicad`` drops the
 KiCad stages, ``--skip-ngspice`` the SPICE stage), 1 otherwise, 2 for a usage
@@ -139,7 +146,10 @@ def _configuration_check(workdir: Path, required: bool) -> Check:
     bad = {k: n for _, counts in found.values() for k, n in counts.items() if k in CONFIGURATION_VIOLATIONS}
     if bad:
         check.status = "FAIL"
-        check.message = "run `ai-eda setup-kicad` (KiCad's global library tables): " + ", ".join(f"{k} x{n}" for k, n in sorted(bad.items()))
+        check.message = (
+            "KiCad did not resolve its libraries (its global library tables, or the libraries they name: `ai-eda doctor` shows the tables, "
+            "`ai-eda setup-kicad` writes missing ones): " + ", ".join(f"{k} x{n}" for k, n in sorted(bad.items()))
+        )
     else:
         check.status = "PASS"
         check.message = "no library-table violation in " + " / ".join(found)

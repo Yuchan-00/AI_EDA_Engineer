@@ -49,7 +49,6 @@ import importlib.util
 import io
 import json
 import os
-import shutil
 import stat
 import struct
 import sys
@@ -61,6 +60,7 @@ from typing import Any
 import pytest
 
 from ai_eda.llm.claude_cli import CLI_NAME, WINDOWS_CLI_NAME, absolute_cli_path
+from ai_eda.tools.kicad.install import which_absolute
 
 #: the file whose presence next to an executable marks it as this fake (tests/conftest.py lets discovery return only such)
 FAKE_MARKER = ".fake-claude-cli"
@@ -454,7 +454,7 @@ class FakeClaudeCli:
         monkeypatch.setenv("PATH", path)
         monkeypatch.delenv("AI_EDA_CLAUDE_CLI", raising=False)
         # the same lookups ai_eda.llm.claude_cli.find_claude_cli makes, so exe is spelled exactly as it returns it
-        found = (shutil.which(WINDOWS_CLI_NAME) if os.name == "nt" else None) or shutil.which(CLI_NAME)
+        found = (which_absolute(WINDOWS_CLI_NAME) if os.name == "nt" else None) or which_absolute(CLI_NAME)
         assert found is not None and Path(found).parent == self.root, f"the fake is not what PATH resolves: {found}"
         self.found = absolute_cli_path(found)
         return path

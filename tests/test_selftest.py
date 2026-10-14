@@ -41,7 +41,10 @@ def test_library_table_violations_fail_the_configuration_line(tmp_path: Path):
     )
     check = _configuration_check(tmp_path, required=True)
     assert check.status == "FAIL" and not check.ran
-    assert check.message == "run `ai-eda setup-kicad` (KiCad's global library tables): footprint_link_issues x3, lib_footprint_issues x3, lib_symbol_issues x3"
+    assert check.message == (
+        "KiCad did not resolve its libraries (its global library tables, or the libraries they name: `ai-eda doctor` shows the tables, "
+        "`ai-eda setup-kicad` writes missing ones): footprint_link_issues x3, lib_footprint_issues x3, lib_symbol_issues x3"
+    )
     assert _violation_lines(tmp_path) == ["DRC FAIL: lib_footprint_issues x3", "ERC FAIL: footprint_link_issues x3, lib_symbol_issues x3"]
     assert {"lib_symbol_issues", "footprint_link_issues", "lib_footprint_issues"} == CONFIGURATION_VIOLATIONS
 

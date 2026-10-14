@@ -39,7 +39,6 @@ copper is then unknown, and every user says so instead of guessing). A
 from __future__ import annotations
 
 import math
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -243,11 +242,15 @@ class FootprintDef:
 
 
 def _default_library_roots() -> list[Path]:
-    """KiCad library roots to search: ``$KICAD*_SYMBOL_DIR``'s parent, then the installed KiCads.
+    """KiCad library roots to search: ``$KICAD10_SYMBOL_DIR``'s (else ``$KICAD_SYMBOL_DIR``'s) parent, then the installed KiCads.
 
-    The installed KiCads come from :mod:`ai_eda.tools.kicad.install` (each
-    operating system's own install locations; Windows versions ordered
-    numerically, ``10.0`` before ``9.0``), and the installation whose
+    Each variable is used only when it is an absolute path (an empty or
+    relative value counts as unset): a root relative to the working directory
+    would let a project folder - GUI runs start there - supply the pin
+    numbers the compilers embed. The installed KiCads come from
+    :mod:`ai_eda.tools.kicad.install` (each operating system's own install
+    locations; Windows versions ordered numerically across the per-user and
+    all-users folders, ``10.0`` before ``9.0``), and the installation whose
     ``kicad-cli`` this project actually runs
     (:func:`~ai_eda.tools.kicad.install.find_kicad_cli`) comes first, so the
     libraries embedded in our files are the ones that binary compares them
@@ -255,12 +258,12 @@ def _default_library_roots() -> list[Path]:
     holding ``symbols`` / ``footprints`` / ``3dmodels``: ``<root>/share/kicad``
     on Windows and Linux, ``KiCad.app/Contents/SharedSupport`` on macOS.
     """
-    from ai_eda.tools.kicad.install import find_kicad_cli, library_shares, share_dir
+    from ai_eda.tools.kicad.install import _absolute_env, find_kicad_cli, library_shares, share_dir
 
     roots: list[Path] = []
-    env = os.environ.get("KICAD10_SYMBOL_DIR") or os.environ.get("KICAD_SYMBOL_DIR")
-    if env:
-        roots.append(Path(env).parent)
+    env = _absolute_env("KICAD10_SYMBOL_DIR") or _absolute_env("KICAD_SYMBOL_DIR")
+    if env is not None:
+        roots.append(env.parent)
     shares = library_shares()
     cli_share = share_dir(find_kicad_cli())
     if cli_share is not None:

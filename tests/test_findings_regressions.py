@@ -10,7 +10,6 @@ from __future__ import annotations
 import csv
 import json
 import os
-import shutil
 from pathlib import Path
 from unittest import mock
 
@@ -372,14 +371,16 @@ def test_kicad_version_directories_sort_numerically_and_cli_install_comes_first(
     monkeypatch.setattr(kicad_install, "platform", lambda: "win32")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "no-program-files"))
+    monkeypatch.delenv("ProgramW6432", raising=False)
+    monkeypatch.setattr(kicad_install, "DEFAULT_PROGRAM_FILES", tmp_path / "no-default-program-files")
     monkeypatch.delenv("KICAD10_SYMBOL_DIR", raising=False)
     monkeypatch.delenv("KICAD_SYMBOL_DIR", raising=False)
-    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(kicad_install, "which_absolute", lambda name: None)  # nothing on PATH
     assert [p.name for p in kicad_install.version_dirs(base)] == ["10.0", "9.0", "8.0", "junk"]
     assert kicad_cli.find_kicad_cli() == str(base / "10.0" / "bin" / "kicad-cli.exe")
     assert [str(r) for r in kicad_library._default_library_roots()] == [str(base / v / "share" / "kicad") for v in ("10.0", "9.0", "8.0", "junk")]
     # kicad-cli 9 on PATH: its libraries are the ones its ERC/DRC compares against, so they come first
-    monkeypatch.setattr(shutil, "which", lambda name: str(base / "9.0" / "bin" / "kicad-cli.exe"))
+    monkeypatch.setattr(kicad_install, "which_absolute", lambda name: str(base / "9.0" / "bin" / "kicad-cli.exe"))
     assert kicad_library._default_library_roots()[0] == base / "9.0" / "share" / "kicad"
     assert kicad_install.share_dir(str(base / "9.0" / "bin" / "kicad-cli.exe")) == (base / "9.0" / "share" / "kicad").resolve()
     assert kicad_install.share_dir(str(tmp_path / "elsewhere" / "kicad-cli.exe")) is None
