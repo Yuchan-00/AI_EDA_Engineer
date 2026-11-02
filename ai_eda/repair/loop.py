@@ -43,13 +43,16 @@ class RepairOutcome(BaseModel):
         """The outcome as a tool-backed ``repair.loop`` result so ``ir.json`` keeps every attempt.
 
         FAIL when findings stay unresolved or a strategy mutated the IR,
-        NOT_APPLICABLE when there was nothing to repair, PASS when every
+        NOT_APPLICABLE when there was nothing to repair, NOT_VERIFIED when an
+        action failed even though nothing stays unresolved, PASS when every
         action succeeded and the final review has no failures.
         """
         if self.unresolved or self.mutated_ir:
             status = ValidationStatus.FAIL
         elif not self.actions:
             status = ValidationStatus.NOT_APPLICABLE
+        elif not all(a.succeeded for a in self.actions):
+            status = ValidationStatus.NOT_VERIFIED
         else:
             status = ValidationStatus.PASS
         return ValidationResult(
@@ -86,8 +89,12 @@ class RepairLoop:
 
     def run(self, ir: CircuitIR, workdir: Path) -> RepairOutcome:
         actions: list[RepairAction] = []
+        #: findings no strategy may touch (human, regulatory ...) or whose repair changed the design: never retried
         unresolved: dict[str, ValidationResult] = {}
-        #: fingerprint of failing check ids + artifact hashes per iteration, for oscillation detection
+        #: findings whose action failed in the latest iteration: retried once the loop made progress (a re-run
+        #: refused on a stale artifact is tried again after the regeneration that made it fresh)
+        failed: dict[str, ValidationResult] = {}
+        #: fingerprint of failing check ids (with their repair category) + artifact hashes per iteration, for oscillation detection
         seen_states: list[str] = []
         report = self.reviewer.review(ir, workdir)
         iterations = 0
@@ -110,7 +117,7 @@ class RepairLoop:
             #: ask for the same deterministic action (e.g. re-run kicad.drc) do not run it twice
             applied: set[tuple[str, str]] = set()
             for finding in report.failures:
-                if finding.check_id in unresolved:
+                if finding.check_id in unresolved or finding.check_id in failed:
                     continue
                 try:
                     strategy = select_strategy(finding, self.strategies)
@@ -141,7 +148,7 @@ class RepairLoop:
                     progressed = True
                     applied.add(key)
                 else:
-                    unresolved[finding.check_id] = finding.model_copy(update={"message": f"{finding.message} (repair failed: {action.error})"})
+                    failed[finding.check_id] = finding.model_copy(update={"message": f"{finding.message} (repair failed: {action.error})"})
             if mutated:
                 stopped = MUTATION_STOP
                 report = self.reviewer.review(ir, workdir)
@@ -150,12 +157,13 @@ class RepairLoop:
                 stopped = "no repairable failures remain"
                 report = self.reviewer.review(ir, workdir)
                 break
+            failed.clear()  # something changed: a failed action gets another chance against the new state
             report = self.reviewer.review(ir, workdir)
         else:
             stopped = "all failures resolved" if iterations else stopped
 
         # Report still-failing checks; prefer the annotated copy that says *why* repair was refused.
-        still_failing = [unresolved.get(f.check_id, f) for f in report.failures]
+        still_failing = [unresolved.get(f.check_id) or failed.get(f.check_id) or f for f in report.failures]
         if mutated:
             # a mutating strategy may have made its own finding disappear; the design change itself stays unresolved
             failing_ids = {f.check_id for f in still_failing}
@@ -170,6 +178,8 @@ class RepairLoop:
 
     @staticmethod
     def _fingerprint(ir: CircuitIR, report: ReviewReport) -> str:
-        fails = sorted(r.check_id for r in report.failures)
+        # the repair category is part of the state: a re-run that turns a stale report into a real violation
+        # (rerun_tool -> human) is progress to a human decision, not a repeated state
+        fails = sorted(f"{r.check_id}:{r.details.get('repair')}" for r in report.failures)
         arts = sorted(f"{k}:{v.content_hash}" for k, v in ir.artifacts.items())
         return ir.content_hash() + "|" + ",".join(fails) + "|" + ",".join(arts)

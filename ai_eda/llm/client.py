@@ -69,6 +69,11 @@ class Usage(BaseModel):
     cache_write_tokens: int | None = None
     reasoning_tokens: int | None = None
     is_byok: bool | None = None
+    #: an API-equivalent cost estimate that is NOT a charge (a subscription-billed call reports the number the
+    #: CLI printed here and ``cost_usd=0.0`` with ``cost_source="subscription"``); ``None`` when there is none
+    estimated_cost_usd: float | None = None
+    #: how this call is billed: "per_call" (a provider charge, ``cost_usd`` is it) or "subscription" (no per-call charge)
+    billing: str | None = None
 
 
 class LLMResponse(BaseModel):
@@ -93,6 +98,8 @@ class LLMResponse(BaseModel):
     raw_error: str | None = None
     #: model reasoning text when the provider returned it (never parsed, never trusted)
     reasoning: str | None = None
+    #: the routing provider that served this reply ("openrouter" / "claude" / "script"); ``None`` from a bare client
+    via: str | None = None
 
     @property
     def truncated(self) -> bool:
@@ -132,8 +139,10 @@ class LLMError(AiEdaError):
         model: str | None = None,
         usage: Usage | None = None,
         sent: bool | None = None,
+        via: str | None = None,
     ) -> None:
         self.kind = kind
+        self.via = via
         self.status = status
         self.code = code
         self.retry_after = retry_after
@@ -156,7 +165,7 @@ class LLMError(AiEdaError):
     def __reduce__(self):  # type: ignore[override]
         return (
             _rebuild_llm_error,
-            (self.message, self.kind, self.status, self.code, self.retry_after, self.metadata, self.model, self.usage, self.sent),
+            (self.message, self.kind, self.status, self.code, self.retry_after, self.metadata, self.model, self.usage, self.sent, self.via),
         )
 
     @property
@@ -194,15 +203,18 @@ class LLMError(AiEdaError):
 
 def _rebuild_llm_error(
     message: str, kind: str, status: int | None, code: int | str | None, retry_after: float | None,
-    metadata: dict[str, Any], model: str | None, usage: Usage | None = None, sent: bool | None = None,
+    metadata: dict[str, Any], model: str | None, usage: Usage | None = None, sent: bool | None = None, via: str | None = None,
 ) -> LLMError:
-    return LLMError(message, kind=kind, status=status, code=code, retry_after=retry_after, metadata=metadata, model=model, usage=usage, sent=sent)
+    return LLMError(message, kind=kind, status=status, code=code, retry_after=retry_after, metadata=metadata, model=model, usage=usage, sent=sent, via=via)
 
 
 class LLMClient(ABC):
     #: whether a call to this client can cost money. A service with a ``0`` USD budget refuses every
     #: call to a paid client (the first call cannot be priced in advance) and allows a free one.
     paid: bool = True
+    #: how the provider bills: "per_call" (every call is a charge the budget must cover) or "subscription"
+    #: (the user's subscription login is used; no per-call charge, usage and an estimate are shown instead)
+    billing: str = "per_call"
 
     @abstractmethod
     def complete(

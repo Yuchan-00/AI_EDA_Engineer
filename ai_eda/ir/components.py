@@ -12,7 +12,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from ai_eda.ir.provenance import Provenance, ProvenanceKind, SourceRef, Traced
+from ai_eda.ir.provenance import Provenance, ProvenanceKind, SourceRef, Traced, drop_in_design_view
 from ai_eda.ir.simulation import SpiceBinding
 
 
@@ -51,7 +51,10 @@ class LibraryRef(BaseModel):
     library: str  # e.g. "Device", "Package_TO_SOT_SMD"
     name: str  # e.g. "R", "SOT-23"
     verified: bool = False
+    #: where the entry was found - a locator (the KiCad install), not design content
     library_path: str | None = None
+
+    _design = drop_in_design_view("library_path")
 
 
 class SourcingInfo(BaseModel):

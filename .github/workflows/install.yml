@@ -1,0 +1,238 @@
+# Installs AI EDA ENGINEER with the repository's own installers on the five systems of the matrix - ubuntu-24.04,
+# ubuntu-22.04, macos-15 (arm64), an archlinux container and windows-2025 - and checks that it works. Debian and
+# Fedora, which install.sh also supports, are not run here. Those five jobs run the installer from their checkout
+# (./install.sh, install.cmd), then check that the installer's own PATH edit works before the job adds
+# ~/.local/bin to its PATH itself: a fresh login shell with a clean environment finds ai-eda (bash -l; on macOS
+# also zsh -l), and on Windows the user Path in the registry holds %USERPROFILE%\.local\bin. Then
+# `ai-eda doctor --strict` (KiCad 10, its libraries and library tables and ngspice found) and `ai-eda selftest`
+# (the divider designed end to end, with kicad-cli's ERC / DRC run). The installers run the selftest themselves at
+# the end; here it is skipped there (--skip-selftest / -SkipSelftest) and run as its own step into a kept folder -
+# on Linux and macOS under a watchdog that lists the running processes if it hangs, on Windows only under the
+# step's timeout - and its log is always printed (a hung job that is cancelled keeps no log).
+# Two cheap jobs run the README's piped routes without KiCad, each downloading this branch into a new folder:
+# `cat install.sh | bash -s -- ...` on ubuntu-24.04 and `Get-Content install.ps1 | Invoke-Expression` in a new
+# Windows PowerShell 5.1 on windows-2025; then the installed ai-eda runs `doctor` (and on Windows the user Path is
+# read from the registry).
+name: install
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "install.sh"
+      - "install.ps1"
+      - "install.cmd"
+      - "pyproject.toml"
+      - "ai_eda/**"
+      - ".github/workflows/install.yml"
+      - ".github/selftest-watchdog.sh"
+  pull_request:
+    paths:
+      - "install.sh"
+      - "install.ps1"
+      - "install.cmd"
+      - "pyproject.toml"
+      - "ai_eda/**"
+      - ".github/workflows/install.yml"
+      - ".github/selftest-watchdog.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unix:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh
+        timeout-minutes: 30
+        run: ./install.sh --skip-selftest
+      - name: ai-eda from a fresh login shell (the installer's own PATH edit)
+        shell: bash
+        run: |
+          # env -i: none of this job's PATH, only what the system's and the user's login files set
+          check() {
+            found="$(env -i HOME="$HOME" USER="$(id -un)" LOGNAME="$(id -un)" "$1" -lc 'command -v ai-eda' || true)"
+            echo "$1 -l finds ai-eda at: ${found:-nothing}"
+            [ "$found" = "$HOME/.local/bin/ai-eda" ] && [ -x "$found" ]
+          }
+          # the login file bash reads (the first of these that exists) holds the installer's own line - Ubuntu's
+          # ~/.profile also adds an existing ~/.local/bin by itself, so finding ai-eda alone proves less there
+          for f in .bash_profile .bash_login .profile; do
+            if [ -e "$HOME/$f" ]; then grep -H 'added by the AI EDA ENGINEER installer' "$HOME/$f"; break; fi
+          done
+          check /bin/bash
+          if [ "$RUNNER_OS" = macOS ]; then
+            grep -H 'added by the AI EDA ENGINEER installer' "$HOME/.zprofile"
+            check /bin/zsh
+          fi
+      - name: ai-eda on PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: ai-eda doctor --strict
+        run: ai-eda doctor --strict
+      - name: ai-eda selftest (kept for the artifact)
+        if: always()
+        timeout-minutes: 20
+        run: ./.github/selftest-watchdog.sh ai-eda
+      - name: selftest log
+        if: always()
+        run: cat "$RUNNER_TEMP/selftest/selftest.log" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-${{ matrix.os }}
+          path: ${{ runner.temp }}/selftest
+          if-no-files-found: ignore
+
+  arch:
+    name: archlinux
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    timeout-minutes: 60
+    steps:
+      - name: git (for actions/checkout)
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v4
+      - name: install.sh
+        timeout-minutes: 30
+        run: ./install.sh --skip-selftest
+      - name: ai-eda from a fresh login shell (the installer's own PATH edit)
+        run: |
+          # env -i: none of this job's PATH, only what /etc/profile and the profiles in $HOME (/github/home) set
+          for f in .bash_profile .bash_login .profile; do
+            if [ -e "$HOME/$f" ]; then grep -H 'added by the AI EDA ENGINEER installer' "$HOME/$f"; break; fi
+          done
+          found="$(env -i HOME="$HOME" /bin/bash -lc 'command -v ai-eda' || true)"
+          echo "bash -l finds ai-eda at: ${found:-nothing}"
+          [ "$found" = "$HOME/.local/bin/ai-eda" ] && [ -x "$found" ]
+      - name: ai-eda doctor --strict
+        run: ~/.local/bin/ai-eda doctor --strict
+      - name: ai-eda selftest (kept for the artifact)
+        if: always()
+        timeout-minutes: 20
+        run: ./.github/selftest-watchdog.sh ~/.local/bin/ai-eda
+      - name: selftest log
+        if: always()
+        run: cat "$RUNNER_TEMP/selftest/selftest.log" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-archlinux
+          path: ${{ runner.temp }}/selftest
+          if-no-files-found: ignore
+
+  windows:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.cmd (Windows PowerShell 5.1)
+        timeout-minutes: 30
+        shell: cmd
+        run: install.cmd -SkipSelftest
+      - name: the user Path in the registry (the installer's own PATH edit)
+        shell: pwsh
+        run: |
+          # as stored, %VARIABLES% unexpanded: what a new terminal's Path is built from
+          $raw = (Get-Item 'HKCU:\Environment').GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          Write-Host "user Path: $raw"
+          $want = @('%USERPROFILE%\.local\bin', (Join-Path $env:USERPROFILE '.local\bin'))
+          $hits = @($raw -split ';' | Where-Object { $_ -and (($want -contains $_.TrimEnd('\')) -or ($want -contains [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\'))) })
+          if ($hits.Count -eq 0) { throw "the user Path does not hold %USERPROFILE%\.local\bin" }
+          $shim = Join-Path ([Environment]::ExpandEnvironmentVariables($hits[0])) 'ai-eda.cmd'
+          if (-not (Test-Path $shim)) { throw "$shim is missing" }
+      - name: ai-eda on PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
+      - name: ai-eda doctor --strict
+        shell: cmd
+        run: ai-eda doctor --strict
+      - name: ai-eda selftest (kept for the artifact)
+        if: always()
+        timeout-minutes: 20
+        shell: cmd
+        run: ai-eda selftest --dir "%RUNNER_TEMP%\selftest"
+      - name: selftest log
+        if: always()
+        shell: pwsh
+        run: Get-Content -Path "$env:RUNNER_TEMP\selftest\selftest.log" -Encoding UTF8 -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-${{ matrix.os }}
+          path: ${{ runner.temp }}/selftest
+          if-no-files-found: ignore
+
+  piped-unix:
+    name: ubuntu-24.04 (piped)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: cat install.sh | bash -s -- (the README's curl | bash route, without KiCad)
+        timeout-minutes: 15
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        # on stdin the script has no folder of its own, so it downloads the branch into --dir like a user's one-liner
+        run: cat install.sh | bash -s -- --no-kicad --skip-selftest --branch "$BRANCH" --dir "$RUNNER_TEMP/piped"
+      - name: the installed ai-eda doctor
+        run: |
+          link="$(readlink "$HOME/.local/bin/ai-eda")"
+          echo "$HOME/.local/bin/ai-eda -> $link"
+          [ "$link" = "$RUNNER_TEMP/piped/.venv/bin/ai-eda" ] || { echo "the link does not name the downloaded copy"; exit 1; }
+          out="$("$HOME/.local/bin/ai-eda" doctor)"
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q '^kicad-cli *: NOT FOUND' || { echo "doctor did not report kicad-cli NOT FOUND (installed with --no-kicad)"; exit 1; }
+
+  piped-windows:
+    name: windows-2025 (piped, PowerShell 5.1)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get-Content install.ps1 | Invoke-Expression (the README's irm | iex route, without KiCad)
+        timeout-minutes: 15
+        shell: powershell
+        env:
+          AI_EDA_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          # a native program's stderr (uv's, git's progress) is no error here: the exit codes below decide
+          $ErrorActionPreference = 'Continue'
+          $env:AI_EDA_DIR = "$env:RUNNER_TEMP\piped"
+          $env:AI_EDA_NO_KICAD = '1'
+          $env:AI_EDA_SKIP_SELFTEST = '1'
+          # a new Windows PowerShell 5.1, as the README's `powershell -c "irm ... | iex"` starts it: the script's
+          # text with no file behind it, so it downloads the branch into AI_EDA_DIR like a user's one-liner
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -Raw .\install.ps1 | Invoke-Expression"
+          if ($LASTEXITCODE -ne 0) { throw "the piped install.ps1 failed (exit $LASTEXITCODE)" }
+      - name: the installed ai-eda.cmd and the user Path in the registry
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'   # as above: ai-eda's exit code decides, not its stderr
+          $shim = Join-Path $env:USERPROFILE '.local\bin\ai-eda.cmd'
+          $out = & $shim doctor | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) { throw "ai-eda doctor exited $code" }
+          if ($out -notmatch '(?m)^kicad-cli\s*:\s*NOT FOUND') { throw "doctor did not report kicad-cli NOT FOUND (installed with AI_EDA_NO_KICAD=1)" }
+          $raw = (Get-Item 'HKCU:\Environment').GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          Write-Host "user Path: $raw"
+          $want = @('%USERPROFILE%\.local\bin', (Join-Path $env:USERPROFILE '.local\bin'))
+          $hits = @($raw -split ';' | Where-Object { $_ -and (($want -contains $_.TrimEnd('\')) -or ($want -contains [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\'))) })
+          if ($hits.Count -eq 0) { throw "the user Path does not hold %USERPROFILE%\.local\bin" }

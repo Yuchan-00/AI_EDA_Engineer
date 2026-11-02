@@ -6,8 +6,35 @@ is blocked on user input, and records every outcome so the GUI can show
 where the design is and why.
 
 What the orchestrator does *not* do: it never places, routes or otherwise
-changes the design to make a stage pass. It compiles what the IR contains
-(``ir.pcb.tracks`` included) and lets the tools judge it. A stage whose input
+changes the design itself to make a stage pass. The PLACEMENT stage applies
+the ``PCBAgent``'s one deterministic proposal - the placement
+(``placement.core_ring`` when a part has at least 32 pads, else
+``placement.grid``) plus the tracks and vias ``routing.maze`` derived from it (or the placement alone
+when a net is unroutable or ``--answer pcb.routing=skip`` was given; with the opt-in
+``--answer pcb.routing=partial`` the nets the router did route, each whole) - like
+any other proposal (through :meth:`Orchestrator.apply_proposals`, before
+IR_BUILD so every validator hash is about the placed, routed design and the
+``pcb.routing.*`` IR-geometry checks judge that copper there), the
+FAB_CAPABILITY stage right after it records the fab limits the
+``FabCapabilityAgent`` grounded on the archived vendor page into
+``ir.pcb.manufacturing`` (merged, never replacing what the user wrote;
+before IR_BUILD for the same reason - the limits feed the ``.kicad_pro``
+design rules written in the SCHEMATIC stage and the board thickness), and
+the compilers / DRC judge it. Copper the IR already carries is never
+replaced by a proposal. The orchestrator compiles what the
+IR contains (``ir.pcb.tracks`` and ``ir.pcb.silkscreen`` included) and lets the tools judge it.
+
+3D outputs are pictures, never evidence: right after the board compiles,
+the PCB stage compiles the built-in preview ``<project>.preview.glb``
+(``ArtifactKind.MODEL_3D``, :mod:`ai_eda.compilers.model3d`; deterministic,
+registered with ``generated_from_ir_hash``) and appends a note to the stage
+message - how many part boxes have a STEP height - without a ``compile.*``
+result and without touching the stage's status; a refusal is the note. The
+MANUFACTURING_OUTPUTS stage runs KiCad's own STEP / GLB / render exports
+(:data:`KICAD_3D_EXPORTS`, kicad-cli flags not measured on 10.0.6) after the
+gerbers and registers them like the gerbers; without kicad-cli its message
+says :data:`NO_KICAD_3D`, a failed export is a note, and neither is ever a
+FAIL. A stage whose input
 does not exist yet (no components, no ``ir.pcb``, no board to export) is
 NOT_VERIFIED; a stage whose input is inconsistent (pins that do not match
 the library, a pin in no net, an unverified footprint) is FAIL with the
@@ -18,9 +45,10 @@ verdict.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, get_args, get_origin
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from ai_eda.agents import (
     AgentContext,
@@ -28,6 +56,7 @@ from ai_eda.agents import (
     IRProposal,
     CircuitDesignAgent,
     ComponentAgent,
+    FabCapabilityAgent,
     ManufacturingAgent,
     PCBAgent,
     RegulatoryAgent,
@@ -36,24 +65,79 @@ from ai_eda.agents import (
     ReviewAgent,
     SimulationAgent,
 )
+from ai_eda.agents.requirement import EXTRACTION_CHECK, blocks_pipeline, regulatory_scope_keys
 from ai_eda.compilers import (
     BOMCompiler,
     CPLCompiler,
     CompileContext,
     DrillExporter,
     GerberExporter,
+    GlbExporter,
     PCBCompiler,
+    Preview3DCompiler,
+    ProjectFileCompiler,
+    RenderExporter,
     SchematicCompiler,
     SpiceNetlistCompiler,
+    StepExporter,
 )
-from ai_eda.errors import CompileError, NothingToCompileError, ToolUnavailableError
+from ai_eda.errors import CompileError, NothingToCompileError, ToolExecutionError, ToolUnavailableError
 from ai_eda.ir import ArtifactKind, CircuitIR, MissingInformation, ValidationResult, ValidationStatus, worst_status
+from ai_eda.ir.provenance import design_data
+from ai_eda.llm.extraction import request_hash
 from ai_eda.tools.calc import recompute_parameters
 from ai_eda.tools.kicad.cli import KicadCli, run_drc_for, run_erc_for
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.manufacturing.outputs import check_output_artifact
 from ai_eda.validation import ValidationContext, default_registry
 from ai_eda.workflow.stages import STAGE_ORDER, Stage
+
+
+def _stamp(results: list[ValidationResult], ir: CircuitIR) -> None:
+    """Record the IR version the results are about (a result that already carries one keeps it)."""
+    if results:
+        h = ir.content_hash()
+        for r in results:
+            r.ir_hash = r.ir_hash or h
+
+
+def _neutralised_summary(notes: list[str]) -> str:
+    """``'N cell(s) neutralised (R1.Value, ...)'`` from compiler notes of the form ``'<where>: <why>; ...'`` (one line per stage)."""
+    return f"{len(notes)} cell(s) neutralised ({', '.join(n.split(':', 1)[0] for n in notes)})"
+
+
+def _field_annotation(model: Any, name: str) -> Any:
+    """The declared type of field ``name`` on a pydantic model instance (``Any`` when it is not a model field)."""
+    if isinstance(model, BaseModel):
+        field = type(model).model_fields.get(name)
+        if field is not None and field.annotation is not None:
+            return field.annotation
+        raise ValueError(f"{type(model).__name__} has no field {name!r}")
+    return Any
+
+
+def _sequence(obj: Any, leaf: str, where: str) -> list:
+    seq = obj[leaf] if isinstance(obj, dict) else getattr(obj, leaf)
+    if not isinstance(seq, list):
+        raise ValueError(f"{where}: {leaf!r} is not a list")
+    return seq
+
+
+def _validated(annotation: Any, payload: Any, where: str) -> Any:
+    """``payload`` validated as ``annotation`` (an already-valid model instance passes through unchanged)."""
+    if annotation is Any:
+        return payload
+    try:
+        return TypeAdapter(annotation).validate_python(payload)
+    except ValidationError as e:
+        raise ValueError(f"{where}: payload is not a valid {annotation!r}: {e.errors()[0].get('msg', e) if e.errors() else e}") from e
+
+
+def _design_view(item: Any) -> Any:
+    """The design content of an IR element (two equal designs compare equal whatever their clocks and paths say)."""
+    if isinstance(item, BaseModel):
+        return design_data(item)
+    return item
 
 
 class StageOutcome(BaseModel):
@@ -89,6 +173,10 @@ StageFn = Callable[[CircuitIR, AgentContext], StageOutcome]
 
 #: artifact kinds produced by the manufacturing-outputs stage, in export order
 MANUFACTURING_EXPORTS: tuple[ArtifactKind, ...] = (ArtifactKind.GERBER, ArtifactKind.DRILL)
+#: KiCad's own 3D outputs, exported after the gerbers when kicad-cli is available (a picture each: never a status)
+KICAD_3D_EXPORTS: tuple[ArtifactKind, ...] = (ArtifactKind.KICAD_STEP, ArtifactKind.KICAD_GLB, ArtifactKind.KICAD_RENDER)
+#: what the manufacturing-outputs stage says when there is no kicad-cli for the 3D exports
+NO_KICAD_3D = "3D export skipped: kicad-cli not found"
 
 
 class Orchestrator:
@@ -104,6 +192,11 @@ class Orchestrator:
                 ArtifactKind.SPICE_NETLIST: SpiceNetlistCompiler(),
                 ArtifactKind.GERBER: GerberExporter(),
                 ArtifactKind.DRILL: DrillExporter(),
+                ArtifactKind.KICAD_PROJECT: ProjectFileCompiler(),
+                ArtifactKind.MODEL_3D: Preview3DCompiler(),
+                ArtifactKind.KICAD_STEP: StepExporter(),
+                ArtifactKind.KICAD_GLB: GlbExporter(),
+                ArtifactKind.KICAD_RENDER: RenderExporter(),
             },
         )
         # One library instance for the schematic / PCB compilers (parsed libraries are cached per instance).
@@ -114,6 +207,8 @@ class Orchestrator:
             Stage.REGULATORY_RESEARCH: self._agent_stage(RegulatoryAgent()),
             Stage.ARCHITECTURE: self._agent_stage(CircuitDesignAgent()),
             Stage.COMPONENT_SELECTION: self._agent_stage(ComponentAgent()),
+            Stage.PLACEMENT: self._agent_stage(PCBAgent()),
+            Stage.FAB_CAPABILITY: self._agent_stage(FabCapabilityAgent()),
             Stage.IR_BUILD: self._ir_validate,
             Stage.CALCULATION: self._calculation,
             Stage.SPICE: self._agent_stage(SimulationAgent()),
@@ -130,13 +225,38 @@ class Orchestrator:
 
     # --- driver ------------------------------------------------------------------
 
-    def run(self, ir: CircuitIR, stop_after: Stage | None = None) -> PipelineState:
-        state = PipelineState()
+    def run(
+        self,
+        ir: CircuitIR,
+        stop_after: Stage | None = None,
+        *,
+        state: PipelineState | None = None,
+        after_stage: Callable[[Stage, PipelineState], None] | None = None,
+    ) -> PipelineState:
+        """Run the stages in order into ``state`` (a fresh one by default) and return it.
+
+        A caller that passes its own ``state`` keeps the partial outcomes when
+        a stage raises: ``state.current`` is then the stage that died.
+        ``after_stage`` is called with the stage and the state right after
+        each stage's outcome is appended (before the pipeline decides whether
+        it is blocked), so a caller can write a view of the run as it goes -
+        ``ai-eda run`` writes the stage reports through it. The callback is an
+        observer: it gets the live IR through its closure but the orchestrator
+        never reads anything back from it, and whatever it raises propagates
+        like a stage defect, so a caller whose callback must never abort the
+        run wraps it (the CLI does).
+        """
+        state = PipelineState() if state is None else state
+        self._fresh_from = len(ir.validation.results)  # results before this index were carried over from earlier runs
         for stage in STAGE_ORDER:
             state.current = stage
             outcome = self.stages[stage](ir, self.ctx)
             state.outcomes.append(outcome)
-            if outcome.status == ValidationStatus.USER_INPUT_REQUIRED:
+            if after_stage is not None:
+                after_stage(stage, state)
+            # a required question stops the pipeline even when a FAIL in the same stage outranks
+            # USER_INPUT_REQUIRED in the aggregated status: the user is asked, not run past
+            if outcome.status == ValidationStatus.USER_INPUT_REQUIRED or any(q.required for q in outcome.questions):
                 state.blocked = True
                 break
             if stage == stop_after:
@@ -147,35 +267,75 @@ class Orchestrator:
 
     @staticmethod
     def apply_proposals(ir: CircuitIR, proposals: list[IRProposal]) -> None:
-        """Apply agent proposals to the IR.
+        """Apply agent proposals to the design content of the IR.
 
-        This is the *only* place agent output touches the IR, so it is the
-        natural hook for user confirmation / GUI diffing later. Only simple
-        append/set operations on known targets are supported for now.
+        This is the *only* place agent output touches the design, so it is the
+        natural hook for user confirmation / GUI diffing later. Every payload
+        is validated against the type of the field it lands in (the IR's own
+        pydantic models: a dict for a ``Topology`` becomes a ``Topology`` or
+        raises, a string for ``components`` raises), so a malformed proposal
+        can not leave an IR that hashes today and fails to load tomorrow.
+        ``remove`` matches by design content (wall-clock ``created_at`` is not
+        content) and raises when nothing matched: a removal that silently did
+        nothing is worse than one that fails. Once the target's path reaches a
+        dict (``parameters``), the whole rest of the path is one key of it, so a
+        dotted parameter key (``parameters.rf.n_mult``, ``parameters.model.l_q.uhf``)
+        is set as that one key, never walked into.
         """
+        # two phases: every proposal is resolved and validated first, then all are applied - a set of proposals
+        # is one logical change, and a bad one must not leave the first half applied (and the hash moved)
+        plan: list[Callable[[], None]] = []
         for p in proposals:
             obj: Any = ir
+            owner: Any = None
+            field_name = ""
             parts = p.target.split(".")
-            for part in parts[:-1]:
-                obj = getattr(obj, part)
-            leaf = parts[-1]
+            i = 0
+            while i < len(parts) - 1 and not isinstance(obj, dict):
+                owner, field_name = obj, parts[i]
+                obj = getattr(obj, parts[i])
+                i += 1
+            # a dict's key is the whole rest of the path: ``parameters.rf.n_mult`` is the parameter ``rf.n_mult``
+            leaf = ".".join(parts[i:]) if isinstance(obj, dict) else parts[i]
+            if isinstance(obj, dict):
+                # the parent model's annotation names the value type of this dict (``parameters: dict[str, Traced]``)
+                annotation = _field_annotation(owner, field_name) if isinstance(owner, BaseModel) else Any
+                value_type = get_args(annotation)[1] if get_origin(annotation) is dict and len(get_args(annotation)) == 2 else Any
+            else:
+                annotation = _field_annotation(obj, leaf)
+                value_type = annotation
+            where = f"proposal {p.description!r} ({p.operation} {p.target})"
             if p.operation == "append":
-                getattr(obj, leaf).append(p.payload)
+                seq = _sequence(obj, leaf, where)
+                item_type = get_args(annotation)[0] if get_origin(annotation) is list and get_args(annotation) else Any
+                item = _validated(item_type, p.payload, where)
+                plan.append(lambda seq=seq, item=item: seq.append(item))
             elif p.operation == "set":
+                value = _validated(value_type, p.payload, where)
                 if isinstance(obj, dict):
-                    obj[leaf] = p.payload
+                    plan.append(lambda obj=obj, leaf=leaf, value=value: obj.__setitem__(leaf, value))
                 else:
-                    setattr(obj, leaf, p.payload)
+                    plan.append(lambda obj=obj, leaf=leaf, value=value: setattr(obj, leaf, value))
             elif p.operation == "remove":
-                seq = getattr(obj, leaf)
-                seq[:] = [x for x in seq if x != p.payload]
+                seq = _sequence(obj, leaf, where)
+                item_type = get_args(annotation)[0] if get_origin(annotation) is list and get_args(annotation) else Any
+                wanted = _design_view(_validated(item_type, p.payload, where))
+                if not any(_design_view(x) == wanted for x in seq):
+                    raise ValueError(f"{where}: nothing in {p.target} matches the payload; the removal would have been silent")
+                plan.append(lambda seq=seq, wanted=wanted: seq.__setitem__(slice(None), [x for x in seq if _design_view(x) != wanted]))
             else:
                 raise ValueError(f"unknown proposal operation {p.operation!r}")
+        for step in plan:
+            step()
 
     def _agent_stage(self, agent) -> StageFn:
         def fn(ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
             result: AgentResult = agent.run(ir, ctx)
             self.apply_proposals(ir, result.proposals)
+            # The results of an agent that proposes were computed on the IR *before* its proposals, about the part
+            # of the design it owns and proposes; they carry no ir_hash (neither hash would be honest) and count as
+            # evidence only in the run that produced them (see _release). An agent that proposes nothing and judges
+            # the IR as it stands (ManufacturingAgent's mfg.capability) stamps the hash itself.
             ir.validation.extend(result.validation)
             notes = list(result.notes)
             if result.blocked_on_user:
@@ -210,6 +370,7 @@ class Orchestrator:
         for v in default_registry.select(ir):
             if v.consumes & produced:
                 out.extend(v.validate(ir, vctx))
+        _stamp(out, ir)
         ir.validation.extend(out)
         return out
 
@@ -219,6 +380,8 @@ class Orchestrator:
             "regulatory": Stage.REGULATORY_RESEARCH,
             "circuit_design": Stage.ARCHITECTURE,
             "component": Stage.COMPONENT_SELECTION,
+            "pcb": Stage.PLACEMENT,
+            "fab_capability": Stage.FAB_CAPABILITY,
             "simulation": Stage.SPICE,
             "manufacturing": Stage.MANUFACTURABILITY,
             "review": Stage.INDEPENDENT_REVIEW,
@@ -226,13 +389,47 @@ class Orchestrator:
         }[agent.name]
 
     def _missing_information(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
-        pending = [q for q in ir.requirements.missing if q.required and q.key not in ctx.answers]
+        """Open required questions stop the pipeline; otherwise the stage says what "nothing missing" rests on.
+
+        No open question is not evidence that nothing is missing (CLAUDE.md
+        #3): PASS only when the request text *as it is now* was analysed by
+        the model and the user confirmed that extraction (the latest
+        ``requirements.extraction`` is PASS and was made for
+        ``request_hash(request_text())``). Without a request text, without an
+        extraction (no ``--llm``: only the baseline checklist was asked) or
+        with one that is not confirmed / was made for another text the stage
+        is NOT_VERIFIED with that reason - never a silent PASS. Nothing else
+        is recorded: the checklist already is the requirement stage's own
+        question list, so copying it into ``requirements.missing`` would ask
+        twice and still verify nothing.
+        """
+        # a question under a key the user left out of the design is closed, and a model question under a key nothing reads never
+        # blocks (``blocks_pipeline``: the requirement agent's own rule, applied here too to questions an older run recorded)
+        scope_keys = regulatory_scope_keys(ctx)
+        pending = [q for q in ir.requirements.missing if blocks_pipeline(q, ir, scope_keys) and q.key not in ctx.answers]
         if pending:
             return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.USER_INPUT_REQUIRED, questions=pending, message=f"{len(pending)} required question(s)")
-        return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.PASS)
+        text = ir.requirements.request_text()
+        x = ir.validation.latest(EXTRACTION_CHECK)
+        if x is not None and x.status is ValidationStatus.PASS and x.details.get("request_hash") == request_hash(text):
+            return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.PASS, message=(
+                f"no required question open; the request was analysed by the model and the extraction confirmed by the user ({EXTRACTION_CHECK} PASS)"
+            ))
+        if not ir.requirements.raw_input.strip():
+            why = "no required question open, but there is no request text: only the baseline checklist was asked; nothing checked the design for missing information"
+        elif x is None:
+            why = ("no required question open, but the request was not analysed for missing information (no --llm: only the baseline checklist was asked; "
+                   "the request's own numbers and terms are not read)")
+        elif x.status is not ValidationStatus.PASS:
+            why = f"no required question open, but the request extraction is {x.status} for this request text: missing information was not checked"
+        else:
+            why = ("no required question open, but the confirmed request extraction was made for another request text (the request changed since): "
+                   "missing information was not checked for this text")
+        return StageOutcome(stage=Stage.MISSING_INFORMATION, status=ValidationStatus.NOT_VERIFIED, message=why)
 
     def _ir_validate(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         results = default_registry.run(ir, ValidationContext(workdir=ctx.workdir, tools=ctx.tools))
+        _stamp(results, ir)  # validators read the whole IR as it is now: their verdicts are about this version
         ir.validation.extend(results)
         status = worst_status(r.status for r in results)
         # a validator that needs the user (assumptions, undecided model-inferred requirements) is shown as a
@@ -252,23 +449,69 @@ class Orchestrator:
         inconsistent); anything else propagates.
         """
         compiler = ctx.tools["compilers"][kind]
+        # the verdict is recorded as a tool-backed ``compile.<kind>`` result, so a refusal (FAIL) reaches
+        # ``ir.validation``, RELEASE, the exit code and ``ai-eda review`` instead of living only in the stage table
+        stamp = dict(check_id=f"compile.{kind}", tool=getattr(compiler, "id", type(compiler).__name__), tool_version=getattr(compiler, "version", None), ir_hash=ir.content_hash())
         try:
             ir.artifacts[kind] = compiler.compile(ir, CompileContext(workdir=ctx.workdir, tools=ctx.tools))
         except (NothingToCompileError, NotImplementedError) as e:
             ir.artifacts.pop(kind, None)  # an older artifact of this kind would be stale evidence
+            ir.validation.add(ValidationResult(status=ValidationStatus.NOT_VERIFIED, message=str(e), **stamp))
             return ValidationStatus.NOT_VERIFIED, str(e)
         except CompileError as e:
             ir.artifacts.pop(kind, None)
-            return ValidationStatus.FAIL, f"{kind} compile refused: {e}"
-        return ValidationStatus.PASS, str(ir.artifacts[kind].path)
+            message = f"{kind} compile refused: {e}"
+            ir.validation.add(ValidationResult(status=ValidationStatus.FAIL, message=message, details={"repair": "human"}, **stamp))
+            return ValidationStatus.FAIL, message
+        art = ir.artifacts[kind]
+        # a cell the compiler neutralised (BOM free text written with a leading apostrophe) is reported, never hidden:
+        # the full notes in the details, a count + the cells in the message
+        details = {"neutralised": list(art.notes)} if art.notes else {}
+        message = f"compiled {art.path}" + (f"; {_neutralised_summary(art.notes)}" if art.notes else "")
+        ir.validation.add(ValidationResult(status=ValidationStatus.PASS, message=message, artifact_hash=art.content_hash, details=details, **stamp))
+        return ValidationStatus.PASS, str(art.path)
 
     def _compile_stage(self, kind: ArtifactKind) -> StageFn:
         stage = Stage.SCHEMATIC if kind == ArtifactKind.SCHEMATIC else Stage.PCB
 
         def fn(ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
             status, message = self._compile(ir, ctx, kind)
+            if kind == ArtifactKind.SCHEMATIC:
+                # the project file (fab limits as KiCad design rules) is written beside the schematic once there is
+                # one, so ERC and DRC of this run read one project file; the schematic's message stays the stage
+                # message verbatim, the project note is appended, its status folds in
+                if status is ValidationStatus.PASS:
+                    p_status, p_message = self._compile(ir, ctx, ArtifactKind.KICAD_PROJECT)
+                    status = worst_status([status, p_status])
+                    message = f"{message}; project file: {p_message}"
+                else:
+                    ir.artifacts.pop(ArtifactKind.KICAD_PROJECT, None)  # an older project file would be stale evidence
+            else:
+                # the built-in 3D preview of the board just compiled: registered like any artifact, but a picture - its note
+                # is appended and it never changes the stage's status (module docstring of ai_eda.compilers.model3d)
+                message = f"{message}; {self._preview_3d(ir, ctx, board_compiled=status is ValidationStatus.PASS)}"
             return StageOutcome(stage=stage, status=status, message=message)
         return fn
+
+    @staticmethod
+    def _preview_3d(ir: CircuitIR, ctx: AgentContext, *, board_compiled: bool) -> str:
+        """Compile ``ArtifactKind.MODEL_3D`` after a board that compiled; the stage-message note. No ``compile.*`` result is recorded."""
+        kind = ArtifactKind.MODEL_3D
+        compiler = ctx.tools["compilers"].get(kind)
+        if not board_compiled or compiler is None:
+            ir.artifacts.pop(kind, None)  # an older preview would picture another design
+            return "3D preview not compiled: " + ("the board did not compile" if not board_compiled else "no compiler registered")
+        cctx = CompileContext(workdir=ctx.workdir, tools=ctx.tools)
+        try:
+            art, scene = compiler.compile_scene(ir, cctx) if hasattr(compiler, "compile_scene") else (compiler.compile(ir, cctx), None)
+        except (CompileError, NotImplementedError) as e:  # NothingToCompileError and the scene's SceneError are CompileErrors
+            ir.artifacts.pop(kind, None)
+            return f"3D preview not compiled: {e}"
+        ir.artifacts[kind] = art
+        counts = ""
+        if scene is not None:
+            counts = f": {len(scene.bodies_with_step)} part box(es) with a STEP height, {len(scene.bodies_without_step)} flat outline(s) without"
+        return f"3D preview {Path(art.path).name}{counts} (a picture of the IR, not a check)"
 
     def _kicad_check(self, check: str) -> StageFn:
         stage = Stage.ERC if check == "kicad.erc" else Stage.DRC
@@ -297,19 +540,29 @@ class Orchestrator:
     def _manufacturing_outputs(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         """BOM/CPL from the IR, then gerber + drill from the board via kicad-cli, then the format checks."""
         stage = Stage.MANUFACTURING_OUTPUTS
-        compilers = ctx.tools["compilers"]
-        cctx = CompileContext(workdir=ctx.workdir, tools=ctx.tools)
-        ir.artifacts[ArtifactKind.BOM] = compilers[ArtifactKind.BOM].compile(ir, cctx)
-        ir.artifacts[ArtifactKind.CPL] = compilers[ArtifactKind.CPL].compile(ir, cctx)
-        if ArtifactKind.PCB not in ir.artifacts:
-            return StageOutcome(stage=stage, status=ValidationStatus.NOT_VERIFIED, message="BOM/CPL generated; gerber/drill skipped (no PCB)")
-        notes: list[str] = ["BOM/CPL generated"]
+        notes: list[str] = []
         statuses: list[ValidationStatus] = []
+        for kind in (ArtifactKind.BOM, ArtifactKind.CPL):
+            # a BOM cell the compiler refuses (a formula-shaped identity) is a verdict on the IR, not a defect
+            status, message = self._compile(ir, ctx, kind)
+            art = ir.artifacts.get(kind)
+            if status is not ValidationStatus.PASS:
+                statuses.append(status)
+                notes.append(f"{kind}: {message}")
+            elif art is not None and art.notes:
+                notes.append(f"{kind}: {_neutralised_summary(art.notes)}")
+        notes.insert(0, "BOM/CPL compiled" if not statuses else "BOM/CPL: see below")
+        if ArtifactKind.PCB not in ir.artifacts:
+            notes += ["gerber/drill skipped (no PCB)", "3D export skipped (no PCB)"]
+            return StageOutcome(stage=stage, status=worst_status(statuses + [ValidationStatus.NOT_VERIFIED]), message="; ".join(notes))
         for kind in MANUFACTURING_EXPORTS:
             try:
                 status, message = self._compile(ir, ctx, kind)
             except ToolUnavailableError as e:
-                return StageOutcome(stage=stage, status=ValidationStatus.NOT_VERIFIED, message=f"{'; '.join(notes)}; {kind} export skipped: {e}")
+                # the missing tool makes *this* export unverified; an earlier BOM/CPL FAIL in ``statuses`` still counts
+                notes.append(f"{kind} export skipped: {e}")
+                notes += self._export_3d(ir, ctx)
+                return StageOutcome(stage=stage, status=worst_status(statuses + [ValidationStatus.NOT_VERIFIED]), message="; ".join(notes))
             if status != ValidationStatus.PASS:
                 statuses.append(status)
                 notes.append(f"{kind}: {message}")
@@ -319,7 +572,39 @@ class Orchestrator:
             ir.validation.add(res)
             statuses.append(res.status)
             notes.append(f"{res.check_id} {res.status}: {res.message}")
+        notes += self._export_3d(ir, ctx)
         return StageOutcome(stage=stage, status=worst_status(statuses), message="; ".join(notes))
+
+    @staticmethod
+    def _export_3d(ir: CircuitIR, ctx: AgentContext) -> list[str]:
+        """KiCad's STEP / GLB / render of the fresh board (:data:`KICAD_3D_EXPORTS`), registered like the gerbers; the notes. Never a status.
+
+        Without kicad-cli the one note is :data:`NO_KICAD_3D` (an export from
+        an earlier run stays registered and shows as stale, like a gerber set).
+        With it, each export either registers its files or, when kicad-cli
+        refuses or writes nothing usable (its flags are not measured on
+        10.0.6), unregisters the kind - the exporter deleted the old file
+        first - and the note says why; the stage's status is the gerbers'.
+        """
+        kicad = ctx.tools.get("kicad_cli")
+        if not isinstance(kicad, KicadCli) or not kicad.available():
+            return [NO_KICAD_3D]
+        notes: list[str] = []
+        cctx = CompileContext(workdir=ctx.workdir, tools=ctx.tools)
+        for kind in KICAD_3D_EXPORTS:
+            compiler = ctx.tools["compilers"].get(kind)
+            if compiler is None:
+                notes.append(f"{kind} export skipped: no exporter registered")
+                continue
+            try:
+                art = compiler.compile(ir, cctx)
+            except (CompileError, NotImplementedError, ToolUnavailableError, ToolExecutionError) as e:
+                ir.artifacts.pop(kind, None)
+                notes.append(f"{kind} export failed (3D, not a check): {e}")
+                continue
+            ir.artifacts[kind] = art
+            notes.append(f"{kind} exported {', '.join(Path(f).name for f in (art.files or [art.path]))} (3D, not a check)")
+        return notes
 
     def _calculation(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
         """Recompute every derived parameter with its registered calculator (``calc.recompute``).
@@ -336,13 +621,33 @@ class Orchestrator:
         return StageOutcome(stage=Stage.CALCULATION, status=res.status, message=res.message)
 
     def _release(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:
+        """RELEASE is PASS only on evidence: every latest result PASS (or NOT_APPLICABLE), tool-backed, and about this IR.
+
+        A PASS without a ``tool`` is an opinion (ARCHITECTURE invariant 4); a
+        PASS stamped with another IR version's hash is about a different
+        design; a PASS without any stamp (an agent's result) is about this
+        design only when this run produced it - one carried over from an
+        earlier run in ``ir.validation`` vouches for nothing now. None of
+        them releases anything, however the aggregate reads.
+        """
+        latest = ir.validation.latest_by_check()
         overall = ir.validation.overall()
-        ok = overall == ValidationStatus.PASS
-        if ok:
+        current = ir.content_hash()
+        fresh = {r.check_id for r in ir.validation.results[getattr(self, "_fresh_from", 0):]}
+        opinions = sorted(k for k, r in latest.items() if r.status == ValidationStatus.PASS and not r.is_tool_backed)
+        stale = sorted(k for k, r in latest.items() if r.status == ValidationStatus.PASS and r.ir_hash and r.ir_hash != current)
+        carried = sorted(k for k, r in latest.items() if r.status == ValidationStatus.PASS and not r.ir_hash and k not in fresh)
+        if overall == ValidationStatus.PASS and not opinions and not stale and not carried:
             return StageOutcome(stage=Stage.RELEASE, status=ValidationStatus.PASS, message="evidence-backed release")
-        blocking = sorted(k for k, r in ir.validation.latest_by_check().items() if r.status == overall)
-        return StageOutcome(
-            stage=Stage.RELEASE,
-            status=overall,
-            message=f"not releasable: overall validation is {overall} ({', '.join(blocking)})",
-        )
+        reasons: list[str] = []
+        if overall != ValidationStatus.PASS:
+            blocking = sorted(k for k, r in latest.items() if r.status == overall)
+            reasons.append(f"overall validation is {overall} ({', '.join(blocking)})")
+        if opinions:
+            reasons.append(f"PASS without a tool is an opinion, not evidence ({', '.join(opinions)})")
+        if stale:
+            reasons.append(f"PASS produced for another IR version ({', '.join(stale)})")
+        if carried:
+            reasons.append(f"PASS carried over from an earlier run without an IR version, not re-produced by this one ({', '.join(carried)})")
+        status = overall if overall != ValidationStatus.PASS else ValidationStatus.NOT_VERIFIED
+        return StageOutcome(stage=Stage.RELEASE, status=status, message="not releasable: " + "; ".join(reasons))

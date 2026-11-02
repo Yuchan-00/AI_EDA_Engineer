@@ -135,14 +135,15 @@ def test_existence_checks_ground_the_identity_through_the_orchestrator(fake, tmp
     latest = ir.validation.latest_by_check()
     assert latest["component.existence.R1"].status is S.PASS and latest["component.existence.R1"].tool == "parts.existence"
     assert latest["component.facts.R1"].status is S.NOT_VERIFIED and latest["component.facts.R1"].details["rejected"][0]["key"] == "i_max"
-    # part fit is not evaluated by this version and the stage says so: it can never be PASS
-    assert latest[FIT_CHECK].status is S.NOT_VERIFIED and "part fit not evaluated" in latest[FIT_CHECK].message and "sourcing" in latest[FIT_CHECK].details["criteria_not_evaluated"]
-    assert outcome.status is S.NOT_VERIFIED
+    # part fit is not this agent's verdict: the component.fit validator judges electrical stress after SPICE (tests/test_component_fit.py)
+    assert FIT_CHECK not in latest
+    assert outcome.status is S.NOT_VERIFIED  # the rejected fact (component.facts.R1) keeps the stage NOT_VERIFIED
     assert [r.host for r in fake.requests] == [VENDOR_HOST]
     # a second run over the grounded IR changes no design content and fetches nothing (the archived copy is re-verified by hash)
     design_hash = ir.content_hash()
     state2, outcome2, _ = _run(ir, tmp_path, fake, catalog=catalog)
-    assert outcome2.status is S.NOT_VERIFIED and ir.validation.latest("component.existence.R1").status is S.PASS and fake.hits(VR1_URL) == 1
+    # no facts file this time: the stage's only result is the tool-backed existence PASS, so the stage is PASS (fit is judged elsewhere)
+    assert outcome2.status is S.PASS and ir.validation.latest("component.existence.R1").status is S.PASS and fake.hits(VR1_URL) == 1
     assert ir.content_hash() == design_hash
 
 
@@ -180,7 +181,7 @@ def test_user_datasheet_url_is_the_pointer_of_choice(fake, tmp_path):
     fake.add_pdf(VR1_URL, VR1_PAGES)
     ir = _ir(tmp_path, make_part())
     state, outcome, _ = _run(ir, tmp_path, fake, user_urls={"R1": user_url})
-    assert ir.validation.latest("component.existence.R1").status is S.PASS and outcome.status is S.NOT_VERIFIED  # fit not evaluated
+    assert ir.validation.latest("component.existence.R1").status is S.PASS and outcome.status is S.PASS  # existence proven by the tool; fit is judged after SPICE
     assert ir.component("R1").datasheet.url == user_url and ir.component("R1").mpn_tagged_authoritative
     assert [r.host for r in fake.requests] == ["mirror.example.org"]
 
@@ -237,7 +238,7 @@ def test_candidate_presented_then_confirmed_then_grounded(fake, tmp_path):
 
     # run 2: the user confirms what was shown - the choice is theirs, the identity is then checked against the datasheet
     state2, outcome2, _ = _run(ir, tmp_path, fake, llm=svc, answers={CONFIRM_PARTS_KEY: "네"})
-    assert not state2.blocked and outcome2.status is S.NOT_VERIFIED, outcome2.message  # fit is never evaluated; existence and candidates are PASS below
+    assert not state2.blocked and outcome2.status is S.PASS, outcome2.message  # existence and candidates are PASS below; fit is the validator's verdict after SPICE
     assert len(client.calls) == 1  # cached: no second model call
     r1 = ir.component("R1")
     assert r1.provenance.kind is ProvenanceKind.USER_REQUIREMENT and r1.provenance.note.startswith(CHOSEN_NOTE_PREFIX)
@@ -254,7 +255,7 @@ def test_candidate_presented_then_confirmed_then_grounded(fake, tmp_path):
 
     # run 3: nothing lacks an identity any more - no question, no call, no re-fetch
     state3, outcome3, _ = _run(ir, tmp_path, fake, llm=svc)
-    assert not state3.blocked and outcome3.status is S.NOT_VERIFIED and len(client.calls) == 1 and fake.hits(VR1_URL) == 1
+    assert not state3.blocked and outcome3.status is S.PASS and len(client.calls) == 1 and fake.hits(VR1_URL) == 1  # only the existence PASS remains
     assert ir.validation.latest(CANDIDATES_CHECK) is cand2 and ir.validation.latest("component.existence.R1").status is S.PASS
 
 
@@ -349,7 +350,7 @@ def test_model_facts_are_grounded_shown_and_enter_only_when_the_user_confirms(fa
     assert r1.electrical["v_max"].provenance.source.section == "page 2" and r1.electrical["v_max"].provenance.source.content_hash == r1.datasheet.content_hash
     res2 = ir.validation.latest("component.facts.R1.llm")
     assert res2.status is S.NOT_VERIFIED and res2.details["confirmed"] and res2.details["cached"] and "2 confirmed by the user" in res2.message  # one fact was rejected
-    assert "part fit not evaluated" in ir.validation.latest(FIT_CHECK).message
+    assert ir.validation.latest(FIT_CHECK) is None  # the agent claims nothing about fit; component.fit is a validator that needs the op
 
     # run 3: the confirmed facts are re-applied from the cache; nothing is asked again
     state3, outcome3, _ = _run(ir, tmp_path, fake, llm=svc)

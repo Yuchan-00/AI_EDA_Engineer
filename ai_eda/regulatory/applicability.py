@@ -34,9 +34,11 @@ Invariants this module enforces:
   band makes the rule ``APPLICABLE``; ``NOT_APPLICABLE`` needs every voltage
   outside the band *and*, when a ``scope_answer`` is named, that answer given
   - an input rail alone never proves a product is out of scope. AC or DC
-  comes from the value's own words next to the volt unit (``12 V DC``,
-  ``230VAC``, ``교류`` / ``직류``; the word ``AC`` in prose such as "from an AC
-  adapter" is not a rating), else from the ``mains_powered`` answer (yes =
+  comes from the value's own words next to the volt unit for English
+  (``12 V DC``, ``230VAC``, ``DC 60 V``, ``60 V (DC)``; the word ``AC`` in
+  prose such as "from an AC adapter" is not a rating); the Korean words
+  ``교류`` / ``직류`` count anywhere in the value string or the requirement's
+  own sentence (never in a provenance note); else from the ``mains_powered`` answer (yes =
   AC, no = DC); neither -> missing ``mains_powered``. When the words say one
   kind and the mains answer the other, the contradiction is a missing input
   (``mains_powered``) - never resolved silently in either direction. A value
@@ -71,9 +73,10 @@ MAINS_KEY = "mains_powered"
 #: provenance kinds a rule may read a requirement value from
 TRUSTED_KINDS: frozenset[ProvenanceKind] = frozenset({ProvenanceKind.USER_REQUIREMENT, ProvenanceKind.AUTHORITATIVE})
 
-#: ``AC`` / ``DC`` next to a volt unit (``12 V DC``, ``230VAC``, ``48 Vdc``), or the Korean words; never the bare word in prose
-_AC_RE = re.compile(r"(?<![A-Za-z])[Vv]\s*(?:AC|ac|Ac)(?![A-Za-z])|교류")
-_DC_RE = re.compile(r"(?<![A-Za-z])[Vv]\s*(?:DC|dc|Dc)(?![A-Za-z])|직류")
+#: ``AC`` / ``DC`` next to the value: after the volt unit (``12 V DC``, ``230VAC``, ``48 Vdc``, ``60 V (DC)``) or right before
+#: the number (``DC 60 V``, ``AC220V``), or the Korean words; never the bare word in prose (``AC adapter``)
+_AC_RE = re.compile(r"(?<![A-Za-z])[Vv]\s*\(?\s*(?:AC|ac|Ac)\s*\)?(?![A-Za-z])|(?<![A-Za-z])(?:AC|ac|Ac)\s*(?=[0-9])|교류")
+_DC_RE = re.compile(r"(?<![A-Za-z])[Vv]\s*\(?\s*(?:DC|dc|Dc)\s*\)?(?![A-Za-z])|(?<![A-Za-z])(?:DC|dc|Dc)\s*(?=[0-9])|직류")
 _YES_EXTRA = frozenset({"true", "1", "있음", "있어요", "포함"})
 _NO_EXTRA = frozenset({"false", "0", "없음", "없어요", "미포함", "아님"})
 

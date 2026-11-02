@@ -466,14 +466,24 @@ def test_15_the_evaluation_kit_exclusion_is_evaluated_and_what_is_not_evaluated_
 # --------------------------------------------------------------------------- 16: part fit
 
 
-def test_16_the_component_stage_says_that_fit_is_not_evaluated(fake, tmp_path: Path):
+def test_16_the_component_stage_claims_nothing_about_fit_and_the_validator_names_what_it_evaluates(fake, tmp_path: Path):
+    """Part fit is the ``component.fit`` validator's verdict (electrical stress at the SPICE op, tests/test_component_fit.py), not the agent's.
+
+    The COMPONENT_SELECTION stage therefore carries no ``component.fit`` result and is PASS when its tool-backed existence
+    checks all PASS; the validator, evaluated on the same IR without an op, is NOT_VERIFIED and lists the one criterion it
+    evaluates and the seven it does not.
+    """
+    from ai_eda.validation import ValidationContext, default_registry
+
     fake.add_pdf(VR1_URL, VR1_PAGES)
     ir = _ir(tmp_path, make_part())
     state, outcome, _ = _run(ir, tmp_path, fake)
-    fit = ir.validation.latest(FIT_CHECK)
-    assert fit.status is S.NOT_VERIFIED and fit.details["criteria_not_evaluated"] == list(FIT_CRITERIA) and fit.details["criteria_evaluated"] == []
+    assert ir.validation.latest(FIT_CHECK) is None
+    assert ir.validation.latest("component.existence.R1").status is S.PASS and outcome.status is S.PASS  # existence proven by the tool
     assert set(FIT_CRITERIA) == {"electrical stress", "safety", "regulatory", "environment", "reliability", "manufacturability", "sourcing", "cost"}
-    assert ir.validation.latest("component.existence.R1").status is S.PASS and outcome.status is S.NOT_VERIFIED  # existence proven; fit never
+    [fit] = default_registry.get(FIT_CHECK).validate(ir, ValidationContext(workdir=tmp_path))
+    assert fit.status is S.NOT_VERIFIED and fit.tool == FIT_CHECK and "needs an operating point from SPICE" in fit.message
+    assert fit.details["criteria_evaluated"] == ["electrical stress"] and fit.details["criteria_not_evaluated"] == list(FIT_CRITERIA[1:])
 
 
 # --------------------------------------------------------------------------- 17: authority and catalog comparison

@@ -1,0 +1,370 @@
+{
+  "schema_version": "0.1",
+  "project": {
+    "id": "pre_silk",
+    "name": "Board saved before silkscreen",
+    "description": "",
+    "created_at": "2026-09-27T09:47:57.982936Z",
+    "workdir": "."
+  },
+  "requirements": {
+    "raw_input": "",
+    "corrections": [],
+    "requirements": [],
+    "missing": [],
+    "conflicts": [],
+    "extraction_cache": {},
+    "presented": {},
+    "llm_model_spec": null
+  },
+  "topology": null,
+  "components": [
+    {
+      "ref": "R1",
+      "value": "10k",
+      "description": "fixture resistor",
+      "manufacturer": null,
+      "mpn": null,
+      "datasheet": null,
+      "package": null,
+      "pins": [
+        {
+          "number": "1",
+          "name": "~",
+          "electrical_type": "passive",
+          "provenance": {
+            "kind": "derived",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": "fixture",
+            "tool_version": null,
+            "note": "saved before the silkscreen model existed",
+            "created_at": "2026-09-27T09:47:57.982918Z"
+          }
+        },
+        {
+          "number": "2",
+          "name": "~",
+          "electrical_type": "passive",
+          "provenance": {
+            "kind": "derived",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": "fixture",
+            "tool_version": null,
+            "note": "saved before the silkscreen model existed",
+            "created_at": "2026-09-27T09:47:57.982918Z"
+          }
+        }
+      ],
+      "electrical": {},
+      "symbol": {
+        "library": "Device",
+        "name": "R",
+        "verified": true,
+        "library_path": null
+      },
+      "footprint": {
+        "library": "Resistor_SMD",
+        "name": "R_0603_1608Metric",
+        "verified": true,
+        "library_path": null
+      },
+      "sourcing": [],
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": "saved before the silkscreen model existed",
+        "created_at": "2026-09-27T09:47:57.982918Z"
+      },
+      "serves_requirements": [],
+      "spice": null
+    },
+    {
+      "ref": "R2",
+      "value": "4k7",
+      "description": "fixture resistor",
+      "manufacturer": null,
+      "mpn": null,
+      "datasheet": null,
+      "package": null,
+      "pins": [
+        {
+          "number": "1",
+          "name": "~",
+          "electrical_type": "passive",
+          "provenance": {
+            "kind": "derived",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": "fixture",
+            "tool_version": null,
+            "note": "saved before the silkscreen model existed",
+            "created_at": "2026-09-27T09:47:57.982918Z"
+          }
+        },
+        {
+          "number": "2",
+          "name": "~",
+          "electrical_type": "passive",
+          "provenance": {
+            "kind": "derived",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": "fixture",
+            "tool_version": null,
+            "note": "saved before the silkscreen model existed",
+            "created_at": "2026-09-27T09:47:57.982918Z"
+          }
+        }
+      ],
+      "electrical": {},
+      "symbol": {
+        "library": "Device",
+        "name": "R",
+        "verified": true,
+        "library_path": null
+      },
+      "footprint": {
+        "library": "Resistor_SMD",
+        "name": "R_0603_1608Metric",
+        "verified": true,
+        "library_path": null
+      },
+      "sourcing": [],
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": "saved before the silkscreen model existed",
+        "created_at": "2026-09-27T09:47:57.982918Z"
+      },
+      "serves_requirements": [],
+      "spice": null
+    }
+  ],
+  "nets": [
+    {
+      "name": "IN",
+      "kind": "signal",
+      "pins": [
+        {
+          "component_ref": "R1",
+          "pin_number": "1"
+        }
+      ],
+      "net_class": "Default",
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": "saved before the silkscreen model existed",
+        "created_at": "2026-09-27T09:47:57.982918Z"
+      },
+      "serves_requirements": []
+    },
+    {
+      "name": "MID",
+      "kind": "signal",
+      "pins": [
+        {
+          "component_ref": "R1",
+          "pin_number": "2"
+        },
+        {
+          "component_ref": "R2",
+          "pin_number": "1"
+        }
+      ],
+      "net_class": "Default",
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": "saved before the silkscreen model existed",
+        "created_at": "2026-09-27T09:47:57.982918Z"
+      },
+      "serves_requirements": []
+    },
+    {
+      "name": "GND",
+      "kind": "signal",
+      "pins": [
+        {
+          "component_ref": "R2",
+          "pin_number": "2"
+        }
+      ],
+      "net_class": "Default",
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": "saved before the silkscreen model existed",
+        "created_at": "2026-09-27T09:47:57.982918Z"
+      },
+      "serves_requirements": []
+    }
+  ],
+  "constraints": [],
+  "parameters": {},
+  "pcb": {
+    "layers": [
+      {
+        "name": "F.Cu",
+        "kind": "signal"
+      },
+      {
+        "name": "B.Cu",
+        "kind": "signal"
+      }
+    ],
+    "outline": {
+      "width_mm": 20.0,
+      "height_mm": 10.0,
+      "origin_x_mm": 0.0,
+      "origin_y_mm": 0.0
+    },
+    "placements": [
+      {
+        "component_ref": "R1",
+        "x_mm": 5.0,
+        "y_mm": 5.0,
+        "rotation_deg": 0.0,
+        "side": "top",
+        "provenance": {
+          "kind": "derived",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": "fixture",
+          "tool_version": null,
+          "note": "saved before the silkscreen model existed",
+          "created_at": "2026-09-27T09:47:57.982918Z"
+        }
+      },
+      {
+        "component_ref": "R2",
+        "x_mm": 15.0,
+        "y_mm": 5.0,
+        "rotation_deg": 90.0,
+        "side": "top",
+        "provenance": {
+          "kind": "derived",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": "fixture",
+          "tool_version": null,
+          "note": "saved before the silkscreen model existed",
+          "created_at": "2026-09-27T09:47:57.982918Z"
+        }
+      }
+    ],
+    "tracks": [
+      {
+        "net": "MID",
+        "layer": "F.Cu",
+        "start": [
+          5.825,
+          5.0
+        ],
+        "end": [
+          15.0,
+          4.175
+        ],
+        "width_mm": 0.25,
+        "provenance": {
+          "kind": "derived",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": "fixture",
+          "tool_version": null,
+          "note": "saved before the silkscreen model existed",
+          "created_at": "2026-09-27T09:47:57.982918Z"
+        }
+      }
+    ],
+    "vias": [
+      {
+        "net": "MID",
+        "x_mm": 10.0,
+        "y_mm": 5.0,
+        "drill_mm": 0.3,
+        "diameter_mm": 0.6,
+        "layers": [
+          "F.Cu",
+          "B.Cu"
+        ],
+        "provenance": {
+          "kind": "derived",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": "fixture",
+          "tool_version": null,
+          "note": "saved before the silkscreen model existed",
+          "created_at": "2026-09-27T09:47:57.982918Z"
+        }
+      }
+    ],
+    "zones": [],
+    "manufacturing": {
+      "fab": "fixture fab",
+      "min_track_width_mm": null,
+      "min_clearance_mm": {
+        "value": 0.2,
+        "unit": "mm",
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "fixture limit",
+          "created_at": "2026-09-27T09:47:57.983057Z"
+        }
+      },
+      "min_via_drill_mm": null,
+      "min_via_diameter_mm": null,
+      "min_hole_to_edge_mm": null,
+      "layer_count_options": null,
+      "copper_weight_oz": null,
+      "board_thickness_mm": null
+    }
+  },
+  "simulation": null,
+  "regulatory": {
+    "jurisdictions": [],
+    "intended_use": null,
+    "requirements": [],
+    "scope_answers": {},
+    "proposed_candidates": []
+  },
+  "validation": {
+    "results": []
+  },
+  "artifacts": {}
+}

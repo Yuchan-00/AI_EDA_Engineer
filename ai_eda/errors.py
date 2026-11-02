@@ -37,6 +37,15 @@ class ConsistencyError(AiEdaError):
     """Two derived artifacts (or an artifact and the IR) disagree."""
 
 
+class IRSchemaError(AiEdaError):
+    """An IR file can not be loaded as the design it claims to be.
+
+    Raised by :meth:`ai_eda.ir.CircuitIR.load` for a ``schema_version`` this
+    code does not know and for keys the models would silently drop (a typo in
+    a hand-edited ``ir.json`` must not delete design or traceability data).
+    """
+
+
 class CompileError(AiEdaError):
     """The IR cannot be compiled into an artifact without guessing.
 

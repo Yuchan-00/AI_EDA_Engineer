@@ -20,6 +20,8 @@ from ai_eda.llm.extraction import (
     DIRECTIVE_PHRASES,
     GroundedExtraction,
     RequirementExtraction,
+    _agree,
+    _mismatch,
     build_extraction_messages,
     canonical_key,
     confirmation_question,
@@ -31,6 +33,7 @@ from ai_eda.llm.extraction import (
     request_hash,
     upgrade_confirmed,
 )
+from ai_eda.tools.calc.quantity import parse_quantity
 
 MODEL = "test/model"
 RAW = "12V 입력을 5V 2A로 변환하는 회로, 효율 90% 이상, EU에서 판매"
@@ -111,6 +114,37 @@ def test_number_disagreeing_with_quote_is_demoted() -> None:
     assert r.value.provenance.kind == ProvenanceKind.ASSUMPTION
 
 
+def test_a_typeset_minus_grounds_negative_and_a_sign_dropping_model_is_demoted() -> None:
+    """``–120 dBm`` (en dash) is -120 dBm: a model that read -120 grounds, one that dropped the sign never grounds +120."""
+    raw = "receiver sensitivity –120 dBm, FM"
+    g = ground_extraction(raw, _extraction(requirements=[_req("rx_sensitivity", "–120 dBm", -120, "dBm")]), MODEL)
+    [r] = g.requirements
+    assert g.demoted == [] and r.kind == RequirementKind.EXPLICIT and r.value is not None and r.value.value == -120.0 and r.value.unit == "dBm"
+    g = ground_extraction(raw, _extraction(requirements=[_req("rx_sensitivity", "–120 dBm", 120, "dBm")]), MODEL)
+    [r] = g.requirements
+    assert g.demoted == [("rx_sensitivity", "number mismatch: model 120 dBm vs quote -120 dBm")] and r.kind == RequirementKind.ASSUMPTION
+    # the quote cut after the dash is not at a token boundary: it states nothing the user wrote
+    g = ground_extraction(raw, _extraction(requirements=[_req("rx_sensitivity", "120 dBm", 120, "dBm")]), MODEL)
+    [r] = g.requirements
+    assert r.kind == RequirementKind.ASSUMPTION and g.grounded_explicit == [] and "quote not found" in g.demoted[0][1]
+    assert not quote_in_request("120 dBm", "sensitivity –120 dBm") and not quote_in_request("120 dBm", "sensitivity －120 dBm")
+    assert quote_in_request("–120 dBm", raw)
+    # a spaced dash: no sign is known, so no quantity grounds (never +120)
+    g = ground_extraction("sensitivity – 120 dBm", _extraction(requirements=[_req("rx_sensitivity", "120 dBm", 120, "dBm")]), MODEL)
+    assert g.grounded_explicit == [] and g.requirements[0].kind == RequirementKind.ASSUMPTION
+
+
+def test_a_datasheet_page_states_a_typeset_minus_level_as_negative() -> None:
+    from ai_eda.parts.datasheet_facts import _quantity_at
+
+    page = "Sensitivity (12 dB SINAD) –117 dBm typ"
+    start = page.index("–117")
+    parsed, reason = _quantity_at(page, (start, start + len("–117 dBm")))
+    assert reason is None and parsed is not None and parsed.value == -117.0 and parsed.unit == "dBm"  # type: ignore[union-attr]
+    parsed, reason = _quantity_at(page, (start + 1, start + len("–117 dBm")))
+    assert parsed is None and reason is not None
+
+
 def test_unit_disagreeing_with_quote_is_demoted() -> None:
     g = _ground(requirements=[_req("output_current", "2A로", 2, "V")])
     assert g.demoted == [("output_current", "unit mismatch: model 2 V vs quote 2 A")]
@@ -128,6 +162,16 @@ def test_equivalent_unit_spellings_agree() -> None:
     )
     assert g.demoted == [] and g.dropped == []
     assert [(r.value.value, r.value.unit) for r in g.requirements] == [(0.5, "A"), (10000.0, "ohm"), (4.7e-6, "F")]  # type: ignore[union-attr]
+
+
+def test_a_non_finite_number_never_agrees_with_the_quote() -> None:
+    # a relative tolerance holds for inf (|inf - x| <= tol * inf), so agreement must be refused explicitly on either side
+    assert not _agree(float("inf"), 0.09) and not _agree(0.09, float("inf")) and not _agree(float("inf"), float("inf")) and not _agree(float("nan"), float("nan"))
+    assert _agree(0.09, 0.09) and _agree(0.0, 0.0)
+    file_q, page_q = parse_quantity("0.09 mm"), parse_quantity("1e400 mm")
+    assert page_q is not None and page_q.value == float("inf")
+    assert _mismatch(file_q, page_q) == "number mismatch: model 9e-05 m vs quote inf m" and _mismatch(page_q, file_q) is not None and _mismatch(page_q, page_q) is not None
+    assert _mismatch(file_q, file_q) is None
 
 
 def test_unknown_model_unit_is_demoted() -> None:

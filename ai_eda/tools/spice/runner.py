@@ -43,8 +43,8 @@ import builtins
 import hashlib
 import math
 import re
-import shutil
 import subprocess
+import tempfile
 from abc import ABC, abstractmethod
 from enum import StrEnum
 from pathlib import Path
@@ -179,6 +179,10 @@ class SpiceResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     raw_output_path: str | None = None
     raw_output_hash: str | None = None
+    #: the batch runner simulates a copy of the netlist with the analysis card appended: its path and sha256
+    #: (``netlist_path`` / ``netlist_hash`` are the original's, which is what the copy is made from)
+    deck_path: str | None = None
+    deck_hash: str | None = None
     listing: list[str] = Field(default_factory=list)
     elapsed_s: float = 0.0
     timed_out: bool = False
@@ -280,7 +284,7 @@ class SpiceRunner(ABC):
         """How the engine is set up, for the evidence of every run: at least ``engine`` and ``version``.
 
         Engines with more state (a build date, code models, an init-time
-        settings listing where a ``.spiceinit`` / ``spinit`` would show, a
+        settings listing where ``~/.spiceinit`` / ``spinit`` would show, a
         self-test) add it here; the stage persists the whole dict in
         ``results.json`` and the ``spice`` result details.
         """
@@ -302,6 +306,8 @@ def result_from_rawfile(
     command: str,
     log: str = "",
     errors: list[str] | None = None,
+    deck_path: str | None = None,
+    deck_hash: str | None = None,
 ) -> SpiceResult:
     """Build a :class:`SpiceResult` from a rawfile ngspice wrote (batch ``-r`` or ``write``).
 
@@ -324,6 +330,8 @@ def result_from_rawfile(
         engine=engine,
         engine_version=engine_version,
         netlist_path=str(netlist_path),
+        deck_path=deck_path,
+        deck_hash=deck_hash,
         netlist_hash=netlist_hash,
         analysis=SpiceAnalysis(analysis),
         command=command,
@@ -345,8 +353,16 @@ _VERSION_RE = re.compile(r"ngspice-\d+")
 
 
 class NgspiceRunner(SpiceRunner):
-    """ngspice *batch binary* runner (``ngspice -b -r <raw> <deck>``); optional, used only when an
-    ``ngspice`` executable is on PATH (or given). Prefer :class:`ai_eda.tools.spice.NgspiceShared`.
+    """ngspice *batch binary* runner (``ngspice -n -b -r <raw> <deck>``); optional, used only when an
+    ``ngspice`` executable is on an absolute PATH entry (or given). Prefer :class:`ai_eda.tools.spice.NgspiceShared`.
+
+    The PATH lookup is :func:`ai_eda.tools.kicad.install.which_absolute`: the working directory (an empty or
+    relative PATH entry, or Windows' implicit current folder) never supplies the binary. A ``.spiceinit`` runs its
+    ``shell`` lines, and ngspice reads one from its working directory and - from ngspice 45 on - first from the
+    folder of the deck it is given, the output folder here (checked in the ngspice-45 / 46 sources and on Ubuntu's
+    ngspice 45.2 binary by the installer review): the binary runs with ``-n`` (``--no-spiceinit``, in ngspice 42
+    too), which reads no ``.spiceinit`` at all - for this batch binary the user's own ``~/.spiceinit`` is skipped
+    too, unlike :class:`~ai_eda.tools.spice.NgspiceShared` (``spinit`` is still read) - and in a new empty folder.
 
     Batch mode runs the analysis cards inside the deck, so the analysis command
     is written as a card into a copy of the netlist
@@ -358,7 +374,9 @@ class NgspiceRunner(SpiceRunner):
     engine = "ngspice"
 
     def __init__(self, binary: str | None = None) -> None:
-        self.binary = binary or shutil.which("ngspice")
+        from ai_eda.tools.kicad.install import which_absolute  # lazy: the kicad package imports ai_eda.ir, which imports this package
+
+        self.binary = binary or which_absolute("ngspice")
 
     def available(self) -> bool:
         return self.binary is not None
@@ -394,31 +412,36 @@ class NgspiceRunner(SpiceRunner):
             raise ToolExecutionError(f"netlist {netlist_path} does not exist")
         analysis = SpiceAnalysis(analysis)
         cmd = normalise_command(command, analysis)
-        workdir = Path(workdir)
+        workdir = Path(workdir).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
         deck = workdir / f"{netlist_path.stem}.{analysis.value}.cir"
         deck.write_text(self.batch_deck(netlist_path.read_text(encoding="utf-8"), cmd), encoding="utf-8", newline="\n")
         raw = workdir / f"{netlist_path.stem}.{analysis.value}.raw"
         if raw.exists():
             raw.unlink()
-        proc = subprocess.run(
-            [self.binary, "-b", "-r", str(raw), str(deck)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=workdir,
-            timeout=timeout_s,
-        )
+        with tempfile.TemporaryDirectory(prefix="ai-eda-ngspice-") as empty:  # -n: no .spiceinit, here or beside the deck
+            proc = subprocess.run(
+                [self.binary, "-n", "-b", "-r", str(raw), str(deck)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=empty,
+                timeout=timeout_s,
+            )
+        from ai_eda.tools.spice.ngspice_shared import INFORMATIONAL_STDERR_RE  # the same informational lines as the shared runner
+
         log = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
-        errors = [ln for ln in proc.stderr.splitlines() if ln.strip()]
+        errors = [ln for ln in proc.stderr.splitlines() if ln.strip() and not INFORMATIONAL_STDERR_RE.match(ln.strip())]
         if proc.returncode != 0:
             errors.append(f"ngspice exited {proc.returncode}")
         base = dict(
             engine=self.engine,
             engine_version=self.version(),
-            netlist_path=str(deck),
-            netlist_hash=self.netlist_hash(deck),
+            netlist_path=str(netlist_path),
+            netlist_hash=self.netlist_hash(netlist_path),
+            deck_path=str(deck),
+            deck_hash=self.netlist_hash(deck),
             analysis=analysis,
             command=cmd,
         )

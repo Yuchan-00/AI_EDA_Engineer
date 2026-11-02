@@ -1,0 +1,752 @@
+{
+  "schema_version": "0.1",
+  "project": {
+    "id": "rc_before_rf",
+    "name": "rc before rf",
+    "description": "",
+    "created_at": "2026-09-28T19:54:42.694526Z",
+    "workdir": null
+  },
+  "requirements": {
+    "raw_input": "",
+    "corrections": [],
+    "requirements": [],
+    "missing": [],
+    "conflicts": [],
+    "extraction_cache": {},
+    "presented": {},
+    "llm_model_spec": null
+  },
+  "topology": null,
+  "components": [
+    {
+      "ref": "R1",
+      "value": "1.5915k",
+      "description": "",
+      "manufacturer": null,
+      "mpn": null,
+      "datasheet": null,
+      "package": null,
+      "pins": [
+        {
+          "number": "1",
+          "name": "~1",
+          "electrical_type": "passive",
+          "provenance": {
+            "kind": "authoritative",
+            "source": {
+              "title": "Generic passive datasheet",
+              "url": null,
+              "authority": "Vendor",
+              "section": null,
+              "document_path": null,
+              "content_hash": "sha256:abc",
+              "retrieved_at": null
+            },
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694489Z"
+          }
+        },
+        {
+          "number": "2",
+          "name": "~2",
+          "electrical_type": "passive",
+          "provenance": {
+            "kind": "authoritative",
+            "source": {
+              "title": "Generic passive datasheet",
+              "url": null,
+              "authority": "Vendor",
+              "section": null,
+              "document_path": null,
+              "content_hash": "sha256:abc",
+              "retrieved_at": null
+            },
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694489Z"
+          }
+        }
+      ],
+      "electrical": {},
+      "symbol": null,
+      "footprint": null,
+      "sourcing": [],
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": null,
+        "created_at": "2026-09-28T19:54:42.694509Z"
+      },
+      "serves_requirements": [],
+      "spice": {
+        "device": "R",
+        "exclude": false,
+        "exclude_reason": "",
+        "value": {
+          "value": 1591.5494309189535,
+          "unit": "ohm",
+          "provenance": {
+            "kind": "authoritative",
+            "source": {
+              "title": "Generic passive datasheet",
+              "url": null,
+              "authority": "Vendor",
+              "section": null,
+              "document_path": null,
+              "content_hash": "sha256:abc",
+              "retrieved_at": null
+            },
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694608Z"
+          }
+        },
+        "model_name": null,
+        "model_card": null,
+        "pin_order": [
+          "1",
+          "2"
+        ],
+        "ignored_pins": {},
+        "params": {},
+        "provenance": {
+          "kind": "authoritative",
+          "source": {
+            "title": "Generic passive datasheet",
+            "url": null,
+            "authority": "Vendor",
+            "section": null,
+            "document_path": null,
+            "content_hash": "sha256:abc",
+            "retrieved_at": null
+          },
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": null,
+          "created_at": "2026-09-28T19:54:42.694489Z"
+        }
+      }
+    },
+    {
+      "ref": "C1",
+      "value": "100n",
+      "description": "",
+      "manufacturer": null,
+      "mpn": null,
+      "datasheet": null,
+      "package": null,
+      "pins": [
+        {
+          "number": "1",
+          "name": "~1",
+          "electrical_type": "passive",
+          "provenance": {
+            "kind": "authoritative",
+            "source": {
+              "title": "Generic passive datasheet",
+              "url": null,
+              "authority": "Vendor",
+              "section": null,
+              "document_path": null,
+              "content_hash": "sha256:abc",
+              "retrieved_at": null
+            },
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694489Z"
+          }
+        },
+        {
+          "number": "2",
+          "name": "~2",
+          "electrical_type": "passive",
+          "provenance": {
+            "kind": "authoritative",
+            "source": {
+              "title": "Generic passive datasheet",
+              "url": null,
+              "authority": "Vendor",
+              "section": null,
+              "document_path": null,
+              "content_hash": "sha256:abc",
+              "retrieved_at": null
+            },
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694489Z"
+          }
+        }
+      ],
+      "electrical": {},
+      "symbol": null,
+      "footprint": null,
+      "sourcing": [],
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": null,
+        "created_at": "2026-09-28T19:54:42.694509Z"
+      },
+      "serves_requirements": [],
+      "spice": {
+        "device": "C",
+        "exclude": false,
+        "exclude_reason": "",
+        "value": {
+          "value": 1e-7,
+          "unit": "F",
+          "provenance": {
+            "kind": "authoritative",
+            "source": {
+              "title": "Generic passive datasheet",
+              "url": null,
+              "authority": "Vendor",
+              "section": null,
+              "document_path": null,
+              "content_hash": "sha256:abc",
+              "retrieved_at": null
+            },
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694702Z"
+          }
+        },
+        "model_name": null,
+        "model_card": null,
+        "pin_order": [
+          "1",
+          "2"
+        ],
+        "ignored_pins": {},
+        "params": {},
+        "provenance": {
+          "kind": "authoritative",
+          "source": {
+            "title": "Generic passive datasheet",
+            "url": null,
+            "authority": "Vendor",
+            "section": null,
+            "document_path": null,
+            "content_hash": "sha256:abc",
+            "retrieved_at": null
+          },
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": null,
+          "created_at": "2026-09-28T19:54:42.694489Z"
+        }
+      }
+    }
+  ],
+  "nets": [
+    {
+      "name": "IN",
+      "kind": "signal",
+      "pins": [
+        {
+          "component_ref": "R1",
+          "pin_number": "1"
+        }
+      ],
+      "net_class": "Default",
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": null,
+        "created_at": "2026-09-28T19:54:42.694509Z"
+      },
+      "serves_requirements": []
+    },
+    {
+      "name": "OUT",
+      "kind": "signal",
+      "pins": [
+        {
+          "component_ref": "R1",
+          "pin_number": "2"
+        },
+        {
+          "component_ref": "C1",
+          "pin_number": "1"
+        }
+      ],
+      "net_class": "Default",
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": null,
+        "created_at": "2026-09-28T19:54:42.694509Z"
+      },
+      "serves_requirements": []
+    },
+    {
+      "name": "GND",
+      "kind": "ground",
+      "pins": [
+        {
+          "component_ref": "C1",
+          "pin_number": "2"
+        }
+      ],
+      "net_class": "Default",
+      "provenance": {
+        "kind": "derived",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": "fixture",
+        "tool_version": null,
+        "note": null,
+        "created_at": "2026-09-28T19:54:42.694509Z"
+      },
+      "serves_requirements": []
+    }
+  ],
+  "constraints": [],
+  "parameters": {},
+  "pcb": null,
+  "simulation": {
+    "stimuli": [
+      {
+        "id": "VIN",
+        "source": "voltage",
+        "net": "IN",
+        "reference_net": "GND",
+        "kind": "dc",
+        "value": {
+          "value": 0.0,
+          "unit": "V",
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694799Z"
+          }
+        },
+        "params": {
+          "ac": {
+            "value": 1.0,
+            "unit": null,
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null,
+              "created_at": "2026-09-28T19:54:42.694811Z"
+            }
+          }
+        },
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "fixture",
+          "created_at": "2026-09-28T19:54:42.694515Z"
+        },
+        "serves_requirements": []
+      }
+    ],
+    "analyses": [
+      {
+        "id": "ac",
+        "kind": "ac",
+        "params": {
+          "variation": {
+            "value": "dec",
+            "unit": null,
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null,
+              "created_at": "2026-09-28T19:54:42.694836Z"
+            }
+          },
+          "points": {
+            "value": 20,
+            "unit": null,
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null,
+              "created_at": "2026-09-28T19:54:42.694843Z"
+            }
+          },
+          "fstart": {
+            "value": 10.0,
+            "unit": null,
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null,
+              "created_at": "2026-09-28T19:54:42.694850Z"
+            }
+          },
+          "fstop": {
+            "value": 100000.0,
+            "unit": null,
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null,
+              "created_at": "2026-09-28T19:54:42.694855Z"
+            }
+          }
+        },
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "fixture",
+          "created_at": "2026-09-28T19:54:42.694515Z"
+        }
+      }
+    ],
+    "expectations": [
+      {
+        "id": "corner",
+        "analysis_id": "ac",
+        "vector": "v(OUT)",
+        "reduce": "at",
+        "at": {
+          "value": 1000.0,
+          "unit": "Hz",
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694916Z"
+          }
+        },
+        "nominal": {
+          "value": 0.70710678,
+          "unit": "V",
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694926Z"
+          }
+        },
+        "tol_abs": {
+          "value": 0.01,
+          "unit": "V",
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694938Z"
+          }
+        },
+        "tol_rel": null,
+        "requirement_id": "req.f_c",
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "fixture",
+          "created_at": "2026-09-28T19:54:42.694515Z"
+        }
+      },
+      {
+        "id": "passband",
+        "analysis_id": "ac",
+        "vector": "v(OUT)",
+        "reduce": "max",
+        "at": null,
+        "nominal": {
+          "value": 1.0,
+          "unit": "V",
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694977Z"
+          }
+        },
+        "tol_abs": null,
+        "tol_rel": {
+          "value": 0.01,
+          "unit": null,
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.694986Z"
+          }
+        },
+        "requirement_id": null,
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "fixture",
+          "created_at": "2026-09-28T19:54:42.694515Z"
+        }
+      }
+    ],
+    "temperature_c": null
+  },
+  "si": {
+    "net_classes": [
+      {
+        "name": "DEFAULT",
+        "description": "",
+        "nets": [],
+        "default": true,
+        "target_z0_ohm": null,
+        "z0_tol_rel": null,
+        "target_zdiff_ohm": null,
+        "zdiff_tol_rel": null,
+        "pairs": [],
+        "pair_uncoupled_max_mm": null,
+        "pair_max_skew_s": null,
+        "max_length_mm": null,
+        "max_delay_s": null,
+        "match_group": null,
+        "max_skew_s": null,
+        "min_width_mm": null,
+        "power_current_a": null,
+        "power_temp_rise_c": null,
+        "t_rise_s": {
+          "value": 1e-9,
+          "unit": "s",
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.695027Z"
+          }
+        },
+        "r_drive_ohm": null,
+        "c_load_f": null,
+        "ringing_tol_rel": null,
+        "driver": null,
+        "promote_to": "Z50",
+        "promoted": [],
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "fixture",
+          "created_at": "2026-09-28T19:54:42.694515Z"
+        }
+      },
+      {
+        "name": "Z50",
+        "description": "",
+        "nets": [
+          "OUT"
+        ],
+        "default": false,
+        "target_z0_ohm": {
+          "value": 50.0,
+          "unit": "ohm",
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.695086Z"
+          }
+        },
+        "z0_tol_rel": {
+          "value": 0.1,
+          "unit": null,
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.695092Z"
+          }
+        },
+        "target_zdiff_ohm": null,
+        "zdiff_tol_rel": null,
+        "pairs": [],
+        "pair_uncoupled_max_mm": null,
+        "pair_max_skew_s": null,
+        "max_length_mm": null,
+        "max_delay_s": null,
+        "match_group": null,
+        "max_skew_s": null,
+        "min_width_mm": null,
+        "power_current_a": null,
+        "power_temp_rise_c": null,
+        "t_rise_s": {
+          "value": 1e-9,
+          "unit": "s",
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": null,
+            "created_at": "2026-09-28T19:54:42.695096Z"
+          }
+        },
+        "r_drive_ohm": null,
+        "c_load_f": null,
+        "ringing_tol_rel": null,
+        "driver": null,
+        "promote_to": null,
+        "promoted": [],
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "fixture",
+          "created_at": "2026-09-28T19:54:42.694515Z"
+        }
+      }
+    ],
+    "timing_paths": [],
+    "critical_fraction": {
+      "value": 0.5,
+      "unit": null,
+      "provenance": {
+        "kind": "user_requirement",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": null,
+        "tool_version": null,
+        "note": null,
+        "created_at": "2026-09-28T19:54:42.695127Z"
+      }
+    },
+    "provenance": {
+      "kind": "user_requirement",
+      "source": null,
+      "derived_from": [],
+      "inputs": {},
+      "tool": null,
+      "tool_version": null,
+      "note": "fixture",
+      "created_at": "2026-09-28T19:54:42.694515Z"
+    }
+  },
+  "regulatory": {
+    "jurisdictions": [],
+    "intended_use": null,
+    "requirements": [],
+    "scope_answers": {},
+    "proposed_candidates": []
+  },
+  "validation": {
+    "results": []
+  },
+  "artifacts": {}
+}

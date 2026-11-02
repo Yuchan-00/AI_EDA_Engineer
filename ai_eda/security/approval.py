@@ -21,6 +21,8 @@ class ExternalAction(StrEnum):
     REGULATORY_SUBMISSION = "regulatory_submission"
     #: opening a network connection to fetch a document (datasheet, official text); granted once per online session
     NETWORK_FETCH = "network_fetch"
+    #: using the user's own subscription login (the Claude Code CLI) for model calls: no per-call charge, quota is used
+    SUBSCRIPTION_USE = "subscription_use"
 
 
 class Approval(BaseModel):

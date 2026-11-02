@@ -40,6 +40,11 @@ def _client(fake: FakeOpenRouter) -> OpenRouterClient:
     return OpenRouterClient(api_key=fake.api_key, base_url=fake.base_url, timeout=10.0, connect_timeout=2.0)
 
 
+def _with_fallback() -> ModelRouter:
+    """Decision 4: no fallback by default - the tests that exercise fallback ask for one explicitly."""
+    return default_router(fallback=DEFAULT_FALLBACK_MODEL)
+
+
 def _service(fake: FakeOpenRouter, budget: LLMBudget | None = None, *, router: ModelRouter | None = None, **kw) -> LLMService:
     sleeps: list[float] = []
     svc = LLMService(
@@ -148,7 +153,7 @@ def test_persistent_429_falls_back_to_the_next_candidate(fake: FakeOpenRouter):
     fake.add_rate_limited(retry_after=1)
     fake.add_rate_limited(retry_after=1)
     fake.add_completion("haiku answers")
-    svc = _service(fake)
+    svc = _service(fake, router=_with_fallback())
     resp = svc.complete(TASK, MSGS)
     assert resp.model_used == DEFAULT_FALLBACK_MODEL
     assert [r.json["model"] for r in fake.chat_requests] == [DEFAULT_PRIMARY_MODEL, DEFAULT_PRIMARY_MODEL, DEFAULT_FALLBACK_MODEL]
@@ -158,7 +163,7 @@ def test_persistent_429_falls_back_to_the_next_candidate(fake: FakeOpenRouter):
 def test_500_falls_back_to_the_next_model_and_reports_model_used(fake: FakeOpenRouter):
     fake.add_server_error()
     fake.add_completion("from the fallback")
-    svc = _service(fake)
+    svc = _service(fake, router=_with_fallback())
     resp = svc.complete(TASK, MSGS)
     assert resp.content == "from the fallback"
     assert resp.model == DEFAULT_FALLBACK_MODEL and resp.model_used == DEFAULT_FALLBACK_MODEL
@@ -179,7 +184,7 @@ def test_provider_fallback_served_model_is_what_gets_recorded(fake: FakeOpenRout
 def test_all_candidates_failing_raises_the_last_error(fake: FakeOpenRouter):
     fake.add_provider_down()
     fake.add_server_error(status=503)
-    svc = _service(fake)
+    svc = _service(fake, router=_with_fallback())
     with pytest.raises(LLMError) as ei:
         svc.complete(TASK, MSGS)
     assert ei.value.status == 503
@@ -197,7 +202,7 @@ def test_terminal_statuses_are_never_retried_and_never_fall_back(fake: FakeOpenR
     else:
         fake.add_error(400, "bad request")
     fake.add_completion("must not be reached")
-    svc = _service(fake)
+    svc = _service(fake, router=_with_fallback())  # a fallback exists and must not be tried
     with pytest.raises(LLMError) as ei:
         svc.complete(TASK, MSGS)
     assert ei.value.status == status
@@ -208,7 +213,7 @@ def test_terminal_statuses_are_never_retried_and_never_fall_back(fake: FakeOpenR
 def test_transport_failure_falls_back():
     # "connection refused" never reached the provider (sent=False): nothing was billed, nothing is recorded
     client = ScriptedLLMClient([LLMError("connection refused", kind="transport", sent=False), {"content": "second model"}])
-    svc = LLMService(client, default_router(), UsageTracker(), LLMBudget(max_usd=1.0), gate=ApprovalGate())
+    svc = LLMService(client, _with_fallback(), UsageTracker(), LLMBudget(max_usd=1.0), gate=ApprovalGate())
     resp = svc.complete(TASK, MSGS)
     assert resp.content == "second model" and resp.model == DEFAULT_FALLBACK_MODEL
     assert [c.model for c in client.calls] == [DEFAULT_PRIMARY_MODEL, DEFAULT_FALLBACK_MODEL]
@@ -218,7 +223,7 @@ def test_transport_failure_falls_back():
 def test_a_200_with_an_error_body_is_recorded_with_the_cost_it_reported(fake: FakeOpenRouter):
     fake.add_committed_error()  # the fake's error body carries usage.cost, as the live service does
     fake.add_completion("recovered")
-    svc = _service(fake, LLMBudget(max_usd=1.0, max_tokens=10_000))
+    svc = _service(fake, LLMBudget(max_usd=1.0, max_tokens=10_000), router=_with_fallback())
     resp = svc.complete(TASK, MSGS)
     assert resp.content == "recovered"
     failed, served = svc.usage.records
@@ -288,7 +293,7 @@ def test_structured_fenced_json_from_a_prompted_model_is_accepted(fake: FakeOpen
 def test_structured_falls_back_after_two_rejections_and_raises_when_all_fail(fake: FakeOpenRouter):
     for _ in range(4):
         fake.add_completion("nope")
-    svc = _service(fake)
+    svc = _service(fake, router=_with_fallback())
     with pytest.raises(StructuredOutputError, match="no model produced a reply matching the schema") as ei:
         svc.structured(TASK, MSGS, Answer)
     assert [r.json["model"] for r in fake.chat_requests] == [DEFAULT_PRIMARY_MODEL] * 2 + [DEFAULT_FALLBACK_MODEL] * 2
@@ -297,7 +302,7 @@ def test_structured_falls_back_after_two_rejections_and_raises_when_all_fail(fak
     fake.add_completion("nope")
     fake.add_completion("nope")
     fake.add_completion('{"value": 9}')
-    svc = _service(fake)
+    svc = _service(fake, router=_with_fallback())
     inst, resp = svc.structured(TASK, MSGS, Answer)
     assert inst.value == 9 and resp.model_used == DEFAULT_FALLBACK_MODEL
 
@@ -305,7 +310,7 @@ def test_structured_falls_back_after_two_rejections_and_raises_when_all_fail(fak
 def test_structured_transport_failure_then_fallback_validates(fake: FakeOpenRouter):
     fake.add_server_error(status=502)
     fake.add_completion('{"value": 5}')
-    svc = _service(fake)
+    svc = _service(fake, router=_with_fallback())
     inst, resp = svc.structured(TASK, MSGS, Answer)
     assert inst.value == 5 and resp.model_used == DEFAULT_FALLBACK_MODEL
 
@@ -362,17 +367,20 @@ def test_from_script_and_from_env(monkeypatch, tmp_path):
     try:
         assert isinstance(svc.client, OpenRouterClient)
         assert svc.client.reasoning == {"effort": "none"} and svc.client.app_title == "AI EDA ENGINEER"
-        assert [c.model for c in svc.router.candidates(TASK)] == [DEFAULT_PRIMARY_MODEL, DEFAULT_FALLBACK_MODEL]
+        assert [c.model for c in svc.router.candidates(TASK)] == [DEFAULT_PRIMARY_MODEL]  # decision 4: no default fallback
+        assert svc.providers == ["openrouter"] and svc.approval_detail == "openrouter budget max_usd=0.1"
         assert "sk-or-v1-test-only-never-real" not in repr(svc.client)
     finally:
         svc.client.close()
 
 
-def test_default_router_orders_primary_then_fallback():
+def test_default_router_has_no_fallback_unless_asked():
     r = default_router()
-    assert [c.model for c in r.candidates(TaskKind.REQUIREMENT_ANALYSIS)] == [DEFAULT_PRIMARY_MODEL, DEFAULT_FALLBACK_MODEL]
+    assert [c.model for c in r.candidates(TaskKind.REQUIREMENT_ANALYSIS)] == [DEFAULT_PRIMARY_MODEL]  # decision 4
     assert all(c.temperature == 0.0 for c in r.candidates(TaskKind.CHAT))
-    custom = default_router("anthropic/claude-haiku-4.5")
+    explicit = default_router(fallback=DEFAULT_FALLBACK_MODEL)
+    assert [c.model for c in explicit.candidates(TaskKind.REQUIREMENT_ANALYSIS)] == [DEFAULT_PRIMARY_MODEL, DEFAULT_FALLBACK_MODEL]
+    custom = default_router("anthropic/claude-haiku-4.5", fallback="anthropic/claude-haiku-4.5")
     assert [c.model for c in custom.candidates(TaskKind.REQUIREMENT_ANALYSIS)] == ["anthropic/claude-haiku-4.5"]  # fallback == primary is dropped
     assert [c.model for c in default_router("x/y", fallback=None).candidates(TaskKind.CHAT)] == ["x/y"]
 

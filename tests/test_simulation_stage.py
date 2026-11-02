@@ -24,15 +24,30 @@ from pathlib import Path
 import pytest
 
 from ai_eda.agents import AgentContext, SimulationAgent
+from ai_eda.compilers import CompileContext, SpiceNetlistCompiler
 from ai_eda.errors import ToolExecutionError
 from ai_eda.ir import (
+    AnalysisSpec,
     ArtifactKind,
+    CircuitDomain,
     CircuitIR,
+    Component,
     Expectation,
     Net,
+    NetKind,
+    Pin,
+    PinElectricalType,
     PinRef,
+    ProjectMeta,
+    Provenance,
+    ProvenanceKind,
     Reduce,
+    SimulationSetup,
     SpiceBinding,
+    SpiceDevice,
+    Stimulus,
+    StimulusKind,
+    Topology,
     ValidationResult,
     ValidationStatus,
     authoritative,
@@ -42,8 +57,9 @@ from ai_eda.repair import RepairLoop, RerunTool
 from ai_eda.review import IndependentReviewer, ReviewArea
 from ai_eda.tools.calc import recompute_parameters, voltage_divider_output
 from ai_eda.tools.kicad import KicadLibrary
-from ai_eda.tools.spice import NgspiceShared
-from ai_eda.tools.spice.stage import judge, read_results, reduce_result, run_spice_for
+from ai_eda.tools.spice import NgspiceShared, SpiceAnalysis, SpiceResult
+from ai_eda.tools.spice.measure import ABSTOL, RELTOL, VNTOL, rising_edge_frequency
+from ai_eda.tools.spice.stage import judge, read_results, reduce_expectation, reduce_result, run_spice_for
 from ai_eda.workflow import Orchestrator, PipelineState, Stage
 from tests.conftest import make_component
 from tests.fixtures_kicad import RESISTOR_DS, USER, divider_with_connector_ir, pin_header
@@ -53,6 +69,10 @@ S = ValidationStatus
 LIB = KicadLibrary()
 runner = NgspiceShared()
 pytestmark = pytest.mark.skipif(not runner.available(), reason="ngspice.dll (KiCad's bundled ngspice shared library) not found")
+HAS_LIBS = LIB.footprint_file("Resistor_SMD", "R_0603_1608Metric") is not None and LIB.symbol_file("Device") is not None
+#: the tests that assert on the WHOLE review report also need the KiCad libraries: without them component.existence.<ref>
+#: fails for Device:R / Conn_01x03 and review.component_provenance is a second FAIL beside the SPICE one under test
+needs_libs = pytest.mark.skipif(not HAS_LIBS, reason="KiCad libraries not installed (Device:R / R_0603_1608Metric)")
 
 
 def _context(tmp_path: Path) -> AgentContext:
@@ -110,7 +130,7 @@ def test_divider_spice_stage_passes_with_real_evidence(tmp_path: Path):
     assert state.outcome(Stage.CALCULATION).status is S.PASS and "4 value(s) recomputed" in state.outcome(Stage.CALCULATION).message
     spice_stage = state.outcome(Stage.SPICE)
     assert spice_stage.status is S.PASS, spice_stage.message
-    assert "re-validated: domain.analog.bias PASS" in spice_stage.message
+    assert "re-validated: " in spice_stage.message and "domain.analog.bias PASS" in spice_stage.message  # component.fit is listed too (registry order)
 
     netlist = ir.artifacts[ArtifactKind.SPICE_NETLIST]
     results = ir.artifacts[ArtifactKind.SPICE_RESULT]
@@ -121,7 +141,7 @@ def test_divider_spice_stage_passes_with_real_evidence(tmp_path: Path):
     assert Path(results.path) == tmp_path / "spice" / "results.json"
 
     summary = ir.validation.latest("spice")
-    assert summary.status is S.PASS and summary.tool == "ngspice-shared" and summary.tool_version == runner.version() == "ngspice-46"
+    assert summary.status is S.PASS and summary.tool == "ngspice-shared" and summary.tool_version == runner.version()
     assert summary.artifact_hash == netlist.content_hash and summary.ir_hash == ir_hash
     assert set(summary.details["analyses"]) == {"op", "dc_vin"}
     assert summary.details["analyses"]["op"] == {**summary.details["analyses"]["op"], "command": "op", "succeeded": True, "n_points": 1, "plot_name": "op1"}
@@ -145,7 +165,7 @@ def test_divider_spice_stage_passes_with_real_evidence(tmp_path: Path):
 
     # results.json is the persisted evidence: every SpiceResult, keyed by analysis id, naming the netlist it ran on
     data = read_results(results.path)
-    assert data["netlist_hash"] == netlist.content_hash and data["ir_hash"] == ir_hash and data["engine_version"] == "ngspice-46"
+    assert data["netlist_hash"] == netlist.content_hash and data["ir_hash"] == ir_hash and data["engine_version"] == runner.version()
     assert data["analyses"]["op"]["result"]["vectors"]["vout"] == pytest.approx([6.0])
     assert len(data["analyses"]["dc_vin"]["result"]["vectors"]["v-sweep"]) == 13
     assert data["netlist_report"]["accepted_provenance_kinds"] == ["authoritative", "derived", "user_requirement"]
@@ -212,6 +232,7 @@ def test_second_pipeline_run_is_consistent_and_ir_build_sees_the_bias(tmp_path: 
 # --------------------------------------------------------------------------- honest failures
 
 
+@needs_libs
 def test_wrong_nominal_fails_and_is_not_repairable(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, LIB)
     ir.simulation.expectations[0].nominal = user_requirement(5.0, "V", note="wrong on purpose")
@@ -234,6 +255,7 @@ def test_wrong_nominal_fails_and_is_not_repairable(tmp_path: Path):
     assert "human" in outcome.unresolved[0].message
 
 
+@needs_libs
 def test_design_change_is_resimulated_and_the_old_expectation_fails_honestly(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, LIB)
     ctx = _context(tmp_path)
@@ -268,6 +290,7 @@ def test_design_change_is_resimulated_and_the_old_expectation_fails_honestly(tmp
     assert final[ReviewArea.SPICE_VS_REQUIREMENTS].status is S.FAIL and final[ReviewArea.SPICE_VS_REQUIREMENTS].details["repair"] == "human"
 
 
+@needs_libs
 def test_design_change_with_recalculated_nominals_and_requirements_converges_to_pass(tmp_path: Path):
     """R1 -> 20k *and* the user now asks for 4 V: nominals and requirements move together, so the loop converges.
 
@@ -299,6 +322,7 @@ def test_design_change_with_recalculated_nominals_and_requirements_converges_to_
     assert ir.artifacts[ArtifactKind.SPICE_RESULT].generated_from_ir_hash == changed and ir.artifacts[ArtifactKind.SPICE_RESULT].matches_disk()
 
 
+@needs_libs
 def test_hand_edited_results_are_detected_and_rerun(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, LIB)
     ctx = _context(tmp_path)
@@ -426,3 +450,217 @@ def test_judge_uses_the_looser_of_abs_and_rel_and_reduce_reports_problems():
     for reduce, expected in ((Reduce.FINAL, 3.0), (Reduce.MAX, 3.0), (Reduce.MIN, 0.0)):
         exp.reduce = reduce
         assert reduce_result(res, exp, "x") == (expected, None)
+
+
+# --------------------------------------------------------------------------- a measured frequency (Reduce.FREQUENCY + tran uic)
+
+#: the astable's timing values: Vcc 5 V, R_c 1 k, R_b 10 k, C 72 nF, V_BE 0.7 V
+ASTABLE_VCC, ASTABLE_R_C, ASTABLE_R_B, ASTABLE_C, ASTABLE_V_BE = 5.0, 1_000.0, 10_000.0, 72e-9, 0.7
+#: f = 1 / (2 R_b C ln((2 Vcc - V_BE) / (Vcc - V_BE))) = 900.2 Hz - the expression the part-B template's calculator will register
+ASTABLE_F_NOMINAL = 1.0 / (2.0 * ASTABLE_R_B * ASTABLE_C * math.log((2.0 * ASTABLE_VCC - ASTABLE_V_BE) / (ASTABLE_VCC - ASTABLE_V_BE)))
+
+
+def _astable_part(ref: str, value: str, pins: list[tuple[str, str, PinElectricalType]], spice: SpiceBinding, electrical: dict | None = None) -> Component:
+    return Component(
+        ref=ref, value=value, description=value,
+        pins=[Pin(number=n, name=name, electrical_type=kind, provenance=USER) for n, name, kind in pins],
+        electrical=dict(electrical or {}), provenance=Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="hand-built astable"), spice=spice,
+    )
+
+
+def astable_ir(tmp_path: Path) -> CircuitIR:
+    """A collector-coupled BJT astable multivibrator, built by hand (no library refs: only the netlist is under test).
+
+    Q1 / Q2 carry pins 1 = E, 2 = B, 3 = C (the KiCad ``Transistor_BJT:2N3904``
+    numbering) on a generic ``.model QNPN NPN`` card; ``C2`` starts at -1 V
+    (``ic``) and the transient runs ``uic`` from 10 ms to 30 ms in 5 us steps,
+    so the saved window holds ~18 periods of the ~900 Hz oscillation.
+    """
+    two = [("1", "", PinElectricalType.PASSIVE), ("2", "", PinElectricalType.PASSIVE)]
+    npn = [("1", "E", PinElectricalType.PASSIVE), ("2", "B", PinElectricalType.INPUT), ("3", "C", PinElectricalType.PASSIVE)]
+    card = user_requirement(".model QNPN NPN", note="generic Gummel-Poon NPN with ngspice's default parameters")
+    q_binding = lambda: SpiceBinding(device=SpiceDevice.Q, model_name="QNPN", model_card=card, pin_order=["3", "2", "1"], provenance=USER)  # noqa: E731
+    r_c, r_b, c = user_requirement(ASTABLE_R_C, "ohm"), user_requirement(ASTABLE_R_B, "ohm"), user_requirement(ASTABLE_C, "F")
+    ir = CircuitIR(project=ProjectMeta(id="astable_hand", name="BJT astable multivibrator (hand-built)", workdir=str(tmp_path)))
+    ir.topology = Topology(name="BJT astable multivibrator", domains=[CircuitDomain.ANALOG], provenance=USER)
+    ir.components = [
+        _astable_part("Q1", "2N3904", npn, q_binding()),
+        _astable_part("Q2", "2N3904", npn, q_binding()),
+        _astable_part("R1", "1k", two, SpiceBinding(device=SpiceDevice.R, value=r_c, provenance=USER), {"resistance": r_c}),
+        _astable_part("R2", "1k", two, SpiceBinding(device=SpiceDevice.R, value=r_c, provenance=USER), {"resistance": r_c}),
+        _astable_part("R3", "10k", two, SpiceBinding(device=SpiceDevice.R, value=r_b, provenance=USER), {"resistance": r_b}),
+        _astable_part("R4", "10k", two, SpiceBinding(device=SpiceDevice.R, value=r_b, provenance=USER), {"resistance": r_b}),
+        _astable_part("C1", "72n", two, SpiceBinding(device=SpiceDevice.C, value=c, provenance=USER), {"capacitance": c}),
+        _astable_part(
+            "C2", "72n", two,
+            SpiceBinding(device=SpiceDevice.C, value=c, params={"ic": user_requirement(-1.0, "V", note="breaks the symmetry so the oscillation starts")}, provenance=USER),
+            {"capacitance": c},
+        ),
+        _astable_part("J1", "Conn_01x03", [("1", "Pin_1", PinElectricalType.PASSIVE), ("2", "Pin_2", PinElectricalType.PASSIVE), ("3", "Pin_3", PinElectricalType.PASSIVE)],
+                      SpiceBinding(exclude=True, exclude_reason="connector, no electrical model", provenance=USER)),
+    ]
+
+    def net(name: str, kind: NetKind, *pins: tuple[str, str]) -> Net:
+        return Net(name=name, kind=kind, pins=[PinRef(component_ref=r, pin_number=p) for r, p in pins], provenance=USER)
+
+    ir.nets = [
+        net("VCC", NetKind.POWER, ("J1", "1"), ("R1", "1"), ("R2", "1"), ("R3", "1"), ("R4", "1")),
+        net("Q1_C", NetKind.SIGNAL, ("R1", "2"), ("Q1", "3"), ("C1", "1")),
+        net("Q2_B", NetKind.SIGNAL, ("C1", "2"), ("R4", "2"), ("Q2", "2")),
+        net("OUT", NetKind.SIGNAL, ("R2", "2"), ("Q2", "3"), ("C2", "1"), ("J1", "2")),
+        net("Q1_B", NetKind.SIGNAL, ("C2", "2"), ("R3", "2"), ("Q1", "2")),
+        net("GND", NetKind.GROUND, ("J1", "3"), ("Q1", "1"), ("Q2", "1")),
+    ]
+    ir.simulation = SimulationSetup(
+        stimuli=[Stimulus(id="VIN", source="voltage", net="VCC", reference_net="GND", kind=StimulusKind.DC, value=user_requirement(ASTABLE_VCC, "V"), provenance=USER)],
+        analyses=[
+            AnalysisSpec(
+                id="tran", kind=SpiceAnalysis.TRAN,
+                params={"step": user_requirement(5e-6, "s"), "stop": user_requirement(30e-3, "s"), "start": user_requirement(10e-3, "s"), "uic": user_requirement(True)},
+                provenance=USER,
+            )
+        ],
+        expectations=[
+            Expectation(
+                id="f_osc", analysis_id="tran", vector="v(OUT)", reduce=Reduce.FREQUENCY, nominal=user_requirement(ASTABLE_F_NOMINAL, "Hz"),
+                tol_rel=user_requirement(0.05, note="the expression neglects V_CE(sat) and the model's finite switching"), provenance=USER,
+            )
+        ],
+    )
+    return ir
+
+
+def test_astable_multivibrator_frequency_is_measured_by_ngspice(tmp_path: Path):
+    """``Reduce.FREQUENCY`` on a real transient: the astable's ~900 Hz is measured from v(OUT)'s rising edges, not assumed."""
+    ir = astable_ir(tmp_path)
+    ctx = _context(tmp_path)
+    ir.artifacts[ArtifactKind.SPICE_NETLIST] = SpiceNetlistCompiler().compile(ir, CompileContext(workdir=tmp_path, tools=ctx.tools))
+    text = Path(ir.artifacts[ArtifactKind.SPICE_NETLIST].path).read_text(encoding="utf-8")
+    assert text.startswith("astable_hand\n.model QNPN NPN\n") and text.endswith("VVIN VCC 0 DC 5\n.end\n")
+    assert "Q1 Q1_C Q1_B 0 QNPN\n" in text and "Q2 OUT Q2_B 0 QNPN\n" in text  # node order C B E from pin_order ["3", "2", "1"]
+    assert "C2 OUT Q1_B 72.0n ic=-1\n" in text and "C1 Q1_C Q2_B 72.0n\n" in text  # format_spice_number: the spelling ngspice reads back exactly
+    assert "uic" not in text and ".tran" not in text  # the analysis is a runner command, never a netlist card
+
+    results = run_spice_for(ir, ctx.tools, tmp_path)
+    ir.validation.extend(results)
+    for r in results:
+        print(f"  {r.check_id:<16} {r.status:<14} {r.message}")
+    summary = ir.validation.latest("spice")
+    assert summary.status is S.PASS, summary.message
+    assert summary.details["analyses"]["tran"]["command"] == "tran 5.00u 30m 10m uic" and summary.details["analyses"]["tran"]["succeeded"]
+    assert summary.details["analyses"]["tran"]["scale"] == "time"
+
+    f_osc = ir.validation.latest("spice.f_osc")
+    assert f_osc.status is S.PASS, f_osc.message
+    assert f_osc.details["reduce"] == "frequency" and f_osc.details["spice_vector"] == "out" and f_osc.details["unit"] == "Hz"
+    assert f_osc.details["nominal"] == pytest.approx(900.2, abs=0.05)
+    assert abs(f_osc.details["measured"] - ASTABLE_F_NOMINAL) <= 0.05 * ASTABLE_F_NOMINAL
+    assert f_osc.details["tolerance"] == pytest.approx(0.05 * ASTABLE_F_NOMINAL) and f_osc.details["deviation"] == abs(f_osc.details["measured"] - ASTABLE_F_NOMINAL)
+    freq = f_osc.details["frequency"]
+    assert freq["edges"] >= 15 and 10e-3 <= freq["first_edge_s"] < freq["last_edge_s"] <= 30e-3
+    assert freq["vmin"] < 0.5 and 4.5 < freq["vmax"] <= 5.0  # a saturated collector swings between ~V_CE(sat) and Vcc
+    assert freq["low"] < freq["mid"] < freq["high"] and freq["mid"] == pytest.approx((freq["vmin"] + freq["vmax"]) / 2)
+    assert freq["floor"] == pytest.approx(RELTOL * freq["vmax"] + VNTOL)  # the flatness floor of a voltage vector, recorded with the verdict
+    # the mean over the window is what was judged
+    assert f_osc.details["measured"] == pytest.approx((freq["edges"] - 1) / (freq["last_edge_s"] - freq["first_edge_s"]))
+    assert f_osc.message.startswith("v(OUT) frequency = ") and " Hz, nominal " in f_osc.message
+    assert f_osc.tool == "ngspice-shared" and f_osc.artifact_hash == ir.artifacts[ArtifactKind.SPICE_NETLIST].content_hash
+    _evidence_is_real(f_osc)
+    assert Path(f_osc.evidence[0].path).name == "astable_hand.tran.raw"
+    data = read_results(ir.artifacts[ArtifactKind.SPICE_RESULT].path)
+    assert data["analyses"]["tran"]["command"] == "tran 5.00u 30m 10m uic"
+    assert min(data["analyses"]["tran"]["result"]["vectors"]["time"]) >= 10e-3  # the start-up transient before 10 ms is not saved
+
+
+def test_astable_without_oscillation_fails_honestly(tmp_path: Path):
+    """The same circuit with its supply at 0 V (the ``uic`` start and C2's ``ic`` kick kept): a flat v(OUT) is FAIL, never PASS.
+
+    Nothing can oscillate without a supply, so the transient's v(OUT) stays
+    within the engine's resolution of 0 V and the stage says "no oscillation
+    detected". (The symmetric start without ``uic`` / ``ic`` is not what this
+    test runs: on ngspice-42 that circuit sometimes starts from round-off, so
+    it is not a deterministic no-oscillation case.)
+    """
+    ir = astable_ir(tmp_path)
+    ir.simulation.stimuli[0].value = user_requirement(0.0, "V")
+    ctx = _context(tmp_path)
+    ir.artifacts[ArtifactKind.SPICE_NETLIST] = SpiceNetlistCompiler().compile(ir, CompileContext(workdir=tmp_path, tools=ctx.tools))
+    text = Path(ir.artifacts[ArtifactKind.SPICE_NETLIST].path).read_text(encoding="utf-8")
+    assert "C2 OUT Q1_B 72.0n ic=-1\n" in text and "VVIN VCC 0 DC 0\n" in text  # the kick stays, the supply is what is dead
+    results = run_spice_for(ir, ctx.tools, tmp_path)
+    ir.validation.extend(results)
+    assert ir.validation.latest("spice").details["analyses"]["tran"]["command"] == "tran 5.00u 30m 10m uic"
+    f_osc = ir.validation.latest("spice.f_osc")
+    assert f_osc.status is S.FAIL and f_osc.message.startswith("no oscillation detected") and f_osc.details["repair"] == "human"
+    assert "measured" not in f_osc.details and f_osc.details["frequency"]["edges"] < 3
+    freq = f_osc.details["frequency"]
+    assert abs(freq["vmin"]) <= freq["floor"] and abs(freq["vmax"]) <= freq["floor"]  # flat at 0 V within the engine's resolution
+    assert ir.validation.latest("spice").status is S.FAIL and "spice.f_osc" in ir.validation.latest("spice").message
+
+
+# --------------------------------------------------------------------------- the measurement's flatness floor and the scale vector
+
+
+def _tran_result(times: list[float], out: list[float], **kw) -> SpiceResult:
+    args = dict(
+        engine="x", engine_version="x", netlist_path="n", netlist_hash="h", analysis=SpiceAnalysis.TRAN, command="tran 1e-5 30m",
+        vectors={"time": times, "out": out}, vector_types={"time": "time", "out": "voltage"}, scale="time", n_points=len(times), succeeded=True,
+    )
+    args.update(kw)
+    return SpiceResult(**args)
+
+
+def _frequency_expectation(vector: str = "v(OUT)", nominal: float = 1000.0) -> Expectation:
+    return Expectation(id="f_osc", analysis_id="tran", vector=vector, reduce=Reduce.FREQUENCY, nominal=user_requirement(nominal, "Hz"), tol_rel=user_requirement(0.05), provenance=USER)
+
+
+def test_numerical_ripple_is_not_an_oscillation():
+    """A ripple within ngspice's own resolution (reltol * level + vntol) is flat: no frequency, "no oscillation detected", never PASS.
+
+    The thresholds scale with the swing, so a swing of 2e-12 V around 2.5 V
+    used to be counted as a full-scale 1 kHz square wave and judged PASS
+    against a 1 kHz expectation.
+    """
+    times = [i * 1e-5 for i in range(3000)]
+    ripple = [2.5 + 1e-12 * (1 if (i // 50) % 2 else -1) for i in range(3000)]  # a 1 kHz pattern of 2e-12 V swing
+    edge = rising_edge_frequency(times, ripple)
+    assert edge.frequency is None and edge.edges == [] and edge.problem.startswith("no oscillation detected: the waveform is flat at 2.5")
+    assert edge.floor == pytest.approx(RELTOL * 2.500000000001 + VNTOL) and "within the engine's resolution" in edge.problem
+    # through the stage: no measurement, so no PASS (and no FAIL claiming a measured frequency)
+    r = reduce_expectation(_tran_result(times, ripple), _frequency_expectation(), "out")
+    assert r.measured is None and r.problem.startswith("no oscillation detected") and r.extra["edges"] == 0 and r.extra["floor"] == edge.floor
+    assert reduce_result(_tran_result(times, ripple), _frequency_expectation(), "out")[0] is None
+    # one-ulp representation noise around a level does not even reach the detector's arithmetic
+    noise = [2.5 + (4.4e-16 if (i * 7919) % 3 == 0 else 0.0) for i in range(3000)]
+    assert rising_edge_frequency(times, noise).problem.startswith("no oscillation detected: the waveform is flat")
+    # a swing just above the floor is measured; a real square wave is unaffected
+    small = [2.5 + 0.01 * (1 if (i // 50) % 2 else -1) for i in range(3000)]  # 20 mV swing: 8 x the 2.5 mV floor
+    assert rising_edge_frequency(times, small).frequency == pytest.approx(1000.0, rel=1e-9)
+    square = [5.0 if (i // 50) % 2 else 0.0 for i in range(3000)]
+    assert rising_edge_frequency(times, square).frequency == pytest.approx(1000.0, rel=1e-9) and rising_edge_frequency(times, square).floor == pytest.approx(RELTOL * 5.0 + VNTOL)
+
+
+def test_the_flatness_floor_follows_the_vector_kind():
+    """A current vector is measured in amperes: its absolute floor is ``abstol`` (1e-12 A), a voltage's is ``vntol`` (1e-6 V)."""
+    times = [i * 1e-5 for i in range(3000)]
+    nano = [1e-9 * (1 if (i // 50) % 2 else 0) for i in range(3000)]  # a 1 nA square wave
+    assert rising_edge_frequency(times, nano, abs_floor=ABSTOL).frequency == pytest.approx(1000.0, rel=1e-9)
+    assert rising_edge_frequency(times, nano).problem.startswith("no oscillation detected")  # the same numbers as volts are within vntol
+    res = _tran_result(times, nano, vectors={"time": times, "vvin#branch": nano}, vector_types={"time": "time", "vvin#branch": "current"})
+    assert reduce_expectation(res, _frequency_expectation("i(VIN)"), "vvin#branch").measured == pytest.approx(1000.0, rel=1e-9)
+    assert reduce_expectation(_tran_result(times, nano), _frequency_expectation(), "out").measured is None
+    with pytest.raises(ValueError):
+        rising_edge_frequency(times, nano, abs_floor=-1.0)
+
+
+def test_a_plot_without_its_scale_vector_is_reported_as_the_scale():
+    """A result whose scale vector is missing names the scale in the problem, never the expectation's vector (which is present)."""
+    res = _tran_result([0.0], [0.0], vectors={"out": [0.0, 1.0, 0.0, 1.0]}, n_points=4)
+    r = reduce_expectation(res, _frequency_expectation(), "out")
+    assert r.measured is None and r.problem == "scale vector not produced: 'time' is not in the tran plot (vectors: ['out'])"
+    dc = SpiceResult(engine="x", engine_version="x", netlist_path="n", netlist_hash="h", analysis=SpiceAnalysis.DC, command="dc v 0 2 1", vectors={"x": [0.0, 1.5, 3.0]}, scale="v-sweep", n_points=3, succeeded=True)
+    at = Expectation(id="a", analysis_id="dc", vector="v(X)", reduce=Reduce.AT, at=user_requirement(1.0, "V"), nominal=user_requirement(1.5, "V"), tol_abs=user_requirement(0.1, "V"), provenance=USER)
+    assert reduce_expectation(dc, at, "x").problem == "scale vector not produced: 'v-sweep' is not in the dc plot (vectors: ['x'])"
+    # an absent expectation vector is still reported as such
+    assert reduce_expectation(_tran_result([0.0, 1.0], [0.0, 1.0]), _frequency_expectation("v(NOPE)"), "nope").problem.startswith("vector not produced: 'nope' is not in the tran plot")
+
