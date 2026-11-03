@@ -70,6 +70,7 @@ class BuildInfo:
     optional: tuple[str, ...] = ()
     #: (allowed layer counts, default)
     layers: tuple[tuple[int, ...], int] = ((4,), 4)
+    # stage 0: a build outside the KR 447 MHz staging (the amateur-band breadboard radio)
     #: the build this one is a variant of (``transceiver_conducted`` -> ``transceiver``)
     variant_of: str | None = None
     #: the modulation the board implements (``modulation`` must name it when stated)
@@ -119,15 +120,30 @@ BUILDS: dict[str, BuildInfo] = {b.build: b for b in (
               "the same composition with a U.FL in place of the antenna, for bench and KC conducted samples; never fitted with an antenna",
               needs=("carrier_frequency", "modulation", "input_voltage"), serves=_TRANSCEIVER_SERVES, optional=_TRANSCEIVER_OPTIONAL,
               variant_of="transceiver"),
+    BuildInfo("uhf_breadboard", "uhf_fm_breadboard", "UHF FM walkie-talkie for a perfboard (amateur 430-440 MHz, discrete)", 0,
+              ("discrete transistors and op-amps on a perfboard, no programmable part: crystal VXO f_c / 12 with varactor FM -> x3 / x2 / x2 -> band-pass -> "
+               "class-A PA -> low-pass -> 1N4148 T/R switch; super-regenerative receiver; TL071 audio with a BD139 / BD140 output. Transmits only under an "
+               "amateur licence (not a KR 447 MHz licence-exempt board)"),
+              needs=("carrier_frequency", "modulation", "input_voltage"), serves=("carrier_frequency", "modulation", "input_voltage", "audio_bandwidth"),
+              optional=("audio_bandwidth",), layers=((2, 4), 2)),
 )}
 
 if tuple(BUILDS) != RADIO_BUILDS:  # the requirement key's values and the family's builds are one list
     raise ValueError(f"the family's builds {tuple(BUILDS)} are not ai_eda.design.inputs.RADIO_BUILDS {RADIO_BUILDS}")
 
 
-def serving_builds(key: str) -> tuple[str, ...]:
-    """The builds that serve the canonical requirement ``key``, in stage order (empty when none does)."""
-    return tuple(b.build for b in BUILDS.values() if key in b.serves)
+def _group(build: str) -> bool:
+    """A build's group: the KR 447 MHz staging (stage >= 1) or the boards outside it (stage 0, the amateur-band breadboard radio)."""
+    return BUILDS[build].stage > 0
+
+
+def serving_builds(key: str, build: str | None = None) -> tuple[str, ...]:
+    """The builds that serve the canonical requirement ``key``, in stage order (empty when none does).
+
+    With ``build`` only the builds of its group: a KR 447 MHz board's refusal never sends the user to the amateur-band breadboard radio (whose
+    430-440 MHz range would refuse a 447 MHz value), nor the breadboard radio's to a KR licence-exempt board.
+    """
+    return tuple(b.build for b in BUILDS.values() if key in b.serves and (build is None or build not in BUILDS or _group(b.build) == _group(build)))
 
 
 def _or_list(items: tuple[str, ...]) -> str:
@@ -143,8 +159,10 @@ def unserved_message(key: str, build: str | None = None) -> str:
     its reason.
     """
     here = f"{key} is not served by radio_build={build}; " if build is not None else ""
-    builds = serving_builds(key)
+    builds = serving_builds(key, build)
     if not builds:
+        if build in BUILDS and not _group(build):  # the breadboard radio: no other board of its group
+            return f"{here}the {build} board serves only {', '.join(BUILDS[build].serves)}"
         why = " (the licence-exempt 447 MHz class is FM telephony [UNVERIFIED])" if key in RF_UNIT_OF else ""
         return f"{here}{key} is served by no radio_build of the KR 447 MHz family{why}"
     return f"{here}{key} is served by radio_build={_or_list(builds)}"
@@ -160,7 +178,7 @@ def refusal_question(why: str, key: str, build: str, keys: list[str] | tuple[str
     (:func:`~ai_eda.design.base.refusal_question`), so the report and the GUI
     offer that answer, not a value under the refused key.
     """
-    others = tuple(b for b in serving_builds(canonical_key(key) or key) if b != build)
+    others = tuple(b for b in serving_builds(canonical_key(key) or key, build) if b != build)
     alt = f"; or start the project of radio_build={_or_list(others)}, which serves it" if others else ""
     text = f"{why}; no template design was proposed. {leave_out_remedy(key, keys, where=f'the {build} board')}{alt}."
     return base_refusal_question(key, text, why)
@@ -177,7 +195,8 @@ def selector_question(ir: CircuitIR) -> MissingInformation:
     question = (
         f"Which board of the KR 447 MHz FM walkie-talkie family should be built? Answer {SELECTOR_KEY} with one of: {rows}. "
         f"Each stage is its own bench-board project; {RECOMMENDED_FIRST} is recommended first. Every KR regulatory number of these boards is an "
-        f"UNVERIFIED placeholder, and KC conformity assessment is needed before any transmission."
+        f"UNVERIFIED placeholder, and KC conformity assessment is needed before any transmission. uhf_breadboard is not a KR 447 MHz board: a "
+        f"discrete perfboard radio for the amateur 430-440 MHz band, used only under an amateur licence."
     )
     why = (f"{', '.join(seen)} {'is' if len(seen) == 1 else 'are'} confirmed but {SELECTOR_KEY} is not" if seen
            else f"{SELECTOR_KEY} is not stated")

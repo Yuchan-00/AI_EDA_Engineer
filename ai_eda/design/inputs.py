@@ -177,7 +177,7 @@ RADIO_BUILD_KEY = "radio_build"
 RADIO_BUILD_ALIASES: tuple[str, ...] = ("radio_build",)
 #: the boards of the radio template family, in build order (``transceiver_conducted``: the transceiver with a coaxial
 #: connector in place of the integral antenna, for conducted bench measurements)
-RADIO_BUILDS: tuple[str, ...] = ("audio_ptt", "rx_backend", "rx_frontend", "tx_exciter", "transceiver", "transceiver_conducted")
+RADIO_BUILDS: tuple[str, ...] = ("audio_ptt", "rx_backend", "rx_frontend", "tx_exciter", "transceiver", "transceiver_conducted", "uhf_breadboard")
 #: (level unit, target unit) -> (calculator, its tool id): the only unit conversions :func:`read_value` makes
 LEVEL_CONVERSIONS = {
     ("dBm", "W"): (rf_calc.dbm_to_w, "calc.rf.dbm_to_w"),

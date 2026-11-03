@@ -32,6 +32,24 @@ ai-eda gui --open   # 로컬 웹 GUI(한국어)
 
 옵션(`--no-kicad`, `--dir` 등), 운영체제별 동작, Debian stable 주의점(KiCad 10 패키지가 없음)은 아래 [설치](#설치) 절에 있습니다.
 
+## 만능기판 UHF FM 무전기 (아마추어 430–440 MHz)
+
+`radio_build = uhf_breadboard`로 고르는 템플릿 `uhf_fm_breadboard`는 프로그래머블 소자 없이 트랜지스터와 연산증폭기만으로 만든 실험용 FM 무전기를 설계합니다(2026-11-03). 채널은 하나로 고정입니다.
+
+- **송신:** f_c/12 수정 VXO + 가변용량 다이오드로 직접 FM → ×3·×2·×2 → 3공진기 대역통과 → BFR92A A급 출력단(약 30 mW) → 5차 저역통과 → 1N4148 T/R 스위치
+- **수신:** 초재생 검파 → TL071 오디오 → BD139/BD140 출력단
+
+아마추어 무선국 허가 조건 안에서만 송신하고, 안테나보다 더미로드가 먼저입니다.
+
+조립 안내(브레드보드·만능기판 순서, 코일, 조정), 만능기판 배치도, 배선표, 예시 KiCad 회로도·PCB는 [docs/uhf_breadboard/README.md](docs/uhf_breadboard/README.md)에 있습니다.
+
+```bash
+ai-eda new uhf_bb --dir ./uhf_bb
+ai-eda run ./uhf_bb/ir.json --answer radio_build=uhf_breadboard --answer "carrier_frequency=432 MHz" \
+   --answer modulation=FM --answer "input_voltage=9 V"
+ai-eda run ./uhf_bb/ir.json --answer confirm_design=yes
+```
+
 ## 현재 상태 (2026‑09‑27)
 
 | 계층 | 상태 |

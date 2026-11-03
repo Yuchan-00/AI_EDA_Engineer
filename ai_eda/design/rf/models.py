@@ -155,6 +155,17 @@ MODEL_VALUES: dict[str, ModelValue] = {m.key: m for m in (
     ModelValue("model.k_pm", 1.257, "rad/V", "phase-modulator slope of the two buffered tanks together (audio_ptt only; on tx_exciter it is the pm_mod fixtures' measured slope)",
                "the tx_exciter pm_mod1 / pm_mod2 fixtures, then a modulation-analyser measurement"),
     ModelValue("model.pot.position", 0.5, None, "wiper position of a potentiometer or trimmer in the design deck (a fraction of the track from END1)", "the lab alignment"),
+    # the UHF breadboard radio (radio_build = uhf_breadboard): hand-wound air coils, a BF199 tripler, 1N4148 switching diodes
+    ModelValue("model.bb.coil_q", 80.0, None,
+               ("unloaded Q of every hand-wound air coil and axial choke of the UHF breadboard radio at its working frequency (tanks, band-pass, "
+                "low-pass, T/R network); short leads on a perfboard or copper-clad board assumed"), "a Q-meter or VNA measurement of the wound coils"),
+    ModelValue("model.bf199.r_out", 1000.0, "ohm",
+               ("the BF199 tripler's own output resistance at its collector, as its tank fixture's source port sees it; the collector feed choke and "
+                "its decoupling are fixture members beside the port"), "NXP / Philips BF199 datasheet (output admittance)"),
+    ModelValue("model.bb.d_on_r", 5.0, "ohm",
+               "a 1N4148 of the T/R switch forward-biased at about 7 mA, as a resistor (the switch's TX state)", "1N4148 datasheet (dynamic resistance; it is no PIN diode)"),
+    ModelValue("model.bb.d_off_c", 4e-12, "F",
+               "a 1N4148 of the T/R switch at zero bias, as a capacitor (the switch's RX state)", "1N4148 datasheet (C_tot at V_R = 0)"),
 )}
 
 #: (key, lower Hz inclusive, upper Hz exclusive) of each inductor-Q band
@@ -227,6 +238,11 @@ def _n(t: Traced | float, what: str) -> str:
 def npn_card() -> ModelCard:
     return ModelCard("model.npn", "QNPN", ".model QNPN NPN (TR=200n)", SpiceDevice.Q, ("C", "B", "E"),
                      "generic Gummel-Poon NPN (ngspice defaults, TR = 200 ns storage time; the astable template's card)", "BFR92 / MMBT3904 vendor models")
+
+
+def pnp_card() -> ModelCard:
+    return ModelCard("model.pnp", "QPNP", ".model QPNP PNP (TR=200n)", SpiceDevice.Q, ("C", "B", "E"),
+                     "generic Gummel-Poon PNP (ngspice defaults, TR = 200 ns storage time)", "BD140 vendor model")
 
 
 def diode_card() -> ModelCard:
@@ -385,6 +401,7 @@ __all__ = [
     "opamp_card",
     "pa_supply_card",
     "pmos_card",
+    "pnp_card",
     "potentiometer_card",
     "varactor_card",
 ]

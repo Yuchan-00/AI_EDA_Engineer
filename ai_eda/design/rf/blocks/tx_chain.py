@@ -480,7 +480,8 @@ class TopC:
 
 def build_top_c(b: BlockBuilder, network: str, *, what: str, n: tuple[str, Traced], f0: tuple[str, Traced], bw: tuple[str, Traced], l: tuple[str, Traced],
                 r_source: tuple[str, Traced], r_load: tuple[str, Traced], idx: dict[int, tuple[str, Traced]], cap_refs: list[str], ind_refs: list[str],
-                nodes: list[str], ind_part: str, netbook: NetBook, cap_part: str = "cap_0402", port: PortLoad | None = None) -> TopC:
+                nodes: list[str], ind_part: str, netbook: NetBook, cap_part: str = "cap_0402", port: PortLoad | None = None,
+                shunt_part: str | None = None) -> TopC:
     """Place and value a Butterworth top-C network of ``n`` resonators (``calc.rf.resonator.top_c.*``) and declare its resonator nets.
 
     ``cap_refs`` in order: the input tap, then per resonator its shunt
@@ -521,18 +522,18 @@ def build_top_c(b: BlockBuilder, network: str, *, what: str, n: tuple[str, Trace
               for i in range(1, order + 1)]
     couples = [calc(b, f"{network}.c_couple.{i}", lambda i=i: radio.top_c_c_couple(n[1], idx[i][1], f0[1], bw[1], l[1], (n[0], idx[i][0], f0[0], bw[0], l[0])))
                for i in range(1, order)]
-    caps: list[tuple[str, Traced, str]] = [(cap_refs[0], c_in, f"{what}: input tap capacitor")]
+    caps: list[tuple[str, Traced, str, str]] = [(cap_refs[0], c_in, f"{what}: input tap capacitor", cap_part)]
     k = 1
     for i in range(order):
-        caps.append((cap_refs[k], shunts[i], f"{what}: resonator {i + 1} shunt capacitor"))
+        caps.append((cap_refs[k], shunts[i], f"{what}: resonator {i + 1} shunt capacitor", shunt_part or cap_part))
         k += 1
         if i < order - 1:
-            caps.append((cap_refs[k], couples[i], f"{what}: coupling capacitor between resonators {i + 1} and {i + 2}"))
+            caps.append((cap_refs[k], couples[i], f"{what}: coupling capacitor between resonators {i + 1} and {i + 2}", cap_part))
             k += 1
-    caps.append((cap_refs[-1], c_out, f"{what}: output tap capacitor"))
+    caps.append((cap_refs[-1], c_out, f"{what}: output tap capacitor", cap_part))
     placed: dict[str, PlacedPart] = {}
-    for ref, value, desc in caps:
-        placed[ref], top.bindings[ref] = passive(b, cap_part, ref, value, desc, deck=False, network=network)
+    for ref, value, desc, kind in caps:
+        placed[ref], top.bindings[ref] = passive(b, kind, ref, value, desc, deck=False, network=network)
     for i, ref in enumerate(ind_refs):
         placed[ref], top.bindings[ref] = passive(b, ind_part, ref, l[1], f"{what}: resonator {i + 1} inductor", deck=False, network=network)
     top.members = [c[0] for c in caps] + list(ind_refs)
