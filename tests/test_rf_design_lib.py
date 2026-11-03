@@ -461,14 +461,15 @@ for _needs, _serves in DESIGN_TABLE.values():
 
 
 def test_the_builds_follow_the_design_table() -> None:
-    assert list(family.BUILDS) == ["audio_ptt", "rx_backend", "rx_frontend", "tx_exciter", "transceiver", "transceiver_conducted"]
+    assert list(family.BUILDS) == ["audio_ptt", "rx_backend", "rx_frontend", "tx_exciter", "transceiver", "transceiver_conducted", "uhf_breadboard"]
     for build, (needs, serves) in DESIGN_TABLE.items():
         b = family.BUILDS[build]
         assert set(b.needs) == needs and set(b.serves) == serves, build
     assert family.BUILDS["audio_ptt"].layers == ((2, 4), 4)
-    assert all(b.layers == ((4,), 4) for k, b in family.BUILDS.items() if k != "audio_ptt")  # decision 7A: the RF lines need a plane
+    assert all(b.layers == ((4,), 4) for k, b in family.BUILDS.items() if k not in ("audio_ptt", "uhf_breadboard"))  # decision 7A: the RF lines need a plane
+    assert family.BUILDS["uhf_breadboard"].layers == ((2, 4), 2)  # a perfboard: 2 layers by default
     assert family.BUILDS["transceiver_conducted"].template_id == family.BUILDS["transceiver"].template_id == "kr447_transceiver"
-    assert [b.stage for b in family.BUILDS.values()] == [1, 2, 3, 4, 5, 5]
+    assert [b.stage for b in family.BUILDS.values()] == [1, 2, 3, 4, 5, 5, 0]  # 0: outside the KR 447 MHz staging
 
 
 def test_closed_world_messages_name_the_serving_builds() -> None:
@@ -495,9 +496,10 @@ def test_the_build_names_equal_the_requirement_key_constants() -> None:
 
 
 def test_the_registry_holds_the_five_templates_in_staging_order() -> None:
-    """Filled at the wave-2 merge in the staging order, the transceiver last (tests/test_kr447_registry.py checks the selection end to end)."""
+    """Filled at the wave-2 merge in the staging order, the transceiver last (tests/test_kr447_registry.py checks the selection end to end);
+    the amateur-band breadboard radio after them, outside the staging."""
     assert isinstance(RF_TEMPLATES, list) and [t.id for t in RF_TEMPLATES] == [
-        "kr447_audio_ptt", "kr447_rx_backend", "kr447_rx_frontend", "kr447_tx_exciter", "kr447_transceiver"]
+        "kr447_audio_ptt", "kr447_rx_backend", "kr447_rx_frontend", "kr447_tx_exciter", "kr447_transceiver", "uhf_fm_breadboard"]
 
 
 # --------------------------------------------------------------------------- block API

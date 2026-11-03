@@ -164,7 +164,7 @@ def _plan(ir: CircuitIR) -> Plan | None:
 
 def test_radio_build_is_a_categorical_requirement_key_not_a_control_key():
     assert RADIO_BUILD_KEY == "radio_build" and RADIO_BUILD_ALIASES == ("radio_build",)
-    assert RADIO_BUILDS == ("audio_ptt", "rx_backend", "rx_frontend", "tx_exciter", "transceiver", "transceiver_conducted")
+    assert RADIO_BUILDS == ("audio_ptt", "rx_backend", "rx_frontend", "tx_exciter", "transceiver", "transceiver_conducted", "uhf_breadboard")
     assert canonical_key("radio_build") == "radio_build" and "radio_build" not in KEY_ALIASES and "radio_build" not in UNIT_OF
     assert RADIO_BUILD_KEY not in CONTROL_KEYS
     every = [a for aliases in KEY_ALIASES.values() for a in aliases] + list(MODULATION_ALIASES)
@@ -491,9 +491,9 @@ def test_the_circuit_agent_asks_the_board_then_presents_and_applies_the_radio_te
 
 
 def test_the_extraction_prompt_names_tx_timeout_radio_build_and_the_band_rule():
-    assert EXTRACTION_VERSION == "0.4"
+    assert EXTRACTION_VERSION == "0.5"
     assert "tx_timeout (s: the transmit time-out" in REQUIREMENT_EXTRACTION_SYSTEM
-    assert "radio_build names which board of the KR 447 MHz walkie-talkie template family to build" in REQUIREMENT_EXTRACTION_SYSTEM
+    assert "radio_build names which board of the radio template family to build" in REQUIREMENT_EXTRACTION_SYSTEM
     assert "never map a description of a board to one" in REQUIREMENT_EXTRACTION_SYSTEM
     assert ("exactly one of " + ", ".join(RADIO_BUILDS)) in REQUIREMENT_EXTRACTION_SYSTEM
     assert "A band is not a carrier_frequency" in REQUIREMENT_EXTRACTION_SYSTEM and '"447 MHz 대역"' in REQUIREMENT_EXTRACTION_SYSTEM

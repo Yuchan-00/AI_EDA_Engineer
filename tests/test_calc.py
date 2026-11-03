@@ -245,6 +245,8 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
         "calc.audio.lowpass1.db_at": (user_requirement(1e3, "Hz"), user_requirement(3e3, "Hz")),
         "calc.audio.lossy_integrator.db_at": (user_requirement(1e3, "Hz"), user_requirement(0.96e-3, "s"), user_requirement(10e3, "ohm"), user_requirement(1e6, "ohm")),
         "calc.audio.butterworth.q": (user_requirement(4.0), user_requirement(1.0)),
+        "calc.audio.butterworth.db_at": (user_requirement(2.0), user_requirement(6e3, "Hz"), user_requirement(3e3, "Hz")),
+        "calc.audio.noninv_gain.db": (user_requirement(1e5, "ohm"), user_requirement(1e3, "ohm")),
         "calc.audio.sallen_key.c1": (user_requirement(0.5412), user_requirement(3e3, "Hz"), user_requirement(1e4, "ohm")),
         "calc.audio.sallen_key.c2": (user_requirement(0.5412), user_requirement(3e3, "Hz"), user_requirement(1e4, "ohm")),
         "calc.rf.tot.period": (user_requirement(2.3), user_requirement(100e3, "ohm"), user_requirement(10e-9, "F")),
@@ -337,4 +339,4 @@ def test_regulator_crystal_lc_and_rc_window_calculators():
     for fn in (rc_tran_step, rc_tran_stop):
         with pytest.raises(ValueError, match="time constant must be positive"):
             fn(user_requirement(0.0, "s"))
-    assert CALC_VERSION == "0.11" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")
+    assert CALC_VERSION == "0.12" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")

@@ -1540,6 +1540,31 @@ def butterworth_q(n: Traced[float], k: Traced[float], ids: tuple[str, str] = ("n
     return _derived(butterworth_pair_q(_num(n, "n"), _num(k, "k")), "calc.audio.butterworth.q", ids, None, "Q_k = 1 / g_k = 1 / (2 sin((2k - 1) pi / (2n)))")
 
 
+def noninv_gain_db_value(r_f: float, r_g: float) -> float:
+    """The non-inverting op-amp stage's gain 20 log10(1 + R_f / R_g) (dB): R_f from the output to the inverting input, R_g from there to AC ground."""
+    rf_, rg = _non_negative(r_f, "the feedback resistance R_f"), _positive(r_g, "the ground-leg resistance R_g")
+    return 20.0 * math.log10(1.0 + rf_ / rg)
+
+
+def butterworth_db(n: float, f: float, f_c: float) -> float:
+    """The n-th order Butterworth low-pass response -10 log10(1 + (f / f_c)^(2n)) (dB; f_c the -3 dB point)."""
+    order = _integer(n, "the filter order n", 1, 20)
+    x = _non_negative(f, "the frequency") / _positive(f_c, "the corner frequency")
+    if x == 0.0:
+        return 0.0
+    return -10.0 * math.log10(1.0 + x ** (2 * order))
+
+
+def noninv_gain_db(r_f: Traced[float], r_g: Traced[float], ids: tuple[str, str] = ("r_f", "r_g")) -> Traced[float]:
+    """The non-inverting stage's mid-band gain (dB): exact for an ideal op-amp with resistive R_f / R_g."""
+    return _derived(noninv_gain_db_value(_num(r_f, "r_f"), _num(r_g, "r_g")), "calc.audio.noninv_gain.db", ids, "dB", "G = 20 log10(1 + R_f / R_g)")
+
+
+def butterworth_db_at(n: Traced[float], f: Traced[float], f_c: Traced[float], ids: tuple[str, str, str] = ("n", "f", "f_c")) -> Traced[float]:
+    """The Butterworth low-pass response at f (dB, negative): an ideal unity-gain Sallen-Key section of Q 1/sqrt(2) is the n = 2 case."""
+    return _derived(butterworth_db(_num(n, "n"), _num(f, "f"), _num(f_c, "f_c")), "calc.audio.butterworth.db_at", ids, "dB", "A = -10 log10(1 + (f / f_c)^(2n))")
+
+
 def sallen_key_c1(q: Traced[float], f_c: Traced[float], r: Traced[float], ids: tuple[str, str, str] = ("q", "f_c", "r")) -> Traced[float]:
     """The unity-gain Sallen-Key low-pass feedback capacitor (F)."""
     return _derived(sallen_key_c1_f(_num(q, "q"), _num(f_c, "f_c"), _num(r, "r")), "calc.audio.sallen_key.c1", ids, "F", "C1 = 2 Q / (2 pi f_c R) (unity gain, R1 = R2 = R)")
@@ -1627,6 +1652,8 @@ RADIO_CALCULATORS = {
     "calc.audio.lowpass1.db_at": lowpass1_db_at,
     "calc.audio.lossy_integrator.db_at": lossy_integrator_db_at,
     "calc.audio.butterworth.q": butterworth_q,
+    "calc.audio.butterworth.db_at": butterworth_db_at,
+    "calc.audio.noninv_gain.db": noninv_gain_db,
     "calc.audio.sallen_key.c1": sallen_key_c1,
     "calc.audio.sallen_key.c2": sallen_key_c2,
     "calc.rf.tot.period": tot_period,
@@ -1656,6 +1683,8 @@ __all__ = [
     "bjt_bias_ic",
     "bjt_bias_ic_a",
     "bpf_dissipation_loss",
+    "butterworth_db",
+    "butterworth_db_at",
     "butterworth_pair_q",
     "butterworth_q",
     "crystal_ladder",
@@ -1671,6 +1700,8 @@ __all__ = [
     "emphasis_corner_hz",
     "emphasis_db",
     "emphasis_db_at",
+    "noninv_gain_db",
+    "noninv_gain_db_value",
     "fm_obw99",
     "fm_obw99_hz",
     "fm_pm_drive_limit",

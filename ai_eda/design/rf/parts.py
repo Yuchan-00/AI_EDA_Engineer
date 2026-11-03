@@ -355,8 +355,74 @@ _ROWS: tuple[PartDef, ...] = (
             status="alternate", unverified=("500 mA rating [UNVERIFIED: ST LF50 datasheet]",)),
 )
 
+#: the UHF breadboard radio (``radio_build = uhf_breadboard``): through-hole parts a perfboard takes, except the BFR92A (SOT-23, on an adapter or
+#: soldered dead-bug onto copper - no through-hole part of the library reaches 432 MHz) and the trimmer capacitors (the library has SMD trimmers only)
+_BB_ROWS: tuple[PartDef, ...] = (
+    PartDef("bb_res", "resistor, 1/4 W axial (through-hole, 7.62 mm pitch)", ("Device", "R"),
+            ("Resistor_THT", "R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"), _two(), "R at its value", symmetric=True),
+    PartDef("bb_cap", "ceramic disc capacitor (through-hole, 2.5 mm pitch; at UHF the leads cut as short as the board allows)", ("Device", "C"),
+            ("Capacitor_THT", "C_Disc_D3.0mm_W1.6mm_P2.50mm"), _two(), "C at its value", symmetric=True,
+            unverified=("a sub-picofarad coupling capacitor (the band-pass's 0.2 pF couplings) is a 'gimmick' of two twisted insulated wires trimmed in the lab "
+                        "[UNVERIFIED: no catalogue part]",)),
+    PartDef("bb_cap_elec", "electrolytic capacitor (radial, through-hole)", ("Device", "C_Polarized"), ("Capacitor_THT", "CP_Radial_D5.0mm_P2.00mm"),
+            (PinSpec("+", number="1", assumption=CP_POLARITY), PinSpec("-", number="2", assumption=CP_POLARITY)), "C at its value",
+            unverified=("the + terminal is pin 1 by pin number: the library pins carry no names (choice cp_polarity) [UNVERIFIED: footprint polarity mark]",)),
+    PartDef("bb_coil", "hand-wound air coil or axial RF choke (through-hole, 7.62 mm pitch); the turns, diameter and wire are lab items", ("Device", "L"),
+            ("Inductor_THT", "L_Axial_L5.3mm_D2.2mm_P7.62mm_Horizontal_Vishay_IM-1"), _two(),
+            "L at its value; in a fixture with a series R from model.bb.coil_q", symmetric=True,
+            unverified=("the inductance and Q of a hand-wound coil (wind, then measure or tune with the trimmer) [UNVERIFIED: a VNA or dip-meter measurement]",)),
+    PartDef("bb_ctrim", "trimmer capacitor (tank / band-pass / super-regenerative detector tuning)", ("Device", "C_Trim"),
+            ("Capacitor_SMD", "C_Trimmer_Murata_TZC3"), _two(), "C at its design value (the trimmer set there)", symmetric=True,
+            unverified=("C_min / C_max covering the design value and which pad is the rotor (the library pins carry no names) [UNVERIFIED: Murata TZC3 datasheet]",)),
+    PartDef("bb_xtal", "VXO crystal (HC-49/U, fundamental mode, f_c / 12)", ("Device", "Crystal"), ("Crystal", "Crystal_HC49-U_Vertical"),
+            (PinSpec("1", name="1"), PinSpec("2", name="2")), "excluded (the VXO is a lab item)", symmetric=True,
+            unverified=("a fundamental-mode crystal at f_c / 12 (a custom frequency unless f_c = 432.000 MHz, 36.000 MHz stock), its pulling range and "
+                        "load capacitance [UNVERIFIED: crystal datasheet]",)),
+    PartDef("bb_varactor", "VXO varactor (a BB910-class tuning diode in DO-35)", ("Device", "D_Capacitance"),
+            ("Diode_THT", "D_DO-35_SOD27_P7.62mm_Horizontal"), _named("K", "A"), "excluded (the VXO is a lab item)",
+            unverified=("C(V) of the fitted varactor (about 20-40 pF at 2-4 V reverse) [UNVERIFIED: BB910 datasheet]",)),
+    PartDef("bb_diode", "1N4148 switching diode (soft limiter, output-stage bias, T/R switch, relay-free supply clamp)", ("Diode", "1N4148"),
+            ("Diode_THT", "D_DO-35_SOD27_P7.62mm_Horizontal"), _named("K", "A"), "D card of model.diode; T/R fixture states R / C",
+            unverified=("1N4148 at 432 MHz as a T/R switch: no PIN diode, so its loss and isolation are lab items [UNVERIFIED: 1N4148 datasheet]",)),
+    PartDef("bb_schottky", "1N5817 reverse-polarity diode in series with the battery", ("Diode", "1N5817"),
+            ("Diode_THT", "D_DO-41_SOD81_P10.16mm_Horizontal"), _named("K", "A"), "excluded (the rails are DC sources in the deck)",
+            unverified=("forward drop about 0.3-0.45 V at the board's current [UNVERIFIED: 1N5817 datasheet]",)),
+    PartDef("bb_npn_osc", "2N3904 VXO transistor (TO-92)", ("Transistor_BJT", "2N3904"), ("Package_TO_SOT_THT", "TO-92_Inline"), _named("E", "B", "C"),
+            "excluded (the VXO is a lab item)", unverified=("2N3904 f_T about 300 MHz: ample at 36 MHz [UNVERIFIED: 2N3904 datasheet]",)),
+    PartDef("bb_npn_x3", "BF199 tripler transistor (TO-92)", ("Transistor_BJT", "BF199"), ("Package_TO_SOT_THT", "TO-92_Inline"), _named("C", "E", "B"),
+            "excluded (no BF199 model); its port model model.bf199.r_out in the tank fixture",
+            unverified=("BF199 f_T about 550 MHz and its TO-92 pin order C / E / B, read from the KiCad library [UNVERIFIED: BF199 datasheet]",)),
+    PartDef("bb_npn_rf", "BFR92A wideband NPN (SOT-23 on a perfboard adapter): x2 / x2 multipliers, PA, RF amplifier, super-regenerative detector",
+            ("Transistor_BJT", "BFR92"), _SOT23, _named("B", "E", "C"), "excluded (port models model.bfr92.* in the fixtures)",
+            unverified=("BFR92A f_T about 5 GHz, I_C max about 25 mA, P_tot about 300 mW and the SOT-23 pin order [UNVERIFIED: NXP BFR92A datasheet]",)),
+    PartDef("bb_npn_out", "BD139 output transistor (TO-126)", ("Transistor_BJT", "BD139"), ("Package_TO_SOT_THT", "TO-126-3_Vertical"),
+            _named("E", "C", "B"), "Q card of model.npn (generic)", unverified=("BD139 ratings [UNVERIFIED: BD139 datasheet]",)),
+    PartDef("bb_pnp_out", "BD140 output transistor (TO-126)", ("Transistor_BJT", "BD140"), ("Package_TO_SOT_THT", "TO-126-3_Vertical"),
+            _named("E", "C", "B"), "Q card of model.pnp (generic)", unverified=("BD140 ratings [UNVERIFIED: BD140 datasheet]",)),
+    PartDef("bb_opamp", "TL071 single op-amp (DIP-8): every audio stage (the dual TL072 is a multi-unit symbol the compilers refuse)",
+            ("Amplifier_Operational", "TL071"), ("Package_DIP", "DIP-8_W7.62mm"),
+            (PinSpec("OUT", unnamed_type="output"), PinSpec("NULL", name="NULL", count=2), *_named("-", "+", "V-", "V+")),
+            "X card of model.opamp (generic single-pole macro; the supply and offset-null pins are ignored)",
+            unverified=("on a single 9 V supply the TL071's inputs need about 3-4 V from either rail and its output swings to about 1.5 V from them: every stage "
+                        "sits on a mid-supply reference [UNVERIFIED: TI TL071 datasheet]",)),
+    PartDef("bb_reg5", "L78L05 5 V regulator (TO-92)", ("Regulator_Linear", "L78L05_TO92"), ("Package_TO_SOT_THT", "TO-92_Inline"),
+            _named("VO", "GND", "VI"), "excluded (no model); its output rail is a DC source in the deck",
+            unverified=("100 mA output and about 1.7 V dropout [UNVERIFIED: ST L78L05 datasheet]",)),
+    PartDef("bb_trimpot", "trimmer potentiometer (Bourns 3386P, through-hole): deviation and regeneration", ("Device", "R_Potentiometer_Trim"),
+            ("Potentiometer_THT", "Potentiometer_Bourns_3386P_Vertical"), (PinSpec("END1", name="1"), PinSpec("WIPER", name="2"), PinSpec("END3", name="3")),
+            "X card of the potentiometer model, or excluded"),
+    PartDef("bb_sw_slide", "SPDT slide switch (through-hole): power on / off, transmit / receive", ("Switch", "SW_SPDT"),
+            ("Button_Switch_THT", "SW_Slide_SPDT_Straight_CK_OS102011MS2Q"), _named("A", "B", "C"),
+            "excluded (no switch model); each position is the rails' DC sources in the deck",
+            unverified=("contact rating and the pad of the common terminal B [UNVERIFIED: C&K OS102011MS2Q datasheet]",)),
+    PartDef("bb_header_2", "2-pin header (9 V battery snap, speaker)", ("Connector_Generic", "Conn_01x02"),
+            ("Connector_PinHeader_2.54mm", "PinHeader_1x02_P2.54mm_Vertical"), _named("Pin_1", "Pin_2"), "excluded (connector)"),
+    PartDef("bb_sma", "SMA antenna / dummy-load connector (through-hole, vertical)", ("Connector", "Conn_Coaxial"),
+            ("Connector_Coaxial", "SMA_Amphenol_132134_Vertical"), _named("In", "Ext"), "excluded; a fixture port of the system impedance"),
+)
+
 #: every usable row, by key
-PARTS: dict[str, PartDef] = {p.key: p for p in _ROWS}
+PARTS: dict[str, PartDef] = {p.key: p for p in (*_ROWS, *_BB_ROWS)}
 
 
 @dataclass(frozen=True)

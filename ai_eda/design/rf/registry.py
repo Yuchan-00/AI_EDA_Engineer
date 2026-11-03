@@ -16,13 +16,16 @@ audio_ptt``), ``kr447_rx_backend`` (stage 2, ``rx_backend``),
 two build variants). Each triggers only on its own confirmed
 ``radio_build`` value(s) (``Template.triggered_by``), so at most one of them
 is ever selected and none triggers without ``radio_build``; the base five
-never read ``radio_build``.
+never read ``radio_build``. Last, ``uhf_fm_breadboard`` (``radio_build =
+uhf_breadboard``): a discrete perfboard radio for the amateur 430-440 MHz
+band, outside the KR 447 MHz staging.
 """
 
 from __future__ import annotations
 
 from ai_eda.design.base import Template
 from ai_eda.design.rf.t_audio_ptt import KR447_AUDIO_PTT
+from ai_eda.design.rf.t_breadboard import UHF_FM_BREADBOARD
 from ai_eda.design.rf.t_rx_backend import KR447RxBackendTemplate
 from ai_eda.design.rf.t_rx_frontend import KR447RxFrontendTemplate
 from ai_eda.design.rf.t_transceiver import KR447_TRANSCEIVER
@@ -35,6 +38,7 @@ RF_TEMPLATES: list[Template] = [
     KR447RxFrontendTemplate(),
     KR447_TX_EXCITER,
     KR447_TRANSCEIVER,
+    UHF_FM_BREADBOARD,
 ]
 
 __all__ = ["RF_TEMPLATES"]

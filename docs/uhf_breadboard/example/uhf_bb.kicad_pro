@@ -1,0 +1,11 @@
+{
+  "board": {
+    "design_settings": {
+      "rules": {}
+    }
+  },
+  "meta": {
+    "filename": "uhf_bb.kicad_pro",
+    "version": 3
+  }
+}

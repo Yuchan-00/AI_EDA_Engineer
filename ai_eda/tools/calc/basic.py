@@ -26,7 +26,9 @@ from ai_eda.ir.provenance import Traced, derived
 #: their recorded version and hash; the recompute never compares the version)
 #: 0.11: the top-C network between loaded ports (``calc.rf.resonator.top_c.port_r`` / ``.port_x`` / ``.c_tap_reactive`` /
 #: ``.ported_s21_db`` / ``.ported_rel_s21_db``: a collector feed choke on the source port, a base divider on the load port)
-CALC_VERSION = "0.11"
+#: 0.12: the non-inverting op-amp stage's gain (``calc.audio.noninv_gain.db``) and the Butterworth low-pass response
+#: (``calc.audio.butterworth.db_at``), for the UHF breadboard radio's audio stages
+CALC_VERSION = "0.12"
 
 #: tool id -> input roles, in the calculator's parameter order
 ROLES: dict[str, tuple[str, ...]] = {
@@ -192,6 +194,8 @@ ROLES: dict[str, tuple[str, ...]] = {
     "calc.audio.lowpass1.db_at": ("f", "f_c"),
     "calc.audio.lossy_integrator.db_at": ("f", "tau_i", "r_in", "r_dc"),
     "calc.audio.butterworth.q": ("n", "k"),
+    "calc.audio.butterworth.db_at": ("n", "f", "f_c"),
+    "calc.audio.noninv_gain.db": ("r_f", "r_g"),
     "calc.audio.sallen_key.c1": ("q", "f_c", "r"),
     "calc.audio.sallen_key.c2": ("q", "f_c", "r"),
     "calc.rf.tot.period": ("k_rc", "r", "c"),
@@ -362,6 +366,8 @@ ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.audio.lowpass1.db_at": ("Hz", "Hz"),
     "calc.audio.lossy_integrator.db_at": ("Hz", "s", "ohm", "ohm"),
     "calc.audio.butterworth.q": (None, None),
+    "calc.audio.butterworth.db_at": (None, "Hz", "Hz"),
+    "calc.audio.noninv_gain.db": ("ohm", "ohm"),
     "calc.audio.sallen_key.c1": (None, "Hz", "ohm"),
     "calc.audio.sallen_key.c2": (None, "Hz", "ohm"),
     "calc.rf.tot.period": (None, "ohm", "F"),

@@ -38,7 +38,7 @@ needs_libs = pytest.mark.skipif(not HAS_LIBS, reason="KiCad 10 libraries with th
 
 #: every radio_build in the design's staging order (§2.0 table) -> its template id (the two transceiver builds are one template)
 STAGES = {"audio_ptt": "kr447_audio_ptt", "rx_backend": "kr447_rx_backend", "rx_frontend": "kr447_rx_frontend", "tx_exciter": "kr447_tx_exciter",
-          "transceiver": "kr447_transceiver", "transceiver_conducted": "kr447_transceiver"}
+          "transceiver": "kr447_transceiver", "transceiver_conducted": "kr447_transceiver", "uhf_breadboard": "uhf_fm_breadboard"}
 #: the registry's template ids, in order
 TEMPLATE_IDS = list(dict.fromkeys(STAGES.values()))
 #: what each build's project states (the family's needs), beside radio_build
@@ -49,6 +49,7 @@ STATED = {
     "tx_exciter": {"input_voltage": "7.4 V", "modulation": "FM", "carrier_frequency": "447.5625 MHz"},
     "transceiver": {"input_voltage": "7.4 V", "modulation": "FM", "carrier_frequency": "447.5625 MHz"},
     "transceiver_conducted": {"input_voltage": "7.4 V", "modulation": "FM", "carrier_frequency": "447.5625 MHz"},
+    "uhf_breadboard": {"input_voltage": "9 V", "modulation": "FM", "carrier_frequency": "432 MHz"},
 }
 #: the base five's sample requirements (tests/test_circuit_templates.py, tests/test_atmega128_template.py)
 BASE_FIVE = {

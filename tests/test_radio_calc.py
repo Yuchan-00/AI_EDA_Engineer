@@ -59,8 +59,8 @@ def w(f: float) -> float:
 
 
 def test_every_radio_calculator_is_registered_with_its_roles_units_and_the_new_version() -> None:
-    assert CALC_VERSION == "0.11"
-    assert len(R.RADIO_CALCULATORS) == 62
+    assert CALC_VERSION == "0.12"
+    assert len(R.RADIO_CALCULATORS) == 64
     for tool, fn in R.RADIO_CALCULATORS.items():
         assert CALCULATORS[tool] == (fn, ROLES[tool])
         params = [p for p in inspect.signature(fn).parameters if p != "ids"]
@@ -75,7 +75,7 @@ def test_every_radio_calculator_is_registered_with_its_roles_units_and_the_new_v
 def test_a_traced_radio_value_records_its_tool_roles_and_version() -> None:
     lo = R.superhet_lo(U(FC, "Hz"), U(IF1, "Hz"), U(-1.0), ("req.carrier_frequency", "rf.if1", "rf.lo1_side"))
     assert lo.value == pytest.approx(426.1625e6, abs=1e-6) and lo.unit == "Hz"
-    assert lo.provenance.tool == "calc.rf.superhet.lo" and lo.provenance.tool_version == "0.11"
+    assert lo.provenance.tool == "calc.rf.superhet.lo" and lo.provenance.tool_version == "0.12"
     assert lo.provenance.inputs == {"f": "req.carrier_frequency", "f_if": "rf.if1", "side": "rf.lo1_side"}
     assert lo.provenance.derived_from == ["req.carrier_frequency", "rf.if1", "rf.lo1_side"]
     assert "LO = f + side IF" in (lo.provenance.note or "")
@@ -454,7 +454,7 @@ def test_the_ported_top_c_network_absorbs_the_collector_choke_and_loads_the_next
     ids = ("r_port", "l_port", "q_port", "f0")
     pr = R.top_c_port_r(U(1000.0, "ohm"), U(l_ch, "H"), U(q), U(f0, "Hz"), ids)
     px = R.top_c_port_x(U(1000.0, "ohm"), U(l_ch, "H"), U(q), U(f0, "Hz"), ids)
-    assert (pr.value, px.value) == pytest.approx((z.real, z.imag), rel=1e-12) and pr.unit == px.unit == "ohm" and pr.provenance.tool_version == "0.11"
+    assert (pr.value, px.value) == pytest.approx((z.real, z.imag), rel=1e-12) and pr.unit == px.unit == "ohm" and pr.provenance.tool_version == "0.12"
     assert pr.value == pytest.approx(660.44, abs=0.01) and px.value == pytest.approx(461.22, abs=0.01)  # the choke is of the port's order
     p = R.top_c_ported_network(2, f0, bw, l, 1000, l_ch, q, 500, r_eff)
     for f in (f0, f0 - FT, f0 + FT):
