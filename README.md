@@ -1,5 +1,7 @@
 # AI EDA ENGINEER
 
+> **English summary.** A verification-first AI system for electronic circuit design. It takes a natural-language requirement through requirements → parts & regulatory research → Universal Circuit IR → calculations / SPICE → KiCad schematic & PCB → ERC / DRC → manufacturing outputs → independent review → auto-fix. The LLM only proposes and orchestrates; facts come from the IR, provenance, deterministic tools (calculators, ngspice, KiCad ERC/DRC, manufacturing checks) and an independent reviewer. Install with the one-line command below, then run `ai-eda doctor` and `ai-eda gui --open`. The rest of this README, the generated reports and the GUI are in Korean.
+
 자연어 회로 설계 요구사항 → 요구사항 분석 → 부품/규제 조사 → **Universal Circuit IR** → 계산/SPICE → KiCad 회로도/PCB → ERC/DRC → 제조 산출물 → 독립 검토 → 자동 수정, 까지를 하나의 검증 우선(verification‑first) 파이프라인으로 수행하는 AI 기반 전자회로 설계 엔지니어링 시스템의 **아키텍처 스캐폴드**입니다.
 
 핵심 원칙: **LLM은 설계의 진실을 결정하지 않는다.** LLM은 제안·조율(orchestration)만 하고, 사실은 IR + provenance + 결정론적 도구(계산기, SPICE, KiCad ERC/DRC, 제조파일 검사) + 독립 리뷰어가 결정합니다.
