@@ -1,0 +1,56 @@
+"Commons Clause" License Condition v1.0
+
+The Software is provided to you by the Licensor under the License, as defined
+below, subject to the following condition.
+
+Without limiting other conditions in the License, the grant of rights under
+the License will not include, and the License does not grant to you, the right
+to Sell the Software.
+
+For purposes of the foregoing, "Sell" means practicing any or all of the
+rights granted to you under the License to provide to third parties, for a fee
+or other consideration (including without limitation fees for hosting or
+consulting/ support services related to the Software), a product or service
+whose value derives, entirely or substantially, from the functionality of the
+Software. Any license notice or attribution required by the License must also
+include this Commons Clause License Condition notice.
+
+Software: AI EDA ENGINEER (the `ai-eda-engineer` Python package `ai_eda`, its
+tests, installers and documentation: every file in this repository)
+
+License: MIT License (below)
+
+Licensor: Yuchan (github.com/Yuchan-00)
+
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 Yuchan (github.com/Yuchan-00)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+Korean summary (the English text above governs / 영문이 우선함): 누구나 무료로
+사용, 복제, 수정, 배포할 수 있습니다(MIT). 단, 이 소프트웨어의 기능에서 가치가
+전부 또는 대부분 나오는 제품이나 서비스를 대가를 받고 제3자에게 제공하는 것
+(호스팅, 컨설팅/지원 포함)은 허용되지 않습니다(Commons Clause). 사본과 파생물에는
+위 저작권 고지와 이 조건 전문을 함께 넣어야 합니다. 판매를 원하면 저작권자와
+별도 계약이 필요합니다.
