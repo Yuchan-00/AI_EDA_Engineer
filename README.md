@@ -108,3 +108,7 @@ install.sh, install.ps1, install.cmd   one-line installers
 ```
 
 Run the tests with `python -m pytest -q -p no:cacheprovider -rs`. Without KiCad and ngspice the tool tests skip, and a green run without them is not tool verification.
+
+## License
+
+MIT License with the Commons Clause License Condition v1.0, see [LICENSE](LICENSE). You may use, copy, modify and share this software free of charge; you may not sell it, or a product or service whose value comes substantially from it (hosting and paid support included), without a separate agreement with the author. Because of that restriction it is source-available rather than OSI-approved open source.
