@@ -133,23 +133,27 @@ def template_library(root: Path, *, led: bool = True, led_pin_names: tuple[str, 
     ``2 = B`` (input), ``3 = C`` (passive) like KiCad 10's ``Q_NPN_EBC``, with THT footprints for the astable.
     """
     two = lambda: [_pin("1", "~", -5.08, 0), _pin("2", "~", 5.08, 180)]  # noqa: E731
-    symbols = [_symbol("R", "R", two(), "Resistor_SMD:R_0603_1608Metric"), _symbol("C", "C", two(), "Capacitor_SMD:C_0603_1608Metric")]
+    symbols = [_symbol("R", "R", two(), "Resistor_SMD:R_0603_1608Metric"), _symbol("C", "C", two(), "Capacitor_SMD:C_0603_1608Metric"),
+               _symbol("L", "L", two(), "Inductor_SMD:L_0805_2012Metric")]
     if led:
         symbols.append(_symbol("LED", "D", [_pin("1", led_pin_names[0], -5.08, 0), _pin("2", led_pin_names[1], 5.08, 180)], "LED_SMD:LED_0603_1608Metric"))
     conn = _lib(
         _symbol("Conn_01x02", "J", [_pin("1", "Pin_1", -5.08, 0), _pin("2", "Pin_2", 5.08, 180)], "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"),
         _symbol("Conn_01x03", "J", [_pin("1", "Pin_1", -7.62, 0), _pin("2", "Pin_2", 0, 90), _pin("3", "Pin_3", 7.62, 180)], "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"),
+        _symbol("Conn_01x04", "J", [_pin("1", "Pin_1", -7.62, 0), _pin("2", "Pin_2", -2.54, 90), _pin("3", "Pin_3", 2.54, 270), _pin("4", "Pin_4", 7.62, 180)], "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical"),
     )
     e, b, c = npn_pin_names
     bjt = _lib(_symbol("2N3904", "Q", [_pin("1", e, 2.54, 90, y=-5.08), _pin("2", b, -5.08, 0, "input"), _pin("3", c, 2.54, 270, y=5.08)], "Package_TO_SOT_THT:TO-92_Inline"))
+    diode = _lib(_symbol("1N4001", "D", [_pin("1", "K", -5.08, 0), _pin("2", "A", 5.08, 180)], "Diode_THT:D_DO-41_SOD81_P10.16mm_Horizontal"))  # KiCad 10's 1N4001: 1 = K, 2 = A
     (root / "symbols").mkdir(parents=True, exist_ok=True)
     (root / "symbols" / "Device.kicad_sym").write_text(sexpr.dumps(_lib(*symbols)), encoding="utf-8")
     (root / "symbols" / "Connector_Generic.kicad_sym").write_text(sexpr.dumps(conn), encoding="utf-8")
     (root / "symbols" / "Transistor_BJT.kicad_sym").write_text(sexpr.dumps(bjt), encoding="utf-8")
-    for lib, name, n, tht in (("Resistor_SMD", "R_0603_1608Metric", 2, False), ("Capacitor_SMD", "C_0603_1608Metric", 2, False), ("LED_SMD", "LED_0603_1608Metric", 2, False),
-                              ("Connector_PinHeader_2.54mm", "PinHeader_1x02_P2.54mm_Vertical", 2, False), ("Connector_PinHeader_2.54mm", "PinHeader_1x03_P2.54mm_Vertical", 3, False),
+    (root / "symbols" / "Diode.kicad_sym").write_text(sexpr.dumps(diode), encoding="utf-8")
+    for lib, name, n, tht in (("Resistor_SMD", "R_0603_1608Metric", 2, False), ("Capacitor_SMD", "C_0603_1608Metric", 2, False), ("Inductor_SMD", "L_0805_2012Metric", 2, False), ("LED_SMD", "LED_0603_1608Metric", 2, False),
+                              ("Connector_PinHeader_2.54mm", "PinHeader_1x02_P2.54mm_Vertical", 2, False), ("Connector_PinHeader_2.54mm", "PinHeader_1x03_P2.54mm_Vertical", 3, False), ("Connector_PinHeader_2.54mm", "PinHeader_1x04_P2.54mm_Vertical", 4, False),
                               ("Resistor_THT", "R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal", 2, True), ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm", 2, True),
-                              ("Package_TO_SOT_THT", "TO-92_Inline", 3, True)):
+                              ("Package_TO_SOT_THT", "TO-92_Inline", 3, True), ("Diode_THT", "D_DO-41_SOD81_P10.16mm_Horizontal", 2, True)):
         pretty = root / "footprints" / f"{lib}.pretty"
         pretty.mkdir(parents=True, exist_ok=True)
         sexpr.dump_file(_footprint(name, n, tht), pretty / f"{name}.kicad_mod")
@@ -211,7 +215,9 @@ def test_first_run_presents_the_table_and_applies_nothing(tmp_path: Path):
     assert "req.input_voltage: input_voltage = 12 V (stated as '12 V')" in question
     assert "req.output_voltage: output_voltage = 5 V (stated as '5 V')" in question
     assert "r2 = 10000 ohm - lower resistor" in question and "tol_rel = 0.01 - relative tolerance" in question
-    assert "r1 = 14000 ohm [calc.divider.r1_for_v_out from v_in, v_out_target, r2]" in question
+    # the solved R1 and the part: 13k / 15k (E24) miss the 1 % output tolerance, so R1 is the E96 value 14.0k
+    assert "r1_ideal = 14000 ohm [calc.divider.r1_for_v_out from v_in, v_out_target, r2]" in question
+    assert "r1 = 14000 ohm [calc.e_series.e96.nearest from r1_ideal]" in question
     assert "R1 Device:R / Resistor_SMD:R_0603_1608Metric, value 14k (pins 1, 2 from " in question
     assert "J1 Connector_Generic:Conn_01x03 / Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical" in question
     assert "VOUT (signal): J1.2, R1.2, R2.1" in question and "v(VOUT) = 5 V +/- 1% verifies req.output_voltage" in question
@@ -236,7 +242,7 @@ def test_confirm_applies_the_divider_with_the_choices_as_user_values(tmp_path: P
     ids_before = [r.id for r in ir.requirements.requirements]
     state, ctx = _confirm(ir, tmp_path, lib, None)
     out = state.outcome(Stage.ARCHITECTURE)
-    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"17 proposal(s) applied, nothing verified; template divider v{TEMPLATE_VERSION} confirmed by the user: 17 proposal(s)")
+    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"18 proposal(s) applied, nothing verified; template divider v{TEMPLATE_VERSION} confirmed by the user: 18 proposal(s)")
     assert "design choices recorded as the user's values: r2 = 10000 ohm" in out.message
     assert [q.key for q in out.questions] == ["output_current"] and not out.questions[0].required  # advisory, the real key
     assert not state.blocked and state.outcomes[-1].stage is Stage.RELEASE and state.outcomes[-1].status is not S.PASS
@@ -246,15 +252,16 @@ def test_confirm_applies_the_divider_with_the_choices_as_user_values(tmp_path: P
     assert [c.ref for c in ir.components] == ["R1", "R2", "J1"] and [n.name for n in ir.nets] == ["VIN", "VOUT", "GND"]
     assert ir.topology.name == "resistive divider" and [c.id for c in ir.constraints] == ["c.divider.unloaded"]
     p = ir.parameters
-    assert list(p) == ["v_in", "v_out_target", "r2", "r1", "v_out", "tol_rel"]
+    assert list(p) == ["v_in", "v_out_target", "r2", "r1_ideal", "r1", "v_out", "tol_rel"]
     for key, rid, value in (("v_in", "req.input_voltage", 12.0), ("v_out_target", "req.output_voltage", 5.0)):
         assert p[key].value == value and p[key].provenance.kind is ProvenanceKind.USER_REQUIREMENT
         assert p[key].provenance.derived_from == [rid] and p[key].provenance.note.startswith(f"parsed from {rid}: ")
     for key in ("r2", "tol_rel"):
         assert p[key].provenance.kind is ProvenanceKind.USER_REQUIREMENT and p[key].provenance.tool is None
         assert p[key].provenance.note.startswith(f"{CHOICE_NOTE_PREFIX}; template divider v{TEMPLATE_VERSION}: {key} = ")
-    assert p["r1"].value == 14000.0 and p["r1"].unit == "ohm" and p["r1"].provenance.tool == "calc.divider.r1_for_v_out"
-    assert p["r1"].provenance.inputs == {"v_in": "v_in", "v_out": "v_out_target", "r2": "r2"} and p["r1"].provenance.tool_version == CALC_VERSION
+    assert p["r1_ideal"].value == 14000.0 and p["r1_ideal"].unit == "ohm" and p["r1_ideal"].provenance.tool == "calc.divider.r1_for_v_out"
+    assert p["r1_ideal"].provenance.inputs == {"v_in": "v_in", "v_out": "v_out_target", "r2": "r2"} and p["r1_ideal"].provenance.tool_version == CALC_VERSION
+    assert p["r1"].value == 14000.0 and p["r1"].unit == "ohm" and p["r1"].provenance.tool == "calc.e_series.e96.nearest" and p["r1"].provenance.inputs == {"x": "r1_ideal"}
     assert p["v_out"].value == 5.0 and p["v_out"].provenance.tool == "calc.divider.v_out"
     r1 = ir.component("R1")
     assert r1.electrical["resistance"].value == r1.spice.value.value == 14000.0 and r1.value == "14k" and r1.symbol.verified and r1.footprint.verified
@@ -266,8 +273,8 @@ def test_confirm_applies_the_divider_with_the_choices_as_user_values(tmp_path: P
     assert exp.tol_rel.value == 0.01 and exp.tol_rel.provenance.kind is ProvenanceKind.USER_REQUIREMENT
     # verification: only computed values are recomputed, no assumption / model value anywhere
     rec = recompute_parameters(ir)
-    assert rec.status is S.PASS and rec.message == "5 value(s) recomputed"
-    assert set(rec.details["parameters"]) == {"r1", "v_out", "components[R1].electrical[resistance]", "components[R1].spice.value", "simulation.expectations[v_out].nominal"}
+    assert rec.status is S.PASS and rec.message == "6 value(s) recomputed"
+    assert set(rec.details["parameters"]) == {"r1_ideal", "r1", "v_out", "components[R1].electrical[resistance]", "components[R1].spice.value", "simulation.expectations[v_out].nominal"}
     validators = _validate(ir, tmp_path, lib)
     assert validators["ir.assumptions"] is S.PASS and validators["ir.llm_requirements"] is S.PASS and validators["ir.connectivity"] is S.PASS
     assert ir.validation.latest("calc.recompute").status is S.PASS
@@ -427,6 +434,18 @@ def test_agent_refuses_a_non_empty_design_a_parameter_clash_and_a_missing_librar
     assert f"{CONFIRM_DESIGN_KEY} ignored: no template to confirm" in out.message
 
 
+def test_a_confirmation_beside_a_refused_template_is_ignored_with_the_fourth_reason(tmp_path: Path):
+    # the template matches but refuses (a load a divider cannot supply): the plan proposes nothing, so a
+    # confirm_design=yes given in the same run has nothing to apply and says so - the fourth of the four reasons
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path)
+    state, _ = _run(ir, tmp_path, lib, {**BASE, **DIVIDER, "output_current": "2 A", CONFIRM_DESIGN_KEY: "yes"})
+    out = state.outcome(Stage.ARCHITECTURE)
+    assert ir.components == [] and not state.blocked
+    assert "template divider not proposed: the request needs 5 V at 2 A from 12 V (req.output_current)" in out.message
+    assert f"{CONFIRM_DESIGN_KEY} ignored: template divider proposes nothing" in out.message
+
+
 # --------------------------------------------------------------------------- inputs: whole-string parse, aliases, ambiguity, unconfirmed values
 
 
@@ -524,13 +543,15 @@ def test_led_template_wires_by_pin_name_and_models_the_led_as_a_confirmed_choice
     ir = _ir(tmp_path, "led")
     question = _present(ir, tmp_path, lib, LED)
     assert "led_model: ideal constant-V_f LED: D1 is excluded from the netlist and replaced by the stimulus VLED = v_f" in question
-    assert "req.led_forward_current: led_forward_current = 0.01 A (stated as '10 mA')" in question and "r_led = 300 ohm [calc.led.R from v_in, v_f, i_f]" in question
+    assert "req.led_forward_current: led_forward_current = 0.01 A (stated as '10 mA')" in question and "r_led_ideal = 300 ohm [calc.led.R from v_in, v_f, i_f]" in question
+    assert "r_led = 300 ohm [calc.e_series.e24.nearest from r_led_ideal]" in question
     state, ctx = _confirm(ir, tmp_path, lib, None)
-    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"16 proposal(s) applied, nothing verified; template led v{TEMPLATE_VERSION} confirmed by the user: 16 proposal(s)")
+    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"17 proposal(s) applied, nothing verified; template led v{TEMPLATE_VERSION} confirmed by the user: 17 proposal(s)")
     assert [c.ref for c in ir.components] == ["R1", "D1", "J1"]
     p = ir.parameters
-    assert list(p) == ["v_in", "v_f", "i_f", "r_led", "i_led", "tol_rel"]
-    assert p["r_led"].value == 300.0 and p["r_led"].provenance.tool == "calc.led.R" and p["r_led"].provenance.inputs == {"v_supply": "v_in", "v_f": "v_f", "i_f": "i_f"}
+    assert list(p) == ["v_in", "v_f", "i_f", "r_led_ideal", "r_led", "i_led", "tol_rel"]
+    assert p["r_led_ideal"].value == 300.0 and p["r_led_ideal"].provenance.tool == "calc.led.R" and p["r_led_ideal"].provenance.inputs == {"v_supply": "v_in", "v_f": "v_f", "i_f": "i_f"}
+    assert p["r_led"].value == 300.0 and p["r_led"].provenance.tool == "calc.e_series.e24.nearest" and p["r_led"].provenance.inputs == {"x": "r_led_ideal"}
     assert p["i_led"].value == pytest.approx(0.01) and p["i_led"].provenance.tool == "calc.led.I" and p["i_led"].provenance.inputs == {"v_supply": "v_in", "v_f": "v_f", "r": "r_led"}
     d1 = ir.component("D1")
     assert [(pin.number, pin.name) for pin in d1.pins] == [("1", "K"), ("2", "A")]
@@ -542,7 +563,7 @@ def test_led_template_wires_by_pin_name_and_models_the_led_as_a_confirmed_choice
     exp = ir.simulation.expectations[0]
     assert exp.vector == "i(VLED)" and exp.nominal.provenance.tool == "calc.led.I" and exp.requirement_id == "req.led_forward_current"
     assert "current through the ideal source VLED that replaces D1" in exp.provenance.note
-    assert recompute_parameters(ir).message == "5 value(s) recomputed" and _validate(ir, tmp_path, lib)["ir.assumptions"] is S.PASS
+    assert recompute_parameters(ir).message == "6 value(s) recomputed" and _validate(ir, tmp_path, lib)["ir.assumptions"] is S.PASS
     assert _netlist(ir, tmp_path, lib) == "led\nR1 VCC LED_A 300\nVVIN VCC 0 DC 5\nVVLED LED_A 0 DC 2\n.end\n"
     assert state.outcome(Stage.PCB).status is S.PASS and state.outcome(Stage.SCHEMATIC).status is S.PASS
     assert IndependentReviewer(tools=ctx.tools).check_requirements_vs_ir(ir, tmp_path).status is S.PASS
@@ -584,6 +605,38 @@ def test_led_current_is_measured_through_the_ideal_source_and_the_review_says_so
     assert rep.details["quantity_version"] == QUANTITY_VERSION
 
 
+# --------------------------------------------------------------------------- standard part values (E series)
+
+
+def _built(tmp_path: Path, name: str, answers: dict[str, str]) -> CircuitIR:
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path, name)
+    _present(ir, tmp_path, lib, answers)
+    _confirm(ir, tmp_path, lib, None)
+    return ir
+
+
+def test_led_resistor_is_a_value_that_is_sold_and_the_current_is_recomputed_from_it(tmp_path: Path):
+    """5 V, V_f 2.1 V, 7 mA solves R = 414.29 ohm (no part); E24 430 ohm gives 6.74 mA (3.7 % off, over the 2 %), E96 412 ohm 7.04 mA."""
+    ir = _built(tmp_path, "led", {"input_voltage": "5 V", "led_forward_voltage": "2.1 V", "led_forward_current": "7 mA"})
+    p = ir.parameters
+    assert p["r_led_ideal"].value == pytest.approx(414.2857142857143) and p["r_led"].value == 412.0 and p["r_led"].provenance.tool == "calc.e_series.e96.nearest"
+    assert ir.component("R1").value == "412" and ir.component("R1").spice.value.value == 412.0 and ir.component("R1").electrical["resistance"].value == 412.0
+    assert p["i_led"].value == pytest.approx(2.9 / 412.0) and abs(p["i_led"].value / 7e-3 - 1.0) < 0.02
+    assert ir.simulation.expectations[0].nominal.value == p["i_led"].value and recompute_parameters(ir).status is S.PASS
+
+
+def test_divider_moves_r2_when_no_standard_r1_reaches_the_output_with_10k(tmp_path: Path):
+    """12 V -> 1.1031 V solves R1 = 98.78k with R2 = 10k: the E96 neighbours 97.6k / 100k both miss 1 %, and so do 9.1k and 11k (the two E24 values nearest to 10k); with R2 = 12k, R1 = 118k reaches it (+0.42 %)."""
+    ir = _built(tmp_path, "divider", {"input_voltage": "12 V", "output_voltage": "1.1031 V"})
+    p = ir.parameters
+    assert p["r2"].value == 12000.0 and p["r2"].provenance.kind is ProvenanceKind.USER_REQUIREMENT  # still a confirmed choice, shown in the table
+    assert p["r1"].value == 118000.0 and p["r1"].provenance.tool == "calc.e_series.e96.nearest"
+    assert abs(p["v_out"].value / 1.1031 - 1.0) <= 0.01 and p["v_out"].value == pytest.approx(12.0 * 12000.0 / (118000.0 + 12000.0))
+    assert {c.ref: c.value for c in ir.components if c.ref != "J1"} == {"R1": "118k", "R2": "12k"}
+    assert recompute_parameters(ir).status is S.PASS
+
+
 # --------------------------------------------------------------------------- RC low-pass
 
 
@@ -592,14 +645,18 @@ def test_rc_template_ties_the_corner_expectation_to_the_users_requirement(tmp_pa
     ir = _ir(tmp_path, "rc")
     question = _present(ir, tmp_path, lib, RC)
     assert "c = 1e-07 F - shunt capacitor" in question and "ac_points = 100 - points per decade" in question and "ac_variation = 'dec'" in question
-    assert "r = 1591.54943092 ohm [calc.rc.r_for_cutoff from f_c, c]" in question and "expectation h_fc: v(OUT) at 1000 Hz = 0.707106781187 +/- 2% verifies req.cutoff_frequency" in question
+    assert "r_ideal = 1591.54943092 ohm [calc.rc.r_for_cutoff from f_c, c]" in question and "r = 1600 ohm [calc.e_series.e24.nearest from r_ideal]" in question
+    assert "h_fc_placed = 0.705232035163 [calc.rc.lowpass_magnitude from f_c, tau]" in question and "expectation h_fc: v(OUT) at 1000 Hz = 0.707106781187 +/- 2% verifies req.cutoff_frequency" in question
     ids_before = [r.id for r in ir.requirements.requirements]
     state, ctx = _confirm(ir, tmp_path, lib, None)
-    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"20 proposal(s) applied, nothing verified; template rc_lowpass v{TEMPLATE_VERSION} confirmed by the user: 20 proposal(s)")
+    assert state.outcome(Stage.ARCHITECTURE).message.startswith(f"23 proposal(s) applied, nothing verified; template rc_lowpass v{TEMPLATE_VERSION} confirmed by the user: 23 proposal(s)")
     assert [r.id for r in ir.requirements.requirements] == ids_before and ir.requirements.get("cutoff_gain") is None  # no fabricated requirement
     p = ir.parameters
-    assert list(p) == ["f_c", "c", "r", "tau", "h_fc", "tol_rel", "ac_fstart", "ac_fstop", "ac_probe"]
-    assert p["r"].value == pytest.approx(1591.5494309189535) and p["r"].provenance.tool == "calc.rc.r_for_cutoff"
+    assert list(p) == ["f_c", "c", "r_ideal", "tau_ideal", "h_fc", "tol_rel", "r", "tau", "h_fc_placed", "ac_fstart", "ac_fstop", "ac_probe"]
+    # the solved R stays as r_ideal; R1 is the E24 value nearest to it (|H(f_c)| moves 0.27 %, inside half the 2 % tolerance)
+    assert p["r_ideal"].value == pytest.approx(1591.5494309189535) and p["r_ideal"].provenance.tool == "calc.rc.r_for_cutoff"
+    assert p["r"].value == 1600.0 and p["r"].unit == "ohm" and p["r"].provenance.tool == "calc.e_series.e24.nearest" and p["r"].provenance.inputs == {"x": "r_ideal"}
+    assert p["h_fc_placed"].value == pytest.approx(0.7052320351631289) and p["h_fc"].provenance.inputs == {"f": "f_c", "tau": "tau_ideal"}
     assert p["tau"].provenance.tool == "calc.rc.tau" and p["h_fc"].value == pytest.approx(2 ** -0.5) and p["h_fc"].unit is None
     assert (p["ac_fstart"].value, p["ac_fstop"].value) == (10.0, 100000.0) and p["ac_fstart"].provenance.inputs == {"f_c": "f_c"}
     assert p["c"].provenance.kind is ProvenanceKind.USER_REQUIREMENT and p["c"].value == 1e-7
@@ -610,10 +667,10 @@ def test_rc_template_ties_the_corner_expectation_to_the_users_requirement(tmp_pa
     assert exp.reduce is Reduce.AT and exp.at.value == 1000.0 and exp.at.unit == "Hz" and exp.at.provenance.derived_from == ["req.cutoff_frequency"]
     assert exp.nominal.provenance.tool == "calc.rc.lowpass_magnitude" and exp.requirement_id == "req.cutoff_frequency" and exp.tol_rel.value == 0.02
     assert [c.id for c in ir.constraints] == ["c.rc_lowpass.cutoff"] and "|H(f_c)| = 1/sqrt(2)" in ir.topology.rationale
-    assert recompute_parameters(ir).message == "10 value(s) recomputed"
-    assert _netlist(ir, tmp_path, lib) == "rc\nC1 OUT 0 1e-7\nR1 IN OUT 1.5915494309189537k\nVVIN IN 0 DC 1 AC 1\n.end\n"
-    # the part value is the calculator's value to 5 significant digits (display); the netlist above keeps the exact number; E-series snapping is not built
-    assert ir.component("R1").value == "1.5915k" and ir.component("C1").value == "100n"
+    assert recompute_parameters(ir).message == "13 value(s) recomputed"
+    assert _netlist(ir, tmp_path, lib) == "rc\nC1 OUT 0 1e-7\nR1 IN OUT 1.6k\nVVIN IN 0 DC 1 AC 1\n.end\n"
+    # the part is a value that is sold (E24), and the netlist simulates that same value
+    assert ir.component("R1").value == "1.6k" and ir.component("C1").value == "100n"
     assert part_value_agrees(ir.component("R1").value, p["r"].value, "ohm") is True and ir.component("R1").spice.value.value == p["r"].value
     assert state.outcome(Stage.PCB).status is S.PASS and IndependentReviewer(tools=ctx.tools).check_requirements_vs_ir(ir, tmp_path).status is S.PASS
 
@@ -626,7 +683,9 @@ def test_rc_corner_is_verified_by_ngspice_and_the_reviewer_compares_the_sweep_po
     state, ctx = _confirm(ir, tmp_path, lib, Stage.SPICE, spice=True)
     r = ir.validation.latest("spice.h_fc")
     assert state.outcome(Stage.SPICE).status is S.PASS and r.status is S.PASS
-    assert r.details["measured"] == pytest.approx(2 ** -0.5, rel=1e-6) and r.details["bracket"]["method"] == "log-log"
+    # the simulation runs the placed 1.6 kohm and is judged against the target 1/sqrt(2) of the requirement
+    assert r.details["measured"] == pytest.approx(0.7052320351631289, rel=1e-6) and r.details["bracket"]["method"] == "log-log"
+    assert r.details["nominal"] == pytest.approx(2 ** -0.5)
     rep = IndependentReviewer(tools=ctx.tools).check_spice_vs_requirements(ir, tmp_path)
     assert rep.status is S.PASS and rep.details["verified"] == {"h_fc": "req.cutoff_frequency"} and rep.details["not_compared"] == []
 
@@ -688,7 +747,7 @@ ASTABLE_C_VALUE = "64.817n"
 
 def test_astable_calculators_refuse_out_of_domain_inputs():
     c = astable_c_for_frequency(user_requirement(1000.0, "Hz"), user_requirement(10_000.0, "ohm"), user_requirement(5.0, "V"), user_requirement(0.7, "V"))
-    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.11"
+    assert c.value == pytest.approx(ASTABLE_C) and c.unit == "F" and c.provenance.tool == "calc.astable.c_for_frequency" and c.provenance.tool_version == CALC_VERSION == "0.12"
     assert c.provenance.inputs == {"f_osc": "f_osc", "r_b": "r_b", "v_cc": "v_cc", "v_be": "v_be"}
     f = astable_frequency(user_requirement(10_000.0, "ohm"), c, user_requirement(5.0, "V"), user_requirement(0.7, "V"))
     assert f.value == pytest.approx(1000.0) and f.unit == "Hz" and f.provenance.tool == "calc.astable.f"
@@ -893,7 +952,8 @@ ASTABLE_VALIDITY_POINTS = (("3 V", "100 Hz", 100.0), ("6 V", "100 Hz", 100.0), (
 @needs_dll
 @pytest.mark.parametrize(("supply", "frequency", "f_hz"), ASTABLE_VALIDITY_POINTS)
 def test_astable_verifies_at_the_bounds_of_its_own_validity_range(tmp_path: Path, supply: str, frequency: str, f_hz: float):
-    """Every point the template admits is one its shipped transient completes at, with the frequency inside half the tolerance.
+    """Every point the template admits is one its shipped transient completes at, with the frequency inside the tolerance and at most
+    the deviation anchor measured for this engine (half the tolerance on ngspice-42, just over it on ngspice-46; decision 17).
 
     With the storage-less ``.model QNPN NPN`` the transient aborted at 3 V /
     100 Hz, 6 V / 100 Hz, 6 V / 200 Hz and 3 V / 200 Hz ("Timestep too
@@ -912,32 +972,42 @@ def test_astable_verifies_at_the_bounds_of_its_own_validity_range(tmp_path: Path
     assert f_osc.status is S.PASS and out_high.status is S.PASS and out_low.status is S.PASS, (f_osc.message, out_high.message, out_low.message)
     nominal, measured = f_osc.details["nominal"], f_osc.details["measured"]
     assert nominal == pytest.approx(f_hz) and f_osc.details["tolerance"] == pytest.approx(AstableTemplate.TOL_REL * nominal)
-    # the measured deviation is the one the tolerance was chosen from (positive, below the recorded maximum) and uses at most half of it
-    assert 0.0 < (measured - nominal) / nominal <= AstableTemplate.MEASURED_DEVIATION_MAX and f_osc.details["deviation"] <= 0.5 * f_osc.details["tolerance"], measured
     assert f_osc.details["frequency"]["edges"] >= 8
+    # the measured deviation is positive (V_CE(sat) wins over the storage time) and inside the tolerance on every engine ...
+    deviation = (measured - nominal) / nominal
+    assert 0.0 < deviation <= AstableTemplate.TOL_REL, measured
+    # ... and at most the anchor recorded for THIS engine (decision 17: anchors per version, the tolerance never widened to fit one);
+    # a version without an anchor is uncalibrated: the tolerance checks above stand, the anchor assertion is not borrowed from a neighbour
+    anchor = AstableTemplate.MEASURED_DEVIATION_MAX_BY_ENGINE.get(runner.version())
+    if anchor is None:
+        pytest.skip(f"no measured deviation anchor for {runner.version()} (deviation {100 * deviation:.3f} %, tolerance held)")
+    assert deviation <= anchor, (runner.version(), measured, anchor)
 
 
 def test_astable_tolerance_covers_the_measured_deviation_of_the_whole_validity_range():
     """The tolerance is justified by the worst admitted point, not by one convenient operating point, and its rationale says so."""
-    assert AstableTemplate.TOL_REL >= 2 * AstableTemplate.MEASURED_DEVIATION_MAX
+    assert AstableTemplate.TOL_REL >= 2 * AstableTemplate.MEASURED_DEVIATION_MAX  # the ngspice-42 grid the tolerance was chosen from
+    anchors = AstableTemplate.MEASURED_DEVIATION_MAX_BY_ENGINE
+    assert anchors["ngspice-42"] == AstableTemplate.MEASURED_DEVIATION_MAX and all(0.0 < a <= AstableTemplate.TOL_REL for a in anchors.values())
+    assert all(v.startswith("ngspice-") and v[8:].isdigit() for v in anchors)  # spelled as NgspiceShared.version() spells it
     assert AstableTemplate.MODEL_CARD == ".model QNPN NPN (TR=200n)" and f"TR={AstableTemplate.MODEL_TR_S * 1e9:.12g}n" in AstableTemplate.MODEL_CARD
     doc = AstableTemplate.__doc__
     assert "+1.6 % (6 V, 20 kHz)" in doc and "+4.9 % (3 V, 100 Hz)" in doc and "Timestep too small" in doc and "TR = 200 ns" in doc
 
 
 def test_readme_usage_counts_every_template():
-    """README's usage sentence names as many templates as ``TEMPLATES`` holds (the astable was added without updating it)."""
-    readme = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
+    """The Korean README's usage sentence names as many templates as ``TEMPLATES`` holds (the astable was added without updating it)."""
+    readme = (Path(__file__).parent.parent / "README.ko.md").read_text(encoding="utf-8")
     line = next(ln for ln in readme.splitlines() if "템플릿은 " in ln and "confirm_design=yes" in ln)
-    assert f"템플릿은 {len(TEMPLATES)}종(" in line and len(TEMPLATES) == 5
-    for name in ("무부하 저항 분배기", "LED+직렬 저항", "1차 RC 저역통과", "BJT 비안정 멀티바이브레이터", "ATmega128 개발 보드"):
+    assert f"템플릿은 {len(TEMPLATES)}종(" in line and len(TEMPLATES) == 8
+    for name in ("무부하 저항 분배기", "LED+직렬 저항", "1차 RC 저역통과", "2차 LC 저역통과", "I2C 풀업", "BJT 로우사이드 스위치", "BJT 비안정 멀티바이브레이터", "ATmega128 개발 보드"):
         assert name in line, name
     # every present-tense count agrees: each "템플릿 N종(" phrase (the Agent row too), the GUI section's example list and the GUI's own hint
     # (the dated change-log entries keep the counts of their day and are not checked)
     present = readme.split("\n## 변경 이력", 1)[0]
     counts = re.findall(r"템플릿은? (\d+)종\(", present)
     assert len(counts) >= 2 and set(counts) == {str(len(TEMPLATES))}, counts
-    word = {4: "네", 5: "다섯", 6: "여섯"}[len(TEMPLATES)]
+    word = {4: "네", 5: "다섯", 6: "여섯", 7: "일곱", 8: "여덟"}[len(TEMPLATES)]
     gui = next(ln for ln in readme.splitlines() if "새 프로젝트 폼(이름, 요청문," in ln)
     assert f"새 프로젝트 폼(이름, 요청문, {word} 템플릿의 예시 요청문)" in gui
     page = (Path(__file__).parent.parent / "ai_eda" / "gui" / "page.py").read_text(encoding="utf-8")

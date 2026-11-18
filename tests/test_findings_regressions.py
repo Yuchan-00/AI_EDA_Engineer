@@ -571,6 +571,25 @@ def test_gerber_check_uses_the_ir_layer_count_and_zone_layers(divider_ir: Circui
     assert check_output_artifact(art).details["board_from_ir"] is False
 
 
+def test_a_12_layer_gerber_set_missing_l1_fails(tmp_path: Path):
+    """Copper plots are matched exactly: Copper,L10 .. L12 no longer satisfy a missing Copper,L1 (0.3 matched them by prefix)."""
+    copper = {f"Cu{k}": f"Copper,L{k},{'Top' if k == 1 else 'Bot' if k == 12 else 'Inr'}" for k in range(1, 13)}
+    rest = {"F_Mask": "Soldermask,Top", "B_Mask": "Soldermask,Bot", "Edge_Cuts": "Profile,NP"}
+    full = [Path(f) for f in _gerber_set(tmp_path / "full", "sha256:x", {**copper, **rest}).files]
+    res = check_gerber_set(full, layer_count=12)
+    assert res.status is S.PASS and res.tool_version == "0.4"
+    without_l1 = [Path(f) for f in _gerber_set(tmp_path / "no_l1", "sha256:x", {**{k: v for k, v in copper.items() if k != "Cu1"}, **rest}).files]
+    res = check_gerber_set(without_l1, layer_count=12)
+    assert res.status is S.FAIL and "missing layers: ['Copper,L1']" in res.message and res.tool_version == "0.4"
+    # a board of fewer than 10 layers is judged and stamped as before
+    two = [Path(f) for f in _gerber_set(tmp_path / "two", "sha256:x").files]
+    assert check_gerber_set(two).status is S.PASS and check_gerber_set(two).tool_version == "0.3"
+    # ... unless a stray L10+ plot is what the prefix match would have counted as its L1: that verdict is the new one, and says so
+    stray = [Path(f) for f in _gerber_set(tmp_path / "stray", "sha256:x", {"Cu10": "Copper,L10,Inr", "B_Cu": "Copper,L2,Bot", **rest}).files]
+    res = check_gerber_set(stray)
+    assert res.status is S.FAIL and "missing layers: ['Copper,L1']" in res.message and res.tool_version == "0.4"
+
+
 @needs_kicad
 def test_zone_is_refilled_for_drc_and_plotted_in_the_gerbers(tmp_path: Path):
     """A GND pour that is the *only* GND connection: DRC must see it and the copper plot must contain it."""

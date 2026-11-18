@@ -65,6 +65,7 @@ from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
 from ai_eda.ir import CircuitIR, MissingInformation, ProvenanceKind, ValidationResult, ValidationStatus
 from ai_eda.ir.regulatory import Applicability, GroundedQuote, ProposedRegulation, RegulatoryProvenance, RegulatoryRequirement, RegulatoryState
 from ai_eda.llm.client import LLMError, LLMMessage
+from ai_eda.llm.crosscheck import not_crosschecked_note
 from ai_eda.agents.keys import ACCEPT_REGS_KEY, CONTROL_KEYS, PROPOSE_REGS_KEY, REJECT_REGS_KEY
 from ai_eda.llm.extraction import _strictify, find_directive, is_confirmation
 from ai_eda.llm.router import TaskKind
@@ -298,6 +299,8 @@ class RegulatoryAgent(Agent):
                                          details={"request_hash": key, "error_type": kind, "error": str(e)}), [], notes)
             called = True
             model = resp.model_used or resp.model
+            if llm.crosscheck:
+                notes.append(not_crosschecked_note("regulation proposals", model))
             billed = [a for a in llm.last_attempts if a.usage is not None]
             costs = [a.cost_usd for a in billed]
             cost = None if not costs or any(c is None for c in costs) else float(sum(c for c in costs if c is not None))

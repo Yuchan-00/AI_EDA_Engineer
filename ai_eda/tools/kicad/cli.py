@@ -43,6 +43,13 @@ running the binary, see ``docs/ARCHITECTURE.md``):
   empty, also with ``--schematic-parity``), so DRC judges and the plots
   contain the pour; without the flags DRC sees no zone copper and the gerbers
   omit it entirely. Both are always passed and recorded.
+* Drill: ``pcb export drill --format excellon`` writes the merged
+  ``<stem>.drl`` (``TF.FileFunction,MixedPlating,1,<n>``) and, for a board
+  with blind / buried / micro vias, one ``<stem>-<upper>-<lower>.drl`` per
+  via span (``front`` / ``in<k>`` / ``back``; ``Plated,<a>,<b>,Blind`` or
+  ``Buried``), micro and blind vias on one span sharing a file (measured on
+  6- and 12-layer probe boards); :meth:`KicadCli.export_drill` requires
+  exactly the spans the IR names.
 
 Status policy (spec 12): a report with *any* violation - error or warning,
 excluded or not - is FAIL. KiCad's severity is advisory; hiding warnings
@@ -61,14 +68,15 @@ and whether kicad-cli rewrote it ``project_rewritten``), and
 unchanged on disk before and after the run) - otherwise ``project_reason``
 and no rules, so a stale or hand-edited project file can never pass as the
 compiler's. Whether kicad-cli 10 actually *applies* the sibling project's
-``board.design_settings.rules`` is NOT measured yet:
+``board.design_settings.rules`` is measured per version:
 :data:`PROJECT_RULES_MEASURED_VERSIONS` lists the kicad-cli versions for
 which ``tests/test_kicad_cli.py`` has demonstrated it (a 5 mm
 ``min_track_width`` produces ``track_width`` violations on the vertical-slice
-board, 0.127 mm none, ERC output unchanged, project file not rewritten) and
-is empty until that run is recorded; the capability check reads it.
+board, 0.127 mm none, ERC output unchanged, project file not rewritten);
+the capability check reads it. Recorded: 10.0.6 (canary passed 2026-11-04 on
+Windows 11, KiCad 10.0.6 / ngspice-46).
 
-3D exports - **NOT measured on 10.0.6**: :meth:`KicadCli.export_step`,
+3D exports - measured on 10.0.6 (same run): :meth:`KicadCli.export_step`,
 :meth:`KicadCli.export_glb` and :meth:`KicadCli.render` run ``kicad-cli pcb
 export step``, ``pcb export glb`` and ``pcb render`` with the flags of
 :data:`STEP_EXPORT_FLAGS`, :data:`GLB_EXPORT_FLAGS` and the ``render``
@@ -76,10 +84,11 @@ arguments below, taken from the KiCad command-line documentation (``--output``,
 ``--force``, ``--subst-models``, ``--include-tracks`` / ``-pads`` / ``-zones`` /
 ``-silkscreen`` / ``-soldermask``; ``render``: ``--side``, ``--width``,
 ``--height``, ``--quality``, ``--background``, ``--zoom``, ``--perspective``).
-None of it has been run here: :data:`EXPORT_3D_MEASURED_VERSIONS` lists the
-kicad-cli versions on which ``tests/test_kicad_3d_export.py`` (a canary that
-skips without kicad-cli) found every flag in the subcommand's ``--help`` and
-got a STEP / glTF / PNG file back, and is empty until that run is recorded.
+:data:`EXPORT_3D_MEASURED_VERSIONS` lists the kicad-cli versions on which
+``tests/test_kicad_3d_export.py`` (a canary that skips without kicad-cli)
+found every flag in the subcommand's ``--help`` and got a STEP / glTF / PNG
+file back; a version not listed there is unmeasured and its exports are notes,
+not evidence.
 Each export deletes a stale file at its output path first, accepts only exit
 code 0 (not the 5 of ERC / DRC) and checks the written file's signature
 (``ISO-10303-21`` / ``glTF`` / PNG); anything else is a
@@ -91,13 +100,14 @@ reproducible bytes.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from ai_eda.errors import ToolExecutionError, ToolUnavailableError
 from ai_eda.tools.kicad.install import find_kicad_cli  # where KiCad is installed, per OS
@@ -134,13 +144,13 @@ def complaint_lines(stderr: str) -> list[str]:
 WARNING_POLICY = "any violation (error or warning, excluded or not) is FAIL; counts in message, lists in details"
 
 #: kicad-cli versions measured to apply ``board.design_settings.rules`` of the sibling ``.kicad_pro`` in ``pcb drc``
-#: (``tests/test_kicad_cli.py`` canary). Empty until the measurement is recorded: an unmeasured version can not
-#: prove the fab minimums (``ai_eda.tools.manufacturing.capability``).
-PROJECT_RULES_MEASURED_VERSIONS: frozenset[str] = frozenset()
+#: (``tests/test_kicad_cli.py`` canary). An unmeasured version can not prove the fab minimums
+#: (``ai_eda.tools.manufacturing.capability``). 10.0.6: canary PASSED 2026-11-04 (Windows 11).
+PROJECT_RULES_MEASURED_VERSIONS: frozenset[str] = frozenset({"10.0.6"})
 
 #: kicad-cli versions on which the 3D export / render flags below were measured (``tests/test_kicad_3d_export.py``
-#: canary). Empty: the flags are the KiCad documentation's, not run on 10.0.6 (module docstring).
-EXPORT_3D_MEASURED_VERSIONS: frozenset[str] = frozenset()
+#: canary: every flag in ``--help``, STEP / glTF / PNG written). 10.0.6: canary PASSED 2026-11-04 (Windows 11).
+EXPORT_3D_MEASURED_VERSIONS: frozenset[str] = frozenset({"10.0.6"})
 #: ``pcb export step`` flags (documented, unmeasured): overwrite, substitute STEP for VRML models, and the copper /
 #: silkscreen / mask the board body carries
 STEP_EXPORT_FLAGS: tuple[str, ...] = (
@@ -411,14 +421,40 @@ class KicadCli:
             raise ToolExecutionError(f"gerber job file lists files that were not written: {missing}")
         return sorted(files, key=lambda p: p.name) + [job]
 
-    def export_drill(self, pcb: Path, out_dir: Path) -> list[Path]:
-        """Merged Excellon drill file ``<stem>.drl`` (written even when the board has no holes)."""
+    def export_drill(self, pcb: Path, out_dir: Path, pairs: Sequence[str] = ()) -> list[Path]:
+        """Merged Excellon drill file ``<stem>.drl`` (written even when the board has no holes), plus one file per via span.
+
+        ``pairs`` names the board's blind / buried / micro via spans as
+        kicad-cli 10.0.6 names their files, ``<upper>-<lower>`` with ``front``
+        / ``in<k>`` / ``back`` (``front-in2``; measured on 6- and 12-layer
+        probe boards: ``<stem>-front-in2.drl``, ``<stem>-in2-in9.drl``,
+        ``<stem>-in10-back.drl``, one file per span whatever the via kinds on
+        it). Every ``<stem>-*.drl`` in ``out_dir`` is removed first, so no file
+        of an earlier run is returned; after the run ``<stem>.drl`` and
+        ``<stem>-<pair>.drl`` for each pair must exist, and no other
+        ``<stem>-*.drl`` may: a span file the IR does not account for (another
+        kicad-cli naming, a via the IR does not hold) is refused rather than a
+        drill set shipped without it. Returns ``[<stem>.drl, *pair files in
+        pairs order]`` - with no pairs exactly ``[<stem>.drl]``, as before.
+        """
         out_dir.mkdir(parents=True, exist_ok=True)
+        for stale in sorted(out_dir.glob(f"{glob.escape(pcb.stem)}-*.drl")):
+            stale.unlink()
         self._run(["pcb", "export", "drill", "--format", "excellon", "-o", str(out_dir) + os.sep, str(pcb)])
         drl = out_dir / f"{pcb.stem}.drl"
         if not drl.is_file():
             raise ToolExecutionError(f"drill export produced no {drl.name} in {out_dir}")
-        return [drl]
+        files = [drl]
+        for pair in pairs:
+            name = f"{pcb.stem}-{pair}.drl"
+            if not (out_dir / name).is_file():
+                raise ToolExecutionError(f"drill export produced no {name} for the {pair} via span")
+            files.append(out_dir / name)
+        expected = {f.name for f in files}
+        extra = sorted(f.name for f in out_dir.glob(f"{glob.escape(pcb.stem)}-*.drl") if f.name not in expected)
+        if extra:
+            raise ToolExecutionError(f"drill export wrote {extra} beyond the via span(s) the IR names ({list(pairs)}): the drill set would ship without them")
+        return files
 
     def export_netlist(self, schematic: Path, out_path: Path, fmt: str = "kicadsexpr") -> Path:
         out_path.parent.mkdir(parents=True, exist_ok=True)

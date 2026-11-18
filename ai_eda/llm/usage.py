@@ -32,6 +32,9 @@ from ai_eda.llm.router import TaskKind
 
 #: the ``Usage.billing`` / ``Usage.cost_source`` value of a call on the user's subscription (a known zero charge)
 SUBSCRIPTION = "subscription"
+#: the ``Usage.billing`` / ``Usage.cost_source`` value of a call to a server on this machine (a known zero charge that IS a
+#: charge record: it counts 0 USD against a USD budget, and never as an unknown cost)
+LOCAL = "local"
 
 
 def is_charge(usage: Usage) -> bool:
@@ -87,4 +90,4 @@ class UsageTracker(BaseModel):
         return float(sum(e for e in estimates if e is not None))
 
 
-__all__ = ["SUBSCRIPTION", "UsageRecord", "UsageTracker", "is_charge"]
+__all__ = ["LOCAL", "SUBSCRIPTION", "UsageRecord", "UsageTracker", "is_charge"]

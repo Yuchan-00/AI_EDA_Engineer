@@ -4,8 +4,9 @@
 SPICE evidence through :func:`~ai_eda.tools.spice.evidence.fresh_spice_run`;
 :class:`RFImpedanceValidator` judges the RF nets' routed copper through the
 ``si.impedance`` machinery (IR geometry + calculators, never DRC, and only on
-a design that carries RF); the others still return NOT_VERIFIED until an
-analysis backend exists.
+a design that carries RF); :class:`SignalIntegrityValidator` copies the
+``si.crosstalk`` rows under its own tool; the others still return
+NOT_VERIFIED until an analysis backend exists.
 Keeping the stubs here means the *selection* mechanism is exercised end to
 end and the GUI can show "this check exists but has not run".
 """
@@ -45,7 +46,7 @@ class PowerThermalValidator(Validator):
 
     Per component: the dissipation is the one ``component.fit`` computes
     (:func:`~ai_eda.validation.fit.component_stress`: a plain ``R`` binding
-    at the fresh op; anything else is "not computed", ngspice records no
+    at the fresh op, or ngspice's own figure for a probed BJT / MOSFET; anything else is "not computed", ngspice records no
     element currents), ``theta_ja`` (K/W; ``degC/W`` spellings are the same
     unit) and ``t_j_max`` (degC) are authoritative / user datasheet facts in
     ``Component.electrical``, and the ambient ``Ta`` is
@@ -292,16 +293,80 @@ class RFImpedanceValidator(Validator):
         return [self._result(overall, message, **details)]
 
 
+#: tool id / version of ``domain.high_speed.si`` (bumped when what it copies or judges changes; 0.2: a victim handed to spice.xtalk takes
+#: that result for the current IR)
+HS_TOOL = "domain.high_speed"
+HS_VERSION = "0.2"
+
+
 class SignalIntegrityValidator(Validator):
-    """The crosstalk placeholder of a high-speed design: impedance, length, delay, skew, pairs and timing are the ``si.*`` checks
-    (:mod:`ai_eda.validation.si`, when ``ir.si`` states constraints) and ``spice.si.*``; crosstalk is judged nowhere yet."""
+    """The crosstalk summary of a high-speed design: the ``si.crosstalk`` rows, with the ``spice.xtalk.<victim>`` verdicts in place of the
+    rows that hand off (impedance, length, delay, skew, pairs and timing are the other ``si.*`` checks and ``spice.si.*``).
+
+    It computes :func:`ai_eda.validation.si.crosstalk_result` on the current
+    IR (as ``domain.rf.impedance`` delegates to ``si.impedance``) and copies
+    its rows under its own tool and version. A row that hands off ("judged by
+    spice.xtalk.<victim>") takes the status and message of that result when
+    its ``ir_hash`` is the current IR's; without one it is NOT_VERIFIED "no
+    spice.xtalk result for the current IR" (the hand-off is not a verdict).
+    The summary is the worst row: never PASS or FAIL from the closed forms,
+    PASS / FAIL only from the SPICE decks. It declares ``consumes={"spice"}``,
+    so the orchestrator runs it again after the SPICE stage. No ``ir.si`` (no
+    class states the driver model) or no placed board (no copper) is
+    NOT_VERIFIED naming what is missing.
+    """
 
     id = "domain.high_speed.si"
     domains = frozenset({CircuitDomain.HIGH_SPEED})
-    description = "Crosstalk (impedance, length, delay, skew, pairs and timing are the si.* / spice.si.* checks)"
+    description = ("Crosstalk: the si.crosstalk rows (matched-termination closed forms that rank and explain, never PASS or FAIL) with the "
+                   "spice.xtalk.<victim> coupled-line verdicts where they hand off; impedance, length, delay, skew, pairs and timing are the si.* / "
+                   "spice.si.* checks")
+    consumes = frozenset({SPICE_CHECK_ID})
+
+    def _result(self, status: ValidationStatus, message: str, **details: Any) -> ValidationResult:
+        return ValidationResult(check_id=self.id, status=status, message=message, tool=HS_TOOL, tool_version=HS_VERSION, details={"kind": SI_KIND, **details})
 
     def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
-        return [self.not_verified("crosstalk analysis not implemented (impedance / length / delay / skew / timing: si.* and spice.si.* when ir.si states constraints)")]
+        from ai_eda.validation.si import crosstalk_result
+
+        missing = []
+        if ir.si is None:
+            missing.append("no ir.si: no net class states the driver model (edge, source resistance, load) the crosstalk rows need")
+        if ir.pcb is None or not ir.pcb.placements:
+            missing.append("no placed board: the copper the crosstalk rows measure does not exist yet")
+        if missing:
+            return [self._result(S.NOT_VERIFIED, "crosstalk not judged: " + "; ".join(missing), missing=missing)]
+        assert ir.si is not None
+        library = ctx.tools.get("kicad_library")
+        library = library if isinstance(library, KicadLibrary) else None
+        measures = measure_nets(ir, library=library)
+        pads = net_pads(ir, library) if library is not None else None
+        r = crosstalk_result(ir, ir.si, measures, pads)
+        rows = [dict(x) for x in r.details.get("rows", [])]
+        handed = [x for x in rows if x.get("judged_by")]
+        if not handed:
+            return [self._result(r.status, f"{r.check_id}: {r.message}", check=r.check_id, check_tool=r.tool, check_version=r.tool_version,
+                                 copied_status=r.status.value, rows=rows)]
+        ir_hash = ir.content_hash()
+        latest = ir.validation.latest_by_check()
+        judged: list[str] = []
+        for x in handed:
+            res = latest.get(x["judged_by"])
+            if res is not None and res.ir_hash == ir_hash:
+                x.update(status=res.status.value, reason=f"{res.check_id}: {res.message}", judged_result={
+                    "check": res.check_id, "status": res.status.value, "tool": res.tool, "tool_version": res.tool_version})
+                judged.append(f"{res.check_id} {res.status.value}")
+            else:
+                x.update(status=S.NOT_VERIFIED.value, reason=f"handed to {x['judged_by']}, which has no result for the current IR (the SPICE stage has not "
+                                                             f"run on it): {x['reason']}")
+                judged.append(f"{x['judged_by']} (no result for the current IR)")
+        status = worst_status(S(x["status"]) for x in rows)
+        message = f"{r.check_id}: {r.message}; coupled-line verdicts: {', '.join(judged)}"
+        details: dict[str, Any] = {"check": r.check_id, "check_tool": r.tool, "check_version": r.tool_version, "copied_status": r.status.value,
+                                   "rows": rows}
+        if status is S.FAIL:
+            details["repair"] = "human"
+        return [self._result(status, message, **details)]
 
 
 class PowerIntegrityValidator(Validator):

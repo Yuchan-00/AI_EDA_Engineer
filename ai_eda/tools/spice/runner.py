@@ -268,6 +268,8 @@ class SpiceResult(BaseModel):
 
 class SpiceRunner(ABC):
     engine: str = "abstract"
+    #: whether ``run`` takes ``probes=`` (device operating-point quantities such as ``@q1[ic]``) for an op
+    device_probes: bool = False
 
     @abstractmethod
     def available(self) -> bool: ...

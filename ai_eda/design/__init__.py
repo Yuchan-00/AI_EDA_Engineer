@@ -74,6 +74,7 @@ from ai_eda.design.inputs import (
     read_value,
 )
 from ai_eda.design.stackup import GENERIC_STACKS, board_layers, generic_stackup, layer_count_choice_text, plane_zones, stackup_choices, with_planes
+from ai_eda.design.materials import MATERIAL_IDS, MATERIAL_STACKS, MATERIALS, select_material
 from ai_eda.design.library_parts import TemplateRefusal, library_component, pin_by_name
 from ai_eda.design.templates import (
     RF_FAMILY_MODULE,
@@ -125,6 +126,10 @@ __all__ = [
     "read_layer_count",
     "stackup_choices",
     "with_planes",
+    "MATERIALS",
+    "MATERIAL_IDS",
+    "MATERIAL_STACKS",
+    "select_material",
     "CHOICE_NOTE_PREFIX",
     "CONFIRM_DESIGN_KEY",
     "DESIGN_CATEGORIES",

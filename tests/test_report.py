@@ -15,6 +15,7 @@ import json
 import re
 import threading
 from contextlib import redirect_stderr, redirect_stdout
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,139 @@ from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.workflow import STAGE_ORDER, Orchestrator, PipelineState, Stage, StageOutcome
 
 ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[0-9.]*(?:Z|[+-]\d{2}:\d{2})?")
+
+# Keys, descriptions, severities and version copied from p12/stm32_display's saved KiCad 10.0.6 results.
+SAVED_KICAD_IGNORED = {
+    "kicad.erc": [
+        {"key": "single_global_label", "description": "Global label only appears once in the schematic"},
+        {"key": "four_way_junction", "description": "Four connection points are joined together"},
+        {"key": "simulation_model_issue", "description": "SPICE model issue"},
+        {"key": "footprint_filter", "description": "Assigned footprint doesn't match footprint filters"},
+    ],
+    "kicad.drc": [
+        {"key": "missing_courtyard", "description": "Footprint has no courtyard defined"},
+        {"key": "track_not_centered_on_via", "description": "Track endpoint not centered on via"},
+        {"key": "tuning_profile_track_geometries", "description": "Tuning profile track geometries"},
+        {"key": "footprint_filters_mismatch", "description": "Footprint doesn't match symbol's footprint filters"},
+        {"key": "footprint_type_mismatch", "description": "Footprint component type doesn't match footprint pads"},
+    ],
+}
+SCOPE_CASES = ("saved", "none", "missing", "missing_ignored", "missing_severities", "missing_version", "stale", "excluded", "escape", "key_only")
+
+
+def _visible_text(html: str) -> str:
+    """Text outside collapsed details; the scope must be readable without opening anything."""
+    class VisibleText(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.depth = 0
+            self.parts = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "details":
+                self.depth += 1
+
+        def handle_endtag(self, tag):
+            if tag == "details":
+                self.depth -= 1
+
+        def handle_data(self, data):
+            if not self.depth:
+                self.parts.append(data)
+
+    parser = VisibleText()
+    parser.feed(html)
+    return " ".join(parser.parts)
+
+
+def _scope_project(tmp_path: Path, case: str) -> tuple[CircuitIR, PipelineState, Path]:
+    """Portable stored-result fixtures; statuses are test inputs, never inferred from the scope."""
+    ir = _plain_ir(tmp_path)
+    outcomes = []
+    for check, ignored in SAVED_KICAD_IGNORED.items():
+        details = {"ignored_checks": [dict(c) for c in ignored], "included_severities": ["error", "warning", "exclusion"], "excluded": []}
+        status, message, version = ValidationStatus.PASS, "0 error(s), 0 warning(s)", "10.0.6"
+        if case == "none":
+            details["ignored_checks"] = []
+        elif case == "missing":
+            details = {}
+        elif case == "missing_ignored":
+            del details["ignored_checks"]
+        elif case == "missing_severities":
+            del details["included_severities"]
+        elif case == "missing_version":
+            version = None
+        elif case == "excluded":
+            details["excluded"] = [{"type": "clearance", "severity": "error", "excluded": True, "description": "Excluded finding"}]
+            status = ValidationStatus.FAIL
+            message = "1 error(s), 0 warning(s) (1 marked excluded in the design, still counted)"
+        elif case == "escape":
+            details["ignored_checks"] = [{"key": '<script>alert("key")</script>', "description": '<img src=x onerror="bad"> & \'description\' | next\nline'}]
+            details["included_severities"] = ["error", '<script>alert("severity")</script>']
+            version = '<script>alert("version")</script>'
+        elif case == "key_only":
+            details["ignored_checks"] = [{"key": "missing_description"}, "legacy_key"]
+        evidence = tmp_path / f"{check}.json"
+        evidence.write_text(json.dumps(details), encoding="utf-8")
+        r = ValidationResult(
+            check_id=check, status=status, message=message, tool="kicad-cli", tool_version=version,
+            ir_hash="sha256:earlier-design" if case == "stale" else ir.content_hash(), details=details,
+            evidence=[Evidence(description="recorded KiCad report", path=str(evidence), content_hash=sha256_of_file(evidence))],
+        )
+        ir.validation.add(r)
+        outcomes.append(StageOutcome(stage=Stage.ERC if check == "kicad.erc" else Stage.DRC, status=status, message=message))
+        if case == "stale":
+            evidence.write_text("{}", encoding="utf-8")
+    outcomes.append(StageOutcome(stage=Stage.RELEASE, status=ValidationStatus.NOT_VERIFIED, message="fixture release outcome"))
+    ir_path = _record(tmp_path, ir, outcomes)
+    return ir, load_pipeline_record(tmp_path).record.state, ir_path
+
+
+def _assert_scope_text(text: str, case: str) -> None:
+    if case.startswith("missing"):
+        assert "scope unavailable" in text and "no checks ignored" not in text
+    else:
+        assert "scope unavailable" not in text
+        if case == "none":
+            assert "no checks ignored (recorded)" in text
+        elif case == "key_only":
+            assert "missing_description" in text and "legacy_key" in text
+        elif case != "escape":
+            for checks in SAVED_KICAD_IGNORED.values():
+                assert f"ignored checks ({len(checks)})" in text
+                for check in checks:
+                    assert check["key"] in text and check["description"] in text
+        if case != "escape":
+            assert "included severities: error, warning, exclusion" in text
+    assert "tool version: " in text
+    if case not in ("missing_version", "escape"):
+        assert "tool version: 10.0.6" in text
+
+
+@pytest.mark.parametrize("case", SCOPE_CASES)
+def test_kicad_scope_is_visible_beside_the_stored_result(tmp_path: Path, case: str):
+    ir, state, ir_path = _scope_project(tmp_path, case)
+    before = ir_path.read_bytes(), ir.model_dump_json(), state.model_dump_json()
+    data = _data(ir_path, tmp_path)
+    html = render_report_file(ir_path).read_text(encoding="utf-8")
+    _assert_scope_text(_visible_text(html), case)
+    for row in data.validation.latest:
+        stored = ir.validation.latest(row.check_id)
+        assert row.status == str(stored.status) and row.message == stored.message
+        assert f'<span>{esc(row.message)}</span><div class="kicad-scope">{esc(row.kicad_scope)}</div>' in html
+        if case == "stale":
+            assert row.freshness.startswith(STALE) and row.evidence[0].state == CHANGED_ON_DISK
+        if case == "excluded":
+            assert row.status == "FAIL" and "still counted" in _visible_text(html)
+    assert data.release.status == "NOT_VERIFIED" and data.release.reasons == ["fixture release outcome"]
+    if case == "escape":
+        assert "<script>" not in html and "<img src=" not in html
+        assert '&lt;script&gt;alert(&quot;key&quot;)&lt;/script&gt;' in html
+        assert '&lt;script&gt;alert(&quot;severity&quot;)&lt;/script&gt;' in html
+        assert '&lt;script&gt;alert(&quot;version&quot;)&lt;/script&gt;' in html
+        assert '&lt;img src=x onerror=&quot;bad&quot;&gt;' in html
+    assert html == render_report_file(ir_path).read_text(encoding="utf-8")
+    assert before == (ir_path.read_bytes(), ir.model_dump_json(), state.model_dump_json())
 
 
 def _cli(*argv: str) -> tuple[int, str, str]:
@@ -351,6 +485,71 @@ def _record(tmp_path: Path, ir: CircuitIR, outcomes: list[StageOutcome], **kw) -
     save_pipeline_record(state, ir, ir_path, tmp_path, results_before=kw.pop("results_before", 0),
                          ir_file_sha256=sha256_of_file(ir_path), **kw)
     return ir_path
+
+
+def _actions_project(tmp_path: Path):
+    from tests.test_report_actions import _result, saved_run_results
+
+    ir = _plain_ir(tmp_path)
+    ir.validation.add(_result("component.existence.C1", "superseded failure", status=ValidationStatus.FAIL))
+    ir.validation.extend(saved_run_results())
+    hostile = '<script>alert("x")</script> & \'quoted\' | next\nline'
+    ir.validation.add(_result("unknown.<input>&", hostile, details={"checks": None}))
+    ir.validation.add(_result("finished", "historical missing input"))
+    ir.validation.add(_result("finished", "checked", status=ValidationStatus.PASS))
+    ir.validation.add(_result("not_applicable", "stored scope exclusion", status=ValidationStatus.NOT_APPLICABLE))
+    board = tmp_path / "stored.kicad_pcb"
+    board.write_bytes(b"stored board bytes: the report must never compile or rewrite this file\n")
+    ir.artifacts[ArtifactKind.PCB] = ArtifactRef(kind=ArtifactKind.PCB, path=str(board), content_hash=sha256_of_file(board),
+                                               generated_from_ir_hash=ir.content_hash(), generator="fixture")
+    ir_path = _record(tmp_path, ir, [StageOutcome(stage=Stage.RELEASE, status=ValidationStatus.NOT_VERIFIED, message="stored release outcome")])
+    state = load_pipeline_record(tmp_path).record.state
+    return ir, state, ir_path, board
+
+
+def test_remaining_action_groups_are_visible_safe_deterministic_and_read_only(tmp_path: Path):
+    ir, state, ir_path, board = _actions_project(tmp_path)
+    before = (ir.model_dump_json(), ir.content_hash(), ir.validation.overall(), state.model_dump_json(),
+              ir_path.read_bytes(), (tmp_path / PIPELINE_FILE).read_bytes(), board.read_bytes(), sha256_of_file(board))
+    data = build_report_data(ir, ir_path, tmp_path, ir_sha=sha256_of_file(ir_path))
+    html = render_report_file(ir_path).read_text(encoding="utf-8")
+    section = html.split("<h2>Remaining work</h2>", 1)[1].split("</section>", 1)[0]
+    latest = ir.validation.latest_by_check()
+    expected = {k: r for k, r in latest.items() if r.status not in (ValidationStatus.PASS, ValidationStatus.NOT_APPLICABLE)}
+    checks = [c for g in data.remaining_work for c in g.checks]
+    assert len(checks) == len(expected) == 55
+    assert {c.check_id for c in checks} == set(expected)
+    for check in checks:
+        assert (check.status, check.message) == (str(expected[check.check_id].status), expected[check.check_id].message)
+        assert section.count(f"<td>{esc(check.check_id)}</td>") == 1
+        assert f"<td>{esc(check.message)}</td>" in section
+    for group in data.remaining_work:
+        assert group.title in _visible_text(html) and esc(group.next_action) in section
+        assert f"<td>{esc(group.role)}</td>" in section
+    assert "superseded failure" not in section and "historical missing input" not in section and "<td>finished</td>" not in section
+    assert "<script>" not in html and "<input>" not in html
+    assert data.release.status == "NOT_VERIFIED" and data.release.reasons == ["stored release outcome"]
+    assert html == render_html(data) == render_report_file(ir_path).read_text(encoding="utf-8")
+    assert before == (ir.model_dump_json(), ir.content_hash(), ir.validation.overall(), state.model_dump_json(),
+                      ir_path.read_bytes(), (tmp_path / PIPELINE_FILE).read_bytes(), board.read_bytes(), sha256_of_file(board))
+
+
+def test_remaining_work_escapes_all_group_metadata_and_handles_empty_results(tmp_path: Path):
+    ir, _state, ir_path, _board = _actions_project(tmp_path)
+    data = _data(ir_path, tmp_path)
+    hostile = '<img src=x onerror="bad"> & \'metadata\''
+    group = data.remaining_work[0]
+    for field in ("id", "title", "role", "next_action"):
+        setattr(group, field, hostile)
+    group.checks[0].check_id = hostile
+    group.checks[0].status = hostile
+    html = render_html(data)
+    section = html.split("<h2>Remaining work</h2>", 1)[1].split("</section>", 1)[0]
+    assert "<img" not in html and esc(hostile) in section
+    assert f'class="st st-{esc(hostile)}"' in section
+    ir.validation.results.clear()
+    empty = build_report_data(ir, ir_path, tmp_path, ir_sha=sha256_of_file(ir_path))
+    assert empty.remaining_work == [] and "No latest non-PASS results recorded." in render_html(empty)
 
 
 def test_release_section_renders_pass_verbatim(tmp_path: Path):
@@ -682,3 +881,18 @@ def test_pipeline_json_is_not_an_artifact_and_not_hashed(project: tuple[Path, Pi
     h = ir.content_hash()
     (tmp_path / PIPELINE_FILE).unlink()
     assert CircuitIR.load(ir_path).content_hash() == h
+
+
+def test_shell_path_quotes_only_what_the_users_shell_needs(monkeypatch):
+    """A8: a plain workdir path is written bare; spaces are protected the way the user's shell reads them; PowerShell /
+    cmd.exe metacharacters never end up inside double quotes on Windows; a POSIX backslash is not written bare."""
+    from ai_eda.report import data as report_data
+
+    monkeypatch.setattr(report_data.os, "name", "nt")
+    assert report_data.shell_path(r"C:\Users\me\proj\ir.json") == r"C:\Users\me\proj\ir.json"
+    assert report_data.shell_path(r"C:\My Docs\ir.json") == '"C:\\My Docs\\ir.json"'
+    assert report_data.shell_path(r"C:\$x\it's\ir.json") == "'C:\\$x\\it''s\\ir.json'"
+    monkeypatch.setattr(report_data.os, "name", "posix")
+    assert report_data.shell_path("/home/me/proj/ir.json") == "/home/me/proj/ir.json"
+    assert report_data.shell_path("/home/me/my proj/ir.json") == "'/home/me/my proj/ir.json'"
+    assert report_data.shell_path("/home/me/odd\\name/ir.json") == "'/home/me/odd\\name/ir.json'"

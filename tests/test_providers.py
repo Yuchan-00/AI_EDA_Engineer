@@ -135,7 +135,7 @@ def test_model_config_spec_property():
 
 
 def test_known_providers_and_defaults():
-    assert KNOWN_PROVIDERS == ("openrouter", "claude", "script")
+    assert KNOWN_PROVIDERS == ("openrouter", "claude", "script", "codex", "openai_compat")
     assert DEFAULT_CLAUDE_MODEL == "claude-sonnet-5"
     assert default_model(None) == default_model("openrouter") == default_model("script") == DEFAULT_PRIMARY_MODEL
     assert default_model("claude") == DEFAULT_CLAUDE_MODEL

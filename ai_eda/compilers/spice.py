@@ -33,7 +33,8 @@ Invariants this module enforces:
   a part gets, which net is stimulated, what runs, what is judged) with
   ``LLM_GENERATED`` provenance are ``CompileError``; model cards must be
   authoritative or user-supplied. The kinds that were accepted (and every
-  value or decision that rests on an ``assumption``) are listed by
+  value or decision that rests on an ``assumption``, and every model card
+  whose note says nobody named its source) are listed by
   :func:`build_report`; the SPICE stage reports results that rest on an
   assumption as NOT_VERIFIED.
 * **A lossless line is fully stated.** A ``T`` element (``SpiceDevice.T``,
@@ -42,6 +43,45 @@ Invariants this module enforces:
   ``T`` line without ``td`` with a delay of its own choosing and no error
   (measured), so such a binding is a ``CompileError`` and the runner's deck
   check refuses such a line too.
+* **A coupled line is fully stated.** A ``P`` element (``SpiceDevice.P``,
+  ngspice's CPL with two lines; six pins: line 1 in, line 2 in, GND1, line 1
+  out, line 2 out, GND2, both GND pins on the ground net) carries exactly
+  ``l11`` ``l12`` ``l22`` (H/m), ``c11`` ``c22`` ``cm`` (F/m) and ``length``
+  (m), each positive, and no value or model. The compiler names the model
+  ``<ref>_cpl`` and writes it on the line after the element in the form of
+  the ngspice-46 manual sect. 6.4.2 example (Maxwell matrices as upper
+  triangles X11 X12 X22), with all of R, L, G, C and length given (cplsetup.c)
+  and the length on the model, never on the instance (inp2p.c drops an
+  instance length it cannot evaluate; both source files as the crosstalk
+  research step read them, ``crosstalk.json``)::
+
+      P<ref> <in1> <in2> 0 <out1> <out2> 0 <ref>_cpl
+      .model <ref>_cpl CPL length=<m> R=1 0 1 L=<l11> <l12> <l22> G=0 0 0 C=<c11> <-cm> <c22>
+
+  L and C must be positive definite (``l11 l22 > l12^2``, ``c11 c22 >
+  cm^2``): ngspice ends the engine on a capacitance matrix that is not (the
+  crosstalk research step's reading of ngspice's cplsetup.c, not measured
+  here). R is :data:`CPL_R_OHM_PER_M` (1 ohm/m, the manual example's
+  ``R=1 0 1``) on the diagonal, not ngspice's 1e-4 ohm/m floor: on
+  ngspice-46 a CPL at 1e-4 ohm/m simulates a matched pair wrongly with no
+  error (measured, :mod:`ai_eda.tools.spice.ngspice_shared` item 12); the
+  off-diagonal 0 is raised to 1e-4 ohm/m by the engine itself (the same
+  reading of cplsetup.c). G is 0 (no dielectric loss).
+* **A switch is fully stated and simulation-only.** A voltage-controlled
+  switch (``SpiceDevice.S``) is only a simulation element
+  (:class:`~ai_eda.ir.simulation.SimElement`; a part bound as ``S`` is a
+  ``CompileError``), written ``S<id> <net> <reference_net> <control_net>
+  <control_reference_net> <model>``. All four nodes must be nodes of the
+  deck (an IR net or a ``SimulationSetup.nodes`` entry; the refusal names the
+  element and the node), the control pair is required and refused on every
+  other device, and the model it names must be a top-level ``.model <name> SW(...)``
+  card line, read as ngspice reads the card (:func:`switch_model_problem`;
+  the model-card rules: authoritative or user provenance) giving
+  exactly ``RON`` ``ROFF`` ``VT`` ``VH`` (:data:`~ai_eda.ir.simulation.SWITCH_MODEL_PARAMS`)
+  with ``0 < RON < ROFF``, finite VT and ``VH >= 0``: on ngspice-46 a bare
+  ``.model SWD SW`` simulates the switch closed, at 1 ohm, with its control
+  at 0 V (the engine's own defaults - measured 2026-11-18), a different
+  circuit without a word. The switch takes no value and no params.
 * **A tolerance must be a tolerance.** An expectation whose ``nominal`` is 0
   needs ``tol_abs``: ``tol_rel`` alone would be a zero tolerance. A one-sided
   ``bound`` (``at_least`` / ``at_most``: PASS on the passing side of
@@ -52,7 +92,9 @@ Invariants this module enforces:
 * **A reduction must fit its analysis.** ``reduce=value`` only on ``op``,
   ``at`` / ``final`` / ``max`` / ``min`` only on a sweep, and
   ``reduce=frequency`` (rising mid-level crossings over time) only on a
-  ``tran`` analysis: a dc or ac sweep has no time axis to count edges on.
+  ``tran`` analysis: a dc or ac sweep has no time axis to count edges on;
+  its optional window ``t_start`` / ``t_stop`` is both or neither and, when
+  given, follows the window rule of the windowed reductions below.
   ``reduce=db_at`` only on an ``ac`` analysis, with ``at`` and a magnitude
   vector (never ``vp`` / ``vr`` / ``vi``); ``rms`` / ``db_rms`` /
   ``harmonic_dbc`` / ``am_depth`` only on a ``tran`` analysis, over a window
@@ -70,8 +112,19 @@ Invariants this module enforces:
   reductions are Python arithmetic on the vectors ngspice wrote, so no
   ``.save`` / ``.meas`` / ``.four`` / ``sp`` / ``noise`` card or command
   exists here.
-* **A modulated source is fully stated.** ``AM(VA VO MF FC TD)`` and
-  ``SFFM(VO VA FC MDI FS)`` take every parameter, finite; ``mf`` / ``fc``
+* **A modulated source is fully stated.** The IR's AM params (``va``,
+  ``vo``, ``mf``, ``fc``, ``td``: v = VA (VO + sin 2 pi MF t) sin 2 pi FC t)
+  are written in ngspice 43+'s form ``AM(VO VMO VMA FM FC TD)`` = ``AM(0
+  VA*VO VA MF FC TD)`` (ngspice 43 renumbered the source: V = VO + (VMO +
+  VMA sin 2 pi FM t) sin 2 pi FC t; the older five-value form is read
+  positionally, with FC = 0, as a flat line - measured on ngspice-46,
+  2026-11-04). ngspice-42 reads the new form by its own formula as VA = 0, a
+  zero source, so the SPICE stage refuses an AM source below ngspice-43.
+  ``SFFM(VO VA FC MDI FS)`` is the same order in both (ngspice 43+ names the
+  last FM) but ngspice 43+ clamps MDI to FC / FM ("Warning: MDI in v1 limited
+  to FC/FM", printed once per process, then silent - measured on ngspice-46,
+  2026-11-04), so the compiler refuses ``mdi > fc / fs``. Both take every
+  parameter, finite; ``mf`` / ``fc``
   (AM) and ``fc`` / ``fs`` (SFFM) must be > 0 and ``td`` >= 0 - ngspice-42
   silently replaces a zero MF or FS by a default of its own and simulates
   another waveform (measured, :class:`~ai_eda.ir.simulation.StimulusKind`).
@@ -107,7 +160,11 @@ Netlist layout::
     [.temp <t>]
     <model cards, verbatim, sorted by model name>
     <elements: "<NAME> <nodes in pin_order> <value|model_name> [k=v ...]">
-               (a lossless line: "T<ref> <p1+> <p1-> <p2+> <p2-> td=<s> z0=<ohm>")
+               (a lossless line: "T<ref> <p1+> <p1-> <p2+> <p2-> td=<s> z0=<ohm>";
+                a coupled line: "P<ref> <6 nodes> <ref>_cpl" and on the next line its ".model <ref>_cpl CPL ...")
+    <simulation-only elements: "<NAME> <net node> <reference node> <value|model_name> [k=v ...]"
+               (a switch: "S<id> <net node> <reference node> <control node> <control reference node> <model_name>";
+               SimulationSetup.elements sorted by id; nodes may be SimulationSetup.nodes)>
     <stimuli:  "V<id>|I<id> <net node> <reference node> DC <v> | PULSE(...) | SINE(...) | PWL(...) | AM(...) | SFFM(...) [AC <mag>]">
     .end
 
@@ -128,6 +185,7 @@ accepted provenance kinds, the analysis commands and the vector names).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -142,11 +200,16 @@ from ai_eda.ir.simulation import (
     AC_VARIATIONS,
     ANALYSIS_OPTIONAL_PARAMS,
     ANALYSIS_PARAMS,
+    CONTROLLED_DEVICES,
     DEVICE_PARAMS,
     ELECTRICAL_KEYS,
+    MODEL_CARD_NO_SOURCE,
     MODEL_DEVICES,
     NODE_COUNTS,
+    OPTIONAL_WINDOW_REDUCES,
     PARAM_DEVICES,
+    SIM_ELEMENT_DEVICES,
+    SWITCH_MODEL_PARAMS,
     DB_REDUCES,
     REDUCE_PARAM_UNITS,
     REDUCE_PARAMS,
@@ -166,7 +229,7 @@ from ai_eda.ir.simulation import (
     Stimulus,
     StimulusKind,
 )
-from ai_eda.tools.calc.si import format_spice_number, ngspice_reads
+from ai_eda.tools.calc.si import format_spice_number, ngspice_reads, parse_spice_number
 from ai_eda.tools.spice.measure import MIN_CARRIER_TO_MOD_RATIO, MIN_HARMONIC_PERIODS, PERIOD_REL_TOL
 from ai_eda.tools.spice.ngspice_shared import NODE_RE, validate_deck
 from ai_eda.tools.spice.runner import SpiceAnalysis
@@ -196,6 +259,24 @@ _FORBIDDEN_CARD_PREFIXES: tuple[str, ...] = (
 def element_name(ref: str, device: SpiceDevice) -> str:
     """``R1`` -> ``R1``; ``U1`` as a subcircuit -> ``XU1`` (ngspice reads the device from the first letter)."""
     return ref if ref[:1].upper() == device.value else f"{device.value}{ref}"
+
+
+#: device operating-point quantities a runner that can (``SpiceRunner.device_probes``) keeps beside the node vectors
+#: of an op, per device (measured on ngspice-46: a BJT's and a MOSFET's ``p`` is its dissipation in W; a diode's
+#: ``p`` reads ``inf`` there, so a diode has no probe)
+DEVICE_PROBES: dict[SpiceDevice, tuple[str, ...]] = {
+    SpiceDevice.Q: ("p", "vbe", "vbc", "ic", "ib"),
+    SpiceDevice.M: ("p", "id", "vgs", "vds"),
+}
+_PROBE_ELEMENT = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def device_probes(name: str, device: SpiceDevice) -> dict[str, str]:
+    """``{"p": "@q1[p]", ...}`` for the netlist element ``name``; empty for a device without probes or a name a probe cannot carry."""
+    low = name.lower()
+    if device not in DEVICE_PROBES or not _PROBE_ELEMENT.fullmatch(low):
+        return {}
+    return {q: f"@{low}[{q}]" for q in DEVICE_PROBES[device]}
 
 
 def stimulus_name(stimulus: Stimulus) -> str:
@@ -394,6 +475,95 @@ def _card_definitions(card: str) -> dict[str, tuple[str, list[str]]]:
     return defs
 
 
+def check_model_card(what: str, model_name: str | None, text: str) -> tuple[str, dict[str, tuple[str, list[str]]]]:
+    """The normalised card and what it defines; :class:`CompileError` when the text is not a card that defines ``model_name``.
+
+    The one judge of a card's text, for the compiler and for whoever takes a card in (a design file) before the pipeline runs.
+    """
+    if not model_name:
+        raise CompileError(f"{what}: model_card given without model_name")
+    card = _normalise_card(text, what)
+    defs = _card_definitions(card)
+    if model_name.lower() not in defs:
+        raise CompileError(f"{what}: model_card does not define {model_name!r} (it defines {sorted(defs) or 'nothing'})")
+    return card, defs
+
+
+def model_card_hash(card: str) -> str:
+    """sha256 of a normalised card, the text the netlist carries."""
+    return "sha256:" + hashlib.sha256(card.encode("utf-8")).hexdigest()
+
+
+def switch_model_problem(card: str, model_name: str) -> str | None:
+    """Why ``.model <model_name>`` in the normalised ``card`` is not the ``SW`` model a voltage-controlled switch needs, else ``None``.
+
+    The model line (``+`` continuations joined) must read ``SW(...)`` or
+    ``SW ...`` with exactly the parameters of
+    :data:`~ai_eda.ir.simulation.SWITCH_MODEL_PARAMS` as ``name=value`` (case
+    free, ``=`` may be spaced, commas separate), each a SPICE number ngspice
+    reads as one number: ``0 < RON < ROFF``, VT finite, ``VH >= 0``. A
+    missing one is refused rather than left to ngspice's default (module
+    docstring).
+
+    The card is read the way ngspice-46 reads it (measured 2026-11-18): a
+    ``+`` line, indented or not, continues the last line that is neither
+    blank nor a ``*`` comment; a ``.model`` inside a ``.subckt`` ... ``.ends``
+    body is local to that subcircuit, so a top-level switch never uses it
+    (a card whose only ``.model <name>`` is there does not load: "can't find
+    model"); of two top-level ``.model <name>`` lines the first is the one
+    simulated. That top-level line is the one judged here.
+    """
+    lines: list[str] = []
+    for raw in card.split("\n"):
+        s = raw.strip()
+        if not s or s.startswith("*"):
+            continue
+        if s.startswith("+") and lines:
+            lines[-1] += " " + s[1:]
+        else:
+            lines.append(s)
+    depth = 0
+    for ln in lines:
+        first = ln.split()[0].lower()
+        if first == ".subckt":
+            depth += 1
+            continue
+        if first == ".ends":
+            depth = max(0, depth - 1)
+            continue
+        m = _CARD_DEF.match(ln)
+        if depth or m is None or m.group(1).lower() != "model" or m.group(2).lower() != model_name.lower():
+            continue
+        body = re.sub(r"\s*=\s*", "=", m.group(3).replace("(", " ").replace(")", " ").replace(",", " "))
+        toks = body.split()
+        if not toks or toks[0].lower() != "sw":
+            return f"model {model_name!r} is a {toks[0] if toks else 'typeless'} model; a voltage-controlled switch needs an SW model"
+        values: dict[str, float] = {}
+        for tok in toks[1:]:
+            key, eq, text = tok.partition("=")
+            key = key.lower()
+            if not eq or not key or not text:
+                return f"SW model {model_name!r}: {tok!r} is not a name=value parameter"
+            if key not in SWITCH_MODEL_PARAMS:
+                return f"SW model {model_name!r}: parameter {key!r} is not one of {list(SWITCH_MODEL_PARAMS)}"
+            if key in values:
+                return f"SW model {model_name!r} gives {key} twice"
+            try:
+                values[key] = parse_spice_number(text)
+            except ValueError as e:
+                return f"SW model {model_name!r} parameter {key}: {e}"
+        missing = [k for k in SWITCH_MODEL_PARAMS if k not in values]
+        if missing:
+            return (f"SW model {model_name!r} does not give {missing}: ngspice would use defaults of its own "
+                    "(a bare SW model is a 1 ohm switch closed at 0 V control - measured)")
+        if not 0.0 < values["ron"] < values["roff"]:
+            return f"SW model {model_name!r} needs 0 < RON < ROFF, got RON={values['ron']:g} ROFF={values['roff']:g}"
+        if values["vh"] < 0.0:
+            return f"SW model {model_name!r} needs VH >= 0 (the hysteresis around VT), got VH={values['vh']:g}"
+        return None
+    return f"no top-level .model line defines {model_name!r} (a .model inside a .subckt is local to it; ngspice would not find it)"
+
+
 # --------------------------------------------------------------------------- stimuli
 
 
@@ -446,6 +616,11 @@ def _stimulus_spec(s: Stimulus, ledger: _Ledger) -> str:
             numbers = _pwl_points(ledger.accept(params["points"], f"{what} param points"), f"{what} param points", ledger)
         else:
             numbers = [_number(ledger.accept(params[k], f"{what} param {k}"), f"{what} param {k}", ledger) for k in required]
+            if s.kind == StimulusKind.AM:
+                # ngspice 43+: AM(VO VMO VMA FM FC TD) with V = VO + (VMO + VMA sin(2 pi FM t)) sin(2 pi FC t); the IR's
+                # VA (VO + sin(2 pi MF t)) sin(2 pi FC t) is VO = 0, VMO = VA VO, VMA = VA (module docstring; the stage gates the engine)
+                va, vo = float(params["va"].value), float(params["vo"].value)
+                numbers = ["0", ledger.number(va * vo, f"{what} param vmo (va x vo)"), numbers[0], *numbers[2:]]
             for k in STIMULUS_POSITIVE_PARAMS.get(s.kind, ()):
                 if float(params[k].value) <= 0.0:
                     raise CompileError(
@@ -455,6 +630,13 @@ def _stimulus_spec(s: Stimulus, ledger: _Ledger) -> str:
             for k in STIMULUS_NON_NEGATIVE_PARAMS.get(s.kind, ()):
                 if float(params[k].value) < 0.0:
                     raise CompileError(f"{what}: {s.kind.value} param {k} (a delay) must be >= 0, got {params[k].value!r}")
+            if s.kind == StimulusKind.SFFM:
+                mdi, limit = float(params["mdi"].value), float(params["fc"].value) / float(params["fs"].value)
+                if mdi < 0.0 or mdi > limit:
+                    raise CompileError(
+                        f"{what}: sffm param mdi must be within 0 .. fc / fs = {limit:.12g}, got {mdi!r} "
+                        "(ngspice 43+ clamps it to that limit and simulates another waveform, with one warning per process - measured on ngspice-46)"
+                    )
             given = [k for k in optional if k in params]
             if given != list(optional[: len(given)]):
                 raise CompileError(f"{what}: optional sine params must be given in order {list(optional)}, got {given}")
@@ -596,8 +778,19 @@ def _is_number(value) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float))
 
 
+#: why each :data:`~ai_eda.ir.simulation.PARAM_DEVICES` device needs every one of its params (the refusal's reason)
+_PARAM_DEVICE_WHY: dict[SpiceDevice, str] = {
+    SpiceDevice.T: "ngspice would simulate a line without td with a delay of its own choosing",
+    SpiceDevice.P: "a coupled line is its two Maxwell matrices per metre and its length, every entry stated",
+}
+#: the series resistance on the diagonal of a coupled line's R matrix, ohm/m: the ngspice-46 manual example's ``R=1 0 1``
+#: (sect. 6.4.2). Not the engine's 1e-4 floor, which simulates a matched pair wrongly with no error on ngspice-46 (measured
+#: 2026-11-13, :mod:`ai_eda.tools.spice.ngspice_shared` item 12). A choice, not a modelled trace resistance
+CPL_R_OHM_PER_M = 1.0
+
+
 def _check_param_device(ref: str, dev: SpiceDevice, b) -> None:
-    """A :data:`~ai_eda.ir.simulation.PARAM_DEVICES` element (the lossless ``T`` line): exactly its params, each a positive number in its unit, no value, no model."""
+    """A :data:`~ai_eda.ir.simulation.PARAM_DEVICES` element (the lossless ``T`` line, the coupled ``P`` line): exactly its params, each a positive number in its unit, no value, no model."""
     if b.value is not None or b.model_name is not None or b.model_card is not None:
         raise CompileError(f"{ref}: a {dev.value} element takes its params {sorted(DEVICE_PARAMS[dev])}, not a value or a model")
     required = DEVICE_PARAMS[dev]
@@ -606,7 +799,7 @@ def _check_param_device(ref: str, dev: SpiceDevice, b) -> None:
     if missing or extra:
         raise CompileError(
             f"{ref}: a {dev.value} element needs exactly the params {sorted(required)} (missing {missing}, not allowed {extra}); "
-            "ngspice would simulate a line without td with a delay of its own choosing"
+            f"{_PARAM_DEVICE_WHY[dev]}"
         )
     for key, unit in required.items():
         traced = b.params[key]
@@ -614,6 +807,36 @@ def _check_param_device(ref: str, dev: SpiceDevice, b) -> None:
             raise CompileError(f"{ref} param {key} must be a positive finite number, got {traced.value!r}")
         if traced.unit is not None and _unit_key(traced.unit) != _unit_key(unit):
             raise CompileError(f"{ref} param {key} carries unit {traced.unit!r}, a {dev.value} element takes {key} in {unit}")
+
+
+def _coupled_line(ref: str, name: str, nodes: list[str], b, ledger: _Ledger) -> str:
+    """The ``P`` element line and, on the next line, its ``.model <ref>_cpl CPL`` card (module docstring).
+
+    The params were checked by :func:`_check_param_device`. ``CompileError``
+    when a GND pin is not on the ground net or a matrix is not positive
+    definite.
+    """
+    if nodes[2] != "0" or nodes[5] != "0":
+        raise CompileError(
+            f"{ref}: a coupled line's GND1 and GND2 (the 3rd and 6th pins of pin_order) must be on the ground net, got nodes {nodes[2]!r} and {nodes[5]!r}"
+        )
+    p = {k: float(ledger.accept(b.params[k], f"{ref} param {k}").value) for k in sorted(DEVICE_PARAMS[SpiceDevice.P])}
+    if p["l11"] * p["l22"] <= p["l12"] ** 2:
+        raise CompileError(f"{ref}: the inductance matrix is not positive definite (l11 l22 = {p['l11'] * p['l22']:.6g} <= l12^2 = {p['l12'] ** 2:.6g})")
+    if p["c11"] * p["c22"] <= p["cm"] ** 2:
+        raise CompileError(
+            f"{ref}: the capacitance matrix is not positive definite (c11 c22 = {p['c11'] * p['c22']:.6g} <= cm^2 = {p['cm'] ** 2:.6g}); "
+            "ngspice ends the engine on such a matrix"
+        )
+
+    def num(key: str) -> str:
+        return ledger.number(p[key], f"{ref} param {key}")
+
+    r = ledger.number(CPL_R_OHM_PER_M, f"{ref} R (CPL_R_OHM_PER_M)")
+    c12 = ledger.number(-p["cm"], f"{ref} C12 (= -cm)")
+    model = f"{ref}_cpl"
+    return (f"{name} {' '.join(nodes)} {model}\n"
+            f".model {model} CPL length={num('length')} R={r} 0 {r} L={num('l11')} {num('l12')} {num('l22')} G=0 0 0 C={num('c11')} {c12} {num('c22')}")
 
 
 def _check_expectation(exp: Expectation, ir: CircuitIR, setup: SimulationSetup, ledger: _Ledger) -> str:
@@ -667,7 +890,8 @@ def _check_reduction(exp: Expectation, ir: CircuitIR, analysis: AnalysisSpec, wh
     param is a finite number accepted through the ledger (``llm_generated`` is
     refused); a unit, when the param states one, must be the one
     :data:`~ai_eda.ir.simulation.REDUCE_PARAM_UNITS` names. The window of a
-    tran reduction lies inside the analysis' saved window; an RMS needs
+    tran reduction lies inside the analysis' saved window (a frequency's
+    optional window too: both ``t_start`` and ``t_stop`` or neither); an RMS needs
     ``f_max > 0``; a harmonic's window holds at least two whole periods of
     ``f0``; an AM depth needs ``f_carrier >= 20 f_mod``
     and a window of at least one modulation period; a dB level needs
@@ -706,6 +930,9 @@ def _check_reduction(exp: Expectation, ir: CircuitIR, analysis: AnalysisSpec, wh
             raise CompileError(f"{what}: reduce=db_at needs a magnitude vector (v(...) / i(...)), got {exp.vector!r}: 20 log10 of a phase or of a real / imaginary part is not a level")
     if kind in WINDOW_REDUCES and analysis.kind != SpiceAnalysis.TRAN:
         raise CompileError(f"{what}: reduce={kind.value} reads a time window, which only a tran analysis produces ({exp.analysis_id} is {analysis.kind.value})")
+    if kind in OPTIONAL_WINDOW_REDUCES and ("t_start" in values) != ("t_stop" in values):
+        raise CompileError(f"{what}: reduce={kind.value} takes its window as both t_start and t_stop or neither, got only {sorted(k for k in ('t_start', 't_stop') if k in values)}")
+    windowed = kind in WINDOW_REDUCES or (kind in OPTIONAL_WINDOW_REDUCES and "t_start" in values)
     if kind in REFERENCE_REDUCES:
         if (exp.reference_vector is not None) == ("ref" in values):
             raise CompileError(f"{what}: reduce={kind.value} needs exactly one of reference_vector or params['ref'] (the level the vector is compared with)")
@@ -717,7 +944,7 @@ def _check_reduction(exp: Expectation, ir: CircuitIR, analysis: AnalysisSpec, wh
                 raise CompileError(f"{what}: reference_vector {exp.reference_vector!r} names a part of a complex vector; a reference level is a magnitude (v(...) / i(...))")
             if _vector_unit(exp.reference_vector) != _vector_unit(exp.vector):
                 raise CompileError(f"{what}: reference_vector {exp.reference_vector!r} and vector {exp.vector!r} are not the same kind of quantity (a voltage ratio or a current ratio)")
-    if kind in WINDOW_REDUCES:
+    if windowed:
         t0, t1 = values["t_start"], values["t_stop"]
         start = float(analysis.params["start"].value) if "start" in analysis.params else 0.0
         stop = float(analysis.params["stop"].value)
@@ -819,6 +1046,16 @@ def _compile(ir: CircuitIR) -> _Compiled:
     nodes = _nodes(ir)
     ledger = _Ledger()
     claimed: dict[str, str] = {}
+    setup = ir.simulation
+    node_of: dict[str, str] = dict(nodes.of_net)  # IR nets, plus the simulation-private nodes (SimulationSetup.nodes)
+    if setup is not None:
+        for node_name in setup.nodes:
+            what = f"simulation node {node_name!r}"
+            if not node_name or any(ch in _BAD_NODE_CHARS for ch in node_name) or not NODE_RE.fullmatch(node_name):
+                raise CompileError(f"{what}: not a plain node name")
+            if node_name.lower() in ("0", "gnd") or node_name.lower() in {n.lower() for n in node_of}:
+                raise CompileError(f"{what}: collides with a net or the ground node (ngspice is case-insensitive)")
+            node_of[node_name] = node_name
 
     def claim(name: str, what: str) -> None:
         if not _NAME.match(name):
@@ -834,8 +1071,34 @@ def _compile(ir: CircuitIR) -> _Compiled:
     element_lines: list[str] = []
     element_names: list[str] = []
     cards: dict[str, str] = {}  # model name (lower) -> normalised card text
+    # one row per card taken in: whose, which model, its hash and where it comes from (``source``: an authoritative
+    # card's archived document; a user's own statement of the source is in ``note``)
+    model_cards: list[dict] = []
+    probes: dict[str, dict[str, str]] = {}  # component ref -> quantity -> the op vector a probing runner records for it
     defined: dict[str, tuple[str, list[str], str]] = {}  # name (lower) -> (kind, ports, card key)
     referenced: list[tuple[str, SpiceDevice, str, int]] = []  # (ref, device, model_name, node count)
+    cpl_models: dict[str, str] = {}  # the .model name a coupled line's compiler-written card defines (lower) -> its component ref
+
+    def register_card(what: str, model_name: str | None, model_card: Traced) -> None:
+        """Accept and normalise one model card (a component binding's or a simulation element's) into ``cards`` / ``defined``."""
+        if not model_name:
+            raise CompileError(f"{what}: model_card given without model_name")
+        ledger.accept(model_card, f"{what} model_card", model_card=True)
+        card, defs = check_model_card(what, model_name, model_card.value)
+        key = model_name.lower()
+        prov = model_card.provenance
+        unsourced = f"{what} model_card {MODEL_CARD_NO_SOURCE}"
+        if (prov.note or "").endswith(MODEL_CARD_NO_SOURCE) and unsourced not in ledger.assumptions:
+            ledger.assumptions.append(unsourced)  # the user's text, but nothing says what it models
+        model_cards.append({"of": what, "model": model_name, "sha256": model_card_hash(card), "provenance": prov.kind.value, "note": prov.note, "source": None if prov.source is None else prov.source.model_dump(mode="json", exclude_none=True)})
+        if key in cards and cards[key] != card:
+            raise CompileError(f"model {model_name!r} has two different model cards in the IR ({what} disagrees with an earlier component)")
+        if key not in cards:
+            for dname, (dkind, ports) in defs.items():
+                if dname in defined and defined[dname][2] != key:
+                    raise CompileError(f"{what}: model_card defines {dname!r} which the card for {defined[dname][2]!r} also defines")
+                defined[dname] = (dkind, ports, key)
+            cards[key] = card
 
     for c in sorted(ir.components, key=lambda c: c.ref):
         b = c.spice
@@ -849,6 +1112,11 @@ def _compile(ir: CircuitIR) -> _Compiled:
         if b.device is None:
             raise CompileError(f"{c.ref}: SPICE binding has no device and is not excluded")
         dev = b.device
+        if dev in CONTROLLED_DEVICES:
+            raise CompileError(
+                f"{c.ref}: a voltage-controlled switch ({dev.value}) is a simulation-only element (SimulationSetup.elements, with its "
+                "control nodes), never a part's binding; bind the part as what it is, or exclude it and add the switch across it"
+            )
         pins = [p.number for p in c.pins]
         if not b.pin_order:
             raise CompileError(f"{c.ref}: pin_order is empty")
@@ -919,27 +1187,82 @@ def _compile(ir: CircuitIR) -> _Compiled:
                 raise CompileError(f"{c.ref}: model_name {b.model_name!r} is not a single token")
             rest.append(b.model_name)
             referenced.append((c.ref, dev, b.model_name, len(b.pin_order)))
-        rest += _param_tokens(b.params, c.ref, ledger)
-        if b.model_card is not None:
-            if not b.model_name:
-                raise CompileError(f"{c.ref}: model_card given without model_name")
-            ledger.accept(b.model_card, f"{c.ref} model_card", model_card=True)
-            card = _normalise_card(b.model_card.value, c.ref)
-            defs = _card_definitions(card)
-            key = b.model_name.lower()
-            if key not in defs:
-                raise CompileError(f"{c.ref}: model_card does not define {b.model_name!r} (it defines {sorted(defs) or 'nothing'})")
-            if key in cards and cards[key] != card:
-                raise CompileError(f"model {b.model_name!r} has two different model cards in the IR ({c.ref} disagrees with an earlier component)")
-            if key not in cards:
-                for dname, (dkind, ports) in defs.items():
-                    if dname in defined and defined[dname][2] != key:
-                        raise CompileError(f"{c.ref}: model_card defines {dname!r} which the card for {defined[dname][2]!r} also defines")
-                    defined[dname] = (dkind, ports, key)
-                cards[key] = card
-        element_lines.append(" ".join([name, *node_list, *rest]))
+        if dev == SpiceDevice.P:  # the element line and its own .model line; its params are the model's, never the instance's
+            element_lines.append(_coupled_line(c.ref, name, node_list, b, ledger))
+            cpl_models[f"{c.ref}_cpl".lower()] = c.ref
+        else:
+            rest += _param_tokens(b.params, c.ref, ledger)
+            if b.model_card is not None:
+                register_card(c.ref, b.model_name, b.model_card)
+            element_lines.append(" ".join([name, *node_list, *rest]))
         element_names.append(name)
+        if device_probes(name, dev):
+            probes[c.ref] = device_probes(name, dev)
 
+    # simulation-only elements (SimulationSetup.elements): net to net like a stimulus, judged like a part
+    sim_element_lines: list[str] = []
+    sim_element_names: list[str] = []
+    if setup is not None:
+        for el in sorted(setup.elements, key=lambda e: e.id):
+            what = f"simulation element {el.id}"
+            ledger.accept_provenance(el.provenance, what)
+            if not _NAME.match(el.id):
+                raise CompileError(f"{what}: id must be a plain identifier (it becomes an element name)")
+            dev = el.device
+            if dev not in SIM_ELEMENT_DEVICES:
+                raise CompileError(
+                    f"{what}: a simulation-only element is R, C, L or D, or a voltage-controlled switch S "
+                    f"(a source is a stimulus; a transistor or subcircuit is a board part), got {dev.value}"
+                )
+            for net_name in (el.net, el.reference_net):
+                if net_name not in node_of:
+                    raise CompileError(f"{what}: unknown net or simulation node {net_name!r}")
+            if el.net == el.reference_net:
+                raise CompileError(f"{what}: net and reference_net are both {el.net!r}")
+            controlled = dev in CONTROLLED_DEVICES
+            controls = {"control_net": el.control_net, "control_reference_net": el.control_reference_net}
+            if not controlled and any(v is not None for v in controls.values()):
+                given = sorted(k for k, v in controls.items() if v is not None)
+                raise CompileError(f"{what}: {given} belong to a voltage-controlled switch (S); a {dev.value} element has no control nodes")
+            if controlled:
+                missing = [k for k, v in controls.items() if v is None]
+                if missing:
+                    raise CompileError(f"{what}: a voltage-controlled switch needs both control nodes (control_net, control_reference_net), missing {missing}")
+                for field_name, net_name in controls.items():
+                    if net_name not in node_of:
+                        raise CompileError(f"{what}: unknown net or simulation node {net_name!r} for {field_name}")
+                if el.control_net == el.control_reference_net:
+                    raise CompileError(f"{what}: control_net and control_reference_net are both {el.control_net!r} (the control voltage would be identically 0)")
+                if el.params:
+                    raise CompileError(f"{what}: a voltage-controlled switch takes its numbers on its SW model card, no params (got {sorted(el.params)})")
+            name = element_name(el.id, dev)
+            claim(name, what)
+            rest: list[str] = []
+            if dev in VALUE_DEVICES:
+                if el.model_name is not None or el.model_card is not None:
+                    raise CompileError(f"{what}: a {dev.value} element takes a value, not a model")
+                if el.value is None:
+                    raise CompileError(f"{what}: a {dev.value} element needs a value")
+                if _is_number(el.value.value) and float(el.value.value) <= 0.0:
+                    raise CompileError(f"{what}: a {dev.value} value must be positive; got {el.value.value!r} (ngspice would silently simulate a different part)")
+                rest.append(_number(ledger.accept(el.value, f"{what} value"), f"{what} value", ledger))
+            else:
+                if el.value is not None:
+                    raise CompileError(f"{what}: a {dev.value} element takes a model, not a value")
+                if not el.model_name or any(ch in _BAD_NODE_CHARS for ch in el.model_name):
+                    raise CompileError(f"{what}: a {dev.value} element needs a single-token model_name")
+                rest.append(el.model_name)
+                referenced.append((what, dev, el.model_name, 4 if controlled else 2))
+            rest += _param_tokens(el.params, what, ledger)
+            if el.model_card is not None:
+                register_card(what, el.model_name, el.model_card)
+            control_nodes = [node_of[el.control_net], node_of[el.control_reference_net]] if controlled else []  # type: ignore[index]
+            sim_element_lines.append(" ".join([name, node_of[el.net], node_of[el.reference_net], *control_nodes, *rest]))
+            sim_element_names.append(name)
+
+    for key, ref in cpl_models.items():
+        if key in defined:
+            raise CompileError(f"{ref}: its coupled line's model name {key!r} is also defined by a model_card in the IR (the compiler writes that model itself)")
     for ref, dev, model_name, n_nodes in referenced:
         entry = defined.get(model_name.lower())
         if entry is None:
@@ -951,8 +1274,11 @@ def _compile(ir: CircuitIR) -> _Compiled:
             raise CompileError(f"{ref}: a {dev.value} element needs a .model, but {model_name!r} is a .subckt")
         if dev == SpiceDevice.X and len(ports) != n_nodes:
             raise CompileError(f"{ref}: .subckt {model_name} has {len(ports)} ports {ports} but pin_order has {n_nodes} pins")
+        if dev in CONTROLLED_DEVICES:
+            problem = switch_model_problem(cards[entry[2]], model_name)
+            if problem is not None:
+                raise CompileError(f"{ref}: {problem}")
 
-    setup = ir.simulation
     stimulus_lines: list[str] = []
     stimulus_ids: list[str] = []
     commands: dict[str, str] = {}
@@ -965,13 +1291,13 @@ def _compile(ir: CircuitIR) -> _Compiled:
             if not _NAME.match(s.id):
                 raise CompileError(f"{what}: id must be a plain identifier (it becomes an element name)")
             for net_name in (s.net, s.reference_net):
-                if net_name not in nodes.of_net:
+                if net_name not in node_of:
                     raise CompileError(f"{what}: unknown net {net_name!r}")
             if s.net == s.reference_net:
                 raise CompileError(f"{what}: net and reference_net are both {s.net!r}")
             name = stimulus_name(s)
             claim(name, what)
-            stimulus_lines.append(f"{name} {nodes.of_net[s.net]} {nodes.of_net[s.reference_net]} {_stimulus_spec(s, ledger)}")
+            stimulus_lines.append(f"{name} {node_of[s.net]} {node_of[s.reference_net]} {_stimulus_spec(s, ledger)}")
             stimulus_ids.append(s.id)
         seen_ids: set[str] = set()
         for a in setup.analyses:
@@ -999,6 +1325,7 @@ def _compile(ir: CircuitIR) -> _Compiled:
     for key in sorted(cards):
         lines.extend(cards[key].split("\n"))
     lines += element_lines
+    lines += sim_element_lines
     lines += stimulus_lines
     lines.append(".end")
     text = "\n".join(lines) + "\n"
@@ -1018,6 +1345,9 @@ def _compile(ir: CircuitIR) -> _Compiled:
     # connects it, ngspice never sees it
     only_excluded = [n.name for n in ir.nets if n.pins and all(has_no_node(p) for p in n.pins)]
     stimulated = {s.net for s in setup.stimuli} | {s.reference_net for s in setup.stimuli} if setup is not None else set()
+    if setup is not None:  # a net a simulation-only element touches has a node too (a switch's control nets included)
+        stimulated |= {el.net for el in setup.elements} | {el.reference_net for el in setup.elements}
+        stimulated |= {n for el in setup.elements for n in (el.control_net, el.control_reference_net) if n is not None}
     only_excluded = [n for n in only_excluded if n not in stimulated]
     report = {
         "title": ir.project.id,
@@ -1028,11 +1358,15 @@ def _compile(ir: CircuitIR) -> _Compiled:
         "nets_without_pins": [n.name for n in ir.nets if not n.pins],
         "ground_net": nodes.ground.name,
         "models": sorted(cards),
+        "model_cards": model_cards,
+        "device_probes": probes,
         "value_sources": value_sources,
         "accepted_provenance_kinds": sorted(k.value for k in ledger.kinds),
         "assumptions": list(ledger.assumptions),
         "inexact_numbers": list(ledger.inexact),
         "unmodelled_numbers": list(ledger.unmodelled),
+        "sim_elements": sim_element_names,
+        "sim_nodes": [] if setup is None else list(setup.nodes),
         "stimuli": stimulus_ids,
         "analyses": commands,
         "vectors": vectors,
@@ -1060,8 +1394,11 @@ def netlist_elements(text: str) -> list[tuple[str, list[str], str]]:
     The title line, dot cards, comments and the inside of ``.subckt`` blocks
     are skipped; ``+`` continuations are joined. Two-terminal letters
     (R C L V I D) take two nodes, a lossless line (T) four (its ``rest`` is
-    the ``td=... z0=...`` params); Q, M and X take every token up to the model
-    / subcircuit name (trailing ``k=v`` params excluded).
+    the ``td=... z0=...`` params), a voltage-controlled switch (S) four - the
+    switched pair, then the control pair - (its ``rest`` is the model name), a
+    coupled line (P) six (its ``rest`` is the
+    model name; the ``.model`` line is a dot card, skipped); Q, M and X take
+    every token up to the model / subcircuit name (trailing ``k=v`` params excluded).
     """
     lines = _join_continuations(text.splitlines())
     out: list[tuple[str, list[str], str]] = []
@@ -1089,6 +1426,14 @@ def netlist_elements(text: str) -> list[tuple[str, list[str], str]]:
             if len(toks) < 5:
                 raise ValueError(f"malformed element line {s!r}")
             out.append((toks[0], toks[1:5], " ".join(toks[5:])))
+        elif letter == "S":
+            if len(toks) < 6:
+                raise ValueError(f"malformed element line {s!r}")
+            out.append((toks[0], toks[1:5], " ".join(toks[5:])))
+        elif letter == "P":
+            if len(toks) < 8:
+                raise ValueError(f"malformed element line {s!r}")
+            out.append((toks[0], toks[1:7], " ".join(toks[7:])))
         elif letter in "QMX":
             body = toks[1:]
             while body and "=" in body[-1]:
@@ -1106,7 +1451,10 @@ class SpiceNetlistCompiler(Compiler):
     """Writes ``<workdir>/<project.id>.cir`` (+ ``.cir.report.json``) and registers it as ``SPICE_NETLIST``."""
 
     id = "compiler.spice"
-    #: 0.6: AM / SFFM stimuli and the level / window reductions' rules (an IR 0.5 compiled writes the same bytes)
+    #: 0.6: AM / SFFM stimuli and the level / window reductions' rules (an IR 0.5 compiled writes the same bytes). The
+    #: coupled line (P) changes no version: it is written only for a P binding, which every earlier compile refused, so
+    #: every IR that compiled before writes the same bytes and the same report. Nor do the voltage-controlled switch (S) and
+    #: a frequency's window: written / accepted only for an S element or a windowed frequency, which every earlier compile refused
     version = "0.6"
     kind = ArtifactKind.SPICE_NETLIST
 
@@ -1126,6 +1474,7 @@ class SpiceNetlistCompiler(Compiler):
 
 
 __all__ = [
+    "CPL_R_OHM_PER_M",
     "SpiceNetlistCompiler",
     "analysis_command",
     "build",
@@ -1134,5 +1483,6 @@ __all__ = [
     "netlist_elements",
     "spice_vector_name",
     "stimulus_name",
+    "switch_model_problem",
     "vector_is_complex_part",
 ]

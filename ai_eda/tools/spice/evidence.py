@@ -87,6 +87,23 @@ class FreshSpiceRun:
                 return aid, res
         return NO_OP
 
+    def device_op(self, ref: str) -> dict[str, float]:
+        """The device quantities the op recorded for component ``ref`` (``{"p": W, "ic": A, ...}``); empty when none were probed.
+
+        Only finite numbers of vectors the netlist report names for ``ref`` and the op result carries.
+        """
+        picked = self.op()
+        if isinstance(picked, str):
+            return {}
+        vectors = picked[1].get("vectors") or {}
+        named = ((self.data.get("netlist_report") or {}).get("device_probes") or {}).get(ref) or {}
+        out: dict[str, float] = {}
+        for quantity, vector in named.items():
+            samples = vectors.get(vector)
+            if samples and isinstance(samples[-1], (int, float)) and math.isfinite(samples[-1]):
+                out[quantity] = float(samples[-1])
+        return out
+
     def node_voltage(self, ir: CircuitIR, net_name: str) -> float | str:
         """The op voltage of the IR net ``net_name`` (V), or why it is not available."""
         picked = self.op()

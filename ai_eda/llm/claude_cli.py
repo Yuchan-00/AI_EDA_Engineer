@@ -216,6 +216,27 @@ CLI_NAME = "claude"
 WINDOWS_CLI_NAME = "claude.exe"
 #: suffixes Windows runs through ``cmd.exe`` whatever ``shell=`` says (it would re-parse the arguments): never executed
 BATCH_SUFFIXES: tuple[str, ...] = (".cmd", ".bat")
+#: environment variables that would move a CLI call from the subscription login to per-call billing (an API key, a token or a
+#: gateway for the Messages API, Bedrock, Vertex, Foundry): left out of every child environment - the owner's rule of 2026-11-13,
+#: "api 요금이 청구되지 않게" (no API charges)
+BILLING_ENV_VARS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+#: the measured subscription login (``claude auth status``, 2.1.283: ``authMethod`` "oauth_token", ``apiProvider`` "firstParty");
+#: the claude route runs only on it
+SUBSCRIPTION_AUTH_METHOD = "oauth_token"
+#: ``LLMError.code`` of a call refused because the CLI is not on the subscription login
+NOT_SUBSCRIPTION = "not_subscription"
+SUBSCRIPTION_API_PROVIDER = "firstParty"
+
+
+def subscription_env(drop: tuple[str, ...] = BILLING_ENV_VARS) -> dict[str, str]:
+    """This process's environment without the variables that would bill a CLI call per call (case-insensitive names)."""
+    gone = {name.upper() for name in drop}
+    return {k: v for k, v in os.environ.items() if k.upper() not in gone}
+
+
 #: how a subscription-billed call is accounted: a known zero charge, the estimate shown beside it
 COST_SOURCE = "subscription"
 BILLING = "subscription"
@@ -399,6 +420,48 @@ def _reap(proc: subprocess.Popen[bytes]) -> None:
             proc.wait(timeout=REAP_TIMEOUT)
         except subprocess.TimeoutExpired:
             log.info("claude-cli: the killed child %s did not exit within %gs", proc.pid, REAP_TIMEOUT)
+
+
+def exchange(proc: subprocess.Popen[bytes], stdin: bytes, timeout: float) -> tuple[int, bytes, bytes, OSError | None]:
+    """Feed ``stdin`` to the started ``proc`` and collect it: ``(exit code, stdout, stderr, write error)``.
+
+    The prompt is written by a daemon thread (:func:`_feed_stdin`), never by
+    ``communicate``: ``proc.stdin`` is detached first, so ``communicate``
+    only reads stdout / stderr, and its ``timeout`` bounds the whole exchange
+    on every platform and interpreter - CPython 3.12's Windows
+    ``communicate`` writes ``input=`` in the calling thread before its first
+    timeout check, so a child that never read a prompt larger than the pipe
+    buffer would block ``subprocess.run(input=...)`` with no bound. Writing
+    and reading run together (no pipe deadlock). On the timeout
+    (``TimeoutExpired`` propagates) and on any other exception - a
+    ``KeyboardInterrupt`` reaches this thread, which never sits in a
+    blocking write - the child is killed and reaped (:func:`_reap`); the
+    writer then sees the broken pipe and ends, and is joined within
+    :data:`REAP_TIMEOUT` (a daemon: a process the child started that still
+    holds stdin cannot pin the call). Shared by the Claude Code and the Codex
+    CLI clients (:mod:`ai_eda.llm.codex_cli`).
+    """
+    pipe = proc.stdin
+    assert pipe is not None, "the child is started with stdin=PIPE"
+    proc.stdin = None  # communicate() must never write (3.12 on Windows: unbounded) nor close it
+    failures: list[OSError] = []
+    writer = threading.Thread(target=_feed_stdin, args=(pipe, stdin, failures), name=STDIN_WRITER_NAME, daemon=True)
+    try:
+        writer.start()
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+            _reap(proc)
+        if writer.ident is None:
+            _feed_stdin(pipe, b"", failures)  # the writer never started: close stdin here so nothing waits on it
+        raise
+    finally:
+        if writer.ident is not None:
+            writer.join(REAP_TIMEOUT)
+            if writer.is_alive():
+                log.info("claude-cli: stdin still held open by a process the child started; the writer is left to end with it")
+    return proc.returncode, out or b"", err or b"", failures[0] if failures else None
 
 
 def _platform_kind() -> str:
@@ -694,6 +757,8 @@ class ClaudeCodeClient(LLMClient):
         self._version: str | None = None
         self._version_probed = False
         self._resumable: _Resumable | None = None
+        #: the subscription login has been confirmed for this client (:meth:`_require_subscription`, once, before the first call)
+        self._subscription_ok = False
         #: usage of the most recent :meth:`stream` (set when it completed; ``None`` while running / after an error)
         self.last_stream_usage: Usage | None = None
         #: full accounting view of the most recent :meth:`stream`
@@ -711,7 +776,7 @@ class ClaudeCodeClient(LLMClient):
         try:
             return subprocess.run(
                 [self.cli, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=PROBE_TIMEOUT, stdin=subprocess.DEVNULL, env=dict(os.environ),
+                timeout=PROBE_TIMEOUT, stdin=subprocess.DEVNULL, env=subscription_env(),
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -744,6 +809,26 @@ class ClaudeCodeClient(LLMClient):
             auth_method=method if isinstance(method, str) else None,
             api_provider=provider if isinstance(provider, str) else None,
             error=None if proc.returncode == 0 else f"claude auth status exited {proc.returncode}",
+        )
+
+    def _require_subscription(self, model: str) -> None:
+        """The owner's rule of 2026-11-13 (no API charges): before the first model call, confirm the measured subscription login
+        (``loggedIn`` true, ``authMethod`` :data:`SUBSCRIPTION_AUTH_METHOD`, ``apiProvider`` :data:`SUBSCRIPTION_API_PROVIDER`). An
+        API-key, gateway, Bedrock or Vertex login would bill each call, and a login that cannot be read cannot be shown to be the
+        subscription, so either is ``LLMError(kind="transport", code=NOT_SUBSCRIPTION, sent=False)`` before anything starts. The
+        child environment never carries a billing variable either (:func:`subscription_env`)."""
+        if self._subscription_ok:
+            return
+        state = self.login_state()
+        if state.logged_in is True and state.auth_method == SUBSCRIPTION_AUTH_METHOD and state.api_provider == SUBSCRIPTION_API_PROVIDER:
+            self._subscription_ok = True
+            return
+        raise LLMError(
+            f"the Claude Code CLI {self.cli} is not on the subscription login (loggedIn {state.logged_in}, authMethod "
+            f"{state.auth_method!r}, apiProvider {state.api_provider!r}{'; ' + state.error if state.error else ''}); the claude route is "
+            f"used only with authMethod {SUBSCRIPTION_AUTH_METHOD!r} on {SUBSCRIPTION_API_PROVIDER!r} so that no call is billed to an API "
+            "key; nothing was sent - run `claude login` with the subscription account",
+            kind="transport", code=NOT_SUBSCRIPTION, model=model, sent=False,
         )
 
     # ---------------------------------------------------------- lifecycle
@@ -950,6 +1035,7 @@ class ClaudeCodeClient(LLMClient):
                 "flags stay on the Claude Code CLI's command line)",
                 kind="transport", code=PROMPT_TOO_LONG, model=model, sent=False,
             )
+        self._require_subscription(model)
         if held is not None:
             cwd = held.cwd
             self._resumable = None
@@ -978,44 +1064,8 @@ class ClaudeCodeClient(LLMClient):
         return resp
 
     def _exchange(self, proc: subprocess.Popen[bytes], stdin: bytes) -> tuple[int, bytes, bytes, OSError | None]:
-        """Feed ``stdin`` to the started ``proc`` and collect it: ``(exit code, stdout, stderr, write error)``.
-
-        The prompt is written by a daemon thread of this client
-        (:func:`_feed_stdin`), never by ``communicate``: ``proc.stdin`` is
-        detached first, so ``communicate`` only reads stdout / stderr, and
-        its ``timeout`` bounds the whole exchange on every platform and
-        interpreter - CPython 3.12's Windows ``communicate`` writes ``input=``
-        in the calling thread before its first timeout check, so a child that
-        never read a prompt larger than the pipe buffer would block
-        ``subprocess.run(input=...)`` with no bound. Writing and reading run
-        together (no pipe deadlock). On the timeout (``TimeoutExpired``
-        propagates) and on any other exception - a ``KeyboardInterrupt``
-        reaches this thread, which never sits in a blocking write - the child
-        is killed and reaped (:func:`_reap`); the writer then sees the broken
-        pipe and ends, and is joined within :data:`REAP_TIMEOUT` (a daemon: a
-        process the child started that still holds stdin cannot pin the call).
-        """
-        pipe = proc.stdin
-        assert pipe is not None, "the child is started with stdin=PIPE"
-        proc.stdin = None  # communicate() must never write (3.12 on Windows: unbounded) nor close it
-        failures: list[OSError] = []
-        writer = threading.Thread(target=_feed_stdin, args=(pipe, stdin, failures), name=STDIN_WRITER_NAME, daemon=True)
-        try:
-            writer.start()
-            out, err = proc.communicate(timeout=self.timeout)
-        except BaseException:
-            if proc.poll() is None:
-                proc.kill()
-                _reap(proc)
-            if writer.ident is None:
-                _feed_stdin(pipe, b"", failures)  # the writer never started: close stdin here so nothing waits on it
-            raise
-        finally:
-            if writer.ident is not None:
-                writer.join(REAP_TIMEOUT)
-                if writer.is_alive():
-                    log.info("claude-cli: stdin still held open by a process the child started; the writer is left to end with it")
-        return proc.returncode, out or b"", err or b"", failures[0] if failures else None
+        """Feed ``stdin`` to the started ``proc`` and collect it within ``self.timeout`` (:func:`exchange`)."""
+        return exchange(proc, stdin, self.timeout)
 
     def _run(self, model: str, argv: list[str], stdin: bytes, cwd: str) -> tuple[dict[str, Any], int]:
         """Run the CLI with ``stdin`` written to its stdin; return ``(envelope, exit code)`` or raise the typed error.
@@ -1034,7 +1084,7 @@ class ClaudeCodeClient(LLMClient):
         t0 = time.monotonic()
         try:
             child = subprocess.Popen(
-                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=dict(os.environ),
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=subscription_env(),
             )
         except OSError as e:
             # the child could not start (missing binary, E2BIG, winerror 206); a broken stdin pipe never lands here
@@ -1118,6 +1168,7 @@ __all__ = [
     "absolute_cli_path",
     "argv_limit_problem",
     "encode_prompt",
+    "exchange",
     "find_claude_cli",
     "finish_reason_of",
     "parse_usage",

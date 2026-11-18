@@ -8,6 +8,18 @@ kinds reached ngspice. The compiler also never guesses: a component without a
 :class:`SpiceBinding` is a ``CompileError``; a part that has no SPICE meaning
 (a connector, a test point) is bound with ``exclude=True`` and a reason.
 
+Simulation-only elements (:class:`SimElement`, ``SimulationSetup.elements``)
+are what the netlist needs that the board does not have: a two-terminal R /
+C / L by value or a diode on a model card, net to net like a stimulus - a bus
+wiring capacitance, an idealised open-drain driver - or a voltage-controlled
+switch (``S``) across two nets, pressed by the voltage between two control
+nodes - a push button that a press schedule closes and opens inside one
+transient. They may use the
+simulation-private nodes of ``SimulationSetup.nodes`` (a driver's internal
+node, a switch's press schedule). They never reach the BOM, the CPL, the schematic or the placement; the
+compiler applies the component rules to them (provenance, positive values,
+model cards, unique names) and the report lists them with their ``reason``.
+
 Analyses are *not* written into the netlist (no ``.control`` block, no
 ``.tran``/``.ac`` cards): :func:`ai_eda.compilers.spice.analysis_command`
 turns an :class:`AnalysisSpec` into the interactive command the runner issues,
@@ -39,22 +51,45 @@ class SpiceDevice(StrEnum):
     M = "M"
     X = "X"  # subcircuit instance
     T = "T"  # lossless transmission line: port 1 (+, -), port 2 (+, -); params z0 (ohm) and td (s)
+    #: two coupled lines (ngspice CPL): line 1 in, line 2 in, GND1, line 1 out, line 2 out, GND2; Maxwell L / C per metre and the length
+    P = "P"
+    #: voltage-controlled switch (ngspice ``S<name> n+ n- nc+ nc- <model>`` on an ``SW`` model): a simulation-only element
+    #: (:class:`SimElement` with ``control_net`` / ``control_reference_net``), never a part's binding
+    S = "S"
 
 
 #: devices whose element line carries a plain value (ohm / F / H / V / A)
 VALUE_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.R, SpiceDevice.C, SpiceDevice.L, SpiceDevice.V, SpiceDevice.I})
-#: devices whose element line names a ``.model`` (D, Q, M) or ``.subckt`` (X)
-MODEL_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.D, SpiceDevice.Q, SpiceDevice.M, SpiceDevice.X})
+#: devices whose element line names a ``.model`` (D, Q, M, S) or ``.subckt`` (X)
+MODEL_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.D, SpiceDevice.Q, SpiceDevice.M, SpiceDevice.X, SpiceDevice.S})
 #: devices whose element line carries only named params, each one required (no value, no model): the lossless line
 #: ``T<ref> p1+ p1- p2+ p2- td=<s> z0=<ohm>`` - ngspice-42 simulates a T line without ``td`` with a delay of its own
-#: choosing and no error (measured), so the compiler never writes one without both
-PARAM_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.T})
-#: the params each :data:`PARAM_DEVICES` device requires, exactly (sorted: the order the netlist writes them), with their units
-DEVICE_PARAMS: dict[SpiceDevice, dict[str, str]] = {SpiceDevice.T: {"td": "s", "z0": "ohm"}}
+#: choosing and no error (measured), so the compiler never writes one without both. The coupled line ``P`` carries its
+#: params on a ``.model <ref>_cpl CPL`` line the compiler writes next to it (:mod:`ai_eda.compilers.spice`)
+PARAM_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.T, SpiceDevice.P})
+#: the params each :data:`PARAM_DEVICES` device requires, exactly (sorted: the order a T line writes them), with their units.
+#: P: ``l11`` / ``l12`` / ``l22`` and ``c11`` / ``c22`` of the per-metre Maxwell matrices, ``cm`` the positive mutual
+#: capacitance (the matrix entry C12 = -cm), ``length`` the coupled length; each one positive
+DEVICE_PARAMS: dict[SpiceDevice, dict[str, str]] = {
+    SpiceDevice.T: {"td": "s", "z0": "ohm"},
+    SpiceDevice.P: {"c11": "F/m", "c22": "F/m", "cm": "F/m", "l11": "H/m", "l12": "H/m", "l22": "H/m", "length": "m"},
+}
 #: devices with exactly two nodes
 TWO_TERMINAL_DEVICES: frozenset[SpiceDevice] = frozenset(
     {SpiceDevice.R, SpiceDevice.C, SpiceDevice.L, SpiceDevice.V, SpiceDevice.I, SpiceDevice.D}
 )
+#: devices a simulation-only element (:class:`SimElement`) may be: a value R / C / L, a diode on a model card or a
+#: voltage-controlled switch on an ``SW`` model card. A source is a :class:`Stimulus`; a transistor or subcircuit stands for a
+#: part and belongs in ``components``
+SIM_ELEMENT_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.R, SpiceDevice.C, SpiceDevice.L, SpiceDevice.D, SpiceDevice.S})
+#: simulation-only devices that are controlled by the voltage between two more nodes (``SimElement.control_net`` /
+#: ``control_reference_net``, both required on them and refused on every other device)
+CONTROLLED_DEVICES: frozenset[SpiceDevice] = frozenset({SpiceDevice.S})
+#: the parameters an ``S`` element's ``.model <name> SW(...)`` card must give, each exactly once and no other (ngspice's own
+#: defaults are never used silently: on ngspice-46 a bare ``.model SWD SW`` is a 1 ohm switch closed at 0 V control -
+#: measured 2026-11-18): RON and ROFF in ohm, positive and finite, RON < ROFF; VT (V) finite; VH (V) finite and >= 0
+#: (:class:`SimElement`)
+SWITCH_MODEL_PARAMS: tuple[str, ...] = ("ron", "roff", "vt", "vh")
 #: node counts ngspice accepts per device (``None`` = one or more, the subcircuit header decides)
 NODE_COUNTS: dict[SpiceDevice, tuple[int, ...] | None] = {
     SpiceDevice.R: (2,),
@@ -67,6 +102,8 @@ NODE_COUNTS: dict[SpiceDevice, tuple[int, ...] | None] = {
     SpiceDevice.M: (4,),  # drain gate source bulk
     SpiceDevice.X: None,
     SpiceDevice.T: (4,),  # port 1 +, port 1 -, port 2 +, port 2 -
+    SpiceDevice.P: (6,),  # line 1 in, line 2 in, GND1, line 1 out, line 2 out, GND2 (both GND pins on the ground net)
+    SpiceDevice.S: (4,),  # switched +, switched -, control +, control -
 }
 
 #: unit the compiler expects on ``SpiceBinding.value`` per value device (informational; the value itself is SI)
@@ -79,6 +116,10 @@ VALUE_UNITS: dict[SpiceDevice, str] = {
 }
 #: the ``Component.electrical`` key that holds the same physical quantity as ``SpiceBinding.value``; when
 #: the component has it, the compiler requires the two numbers to agree (the simulated part is the shipped part)
+#: in the provenance note of a model card nobody named a source for (a design file's card without ``model_source``):
+#: the card is simulated, and the SPICE compiler lists it among the netlist's assumptions, so nothing passes on it
+MODEL_CARD_NO_SOURCE = "(no model_source)"
+
 ELECTRICAL_KEYS: dict[SpiceDevice, str] = {
     SpiceDevice.R: "resistance",
     SpiceDevice.C: "capacitance",
@@ -100,7 +141,8 @@ class SpiceBinding(BaseModel):
     * ``model_name`` - the ``.model`` / ``.subckt`` name referenced by D, Q, M, X
       (or a semiconductor R/C/L model).
     * ``model_card`` - the verbatim ``.model`` / ``.subckt`` text that defines
-      ``model_name``; it must carry authoritative or user provenance. Several
+      ``model_name``; it must carry authoritative or user provenance, and one
+      whose note says :data:`MODEL_CARD_NO_SOURCE` is not evidence. Several
       components may name the same model; one card per model name is enough.
     * ``pin_order`` - IR pin numbers in SPICE node order (default ``["1", "2"]``
       for two-terminal parts). Must be a permutation of (a subset of) the
@@ -114,7 +156,11 @@ class SpiceBinding(BaseModel):
     * ``params`` - extra ``name=value`` tokens (``ic``, ``area``, ``m``, subckt params);
       for a lossless line (``device=T``, four pins in ``pin_order``: port 1
       +/-, port 2 +/-) exactly ``z0`` (ohm) and ``td`` (s), both positive
-      (:data:`DEVICE_PARAMS`), and no value or model.
+      (:data:`DEVICE_PARAMS`), and no value or model; for a coupled line
+      (``device=P``, six pins: line 1 in, line 2 in, GND1, line 1 out, line 2
+      out, GND2) exactly ``l11`` ``l12`` ``l22`` (H/m), ``c11`` ``c22`` ``cm``
+      (F/m) and ``length`` (m), all positive, and no value or model (the
+      compiler writes the ``.model`` line).
     * ``provenance`` - who decided this binding (device, pin order, exclusion). An
       ``llm_generated`` binding is refused by the compiler like an
       ``llm_generated`` value; an ``assumption`` is reported.
@@ -138,10 +184,14 @@ class StimulusKind(StrEnum):
 
     * ``DC`` - ``value`` only.
     * ``PULSE`` / ``SINE`` / ``PWL`` - ngspice's ``PULSE(...)`` / ``SINE(...)`` / ``PWL(...)``.
-    * ``AM`` - ngspice's amplitude-modulated source ``AM(VA VO MF FC TD)``:
+    * ``AM`` - an amplitude-modulated source stated as ngspice-42 did, ``AM(VA VO MF FC TD)``:
       v(t) = VA (VO + sin(2 pi MF (t - TD))) sin(2 pi FC (t - TD)) for t >= TD, 0 before;
       the modulation depth is m = 1 / VO (the envelope swings between VA (VO - 1)
-      and VA (VO + 1)).
+      and VA (VO + 1)). The compiler writes it in ngspice 43+'s renumbered form
+      ``AM(VO VMO VMA FM FC TD)`` as ``AM(0 VA*VO VA MF FC TD)`` (measured on
+      ngspice-46, 2026-11-04: ``AM(0 2 1 1k 100k 0)`` swings 1..3 V like the
+      ngspice-42 anchor below; the old five-value text reads as a flat line there),
+      and the SPICE stage refuses an AM source on an engine older than 43.
     * ``SFFM`` - ngspice's single-frequency FM source ``SFFM(VO VA FC MDI FS)``:
       v(t) = VO + VA sin(2 pi FC t + MDI sin(2 pi FS t)); FC is the carrier, MDI
       the modulation index (peak deviation / FS), FS the modulating frequency.
@@ -152,7 +202,10 @@ class StimulusKind(StrEnum):
     ``AM(1 2 1k 20k 0.5m)`` is exactly 0 V before TD; VO = 0 is honoured
     (DSB-SC); ``SFFM(0 1 1k 0 10k)`` is the plain 1 kHz sine (MDI = 0 honoured)
     and ``SFFM(0 1 1k 5 10k)`` crosses zero exactly where
-    sin(2 pi 1k t + 5 sin(2 pi 10k t)) does (10.54, 51.02, 86.80 us). But
+    sin(2 pi 1k t + 5 sin(2 pi 10k t)) does (10.54, 51.02, 86.80 us) - on
+    ngspice-42 only: ngspice 43+ limits MDI to FC / FS (a one-time "Warning:
+    MDI in v1 limited to FC/FM", then silent, measured on ngspice-46
+    2026-11-04), so the compiler refuses ``mdi`` above that. But
     **ngspice-42 silently replaces some zero parameters by defaults of its own**:
     ``AM(1 2 0 20k 0)`` (MF = 0) peaks at 3.0 V, not the unmodulated 2.0 V, and
     ``SFFM(0 1 1k 5 0)`` (FS = 0) is not the 1 kHz sine it would be. So the
@@ -259,6 +312,13 @@ class Reduce(StrEnum):
     FINAL = "final"
     MAX = "max"
     MIN = "min"
+    #: peak-to-peak: max - min of the saved samples (a tran ripple, a dc sweep's span). Judged like MAX / MIN on the
+    #: bare number; the samples must all be finite.
+    PP = "pp"
+    #: the time average of a tran vector over the window ``[t_start, t_stop]`` (``params``): the exact integral of the
+    #: piecewise-linear interpolant of the samples ngspice wrote, divided by the window (:func:`ai_eda.tools.spice.measure.window_mean`).
+    #: A window that is not inside the saved samples gives no number. Output unit: the vector's (V or A).
+    MEAN = "mean"
     #: the mean frequency of the rising mid-level crossings of a transient vector over the saved window,
     #: f = (N - 1) / (t_N - t_1) for N >= 3 crossings (:func:`ai_eda.tools.spice.measure.rising_edge_frequency`).
     #: Crossings are detected with hysteresis: armed once a sample is at or below vmin + 0.25 * swing, counted at the
@@ -267,6 +327,11 @@ class Reduce(StrEnum):
     #: own resolution (ngspice's ``reltol`` * level + ``vntol`` / ``abstol``: numerical ripple is not an oscillation),
     #: non-finite samples or a time scale that steps backwards give no number ("no oscillation detected"), which the
     #: stage reports as FAIL, never PASS. Only on a tran analysis (the compiler refuses it elsewhere).
+    #: An optional window ``params`` ``t_start`` / ``t_stop`` (s; both or neither, inside the analysis' saved window by the
+    #: rule of :data:`WINDOW_REDUCES`) restricts all of it - thresholds, crossings, the count - to the piecewise-linear
+    #: interpolant's points on ``[t_start, t_stop]`` (:func:`ai_eda.tools.spice.measure.window_frequency`), so one
+    #: transient that passes through several states (a key pressed after another) gives one frequency per window.
+    #: Without a window it is the whole saved vector, exactly as before the window existed.
     FREQUENCY = "frequency"
     #: a level in dB at one frequency of an ac sweep: 20 log10(|vector(at)| / R), R = |reference_vector(at)| or
     #: ``params["ref"]`` (> 0, the vector's own unit). Both magnitudes are read with :meth:`SpiceResult.interpolate`
@@ -304,7 +369,9 @@ REDUCE_PARAMS: dict[Reduce, tuple[tuple[str, ...], tuple[str, ...]]] = {
     Reduce.FINAL: ((), ()),
     Reduce.MAX: ((), ()),
     Reduce.MIN: ((), ()),
-    Reduce.FREQUENCY: ((), ()),
+    Reduce.PP: ((), ()),
+    Reduce.MEAN: (("t_start", "t_stop"), ()),
+    Reduce.FREQUENCY: ((), ("t_start", "t_stop")),
     Reduce.DB_AT: ((), ("ref",)),
     Reduce.RMS: (("t_start", "t_stop", "f_max"), ()),
     Reduce.DB_RMS: (("t_start", "t_stop", "f_max"), ("ref",)),
@@ -318,7 +385,10 @@ EXPECTATION_BOUNDS: tuple[str, ...] = ("at_least", "at_most")
 #: reductions that read a reference (``reference_vector`` or ``params["ref"]``, exactly one)
 REFERENCE_REDUCES: frozenset[Reduce] = frozenset({Reduce.DB_AT, Reduce.DB_RMS})
 #: reductions over a time window ``[t_start, t_stop]`` of a tran analysis
-WINDOW_REDUCES: frozenset[Reduce] = frozenset({Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH})
+WINDOW_REDUCES: frozenset[Reduce] = frozenset({Reduce.MEAN, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH})
+#: reductions that take the same window optionally: ``t_start`` and ``t_stop`` both or neither, and when given under the
+#: rules of :data:`WINDOW_REDUCES` (inside the analysis' saved window); without them the whole saved vector
+OPTIONAL_WINDOW_REDUCES: frozenset[Reduce] = frozenset({Reduce.FREQUENCY})
 #: the unit of the number a reduction gives, when it is fixed (``RMS`` gives the vector's own unit)
 REDUCE_UNITS: dict[Reduce, str] = {Reduce.DB_AT: "dB", Reduce.DB_RMS: "dB", Reduce.HARMONIC_DBC: "dBc", Reduce.AM_DEPTH: "percent"}
 #: the unit a reduction param must carry when its ``Traced.unit`` is set (``k`` is a plain count and carries none;
@@ -401,11 +471,118 @@ class Expectation(BaseModel):
     _design = drop_empty_in_design_view("params", "reference_vector", "bound")
 
 
+class SimElement(BaseModel):
+    """An element the *simulation* adds between two nets (or simulation-private nodes) that is not a board part.
+
+    ``id`` becomes the element name the way a component ref does (``CBUS`` ->
+    ``CBUS``, ``BUS`` bound as C -> ``CBUS``); it must not collide with a
+    component ref or a stimulus name. ``device`` is one of
+    :data:`SIM_ELEMENT_DEVICES`: R / C / L take ``value`` (ohm / F / H, > 0),
+    D takes ``model_name`` + ``model_card`` under the same rules as a
+    component binding (authoritative or user provenance). ``net`` /
+    ``reference_net`` name IR nets or entries of ``SimulationSetup.nodes``.
+    ``reason`` says what the element stands for and why it is not a part (the
+    report prints it). Nothing ``llm_generated`` is accepted, like everything
+    else that reaches ngspice.
+
+    **The voltage-controlled switch** (``device`` ``S``) is written
+    ``S<id> <net> <reference_net> <control_net> <control_reference_net> <model_name>``:
+    it switches the path between ``net`` and ``reference_net`` by the voltage
+    between its two control nodes, which it requires (both; every other device
+    refuses them). Its ``model_name`` names a ``.model <name> SW(RON=.. ROFF=..
+    VT=.. VH=..)`` card under the model-card rules above that gives exactly
+    :data:`SWITCH_MODEL_PARAMS` (positive finite RON < ROFF, finite VT, finite
+    VH >= 0: ngspice's defaults are never used silently); it takes no value
+    and no params. Its use: a push button stays an open part of the netlist
+    (excluded) and the switch across it, driven by a press schedule (a PWL
+    :class:`Stimulus` on a private node), closes and opens it inside one
+    transient, with the button's datasheet contact and insulation resistance
+    as RON / ROFF. ``control_net`` / ``control_reference_net`` are left out of
+    every dump while ``None`` (``exclude_if``, like ``Via.kind``), so every
+    setup without a switch serialises and hashes byte for byte as before.
+
+    Measured on ngspice-46 (KiCad 10.0.6's ``ngspice.dll``, build Apr 14 2026,
+    through :class:`~ai_eda.tools.spice.NgspiceShared`, 2026-11-18) with
+    ``.model SWM SW(RON=0.1 ROFF=1e8 VT=0.5 VH=0.1)`` in series with 1 kohm
+    across 1 V:
+
+    * the switch presents RON and ROFF exactly (v / i across it: 0.1 ohm on,
+      1e8 ohm off) and nothing in between - an abrupt change, no transition
+      region;
+    * a control ramp 0 -> 1 V over 1 ms (``tran 1u 5m``) closes it at the first
+      time point at or above VT + VH = 0.6 V (1.6005 ms at 0.6005 V; open one
+      point earlier at 0.5995 V) and the ramp back opens it at the first point
+      at or below VT - VH = 0.4 V (3.6005 ms at 0.3995 V): the thresholds are
+      VT +/- VH; a control that starts inside the band (0.5 V from t = 0,
+      ``tran 1u 1m`` with or without ``uic``) leaves the switch open - the
+      engine's own initial state, so a press schedule starts below VT - VH;
+    * a PWL step 0 -> 1 V in 1 us at 1 ms under ``tran 9.56u 3m``: ngspice cuts
+      its step at the PWL corners and the switch is closed from the time point
+      1000.622 us (0.622 V; open at the point before, 1000.489 us, 0.489 V) -
+      within one time point of the 0.6 V crossing at 1000.6 us; the step back
+      opens it at 2000.622 us (0.378 V);
+    * eight such switches pressed one after another for 40 ms each run through
+      ``tran 9.56u 0.42`` (44164 points, no error line), each closing and
+      opening 0.62 us after its PWL corner;
+    * a two-transistor astable (``.model QNPN NPN (TR=200n)``, 1 kohm
+      collectors, 100 nF, a 3.0 V rail, a 6.265 kohm fixed half) whose base
+      resistor chain (C4 .. C5 by the design formula) is tapped by eight such
+      switches pressed one after another (key k joins tap k to the rail)
+      measures in each key's window (10 periods after 4 settling ones,
+      :data:`Reduce.FREQUENCY` with a window) within 0.69 cents of a deck
+      with that key wired in (a 0 V source) and the others open, at ``tran
+      1u``: the two lowest keys' +0.69 / +0.56 cents are mostly the open
+      keys' ROFF across the chain between the base and the pressed tap
+      (+0.72 / +0.42 cents computed for 1e8 ohm), the other six agree within
+      0.2 cents. The same comparison with RB1 and the chain at the formula's
+      values for each rail (six digits) measures, on 2.5 / 3.0 / 4.0 V rails,
+      at most 0.71 / 0.68 / 0.61 cents (the lowest key every time) and the
+      other keys within 0.52 cents (a few tenths of a cent of numerical
+      scatter: with ROFF 1e12 the 3.0 V deck's worst key is 0.21 cents and
+      its lowest -0.01). At ``tran 2u`` the worst is 0.91 cents and at ``tran 9.56u``
+      (period / 400 of C4) 1.81 cents, where a wired deck itself reads up to
+      3.1 cents above ``tran 1u`` (0.7 cents at ``2u``): one deck's periods
+      scatter by about +/- 1 us at 2u (single periods up to 4 us short) and
+      +/- 0.3 us at 1u, so a cent-level note needs a step near period / 2500
+      and several periods per window.
+    """
+
+    id: str
+    device: SpiceDevice
+    net: str
+    reference_net: str
+    #: the control node pair of a voltage-controlled switch (``device`` ``S``, required there, refused elsewhere): closed above
+    #: VT + VH, open below VT - VH of v(control_net) - v(control_reference_net); IR nets or ``SimulationSetup.nodes``. Left out
+    #: of every dump while ``None`` (``exclude_if``, like ``Via.kind``)
+    control_net: str | None = Field(default=None, exclude_if=lambda v: v is None)
+    control_reference_net: str | None = Field(default=None, exclude_if=lambda v: v is None)
+    value: Traced[float] | None = None
+    model_name: str | None = None
+    model_card: Traced[str] | None = None
+    params: dict[str, Traced] = Field(default_factory=dict)
+    reason: str
+    provenance: Provenance
+    serves_requirements: list[str] = Field(default_factory=list)
+
+
 class SimulationSetup(BaseModel):
     stimuli: list[Stimulus] = Field(default_factory=list)
     analyses: list[AnalysisSpec] = Field(default_factory=list)
     expectations: list[Expectation] = Field(default_factory=list)
     temperature_c: Traced[float] | None = None
+    #: simulation-only elements (:class:`SimElement`) - netlisted after the parts, before the stimuli
+    elements: list[SimElement] = Field(default_factory=list)
+    #: simulation-private node names (a driver's internal node): usable by elements and stimuli, never a net of the board
+    nodes: list[str] = Field(default_factory=list)
+
+    # left out of the design view while empty, so an IR saved before they existed keeps its hash
+    _design = drop_empty_in_design_view("elements", "nodes")
+
+    def element(self, id: str) -> SimElement | None:
+        for e in self.elements:
+            if e.id == id:
+                return e
+        return None
 
     def stimulus(self, id: str) -> Stimulus | None:
         for s in self.stimuli:
@@ -421,11 +598,13 @@ class SimulationSetup(BaseModel):
 
 
 __all__ = [
+    "MODEL_CARD_NO_SOURCE",
     "AC_MAGNITUDE_PARAM",
     "AC_VARIATIONS",
     "ANALYSIS_OPTIONAL_PARAMS",
     "ANALYSIS_PARAMS",
     "AnalysisSpec",
+    "CONTROLLED_DEVICES",
     "DB_REDUCES",
     "DEVICE_PARAMS",
     "ELECTRICAL_KEYS",
@@ -433,16 +612,20 @@ __all__ = [
     "Expectation",
     "MODEL_DEVICES",
     "NODE_COUNTS",
+    "OPTIONAL_WINDOW_REDUCES",
     "PARAM_DEVICES",
     "REDUCE_PARAMS",
     "REDUCE_PARAM_UNITS",
     "REDUCE_UNITS",
     "REFERENCE_REDUCES",
     "Reduce",
+    "SIM_ELEMENT_DEVICES",
     "SINE_OPTIONAL_PARAMS",
     "STIMULUS_NON_NEGATIVE_PARAMS",
     "STIMULUS_PARAMS",
     "STIMULUS_POSITIVE_PARAMS",
+    "SWITCH_MODEL_PARAMS",
+    "SimElement",
     "SimulationSetup",
     "SpiceBinding",
     "SpiceDevice",

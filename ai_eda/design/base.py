@@ -63,7 +63,19 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
-from ai_eda.ir import CircuitIR, Keepout, MissingInformation, Provenance, ProvenanceKind, Requirement, Traced
+from ai_eda.ir import (
+    BoardOutline,
+    CircuitIR,
+    Keepout,
+    MissingInformation,
+    PackRegion,
+    Placement,
+    Provenance,
+    ProvenanceKind,
+    Requirement,
+    SilkText,
+    Traced,
+)
 from ai_eda.tools.kicad.library import KicadLibrary
 
 from ai_eda.design.inputs import (
@@ -92,6 +104,8 @@ TOOL_ID = "design.template"
 CHOICE_NOTE_PREFIX = "design choice confirmed by user"
 #: the answer key that confirms a presented plan; a control key (never a requirement), see ``ai_eda.agents.requirement.CONTROL_KEYS``
 CONFIRM_DESIGN_KEY = "confirm_design"
+#: the start of the provenance note on everything a design file (``run --design``) put in the IR, before the file's ``sha256:...``
+DESIGN_FILE_NOTE = "design file "
 #: the answer key that leaves named requirements out of the design (``--answer leave_out=<key>,<key>``); a control key (never a
 #: requirement): the requirement agent moves each named requirement into ``ir.requirements.left_out`` (the user's recorded
 #: decision), so no template reads it and no closed world refuses on it. Every closed-world refusal names this answer
@@ -120,6 +134,12 @@ _NEEDABLE_KEYS: frozenset[str] = frozenset(KEY_ALIASES) | frozenset(CATEGORICAL_
 #: (:func:`served_through_specific_key`). ``frequency`` could be an oscillator's output, a filter corner, an MCU clock
 #: or an RF carrier - reading it as any one of them would be a guess
 AMBIGUOUS_KEYS: dict[str, str] = {"frequency": "Hz"}
+
+
+def design_file_hash(ir: CircuitIR) -> str | None:
+    """The ``sha256:...`` of the design file that built ``ir`` (from its topology's provenance), or ``None`` for any other design."""
+    note = ir.topology.provenance.note if ir.topology is not None else None
+    return note[len(DESIGN_FILE_NOTE):] if note and note.startswith(DESIGN_FILE_NOTE + "sha256:") else None
 
 
 def template_tool(template_id: str) -> str:
@@ -368,6 +388,16 @@ class Plan:
     #: keep-out areas the template's board needs (the transceiver's antenna band): :func:`~ai_eda.design.board.add_board` writes them into
     #: ``ir.pcb.keepouts`` with the board stack and lists them in the table; empty for every other template (its board is unchanged)
     keepouts: list[Keepout] = field(default_factory=list)
+    #: the board layout a template proposes with its board (a keyboard's key row): the outline, the parts it fixes, the rectangles the
+    #: ``placement.fixed`` placer packs the other parts into and the board texts it puts on the silk (``user`` / ``title``, stamped with
+    #: the template's structural provenance - :func:`~ai_eda.design.board.template_silk_text`, the mark by which the PCB agent keeps them
+    #: and places the silkscreen around them). :func:`~ai_eda.design.board.add_board` writes them into ``ir.pcb`` with the board stack
+    #: (or appends them to an existing one, never replacing anything) and lists each in the table; ``None`` / empty for every template
+    #: without its own layout (its board is unchanged)
+    outline: BoardOutline | None = None
+    fixed: list[Placement] = field(default_factory=list)
+    pack_regions: list[PackRegion] = field(default_factory=list)
+    silk_texts: list[SilkText] = field(default_factory=list)
     #: one line per requirement the user left out of the design (:func:`left_out_lines`), shown in the table (and so part of its
     #: hash: a leave-out changes the table the user confirms); empty when nothing was left out (the table is unchanged)
     left_out: list[str] = field(default_factory=list)
@@ -717,6 +747,8 @@ __all__ = [
     "AMBIGUOUS_KEYS",
     "BOARD_KEYS",
     "CHOICE_NOTE_PREFIX",
+    "DESIGN_FILE_NOTE",
+    "design_file_hash",
     "CONFIRM_DESIGN_KEY",
     "DEFAULT_LAYER_POLICY",
     "DESIGN_CATEGORIES",

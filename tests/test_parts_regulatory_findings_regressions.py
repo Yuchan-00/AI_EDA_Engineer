@@ -437,7 +437,7 @@ def test_12_the_input_rail_alone_never_puts_a_design_outside_the_lvd(tmp_path: P
 
 
 def test_14_the_readme_states_what_was_not_measured():
-    readme = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
+    readme = (Path(__file__).parent.parent / "README.ko.md").read_text(encoding="utf-8")
     assert "저장소 밖" in readme and "law.go.kr" in readme and "eCFR" in readme and "측정되지 않" in readme
     assert "합성" in readme  # the offline tests use synthetic pages built from the list's own quotes
 

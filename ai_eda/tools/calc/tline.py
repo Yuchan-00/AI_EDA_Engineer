@@ -634,6 +634,8 @@ def line_geometry(stackup, layer: str, prefix: str = "pcb.stackup") -> tuple[Lin
         return None, f"{layer} is a plane layer ({copper.plane_net.value}); no signal is routed on it"
     if 0 < i < len(names) - 1:
         return None, f"{layer} is an inner signal layer: stripline geometry (the plane spacing b) is not derived from a stackup by this version"
+    if len(names) == 1:  # one copper layer on a metal base (an IMS): the base carries no net, so it is no reference plane
+        return None, f"{NO_REFERENCE_PLANE}: {layer} is the stack's only copper layer (the metal base under it carries no net)"
     j = 1 if i == 0 else i - 1
     neighbour = stackup.copper[j]
     if neighbour.plane_net is None:

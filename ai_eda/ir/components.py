@@ -80,6 +80,8 @@ class Component(BaseModel):
     electrical: dict[str, Traced] = Field(default_factory=dict)
     symbol: LibraryRef | None = None
     footprint: LibraryRef | None = None
+    #: KiCad's board_only footprint attribute: no corresponding schematic symbol.
+    board_only: bool = Field(default=False, exclude_if=lambda v: not v)
     sourcing: list[SourcingInfo] = Field(default_factory=list)
     #: why this part is in the design (which requirement / block it serves)
     provenance: Provenance
@@ -88,6 +90,11 @@ class Component(BaseModel):
     #: how the part appears in SPICE; ``None`` makes the SPICE compiler refuse (it never guesses a
     #: model), a part without SPICE meaning is bound with ``exclude=True`` and a reason
     spice: SpiceBinding | None = None
+    #: the smallest copper layer count the part's manufacturer states it needs (a BGA's escape), with that document in
+    #: ``provenance.source`` (its title and page / section); ``None`` = no such statement. The PCB agent's layer escalation
+    #: starts at it and ignores one without a source. Added after IRs were saved: left out of every dump while ``None``
+    #: (``exclude_if``, like ``Via.kind``), so every IR without it serialises byte for byte as before
+    min_pcb_layers: Traced[int] | None = Field(default=None, exclude_if=lambda v: v is None)
 
     def pin(self, number: str) -> Pin | None:
         for p in self.pins:

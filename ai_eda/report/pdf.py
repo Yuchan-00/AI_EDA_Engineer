@@ -537,7 +537,8 @@ def is_snap(exe: Path | str) -> bool:
         resolved = path.resolve()
     except OSError:
         resolved = path
-    if str(path).startswith(SNAP_PREFIX) or str(resolved).startswith(SNAP_PREFIX) or resolved.name == "snap":
+    # as_posix: on POSIX the same as str(); a test that monkeypatches the platform to linux on Windows spells the path with slashes
+    if path.as_posix().startswith(SNAP_PREFIX) or resolved.as_posix().startswith(SNAP_PREFIX) or resolved.name == "snap":
         return True
     try:
         with path.open("rb") as f:

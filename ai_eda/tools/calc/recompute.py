@@ -63,12 +63,29 @@ from ai_eda.tools.calc.basic import (
     astable_tran_step,
     astable_tran_stop,
     astable_v_be_reverse,
+    bjt_switch_base_current,
+    bjt_switch_base_resistor,
+    bjt_switch_clamp_max,
+    i2c_r_max,
+    i2c_r_min,
+    i2c_r_pullup,
+    i2c_t_30,
+    i2c_t_check,
+    i2c_t_hold,
+    i2c_t_low,
+    i2c_tran_step,
+    i2c_tran_stop,
+    i2c_v_ih,
+    i2c_v_low_diode,
     clock_divided,
     crystal_load_capacitance,
     current_from_voltage_resistance,
     divider_r1_for_v_out,
     ipc2221_width_for_current,
     junction_temperature,
+    lc2_butterworth_level_db,
+    lc2_series_l,
+    lc2_shunt_c,
     lc_cutoff,
     led_current,
     led_series_resistor,
@@ -88,6 +105,7 @@ from ai_eda.tools.calc.basic import (
     voltage_divider_output,
     voltage_divider_ratio,
 )
+from ai_eda.tools.calc.e_series import E_SERIES_CALCULATORS
 from ai_eda.tools.calc.radio import RADIO_CALCULATORS
 from ai_eda.tools.calc.rf import RF_CALCULATORS
 from ai_eda.tools.calc.tline import (
@@ -151,6 +169,23 @@ CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     "calc.regulator.p_dissipation": (regulator_dissipation, ROLES["calc.regulator.p_dissipation"]),
     "calc.crystal.load_capacitance": (crystal_load_capacitance, ROLES["calc.crystal.load_capacitance"]),
     "calc.lc.cutoff": (lc_cutoff, ROLES["calc.lc.cutoff"]),
+    "calc.lc.butterworth2.series_l": (lc2_series_l, ROLES["calc.lc.butterworth2.series_l"]),
+    "calc.lc.butterworth2.shunt_c": (lc2_shunt_c, ROLES["calc.lc.butterworth2.shunt_c"]),
+    "calc.lc.butterworth2.level_db": (lc2_butterworth_level_db, ROLES["calc.lc.butterworth2.level_db"]),
+    "calc.bjt_switch.base_current": (bjt_switch_base_current, ROLES["calc.bjt_switch.base_current"]),
+    "calc.bjt_switch.base_resistor": (bjt_switch_base_resistor, ROLES["calc.bjt_switch.base_resistor"]),
+    "calc.bjt_switch.clamp_max": (bjt_switch_clamp_max, ROLES["calc.bjt_switch.clamp_max"]),
+    "calc.i2c.r_max": (i2c_r_max, ROLES["calc.i2c.r_max"]),
+    "calc.i2c.r_min": (i2c_r_min, ROLES["calc.i2c.r_min"]),
+    "calc.i2c.r_pullup": (i2c_r_pullup, ROLES["calc.i2c.r_pullup"]),
+    "calc.i2c.v_ih": (i2c_v_ih, ROLES["calc.i2c.v_ih"]),
+    "calc.i2c.t_low": (i2c_t_low, ROLES["calc.i2c.t_low"]),
+    "calc.i2c.v_low_diode": (i2c_v_low_diode, ROLES["calc.i2c.v_low_diode"]),
+    "calc.i2c.t_hold": (i2c_t_hold, ROLES["calc.i2c.t_hold"]),
+    "calc.i2c.t_30": (i2c_t_30, ROLES["calc.i2c.t_30"]),
+    "calc.i2c.t_check": (i2c_t_check, ROLES["calc.i2c.t_check"]),
+    "calc.i2c.tran_step": (i2c_tran_step, ROLES["calc.i2c.tran_step"]),
+    "calc.i2c.tran_stop": (i2c_tran_stop, ROLES["calc.i2c.tran_stop"]),
     "calc.tline.microstrip.z0": (microstrip_z0, ROLES["calc.tline.microstrip.z0"]),
     "calc.tline.microstrip.e_eff": (microstrip_e_eff, ROLES["calc.tline.microstrip.e_eff"]),
     "calc.tline.stripline.z0": (stripline_z0, ROLES["calc.tline.stripline.z0"]),
@@ -172,6 +207,8 @@ CALCULATORS: dict[str, tuple[Calculator, tuple[str, ...]]] = {
     **{tool: (fn, ROLES[tool]) for tool, fn in RF_CALCULATORS.items()},
     # RADIO (ai_eda.tools.calc.radio): frequency plan, FM / PM, top-C and crystal-ladder networks, pads, audio, power budget
     **{tool: (fn, ROLES[tool]) for tool, fn in RADIO_CALCULATORS.items()},
+    # E series (ai_eda.tools.calc.e_series): the part value is the IEC 60063 value of the solved number
+    **{tool: (fn, ROLES[tool]) for tool, fn in E_SERIES_CALCULATORS.items()},
 }
 
 #: lower-cased unit spelling -> the key a role's expected unit lower-cases to. A thermal resistance is written
@@ -247,6 +284,12 @@ def derived_values(ir: CircuitIR) -> Iterator[tuple[str, Traced]]:
     setup = ir.simulation
     if setup is None:
         return
+    for el in setup.elements:
+        if el.value is not None and el.value.provenance.kind == ProvenanceKind.DERIVED:
+            yield f"simulation.elements[{el.id}].value", el.value
+        for k, t in el.params.items():
+            if t.provenance.kind == ProvenanceKind.DERIVED:
+                yield f"simulation.elements[{el.id}].params[{k}]", t
     for s in setup.stimuli:
         if s.value is not None and s.value.provenance.kind == ProvenanceKind.DERIVED:
             yield f"simulation.stimuli[{s.id}].value", s.value

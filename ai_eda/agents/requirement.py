@@ -64,6 +64,23 @@ step - the model never decides what enters the IR:
    confirmed, ``PASS`` after, and ``NOT_VERIFIED`` with the reason when the
    model could not be called (budget, transport, schema) - the agent then
    falls back to the checklist.
+8. With cross-check models (``--llm-crosscheck``; nothing of this runs
+   without them) the same request is sent to each of them independently
+   (:meth:`~ai_eda.llm.service.LLMService.cross_structured`; a served reply
+   is cached in the entry under ``crosscheck``), each reply is grounded
+   exactly like the primary's and the grounded results are compared field by
+   field (:func:`~ai_eda.llm.crosscheck.compare_extractions`: requirement
+   items by key, the application statement, the jurisdictions, the declared
+   conflicts as key sets; a question any model asked is asked). An agreed
+   item is proposed as before, its provenance note naming the model(s) that
+   agreed. A differing field is withheld - neither model's value is proposed
+   - and asked as a required question under its key that shows every
+   model's proposal; the user answers it with a typed value (or leaves the
+   key out), and the confirmation is refused while one is open. A
+   ``requirements.crosscheck`` result says what was compared (PASS),
+   what is open (USER_INPUT_REQUIRED) or which cross-check model failed and
+   why (NOT_VERIFIED; asked again next run). An extraction the user already
+   confirmed is not cross-checked (noted).
 
 A model question is still only a question: one the model marked required
 under a key nothing in the pipeline reads (no template key or alias, no
@@ -87,6 +104,13 @@ is dropped, and the confirmation table lists them. The leave-out wins over a
 typed answer to the same key in the same run; a typed answer in a later run
 brings the key back.
 
+A typed value is kept: typing the key again does nothing (noted, with the
+remedy that works for that key - leave it out and answer again). The one
+exception is ``application`` (:data:`RETYPED_KEYS`): a leave-out never takes
+it, so a later, different typed ``application`` replaces the earlier one
+(noted; ``jurisdiction`` and the regulatory scope answers are neither left
+out nor replaced - their note says so instead of naming ``leave_out``).
+
 Only the extraction path rewrites ``requirements.missing``. A run without it
 (checklist, empty request, model unavailable) brings the recorded questions
 up to date instead (:func:`_refreshed_missing`): closed by a leave-out,
@@ -104,10 +128,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
 from ai_eda.agents.keys import CONTROL_KEYS, LEAVE_OUT_KEY
 from ai_eda.agents.leave_out import NEVER_LEFT_OUT, answers_key, apply_leave_out, drop_typed_left_out, same_left_out, split_keys, withdraw_brought_back
 from ai_eda.design.base import AMBIGUOUS_KEYS, DESIGN_CATEGORIES, leave_out_answer, template_reads_key
+from ai_eda.design.inputs import FLEXING_ALIASES, MATERIAL_ALIASES, POWER_DISSIPATION_ALIASES
 from ai_eda.ir import (
     CircuitIR,
     Jurisdiction,
@@ -123,6 +150,7 @@ from ai_eda.ir import (
     user_requirement,
 )
 from ai_eda.llm.client import LLMError
+from ai_eda.llm.crosscheck import ExtractionCrossCheck, compare_extractions, disagreement_question, mark_agreed, withhold
 from ai_eda.llm.extraction import (
     ACCEPT_KEY,
     CONFIRM_KEY,
@@ -147,7 +175,7 @@ from ai_eda.llm.extraction import (
     upgrade_confirmed,
 )
 from ai_eda.llm.router import TaskKind
-from ai_eda.llm.service import BudgetExceededError, LLMService, StructuredOutputError
+from ai_eda.llm.service import BudgetExceededError, CrossCheckReply, LLMService, StructuredOutputError
 from ai_eda.regulatory.candidates import CandidateList, load_candidates
 
 #: Baseline information every design needs before we may proceed.
@@ -159,6 +187,8 @@ BASELINE_QUESTIONS: list[MissingInformation] = [
 ]
 
 EXTRACTION_CHECK = "requirements.extraction"
+#: the result of the cross-check (``--llm-crosscheck``): only a run with cross-check models records it
+CROSSCHECK_CHECK = "requirements.crosscheck"
 
 #: the answer keys that steer an agent (this one, the component, regulatory, circuit-design and PCB agents) are never
 #: requirements: ``CONTROL_KEYS`` is defined once in :mod:`ai_eda.agents.keys` and re-exported here
@@ -205,13 +235,39 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _answerable(ir: CircuitIR, key: str) -> bool:
-    """Whether a typed answer for ``key`` enters the IR: no requirement yet, or one the extraction produced (a typed answer wins)."""
+#: keys whose typed value a later, different typed answer replaces. Every other typed value is changed by leaving the key out
+#: and answering it again; a leave-out never takes ``application`` (:data:`NEVER_LEFT_OUT`), so without this its first answer -
+#: often a guess made to get past the baseline question - could only be changed by editing the IR. Both values are the user's
+#: (``user_requirement``), the id stays ``req.application``, and the changed requirement list makes the confirmation tables ask again.
+RETYPED_KEYS: frozenset[str] = frozenset({"application"})
+
+
+def _retyped(ir: CircuitIR, key: str, answer: str) -> bool:
+    """Whether ``answer`` replaces the user's own earlier answer under ``key``: a :data:`RETYPED_KEYS` key holding a different typed value."""
     existing = ir.requirements.get(key)
-    return existing is None or from_extraction(existing)
+    return (
+        key in RETYPED_KEYS and existing is not None and not from_extraction(existing) and existing.value is not None
+        and existing.value.provenance.kind == ProvenanceKind.USER_REQUIREMENT and existing.value.value != answer
+    )
 
 
-def _kept_notes(ir: CircuitIR, answers: dict[str, str]) -> list[str]:
+def _answerable(ir: CircuitIR, key: str, answer: str) -> bool:
+    """Whether a typed answer for ``key`` enters the IR: no requirement yet, one the extraction produced (a typed answer wins),
+    or the user's earlier answer under a key that is changed by typing it again (:func:`_retyped`)."""
+    existing = ir.requirements.get(key)
+    return existing is None or from_extraction(existing) or _retyped(ir, key, answer)
+
+
+def _change_remedy(key: str, protected: frozenset[str]) -> str:
+    """How the user changes a typed value that is kept - only a remedy that works for ``key``."""
+    if key in RETYPED_KEYS:
+        return f"to change it answer {key} with the new value (a different typed {key} replaces the earlier one)"
+    if key in protected:  # never left out, so the leave-out route does not exist for it
+        return f"to change it edit that requirement in the IR ({leave_out_answer([key])} is refused for this key)"
+    return f"to change it edit that requirement in the IR (or leave it out with {leave_out_answer([key])} and answer {key} again in a later run)"
+
+
+def _kept_notes(ir: CircuitIR, answers: dict[str, str], protected: frozenset[str] = frozenset()) -> list[str]:
     """One note per typed answer that is dropped because its key already holds a typed value (both values named).
 
     The earlier typed answer is kept (it is the user's own value, not an
@@ -220,24 +276,21 @@ def _kept_notes(ir: CircuitIR, answers: dict[str, str]) -> list[str]:
     """
     out: list[str] = []
     for key, given in answers.items():
-        if _answerable(ir, key):
+        if _answerable(ir, key, given):
             continue
         existing = ir.requirements.get(key)
         assert existing is not None
         held = existing.value.value if existing.value is not None else None
-        out.append(
-            f"{key}: answer {given!r} not applied - {existing.id} already holds your earlier answer {held!r}, which is kept; "
-            f"to change it edit that requirement in the IR (or leave it out with {leave_out_answer([key])} and answer {key} again in a later run)"
-        )
+        out.append(f"{key}: answer {given!r} not applied - {existing.id} already holds your earlier answer {held!r}, which is kept; {_change_remedy(key, protected)}")
     return out
 
 
 def _superseded_ids(ir: CircuitIR, answer_reqs: list[Requirement], notes: list[str]) -> set[str]:
-    """Ids of the extraction-derived requirements a typed answer replaces (noted)."""
+    """Ids of the requirements a typed answer replaces (noted): extraction-derived ones, and the user's earlier answer under a :data:`RETYPED_KEYS` key."""
     keys = {a.key for a in answer_reqs}
     out = {r.id for r in ir.requirements.requirements if r.key in keys}
     for r in ir.requirements.requirements:
-        if r.id in out:
+        if r.id in out and from_extraction(r):
             notes.append(f"{r.key}: the user's answer takes precedence over the extraction ({r.id} replaced)")
     return out
 
@@ -271,9 +324,16 @@ def _protected_keys(scope_keys: frozenset[str]) -> frozenset[str]:
     return NEVER_LEFT_OUT | scope_keys | CONTROL_KEYS
 
 
+#: the material rule's board keys (:mod:`ai_eda.design.materials`): no template read them when a model question under them was first asked
+#: as optional, so a model's question under one still is - an extraction (or its cache) asked and blocks exactly as then; the rule asks
+#: its own required ``pcb_material`` question when a confirmed need requires one
+MATERIAL_RULE_KEYS: frozenset[str] = frozenset((*MATERIAL_ALIASES, *FLEXING_ALIASES, *POWER_DISSIPATION_ALIASES))
+
+
 def _known_question_key(key: str, scope_keys: frozenset[str]) -> bool:
-    """Whether an answer under ``key`` is something the pipeline reads: a template key (canonical or alias), a scope key, ``application`` or ``jurisdiction``."""
-    return template_reads_key(key) or key in scope_keys or key in NEVER_LEFT_OUT
+    """Whether an answer under ``key`` is something the pipeline reads: a template key (canonical or alias), a scope key, ``application`` or ``jurisdiction``
+    (a model question under one of :data:`MATERIAL_RULE_KEYS` is not: it is asked as it was before the material rule)."""
+    return (template_reads_key(key) and key not in MATERIAL_RULE_KEYS) or key in scope_keys or key in NEVER_LEFT_OUT
 
 
 def blocks_pipeline(q: MissingInformation, ir: CircuitIR, scope_keys: frozenset[str]) -> bool:
@@ -402,11 +462,17 @@ class RequirementAgent(Agent):
         # Answers the user gave become explicit requirements with user_requirement provenance (regulatory scope answers as such).
         # A typed answer wins over what a model extracted, assumed or had confirmed for the same key (the item is replaced);
         # an answer the user typed earlier is kept, and a note names both values so the dropped one is not a silent no-op.
-        answer_reqs = [_answer_requirement(k, v, scope_keys) for k, v in answers.items() if _answerable(ir, k)]
-        notes.extend(_kept_notes(ir, answers))
+        # (only ``application`` - never left out, so never changed the way other typed values are - is replaced by a different typed answer)
+        for k, v in answers.items():
+            if _retyped(ir, k, v):
+                held = ir.requirements.get(k)
+                assert held is not None and held.value is not None
+                notes.append(f"{k}: your answer {v!r} replaces your earlier answer {held.value.value!r} ({held.id})")
+        answer_reqs = [_answer_requirement(k, v, scope_keys) for k, v in answers.items() if _answerable(ir, k, v)]
+        notes.extend(_kept_notes(ir, answers, _protected_keys(scope_keys)))
         answer_jurisdictions = [
             Jurisdiction(code=code, name=code, provided_by_user=True)
-            for k, v in answers.items() if k == "jurisdiction" and _answerable(ir, k)  # the same rule as the requirement row
+            for k, v in answers.items() if k == "jurisdiction" and _answerable(ir, k, v)  # the same rule as the requirement row
             for code in _split_codes(v)
             if not any(j.code == code for j in ir.regulatory.jurisdictions)
         ]
@@ -520,6 +586,22 @@ class RequirementAgent(Agent):
         confirmed_before = bool(entry.get("confirmed"))
         presented_before = bool(entry.get("presented"))
         confirm_now = False
+
+        # 4b. cross-check (--llm-crosscheck only): the same request to the cross-check model(s), grounded the same way and compared
+        # field by field; a differing field is withheld (neither model's value is proposed) and asked below
+        xcheck: ExtractionCrossCheck | None = None
+        xfailed: list[CrossCheckReply] = []
+        open_keys: list[str] = []
+        if llm.crosscheck:
+            if confirmed_before:
+                notes.append("cross-check not run: you confirmed this extraction in an earlier run, and your confirmation is the decision")
+            else:
+                xcheck, xfailed, xchanged = self._crosscheck(llm, request_text, entry, grounded, notes)
+                cache_changed = cache_changed or xchanged
+                if xcheck is not None:
+                    grounded = withhold(grounded, set(xcheck.differing_keys))
+                    if xcheck.extra_questions:  # a question any model asked is asked (labelled with the model that asked it)
+                        grounded = grounded.model_copy(update={"questions": [*grounded.questions, *xcheck.extra_questions]})
         # the model's questions as the pipeline asks them: a required one under a key nothing reads does not block
         model_questions = [_model_question(q, scope_keys) for q in grounded.questions]  # noted below, only where one is asked
         # leave-outs: the keys a typed answer of this run brings back, then this run's leave_out answer; a key with no
@@ -559,7 +641,8 @@ class RequirementAgent(Agent):
                 notes.append(f"{len(ir.requirements.conflicts) - len(conflicts)} conflict(s) dropped: a requirement they name was left out of the design")
                 proposals.append(IRProposal(description="set requirement conflicts", target="requirements.conflicts", operation="set", payload=conflicts))
         else:
-            kept = [r for r in existing if not from_extraction(r)]
+            retyped = {a.key for a in answer_reqs}  # only a RETYPED_KEYS answer can share a key with a typed requirement
+            kept = [r for r in existing if not from_extraction(r) and r.key not in retyped]
             removed_ids = {r.id for r in existing if from_extraction(r)}
             taken = {r.key for r in kept} | {r.key for r in answer_reqs}
             left_keys = {x.key for x in kept_left}
@@ -567,6 +650,8 @@ class RequirementAgent(Agent):
             app = application_requirement(grounded)
             if app is not None and not any(r.key == "application" for r in items):
                 items.append(app)  # an explicit item keyed ``application`` already carries the user's words: one req.application
+            if xcheck is not None:
+                items = mark_agreed(items, set(xcheck.agreed), xcheck.models)  # agreement: the provenance names both models
             new_items: list[Requirement] = []
             for r in items:
                 if r.key in taken:
@@ -583,6 +668,10 @@ class RequirementAgent(Agent):
                 # stored decisions are re-applied silently; only this run's decisions are reported
                 notes.extend(n for n in dnotes if any(n.startswith(f"{k}:") for k in new_decisions))
             merged, left = apply_leave_out(ir, merged, kept_left, leave, stage_questions, protected, notes)
+            if xcheck is not None:
+                # a differing field stays open until the user typed a value under its key (only a typed item can hold it now) or left it out
+                held = {r.key for r in merged} | {x.key for x in left}
+                open_keys = [k for k in xcheck.differing_keys if k not in held]
             # a conflict naming a requirement the user left out no longer concerns the design
             left_ids = {x.requirement.id for x in left if x.requirement is not None}
             live = [c for c in grounded.conflicts if not (set(c.requirement_ids) & left_ids)]
@@ -596,6 +685,8 @@ class RequirementAgent(Agent):
                     )
                 elif live:
                     notes.append(f"confirmation refused: {len(live)} conflict(s) must be resolved with a correction first")
+                elif open_keys:
+                    notes.append(f"confirmation refused: the models disagree on {', '.join(open_keys)}; answer each with your own value first")
                 else:
                     confirm_now = True
             if confirm_now:
@@ -635,8 +726,14 @@ class RequirementAgent(Agent):
         }
         closed = {x.key for x in left}
         questions: list[MissingInformation] = []
+        if xcheck is not None:
+            # each field the models disagree on, with every model's proposal; it takes the place of a baseline / model question of its key
+            questions += [
+                disagreement_question(d, leave_out=None if d.key in protected else leave_out_answer([d.key]))
+                for d in xcheck.disagreements if d.key in open_keys
+            ]
         for q in BASELINE_QUESTIONS:
-            if q.key in answers or q.key in answered or q.key in closed or (q.key == "jurisdiction" and jurisdictions):
+            if q.key in answers or q.key in answered or q.key in closed or (q.key == "jurisdiction" and jurisdictions) or any(q.key == x.key for x in questions):
                 continue
             questions.append(q)
         for original, q in zip(grounded.questions, model_questions):
@@ -660,7 +757,95 @@ class RequirementAgent(Agent):
         # 7. the stage's own result: what was extracted, at what cost, and whether the user has confirmed it
         result = self._extraction_result(entry, grounded, key, cached=not called, confirmed=confirmed)
         notes.insert(0, result.message)
-        return self._result(questions=questions, proposals=proposals, validation=[result], notes=notes)
+        validation = [result]
+        if xcheck is not None or xfailed:
+            validation.append(self._crosscheck_result(key, xcheck, xfailed, open_keys))
+            notes.insert(1, validation[-1].message)
+        return self._result(questions=questions, proposals=proposals, validation=validation, notes=notes)
+
+    @staticmethod
+    def _crosscheck(
+        llm: LLMService, request_text: str, entry: dict[str, Any], grounded: GroundedExtraction, notes: list[str],
+    ) -> tuple[ExtractionCrossCheck | None, list[CrossCheckReply], bool]:
+        """``(comparison or None, failed replies of this run, whether the cache entry changed)`` for the configured cross-check models.
+
+        A cross-check reply is cached in the entry (``entry["crosscheck"][spec]``,
+        the validated reply verbatim) only when it was served and validated, so
+        an unchanged request costs each cross-check model one call, like the
+        primary; a failed one is reported (noted, and in the
+        ``requirements.crosscheck`` result) and asked again in the next run.
+        Each cached reply is grounded on the request exactly like the primary's
+        and compared with it (:func:`~ai_eda.llm.crosscheck.compare_extractions`);
+        ``None`` when no cross-check model has a reply to compare.
+        """
+        stored: dict[str, Any] = {}
+        changed = False
+        for spec, raw in dict(entry.get("crosscheck") or {}).items():
+            try:
+                RequirementExtraction.model_validate(CrossCheckReply.model_validate(raw).data)
+            except ValidationError:
+                notes.append(f"the cached cross-check reply of {spec} no longer matches the schema; asking again")
+                changed = True
+                continue
+            stored[spec] = raw
+        specs = [c.spec for c in llm.crosscheck]
+        missing = [s for s in specs if s not in stored]
+        failed: list[CrossCheckReply] = []
+        if missing:
+            messages = build_extraction_messages(request_text, None, include_schema=False)
+            for reply in llm.cross_structured(TaskKind.REQUIREMENT_ANALYSIS, messages, RequirementExtraction, json_schema=json_schema(), specs=missing):
+                if reply.ok:
+                    stored[reply.spec] = reply.model_dump(mode="json")
+                    changed = True
+                else:
+                    failed.append(reply)
+                    notes.append(f"cross-check model {reply.spec} failed ({reply.outcome}): {reply.error}; its extraction is not compared")
+        if changed:
+            entry["crosscheck"] = stored
+        others: list[GroundedExtraction] = []
+        for spec in specs:
+            if spec not in stored:
+                continue
+            reply = CrossCheckReply.model_validate(stored[spec])
+            others.append(ground_extraction(request_text, RequirementExtraction.model_validate(reply.data), reply.model))
+        if not others:
+            return None, failed, changed
+        return compare_extractions(grounded, others), failed, changed
+
+    @staticmethod
+    def _crosscheck_result(key: str, xcheck: ExtractionCrossCheck | None, failed: list[CrossCheckReply], open_keys: list[str]) -> ValidationResult:
+        """``requirements.crosscheck``: PASS when every compared field agrees (or the user decided it), USER_INPUT_REQUIRED while a
+        differing field is open, NOT_VERIFIED when a cross-check model failed (named, with its error) or none answered."""
+        problems = [f"{r.spec} failed ({r.outcome}): {r.error}" for r in failed]
+        details: dict[str, Any] = {
+            "request_hash": key,
+            "failed": [{"spec": r.spec, "outcome": r.outcome, "error": r.error, "cost_usd": r.cost_usd, "attempts": r.attempts} for r in failed],
+        }
+        if xcheck is None:
+            return ValidationResult(check_id=CROSSCHECK_CHECK, status=ValidationStatus.NOT_VERIFIED,
+                                    message="extraction not cross-checked: " + "; ".join(problems), details=details)
+        decided = [k for k in xcheck.differing_keys if k not in open_keys]
+        if open_keys:
+            status = ValidationStatus.USER_INPUT_REQUIRED
+        elif failed:
+            status = ValidationStatus.NOT_VERIFIED
+        else:
+            status = ValidationStatus.PASS
+        message = (f"cross-check of {xcheck.primary_model} with {', '.join(xcheck.models)}: {len(xcheck.compared)} field(s) compared, "
+                   f"{len(xcheck.agreed)} agree, {len(xcheck.disagreements)} differ")
+        if open_keys:
+            message += f" (withheld until you answer: {', '.join(open_keys)})"
+        if decided:
+            message += f" (decided by you: {', '.join(decided)})"
+        if problems:
+            message += "; " + "; ".join(problems)
+        details.update({
+            "primary_model": xcheck.primary_model, "models": list(xcheck.models), "compared": list(xcheck.compared), "agreed": list(xcheck.agreed),
+            "disagreements": [d.model_dump(mode="json") for d in xcheck.disagreements], "open": list(open_keys), "decided": decided,
+            "questions_added": [q.key for q in xcheck.extra_questions],
+        })
+        return ValidationResult(check_id=CROSSCHECK_CHECK, status=status, message=message, tool=xcheck.primary_model,
+                                tool_version=", ".join(xcheck.models), details=details)
 
     @staticmethod
     def _extract(llm: LLMService, request_text: str) -> dict[str, Any]:

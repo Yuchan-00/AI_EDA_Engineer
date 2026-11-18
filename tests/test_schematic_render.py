@@ -197,16 +197,16 @@ def test_rendered_pin_ends_are_the_compilers_placed_pin_positions(tmp_path: Path
         expected_inner = (snap(pp.position[0] + pp.pin.length * pp.body_dir[0]), snap(pp.position[1] + pp.pin.length * pp.body_dir[1]))
         assert inner == expected_inner, f"{key}: the pin runs to {inner}, not toward the body ({pp.body_dir})"
 
-    # one symbol group per component, one wire stub and one global label per net pin, each stub starting on its drawn pin end
+    # one symbol group per component, one global label per net pin, and one wire stub per net pin starting on its drawn
+    # pin end; the routed net wires (B11) come on top of the stubs
     net_pins = sum(len(n.pins) for n in ir.nets)
     assert [g.get("data-ref") for g in _symbols(root)] == sorted((c.ref for c in ir.components), key=natural_ref_key)
     wires = _classed(root, "line", "wire")
-    assert len(wires) == net_pins
+    assert len(wires) >= net_pins
     assert len([g for g in root.iter(f"{SVG}g") if g.get("class") == "global-label"]) == net_pins
     ends = {conn for conn, _ in rendered.values()}
-    for w in wires:
-        start = (float(w.get("x1")), float(w.get("y1")))
-        assert start in ends, f"wire stub starting at {start} does not start on a drawn pin end"
+    stubs = [w for w in wires if (float(w.get("x1")), float(w.get("y1"))) in ends or (float(w.get("x2")), float(w.get("y2"))) in ends]
+    assert len(stubs) == net_pins, "one wire stub per net pin, starting on a drawn pin end"
 
 
 @pytest.mark.parametrize("mirror", MIRRORS)

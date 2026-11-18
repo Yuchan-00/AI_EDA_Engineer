@@ -84,11 +84,16 @@ from pathlib import Path
 from typing import Any
 
 from ai_eda.design import all_templates
-from ai_eda.design.base import CHOICE_NOTE_PREFIX, NO_RECORD, TOOL_ID, PartNote, Template, TheorySection, parameter_value, quantity
+from ai_eda.design.base import CHOICE_NOTE_PREFIX, NO_RECORD, TOOL_ID, PartNote, Template, TheorySection, design_file_hash, parameter_value, quantity
+from ai_eda.design.board import design_file_silk_text, template_silk_text
 from ai_eda.design.templates import display_spelled
 from ai_eda.errors import CompileError
-from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, Component, Provenance, ProvenanceKind, Reduce, SilkKind, Traced, ValidationResult, ValidationStatus
+from ai_eda.ir import (
+    ARC_SAGITTA_MM, ArtifactKind, ArtifactRef, CircuitIR, Component, Provenance, ProvenanceKind, Reduce, SilkKind, Traced, ValidationResult, ValidationStatus, track_length,
+)
 from ai_eda.parts.existence import CHECK_PREFIX as EXISTENCE_PREFIX
+from ai_eda.report.actions import group_actions
+from ai_eda.report.data import kicad_scope_text
 from ai_eda.report.figures import (
     BOUND_RULE, Figure, bar_figure, board_figure, bound_text, expectation_limit, model3d_figure_from_scene, plot_vector, tolerance_figure, tolerance_rows, waveform_figures,
 )
@@ -100,10 +105,12 @@ from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, Library
 from ai_eda.tools.placement.core_ring import BODY_OVERHANG_MM, CORE_MIN_PADS, EDGE_REF_PREFIXES, INNER_MAX_PADS
 from ai_eda.tools.placement.core_ring import PLACER_ID as RING_PLACER_ID
 from ai_eda.tools.placement.grid import PLACER_ID
+from ai_eda.tools.routing.corners import ARC, CORNER_ENTRY_PREFIX, CORNERS_ARC_VERSION, CORNERS_ID, CORNERS_VERSION, MITER45, STRAIGHTEN
 from ai_eda.tools.model3d.scene import BODY_CAPTION, Scene, build_scene
 from ai_eda.tools.silkscreen.geometry import TEXT_HEIGHT_FACTOR, TEXT_WIDTH_FACTOR
 from ai_eda.tools.silkscreen.place import CONNECTOR_LIBRARY_PREFIX, REFERENCE_CANDIDATES, TITLE_SLIDE_STEP_MM
 from ai_eda.tools.silkscreen.place import PLACER_ID as SILK_PLACER_ID
+from ai_eda.tools.silkscreen.place import PLACER_KEEP_VERSION as SILK_KEEP_VERSION
 from ai_eda.tools.spice.evidence import fresh_spice_run
 from ai_eda.tools.spice.stage import CHECK_ID as SPICE_CHECK
 from ai_eda.validation.layout import CLEARANCE_CHECK, CONNECTIVITY_CHECK, SILK_CLEARANCE_CHECK, SILK_OVERLAP_CHECK, SILK_SIZE_CHECK
@@ -171,6 +178,8 @@ REDUCE_LABELS: dict[Reduce, str] = {
     Reduce.FINAL: "마지막 값",
     Reduce.MAX: "최댓값",
     Reduce.MIN: "최솟값",
+    Reduce.PP: "피크-피크 (최댓값 − 최솟값)",
+    Reduce.MEAN: "구간 평균",
     Reduce.FREQUENCY: "상승 에지 주파수",
     Reduce.DB_AT: "한 주파수에서의 크기 (dB)",
     Reduce.RMS: "구간 RMS",
@@ -275,9 +284,15 @@ def template_for(ir: CircuitIR) -> Template | None:
     return None
 
 
+def _not_a_template(ir: CircuitIR) -> str:
+    """How a design no template built is named: the user's design file with its hash, else :data:`NO_TEMPLATE`."""
+    sha256 = design_file_hash(ir)
+    return NO_TEMPLATE if sha256 is None else f"사용자 제공 설계 (`{sha256}`)"
+
+
 def _header(title: str, ir: CircuitIR) -> list[str]:
     found = template_of(ir)
-    template_line = f"템플릿 `{found[0]}` v{found[1]}" if found is not None else NO_TEMPLATE
+    template_line = f"템플릿 `{found[0]}` v{found[1]}" if found is not None else _not_a_template(ir)
     # the user's leave-outs are named at the top of every report (a report of a design without any is unchanged)
     left = ["- 설계에서 뺀 요구사항 (사용자 결정, `--answer leave_out`): " + ", ".join(
         f"`{x.requirement.id if x.requirement is not None else x.key}`" for x in ir.requirements.left_out)] if ir.requirements.left_out else []
@@ -370,7 +385,7 @@ def theory_figures_of(ir: CircuitIR, figures: ReportFigures) -> None:
     """The template's theory curves into the ``theory`` slot; a non-template design or a template whose numbers the IR lacks gets a sentence."""
     template = template_for(ir)
     if template is None:
-        figures.miss(SLOT_THEORY, f"{NO_TEMPLATE}: 템플릿의 이론 곡선이 없습니다")
+        figures.miss(SLOT_THEORY, f"{_not_a_template(ir)}: 템플릿의 이론 곡선이 없습니다")
         return
     try:
         drawn = template.theory_figures(ir)
@@ -602,6 +617,13 @@ def _parameter_rows(ir: CircuitIR) -> list[list[object]]:
     return rows
 
 
+def _frequency_window(e: Any) -> str:
+    """`` (<t_start> ~ <t_stop> 구간)`` for a frequency measured in a window (the window is part of what it measures); empty otherwise."""
+    if e.reduce is not Reduce.FREQUENCY or "t_start" not in e.params or "t_stop" not in e.params:
+        return ""
+    return f" ({_traced_text(e.params['t_start'])} ~ {_traced_text(e.params['t_stop'])} 구간)"
+
+
 def _simulation_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     sim = ir.simulation
     out = ["## 시뮬레이션 설정", ""]
@@ -615,6 +637,15 @@ def _simulation_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
         params = ", ".join(f"{k} = {_traced_text(v)}" for k, v in s.params.items())
         out.append(f"- `{s.id}` ({s.source}, {s.kind.value}) {s.net} → {s.reference_net}: {_traced_text(s.value)}" + (f"; {params}" if params else "")
                    + (f" — {s.provenance.note}" if s.provenance.note else ""))
+    if sim.elements or sim.nodes:
+        out += ["", "### 시뮬레이션 전용 요소", "", "넷리스트에는 있고 보드(BOM·CPL·회로도·배치)에는 없는 요소입니다. 부품과 같은 규칙으로 컴파일됩니다(출처, 양수 값, 모델 카드).", ""]
+        for el in sim.elements:
+            what = _traced_text(el.value) if el.value is not None else f"모델 `{el.model_name}`"
+            params = ", ".join(f"{k} = {_traced_text(v)}" for k, v in el.params.items())
+            control = f"; 제어 {el.control_net} → {el.control_reference_net}" if el.control_net is not None or el.control_reference_net is not None else ""
+            out.append(f"- `{el.id}` ({el.device.value}) {el.net} → {el.reference_net}: {what}" + (f"; {params}" if params else "") + control + f" — {el.reason}")
+        if sim.nodes:
+            out.append(f"- 시뮬레이션 전용 노드: {', '.join(f'`{n}`' for n in sim.nodes)} (보드의 넷이 아님)")
     out += ["", "### 해석(analyses)", ""]
     for a in sim.analyses:
         params = ", ".join(f"{k} = {_traced_text(v)}" for k, v in a.params.items())
@@ -623,7 +654,7 @@ def _simulation_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     rows: list[list[object]] = []
     for e in sim.expectations:
         rows.append([
-            f"`{e.id}`", e.analysis_id, f"`{e.vector}`", REDUCE_LABELS.get(e.reduce, str(e.reduce)) + (f" at {_traced_text(e.at)}" if e.at is not None else ""),
+            f"`{e.id}`", e.analysis_id, f"`{e.vector}`", REDUCE_LABELS.get(e.reduce, str(e.reduce)) + (f" at {_traced_text(e.at)}" if e.at is not None else "") + _frequency_window(e),
             _traced_text(e.nominal), _traced_text(e.tol_abs) if e.tol_abs is not None else (bound_text(e.bound) if e.bound else "-"),
             (f"{float(e.tol_rel.value) * 100:.4g} %" if e.tol_rel is not None else "-"), e.requirement_id or "(요구사항 없음)",
         ])
@@ -646,13 +677,17 @@ def _simulation_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
             "    f_measured = (N − 1) / (t_N − t_1)", "",
             "에지가 3개 미만이거나 swing 이 엔진 자체의 수렴 허용오차(reltol·max|v| + vntol) 이하이면 '발진 없음' 으로 FAIL 이며 절대 PASS 가 되지 않습니다.", "",
         ]
-    level_kinds = [k for k in (Reduce.DB_AT, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH) if any(e.reduce is k for e in sim.expectations)]
+        if any(_frequency_window(e) for e in sim.expectations):
+            out += ["구간 [t_start, t_stop] 이 주어진 주파수 기대값은 그 구간 안의 파형(보간된 양 끝과 그 사이의 표본)만으로 문턱·에지·개수를 정합니다. "
+                    "한 과도 해석이 여러 상태(건반을 하나씩 누름)를 지나도 구간마다 자기 주파수를 재며, 구간 안의 에지가 3개 미만이면 그 구간을 밝혀 FAIL 입니다.", ""]
+    level_kinds = [k for k in (Reduce.DB_AT, Reduce.MEAN, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH) if any(e.reduce is k for e in sim.expectations)]
     if level_kinds:
         out += ["### 레벨·구간 측정식", "",
                 "ngspice 가 쓴 표본을 잇는 구간별 선형 보간 파형에서 이 프로젝트가 직접 계산합니다(덱에는 .meas / .four 가 없습니다). "
                 "구간 [t_start, t_stop] 은 저장된 표본 안에 있어야 하고, 결과마다 가장 큰 표본 간격이 기록됩니다.", ""]
         formulas = {
             Reduce.DB_AT: "    L = 20·log10(|v(at)| / R)   (R = |기준 벡터(at)| 또는 params.ref; 두 크기는 같은 두 표본 사이에서 읽음)",
+            Reduce.MEAN: "    MEAN = (1/T) · Σ h·(v0 + v1)/2   (T = t_stop − t_start; 보간 파형의 사다리꼴 적분)",
             Reduce.RMS: "    RMS = sqrt( (1/T) · Σ h·(v0² + v0·v1 + v1²)/3 )   (T = t_stop − t_start)",
             Reduce.DB_RMS: "    L = 20·log10(RMS(v) / RMS(기준))   (기준 RMS 가 0 이면 값 없음)",
             Reduce.HARMONIC_DBC: "    A_n = (2/T)·|∫ v(t)·e^(−j2πn·f0·t) dt|,  L_k = 20·log10(A_k / A_1) dBc   (정수 주기, 최대 간격 ≤ 1/(20·k·f0))",
@@ -696,7 +731,7 @@ def theory_report(ir: CircuitIR, library: KicadLibrary | None = None, *, figures
     if template is not None:
         sections = template.theory(ir)
     else:
-        sections = [TheorySection("회로 이론", f"{NO_TEMPLATE}: 이 설계는 템플릿이 만들지 않았으므로 템플릿의 이론 설명이 없습니다. 파라미터 표의 식과 아래 시뮬레이션 설정이 IR 이 담고 있는 전부입니다.")]
+        sections = [TheorySection("회로 이론", f"{_not_a_template(ir)}: 이 설계는 템플릿이 만들지 않았으므로 템플릿의 이론 설명이 없습니다. 파라미터 표의 식과 아래 시뮬레이션 설정이 IR 이 담고 있는 전부입니다.")]
     for sec in sections:
         out += [f"## {sec.title}", "", sec.body, ""]
     out += ["## 이론 그림", "", "템플릿의 이론 식을 이 설계의 파라미터 값으로 그린 곡선입니다(IR 의 `parameters` 만 읽음). 시뮬레이션 결과가 아니며 판정도 아닙니다.", ""]
@@ -926,7 +961,10 @@ def routing_params_of(ir: CircuitIR) -> dict[str, str] | None:
 
 
 def net_routing_stats(ir: CircuitIR) -> list[dict[str, Any]]:
-    """Per net (IR order, then nets only the copper names): segment count, length in mm, layers, via count, track widths - computed from ``ir.pcb.tracks`` / ``vias``."""
+    """Per net (IR order, then nets only the copper names): segment count, length in mm, layers, via count, track widths - computed from ``ir.pcb.tracks`` / ``vias``.
+
+    A segment is one track, straight or arc; an arc (``Track.mid``) is measured by its arc length (:func:`~ai_eda.ir.track_length`), never by the chord between its ends.
+    """
     if ir.pcb is None:
         return []
     order = [n.name for n in ir.nets]
@@ -937,7 +975,7 @@ def net_routing_stats(ir: CircuitIR) -> list[dict[str, Any]]:
     for t in ir.pcb.tracks:
         s = stats[t.net]
         s["segments"] += 1
-        s["length_mm"] += math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1])
+        s["length_mm"] += track_length(t)
         s["layers"].add(t.layer)
         s["widths"].add(t.width_mm)
     for v in ir.pcb.vias:
@@ -1093,6 +1131,119 @@ def _placement_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     return out
 
 
+def _corner_record(entry: str) -> tuple[str, str, float | None] | None:
+    """``(version, kind, size in mm)`` of a ``corner:`` entry in one of the forms ``routing.corners`` writes, else ``None``.
+
+    The forms, field for field: ``corner:routing.corners 0.1:miter45:at=x,y:chamfer=d`` (a 45-degree chamfer; the same under 0.2
+    for a corner its arc style mitred - size ``None``), ``corner:routing.corners 0.2:arc:at=x,y:tangent=d:radius=r`` (a corner
+    rounded into an arc - its radius) and ``corner:routing.corners 0.2:straighten:at=x,y:step=s`` (a sidestep of the router that
+    0.2 straightened before it rounded - its length; this record cut no corner). 0.1 (``CORNERS_VERSION``) mitres only; 0.2
+    (``CORNERS_ARC_VERSION``, the style ``arc``) rounds, mitres a corner no arc goes into, and straightens. Every value must be a
+    finite number, every size positive: an entry with a field missing, repeated, added or unreadable is none of these forms.
+    """
+    parts = entry[len(CORNER_ENTRY_PREFIX):].split(":")
+    tool, _, version = parts[0].rpartition(" ")
+    if tool != CORNERS_ID or len(parts) < 2:
+        return None
+    fields = [part.partition("=") for part in parts[2:]]
+    keys = [key for key, _eq, _value in fields]
+    values = {key: value for key, _eq, value in fields}
+
+    def size(key: str) -> float | None:
+        value = _float(values[key])
+        return value if value is not None and math.isfinite(value) and value > 0 else None
+
+    at = [_float(x) for x in values.get("at", "").split(",")]
+    if len(at) != 2 or any(x is None or not math.isfinite(x) for x in at):
+        return None
+    if parts[1] == MITER45 and version in (CORNERS_VERSION, CORNERS_ARC_VERSION) and keys == ["at", "chamfer"] and size("chamfer") is not None:
+        return version, MITER45, None
+    if parts[1] == ARC and version == CORNERS_ARC_VERSION and keys == ["at", "tangent", "radius"] and size("tangent") is not None:
+        radius = size("radius")
+        if radius is not None:
+            return version, ARC, radius
+    if parts[1] == STRAIGHTEN and version == CORNERS_ARC_VERSION and keys == ["at", "step"]:
+        step = size("step")
+        if step is not None:
+            return version, STRAIGHTEN, step
+    return None
+
+
+def _corner_lines(tracks: list, c: float, g: float) -> list[str]:
+    """The keep-out section's words on what routing.corners did to the copper, when it has any (``corner:`` entries; a corner is one
+    distinct entry per net and layer): the radii above hold for the grid copper; a chamfer or a rounded corner is audited exactly
+    at the clearance, not at the grid margin.
+
+    Copper mitred by routing.corners 0.1 gets the sentence on its 45-degree chamfers. Copper rounded by 0.2 (the ``arc`` style)
+    gets the number of corners rounded into arcs with the range of their radii, the number 0.2 mitred where no arc went in, and
+    how an arc was audited (its chain of chords, the copper's half-width raised by the chain's bound). A corner the pass left or
+    skipped changes no track and leaves no entry: it cannot be counted from the IR, and the sentence says so. Copper on which 0.2
+    straightened sidesteps of the router gets a sentence of its own with their number and the range of their lengths: a
+    ``straighten`` record is a sidestep removed, never counted as a rounded or mitred corner; a sidestep that stayed leaves no
+    entry either. An entry in a form this report does not know is counted as unread, never described as a chamfer.
+    """
+    corners = sorted({(t.net, t.layer, e) for t in tracks for e in t.provenance.derived_from if e.startswith(CORNER_ENTRY_PREFIX)})
+    if not corners:
+        return []
+    mitred: dict[str, int] = {CORNERS_VERSION: 0, CORNERS_ARC_VERSION: 0}
+    radii: list[float] = []
+    steps: list[float] = []
+    unread: list[str] = []
+    for _net, _layer, entry in corners:
+        record = _corner_record(entry)
+        if record is None:
+            unread.append(":".join(entry.split(":")[:3]))  # its prefix, tool and version, style: what kind of record it is
+        elif record[1] == STRAIGHTEN:  # a sidestep straightened, with its length: no corner was rounded or mitred by this record
+            steps.append(record[2])
+        elif record[2] is not None:  # a rounded corner, with its radius
+            radii.append(record[2])
+        else:
+            mitred[record[0]] += 1
+    margins = (
+        f"다른 넷의 트랙·비아·패드 상자와 구리 사이 간격 c = {c:g} mm (두 넷 중 넷 규칙의 간격이 더 크면 그 값; 넷이 없는 "
+        f"패드·구멍과는 c + g/2 = {c + g / 2:.3f} mm), 중심선에서 트랙 keep-out 까지 w/2, 가장자리까지 e + w/2"
+    )
+    out: list[str] = []
+    if mitred[CORNERS_VERSION]:
+        out += [
+            f"이 보드의 구리에는 `{CORNERS_ID}` {CORNERS_VERSION} 의 45도 모따기가 {mitred[CORNERS_VERSION]} 곳 있습니다 (트랙 provenance 의 `{CORNER_ENTRY_PREFIX}` 항목; "
+            "프로젝트 소유자의 모서리 규칙 — 전기적 요구가 아닌 기하 관례). 위 반경은 격자 위의 구리에만 해당합니다. 모따기 구간은 격자 여유 g/2 없이 "
+            f"정확한 기하로 검사했습니다: {margins}. 그래서 모따기 근처의 구리는 위 반경보다 "
+            "가까울 수 있으며, 그 판정도 kicad-cli DRC 가 합니다.", "",
+        ]
+    if radii or mitred[CORNERS_ARC_VERSION]:
+        spread = ""
+        if radii:
+            spread = f" (반지름 {min(radii):g} mm)" if min(radii) == max(radii) else f" (반지름 {min(radii):g}–{max(radii):g} mm)"
+        out += [
+            f"이 보드의 구리에는 `{CORNERS_ID}` {CORNERS_ARC_VERSION} 의 둥근 모서리(원호 트랙)가 {len(radii)} 곳{spread}, 원호를 넣지 못해 45도 모따기로 바꾼 모서리가 "
+            f"{mitred[CORNERS_ARC_VERSION]} 곳 있습니다 (트랙 provenance 의 `{CORNER_ENTRY_PREFIX}` 항목; "
+            "프로젝트 소유자의 모서리 규칙 — 전기적 요구가 아닌 기하 관례). 위 반경은 격자 위의 구리에만 해당합니다. 원호와 모따기 구간은 격자 여유 g/2 없이 "
+            f"정확한 기하로 검사했습니다: {margins}. 원호는 그 위의 점들을 잇는 짧은 직선(현)들의 사슬로 검사했고, 사슬과 원호의 차이 한계 "
+            f"{ARC_SAGITTA_MM:g} mm 만큼 구리의 반폭을 키워 쟀습니다. 그래서 원호·모따기 근처의 구리는 위 반경보다 "
+            "가까울 수 있으며, 그 판정도 kicad-cli DRC 가 합니다. 그대로 두었거나 건너뛴 모서리는 트랙에 항목을 남기지 않아 여기서 세지 않습니다 "
+            "(라우터의 배선 메모가 그 수를 적었다면 아래 단계 기록에 있습니다).", "",
+        ]
+    if steps:
+        spread = f"길이 {min(steps):g} mm" if min(steps) == max(steps) else f"길이 {min(steps):g}–{max(steps):g} mm"
+        out += [
+            f"이 보드의 구리에서 `{CORNERS_ID}` {CORNERS_ARC_VERSION} 는 모서리를 둥글리기 전에 라우터가 남긴 옆걸음(sidestep: 두 직각 모서리 사이의 짧은 트랙) "
+            f"{len(steps)} 곳을 곧게 폈습니다 ({spread}; 트랙 provenance 의 `{CORNER_ENTRY_PREFIX}` 항목 중 `{STRAIGHTEN}`; "
+            "프로젝트 소유자의 모서리 규칙 — 전기적 요구가 아닌 기하 관례). 옆걸음은 의도한 패턴이나 길이 맞춤이 아니라 격자 탐색이 남긴 것입니다. "
+            "그 짧은 트랙을 이웃 트랙을 따라 다음 모서리까지 밀어 거기서 나가는 트랙과 하나로 합쳤고, 패드·비아·접합점은 그대로이며 넷의 길이는 늘지 않습니다. "
+            f"새로 놓인 구리는 격자 여유 g/2 없이 정확한 기하로 검사했습니다: {margins}. 그래서 그 구리는 위 반경보다 "
+            "가까울 수 있으며, 그 판정도 kicad-cli DRC 가 합니다. 곧게 펴지 못한 옆걸음은 트랙에 항목을 남기지 않아 여기서 세지 않습니다 "
+            "(라우터의 배선 메모가 그 수를 적었다면 아래 단계 기록에 있습니다).", "",
+        ]
+    if unread:
+        forms = ", ".join("`" + _cell(form).replace("`", "'") + "`" for form in sorted(set(unread)))
+        out += [
+            f"이 보드의 트랙 provenance 에는 이 보고서가 형식을 읽지 못하는 `{CORNER_ENTRY_PREFIX}` 항목이 {len(unread)} 곳 있습니다 ({forms}): "
+            "어떤 모서리인지 알 수 없어 위 설명에 넣지 않았습니다.", "",
+        ]
+    return out
+
+
 def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     out = ["## 배선", ""]
     pcb = ir.pcb
@@ -1131,6 +1282,9 @@ def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     total_len = sum(s["length_mm"] for s in stats)
     rows.append(["**합계**", len(pcb.tracks), f"{total_len:.3f}", ", ".join(sorted({l for s in stats for l in s['layers']})) or "-", len(pcb.vias), "-"])
     out += ["### 넷별 배선 통계 (IR 의 트랙·비아에서 계산)", "", _table(["넷", "세그먼트", "길이 (mm)", "층", "비아", "폭 (mm)"], rows), ""]
+    arcs = sum(1 for t in pcb.tracks if t.mid is not None)
+    if arcs:  # rounded corners: what the two columns count on such a board
+        out += [f"세그먼트 수에는 원호 트랙 {arcs}개가 들어 있고, 원호의 길이는 양 끝을 잇는 직선(현)이 아니라 호의 길이로 쟀습니다.", ""]
     unrouted = [s["net"] for s in stats if s["segments"] == 0 and s["vias"] == 0]
     if unrouted:
         out += [f"구리가 없는 넷: {', '.join(f'`{n}`' for n in unrouted)} (핀이 하나뿐인 넷은 이을 것이 없고, 그 외는 라우터가 잇지 못한 넷입니다 — `pcb.routing.connectivity` 가 말합니다).", ""]
@@ -1153,6 +1307,7 @@ def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
             "g/2 항은 격자 셀 사이를 지나는 구간까지 보수적으로 덮는 여유입니다. 비아는 어떤 패드 안에도 놓지 않고, 합법적인 배선을 찾지 못한 넷은 구리 없이 남깁니다(반쯤 배선된 넷 없음). "
             f"{PARTIAL_ROUTING_RULE} "
             "이 규칙은 라우터 자체의 파라미터이지 설계 규칙이 아니며, 보드의 유효성은 kicad-cli DRC 가 판정합니다.", "",
+            *_corner_lines(pcb.tracks, c, g),
         ]
     elif None not in (g, w, c, e, d_v):
         out += [
@@ -1165,6 +1320,7 @@ def _routing_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
             f"    보드 가장자리                  e + w/2 = {e + w / 2:.3f} mm   (비아는 e + d_v/2 = {e + d_v / 2:.3f} mm)", "",
             "g/2 항은 격자 셀 사이를 지나는 구간까지 보수적으로 덮는 여유입니다. 비아는 어떤 패드 안에도 놓지 않고, 한 넷이라도 잇지 못하면 그 넷의 구리는 통째로 버립니다(반쯤 배선된 넷 없음). "
             "이 규칙은 라우터 자체의 파라미터이지 설계 규칙이 아니며, 보드의 유효성은 kicad-cli DRC 가 판정합니다.", "",
+            *_corner_lines(pcb.tracks, c, g),
         ]
     out += ["### 구리 이론값 (참고 공식; IR 에 기록되지 않는 표시값)", ""]
     widths = sorted({t.width_mm for t in pcb.tracks})
@@ -1371,6 +1527,13 @@ def _silkscreen_section(ir: CircuitIR) -> list[str]:
     fab_text = f"조립도 층 {len(on_fab)}개" + (f" ({', '.join(on_fab)})" if on_fab else "")
     title_text = ", ".join(f"'{t.text}'" for t in titles) or "없음"
     out.append(f"- 실크 문자 {len(texts)}개: 참조 {len(refs)}개 (실크 {len(refs) - len(on_fab)}개, {fab_text}), 커넥터 핀 라벨 {len(labels)}개, 제목 {title_text}, 사용자 문자 {len(users)}개")
+    # a template's (a design file's) board texts (a key's note name): only boards that have them get the line
+    for who, kept in (("템플릿", [t for t in texts if template_silk_text(t)]), ("설계 파일", [t for t in texts if design_file_silk_text(t)])):
+        if kept:
+            around = any(t.provenance.tool == SILK_PLACER_ID for t in texts)
+            out.append(f"- {who}이 보드와 함께 제안한 문자 {len(kept)}개 ({', '.join(repr(t.text) for t in kept)}): {who}이 둔 자리 그대로입니다"
+                       + (f". 실크 배치기(`{SILK_PLACER_ID}` {SILK_KEEP_VERSION})는 이 문자들을 옮기지 않고 금지 영역으로 삼아 나머지 문자를 그 둘레에 놓았습니다"
+                          if around else "") + ".")
     out.append("- 건너뛴 핀 라벨과 그 이유, 제목의 위치 설명은 아래 단계 기록의 `placement` 메시지에 그대로 있습니다. 위의 배치도·보드 그림에 검정으로 그려진 것이 이 실크입니다.")
     out.append("")
     origins = [_provenance_text(t.provenance) for t in texts]
@@ -1431,7 +1594,18 @@ def _model3d_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     return out
 
 
-def _stage_record_section(record: RunRecord, stages: tuple[Stage, ...], title: str) -> list[str]:
+def _stage_kicad_scope(ir: CircuitIR, stage: Stage) -> str:
+    """Label scope from the latest validation row separately from the recorded stage outcome."""
+    if stage not in (Stage.ERC, Stage.DRC):
+        return ""
+    check = f"kicad.{stage.value}"
+    r = ir.validation.latest(check)
+    if r is None:
+        return " — scope unavailable"
+    return f" — {check} (검사별 최신 기록, {_freshness(r, ir.content_hash())}): {kicad_scope_text(r)}"
+
+
+def _stage_record_section(ir: CircuitIR, record: RunRecord, stages: tuple[Stage, ...], title: str) -> list[str]:
     out = [f"## {title}", ""]
     outcomes = _outcomes(record)
     if outcomes is None:
@@ -1442,7 +1616,7 @@ def _stage_record_section(record: RunRecord, stages: tuple[Stage, ...], title: s
         if o is None:
             out.append(f"- `{stage}`: 도달하지 않음")
         else:
-            out.append(f"- `{stage}`: **{o.status}** — {_cell(o.message) or '(메시지 없음)'}")
+            out.append(f"- `{stage}`: **{o.status}** — {_cell(o.message) or '(메시지 없음)'}{_cell(_stage_kicad_scope(ir, stage))}")
     out.append("")
     return out
 
@@ -1476,7 +1650,7 @@ def circuit_report(ir: CircuitIR, library: KicadLibrary | None, record: RunRecor
     out += _rf_report().rf_circuit_section(ir, figures)
     out += _silkscreen_section(ir)
     out += _model3d_section(ir, figures)
-    out += _stage_record_section(record, CIRCUIT_STAGES, "단계 기록 (PLACEMENT / SCHEMATIC / PCB / DRC)")
+    out += _stage_record_section(ir, record, CIRCUIT_STAGES, "단계 기록 (PLACEMENT / SCHEMATIC / PCB / DRC)")
     return "\n".join(out).rstrip("\n") + "\n"
 
 
@@ -1529,7 +1703,7 @@ def _left_out_section(ir: CircuitIR) -> list[str]:
     ]
 
 
-def _all_stages_section(record: RunRecord) -> list[str]:
+def _all_stages_section(ir: CircuitIR, record: RunRecord) -> list[str]:
     out = ["## 단계 결과", ""]
     outcomes = _outcomes(record)
     if outcomes is None:
@@ -1549,7 +1723,7 @@ def _all_stages_section(record: RunRecord) -> list[str]:
         if o is None:
             rows.append([f"`{stage}`", "-", "도달하지 않음", "-"])
         else:
-            rows.append([f"`{stage}`", str(o.status), o.message or "-", f"{len(o.questions)}개" if o.questions else "-"])
+            rows.append([f"`{stage}`", str(o.status), (o.message or "-") + _stage_kicad_scope(ir, stage), f"{len(o.questions)}개" if o.questions else "-"])
     out += [_table(["단계", "상태", "메시지", "질문"], rows), ""]
     return out
 
@@ -1584,7 +1758,7 @@ def _theory_vs_simulation(ir: CircuitIR, figures: ReportFigures) -> list[str]:
         else:
             dev_text, pct = "-", "-"
         rows.append([
-            f"`{e.id}`", f"`{e.vector}` / {REDUCE_LABELS.get(e.reduce, str(e.reduce))}" + (f" at {_traced_text(e.at)}" if e.at is not None else ""),
+            f"`{e.id}`", f"`{e.vector}` / {REDUCE_LABELS.get(e.reduce, str(e.reduce))}" + (f" at {_traced_text(e.at)}" if e.at is not None else "") + _frequency_window(e),
             _traced_text(e.nominal), quantity(measured, unit) if measured is not None else NO_MEASUREMENT, dev_text, pct,
             quantity(limit, unit) if limit is not None else (bound_text(e.bound, _traced_text(e.nominal)) if e.bound else "-"), r.status if r is not None else NO_RECORD,
         ])
@@ -1594,8 +1768,10 @@ def _theory_vs_simulation(ir: CircuitIR, figures: ReportFigures) -> list[str]:
         if isinstance(freq, dict):
             edges = freq.get("edges")
             t1, tn = freq.get("first_edge_s"), freq.get("last_edge_s")
+            w0, w1 = freq.get("t_start"), freq.get("t_stop")
+            in_window = f" ({quantity(w0, 's')} ~ {quantity(w1, 's')} 구간)" if isinstance(w0, (int, float)) and isinstance(w1, (int, float)) else ""
             extra.append(
-                f"- `{e.id}` 주파수 측정: 상승 에지 {edges}개, 첫 에지 {quantity(t1, 's') if isinstance(t1, (int, float)) else NO_RECORD}, 마지막 에지 {quantity(tn, 's') if isinstance(tn, (int, float)) else NO_RECORD}"
+                f"- `{e.id}` 주파수 측정{in_window}: 상승 에지 {edges}개, 첫 에지 {quantity(t1, 's') if isinstance(t1, (int, float)) else NO_RECORD}, 마지막 에지 {quantity(tn, 's') if isinstance(tn, (int, float)) else NO_RECORD}"
                 + (f", f = ({edges} − 1)/({tn:.6g} − {t1:.6g}) s" if isinstance(edges, int) and isinstance(t1, (int, float)) and isinstance(tn, (int, float)) else "")
                 + f"; 파형 최소 {quantity(freq.get('vmin'), 'V') if isinstance(freq.get('vmin'), (int, float)) else NO_RECORD}, 최대 {quantity(freq.get('vmax'), 'V') if isinstance(freq.get('vmax'), (int, float)) else NO_RECORD}"
             )
@@ -1619,7 +1795,12 @@ def _matrix_section(ir: CircuitIR) -> list[str]:
         ids = sorted(k for k, r in latest.items() if r.status is status)
         if not ids:
             continue
-        rows = [[f"`{k}`", _tool_text(latest[k].tool, latest[k].tool_version), _freshness(latest[k], design_hash), latest[k].message or "-"] for k in ids]
+        rows = []
+        for k in ids:
+            r = latest[k]
+            scope = kicad_scope_text(r)
+            message = (r.message or "-") + (f" — {scope}" if scope else "")
+            rows.append([f"`{k}`", _tool_text(r.tool, r.tool_version), _freshness(r, design_hash), message])
         out += [f"### {status} — {STATUS_WORDS.get(status, str(status))} ({len(ids)}개)", "", _table(["검사", "도구", "대상 IR", "메시지"], rows), ""]
     return out
 
@@ -1696,19 +1877,41 @@ def _conclusion_section(ir: CircuitIR, record: RunRecord) -> list[str]:
     return ["## 결론", "", " ".join(parts), ""]
 
 
+def _action_section(ir: CircuitIR) -> list[str]:
+    labels = {
+        "missing_part_identity": ("부품 식별 정보 없음", "사용자", "나열된 부품의 MPN 과 데이터시트를 제공하세요."),
+        "missing_part_documents": ("부품 자료 없음", "사용자", "나열된 부품의 데이터시트와 누락된 MPN 을 제공하세요."),
+        "offline_part_documents": ("부품 자료를 가져오지 않음", "사용자", "--online 으로 실행하거나 데이터시트와 누락된 MPN 을 제공하세요."),
+        "missing_fab_inputs": ("제조사 입력 없음", "사용자", "--fab-capability FILE 로 제조사의 가공 한계 파일을 제공하고 나열된 한계를 검토하세요."),
+        "unsupported_backends": ("구현되지 않은 백엔드", "소프트웨어", "백엔드 구현이 필요합니다. 현재 사용자 입력으로 이 검사를 활성화할 수 없습니다."),
+        "scope_questions": ("명시적인 범위 질문", "사용자", "--answer key=value 로 나열된 범위 질문에 답하세요."),
+        "unmapped": ("미분류", "미정", "저장된 상태와 이유를 각각 검토하여 다음 행동을 정하세요."),
+    }
+    out = ["## 남은 일 (행동별)", "", "행동별 묶음은 보고용 안내이며 판정이 아닙니다. 검사별 최신 non-PASS 결과만 포함하며 NOT_APPLICABLE 도 저장된 상태 그대로 표시합니다.", ""]
+    groups = group_actions(ir.validation.latest_by_check().values())
+    if not groups:
+        return out + ["최신 non-PASS 결과가 없습니다.", ""]
+    for group in groups:
+        title, role, action = labels[group.id]
+        out += [f"### {title}", "", f"- 그룹: `{group.id}`", f"- 역할: {role}", f"- 다음 행동: {action}", "",
+                _table(["검사", "저장된 상태", "메시지"], [[c.check_id, c.status, c.message] for c in group.checks]), ""]
+    return out
+
+
 def final_report(ir: CircuitIR, record: RunRecord, *, figures: ReportFigures | None = None) -> str:
     """Report 4: requirements, every stage outcome, theory vs simulation per expectation (table, tolerance chart, waveform), the verification matrix, artifacts, the recorded RELEASE outcome, remaining work, conclusion."""
     if figures is None:
         figures = stage_figures(Stage.RELEASE, ir, None)
     out = _header(REPORT_TITLES[Stage.RELEASE], ir)
     out += _requirements_section(ir)
-    out += _all_stages_section(record)
+    out += _all_stages_section(ir, record)
     out += _theory_vs_simulation(ir, figures)
     out += _rf_report().rf_final_section(ir)
     out += _matrix_section(ir)
     out += _artifacts_section(ir)
     out += _release_section(record)
     out += _remaining_section(ir)
+    out += _action_section(ir)
     out += _conclusion_section(ir, record)
     return "\n".join(out).rstrip("\n") + "\n"
 

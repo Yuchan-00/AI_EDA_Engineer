@@ -38,6 +38,14 @@ The detector is deterministic and stdlib-only:
   period of the saved window, so a start-up transient that was cut off by
   the analysis' ``start`` does not enter).
 
+:func:`window_frequency` runs the same detector on the points of one window
+``[t_start, t_stop]`` of the piecewise-linear interpolant (the points the
+window measurements below integrate): its thresholds, crossings and count
+are the window's own, so one transient through several states (a key
+pressed after another) gives one frequency per window, and a window that
+holds fewer than three crossings is "no oscillation detected" naming the
+window.
+
 **Window measurements** (``Reduce.RMS`` / ``DB_RMS`` / ``HARMONIC_DBC`` /
 ``AM_DEPTH``) read the *piecewise-linear interpolant* of the samples ngspice
 wrote over a window ``[t_start, t_stop]`` that must lie inside the saved
@@ -175,8 +183,40 @@ def rising_edge_frequency(times: Sequence[float], values: Sequence[float], *, ab
     (:data:`VNTOL` for a voltage, :data:`ABSTOL` for a current). See the
     module docstring for the detector.
     """
+    return _edge_frequency(times, values, abs_floor, None)
+
+
+def window_frequency(times: Sequence[float], values: Sequence[float], t_start: float, t_stop: float, *, abs_floor: float = VNTOL) -> EdgeFrequency:
+    """:func:`rising_edge_frequency` over the window ``[t_start, t_stop]`` only, or why there is none.
+
+    The window's points are those the window measurements integrate (module
+    docstring: the interpolant's value just after ``t_start``, every sample
+    strictly inside, the value just before ``t_stop``), and the same detector
+    runs on them alone: the thresholds come from the window's own vmin / vmax
+    and only the crossings inside it count, so a transient that passes
+    through several states (silence, one key, the next key) gives each window
+    its own frequency. The series rules of the window measurements apply
+    first (equal lengths, finite samples, a time axis that never steps back),
+    and a window that is not an interval inside the saved samples gives no
+    number. Fewer than :data:`MIN_EDGES` crossings, or a flat window, is "no
+    oscillation detected" naming the window.
+    """
     if not (math.isfinite(abs_floor) and abs_floor >= 0.0):
         raise ValueError(f"abs_floor must be a finite non-negative number, got {abs_floor!r}")
+    problem = _series_problem(times, values)
+    if problem is not None:
+        return EdgeFrequency(None, problem=problem)
+    points, problem = _window(times, values, t_start, t_stop)
+    if problem is not None:
+        return EdgeFrequency(None, problem=problem)
+    return _edge_frequency([t for t, _ in points], [v for _, v in points], abs_floor, (float(t_start), float(t_stop)))
+
+
+def _edge_frequency(times: Sequence[float], values: Sequence[float], abs_floor: float, window: tuple[float, float] | None) -> EdgeFrequency:
+    """The detector of :func:`rising_edge_frequency`; ``window`` (``None``: the whole saved vector) only names where it looked."""
+    if not (math.isfinite(abs_floor) and abs_floor >= 0.0):
+        raise ValueError(f"abs_floor must be a finite non-negative number, got {abs_floor!r}")
+    where = "the saved window" if window is None else f"the window [{window[0]:.6g}, {window[1]:.6g}] s"
     n = len(values)
     if n != len(times):
         return EdgeFrequency(None, problem=f"scale and vector lengths differ ({len(times)} vs {n} samples)")
@@ -192,9 +232,10 @@ def rising_edge_frequency(times: Sequence[float], values: Sequence[float], *, ab
     swing = vmax - vmin
     floor = flat_floor(vmin, vmax, abs_floor)
     if swing <= floor:
+        inside = "" if window is None else f" in {where}"
         return EdgeFrequency(
             None, vmin=vmin, vmax=vmax, floor=floor,
-            problem=f"no oscillation detected: the waveform is flat at {vmin:.6g} .. {vmax:.6g} (swing {swing:.3g} is within the engine's resolution {floor:.3g})",
+            problem=f"no oscillation detected: the waveform is flat at {vmin:.6g} .. {vmax:.6g}{inside} (swing {swing:.3g} is within the engine's resolution {floor:.3g})",
         )
     low = vmin + LOW_FRACTION * swing
     mid = vmin + MID_FRACTION * swing
@@ -225,7 +266,7 @@ def rising_edge_frequency(times: Sequence[float], values: Sequence[float], *, ab
     base = EdgeFrequency(None, edges=edges, low=low, mid=mid, high=high, vmin=vmin, vmax=vmax, floor=floor)
     if len(edges) < MIN_EDGES:
         base.problem = (
-            f"no oscillation detected: {len(edges)} rising edge(s) through the mid level {mid:.6g} in the saved window, "
+            f"no oscillation detected: {len(edges)} rising edge(s) through the mid level {mid:.6g} in {where}, "
             f"{MIN_EDGES} are needed for a frequency (swing {vmin:.6g} .. {vmax:.6g})"
         )
         return base
@@ -438,6 +479,36 @@ def window_rms(times: Sequence[float], values: Sequence[float], t_start: float, 
         integral += (t1 - t0) * (v0 * v0 + v0 * v1 + v1 * v1) / 3.0
     span = points[-1][0] - points[0][0]
     return WindowRms(math.sqrt(max(integral, 0.0) / span), None, samples=len(points), max_step=step, f_max=f_max, step_limit=limit, bias_bound_rel=bias)
+
+
+@dataclass(frozen=True, slots=True)
+class WindowMean:
+    """A window mean, or why there is none (``problem``)."""
+
+    value: float | None
+    problem: str | None
+    samples: int = 0
+    max_step: float | None = None
+
+
+def window_mean(times: Sequence[float], values: Sequence[float], t_start: float, t_stop: float) -> WindowMean:
+    """The exact time average of the piecewise-linear interpolant of ``values`` over ``[t_start, t_stop]``, or why there is none.
+
+    The trapezoid integral of the interpolant divided by the window: the mean a scope would show for the
+    saved waveform. No grid guard: a mean has no read-low bias for a sampled sine; a window that holds less
+    than one period of a periodic waveform still averages what is inside it (the caller chooses the window).
+    """
+    problem = _series_problem(times, values)
+    if problem is not None:
+        return WindowMean(None, problem)
+    points, problem = _window(times, values, t_start, t_stop)
+    if problem is not None:
+        return WindowMean(None, problem)
+    integral = 0.0
+    for (t0, v0), (t1, v1) in zip(points, points[1:]):
+        integral += (t1 - t0) * (v0 + v1) / 2.0
+    span = points[-1][0] - points[0][0]
+    return WindowMean(integral / span, None, samples=len(points), max_step=_max_step(points))
 
 
 def _odd_term(x: float) -> float:

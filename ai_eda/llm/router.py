@@ -5,6 +5,10 @@ Invariants enforced here:
 * **A model spec names its provider.** ``<provider>:<native id>`` -
   ``openrouter:anthropic/claude-sonnet-5``, ``claude:claude-sonnet-5`` (the
   Claude Code CLI; its aliases ``claude:sonnet`` / ``claude:opus`` too),
+  ``codex:gpt-6-luna`` (the Codex CLI on the user's ChatGPT login),
+  ``openai_compat:<id>`` (any OpenAI-compatible chat-completions server:
+  the OpenAI API, llama.cpp ``llama-server``, Ollama, vLLM, LM Studio -
+  ``openai_compat:llama3.1:8b`` keeps the id's own colon),
   ``script:<anything>`` (the scripted client). :func:`parse_model_spec`
   splits on the first ``:`` only when the prefix is a name in
   :data:`KNOWN_PROVIDERS`, so a colon inside a native id survives; an
@@ -12,10 +16,12 @@ Invariants enforced here:
   configured), so every older command line keeps its meaning. ``anthropic:``
   is reserved for a direct Messages-API client that does not exist and is
   refused with a message that names the two routes that do.
-* **Capabilities follow the provider, not the model.** The CLI route carries
-  no caller tools (``supports_tools=False``) and requests structured output
-  through ``--json-schema`` (``supports_structured=True``);
-  :data:`PROVIDER_CAPABILITIES` is the table.
+* **Capabilities follow the provider, not the model.** The CLI routes carry
+  no caller tools (``supports_tools=False``) and request structured output
+  through ``--json-schema`` (Claude Code) / ``--output-schema`` (Codex)
+  (``supports_structured=True``); :data:`PROVIDER_CAPABILITIES` is the table.
+  ``openai_compat`` has no default model (:func:`default_model` refuses: the
+  server decides which ids exist, so the user names one).
 * **No fallback unless the user asked for one (decision 4).** One project
   uses one model where possible: :func:`default_router` has no fallback for
   any provider. ``--llm-fallback <spec>`` adds one explicitly and
@@ -48,9 +54,12 @@ DEFAULT_PRIMARY_MODEL = "anthropic/claude-sonnet-5"
 DEFAULT_FALLBACK_MODEL = "anthropic/claude-haiku-4.5"
 #: the Claude Code CLI model used when the default provider is ``claude`` and no model is named
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
+#: the Codex CLI model used when the default provider is ``codex`` and no model is named (the ChatGPT-login slug the
+#: measurement calls in :mod:`ai_eda.llm.codex_cli` used)
+DEFAULT_CODEX_MODEL = "gpt-6-luna"
 
 #: provider names a spec may carry, in the order the CLI documents them
-KNOWN_PROVIDERS: tuple[str, ...] = ("openrouter", "claude", "script")
+KNOWN_PROVIDERS: tuple[str, ...] = ("openrouter", "claude", "script", "codex", "openai_compat")
 #: prefixes reserved for routes that are not implemented; the value is the refusal text
 RESERVED_PROVIDERS: Mapping[str, str] = {
     "anthropic": "direct Messages-API access is not implemented; use claude: (Claude Code CLI) or openrouter:",
@@ -76,6 +85,10 @@ PROVIDER_CAPABILITIES: Mapping[str, ProviderCapabilities] = {
     # the CLI route carries no caller tools; structured output goes through ``--json-schema``
     "claude": ProviderCapabilities(supports_tools=False, supports_structured=True),
     "script": ProviderCapabilities(supports_tools=True, supports_structured=True),
+    # the Codex CLI carries no caller tools either; structured output goes through ``--output-schema <file>``
+    "codex": ProviderCapabilities(supports_tools=False, supports_structured=True),
+    # the documented chat-completions contract: ``tools`` and ``response_format: json_schema``
+    "openai_compat": ProviderCapabilities(supports_tools=True, supports_structured=True),
 }
 _ANY_CAPABILITIES = ProviderCapabilities(supports_tools=True, supports_structured=True)
 
@@ -192,8 +205,14 @@ def parse_model_spec(
 
 
 def default_model(provider: str | None) -> str:
-    """The model :func:`default_router` names when the user names none: the CLI's Sonnet for ``claude``, OpenRouter's otherwise."""
-    return DEFAULT_CLAUDE_MODEL if check_provider_name(provider) == "claude" else DEFAULT_PRIMARY_MODEL
+    """The model :func:`default_router` names when the user names none: the CLI's Sonnet for ``claude``, :data:`DEFAULT_CODEX_MODEL`
+    for ``codex``, OpenRouter's otherwise; ``ValueError`` for ``openai_compat`` (its server decides which ids exist: name one)."""
+    name = check_provider_name(provider)
+    if name == "openai_compat":
+        raise ValueError("openai_compat has no default model: name one with --llm-model openai_compat:<id> (the id your server serves)")
+    if name == "codex":
+        return DEFAULT_CODEX_MODEL
+    return DEFAULT_CLAUDE_MODEL if name == "claude" else DEFAULT_PRIMARY_MODEL
 
 
 class ModelRouter(BaseModel):
@@ -324,6 +343,7 @@ def same_model_fallback(primary: ModelConfig, providers: Sequence[str]) -> Model
 __all__ = [
     "CLAUDE_CLI_FULL_NAME_PREFIX",
     "DEFAULT_CLAUDE_MODEL",
+    "DEFAULT_CODEX_MODEL",
     "DEFAULT_FALLBACK_MODEL",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_MAX_TOKENS_ANY",

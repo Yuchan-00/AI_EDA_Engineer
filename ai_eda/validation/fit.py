@@ -20,11 +20,15 @@ check; the result says so in every message (:data:`EVALUATED` /
   bound - all of those are NOT_VERIFIED with the voltages recorded, never a
   proxy PASS or FAIL. The *power* criterion computes ``P = V^2 / R`` with the
   registered calculator ``calc.power.P_VR`` for a **plain** ``R`` binding
-  only (a value, no model, no params such as ``m`` / ``tc1`` - with those
+  (a value, no model, no params such as ``m`` / ``tc1`` - with those
   ngspice simulates a resistance that is not ``electrical["resistance"]``)
   from the authoritative resistance the compiler already reconciled with
-  the netlist; ngspice records no element currents in the op, so every other
-  device is NOT_VERIFIED ("dissipation not computed").
+  the netlist. A BJT or MOSFET (``Q`` / ``M``) is judged on the dissipation
+  ngspice itself reports for the device (``@q1[p]``), when the run kept it
+  (:data:`~ai_eda.compilers.spice.DEVICE_PROBES`, an engine that can); its
+  junction voltages and currents are shown in ``details`` and judged by
+  nothing. ngspice records no element currents in the op otherwise, so every
+  other device is NOT_VERIFIED ("dissipation not computed").
 * **A rating is a datasheet fact.** ``v_max`` (V) and ``power_rating`` (W)
   are read from ``Component.electrical`` and must carry ``authoritative`` or
   ``user_requirement`` provenance and the expected unit; an assumption or a
@@ -60,7 +64,7 @@ from ai_eda.validation.registry import default_registry
 FIT_CHECK = "component.fit"
 TOOL = FIT_CHECK
 #: bumped when the judgement rules change
-FIT_VERSION = "0.1"
+FIT_VERSION = "0.2"
 #: the selection criteria of the spec, in the spec's order
 FIT_CRITERIA: tuple[str, ...] = ("electrical stress", "safety", "regulatory", "environment", "reliability", "manufacturability", "sourcing", "cost")
 EVALUATED: tuple[str, ...] = ("electrical stress",)
@@ -117,6 +121,8 @@ class ComponentStress:
     plain_r: bool = False
     dissipation: Traced[float] | None = None
     p_reason: str | None = None
+    #: what ngspice reported for the device itself at the op (``p``, ``ic``, ``vbe`` ...); shown, and only ``p`` is judged
+    device_op: dict[str, float] = field(default_factory=dict)
 
     def voltages(self) -> dict[str, Any]:
         return {"pins": dict(self.pins), "nets": dict(self.nets)}
@@ -172,7 +178,11 @@ def component_stress(ir: CircuitIR, run: FreshSpiceRun, c: Component) -> Compone
             st.v_reason = v1 if isinstance(v1, str) else str(v2)
     st.plain_r = b.device is SpiceDevice.R and b.value is not None and b.model_name is None and b.model_card is None and not b.params
     if b.device is not SpiceDevice.R:
-        st.p_reason = f"dissipation of a {device} device is not computed: {NO_ELEMENT_CURRENTS}"
+        st.device_op = run.device_op(c.ref)
+        if "p" in st.device_op:
+            st.dissipation = derived(st.device_op["p"], tool=run.engine, tool_version=run.engine_version, unit="W", note=f"ngspice's own op dissipation of {c.ref} in analysis {aid}")
+        else:
+            st.p_reason = f"dissipation of a {device} device is not computed: {NO_ELEMENT_CURRENTS}"
         return st
     if not st.plain_r:
         what = []
@@ -298,6 +308,8 @@ class ComponentFitValidator(Validator):
             power = gate(judge_power(c, st, aid), run)
             status = worst_status([S(voltage["status"]), S(power["status"])])
             components[c.ref] = {"status": status.value, "device": st.device, "voltage": voltage, "power": power}
+            if st.device_op:
+                components[c.ref]["device_op"] = dict(st.device_op)
         overall = worst_status(S(e["status"]) for e in components.values())
         message = (f"{len(components)} component(s) at the operating point ({aid}): {summarise(components, ('voltage', 'power'))}; "
                    f"{conditions_note(run.temperature_c)}; criteria evaluated: {', '.join(EVALUATED)}; not evaluated: {', '.join(NOT_EVALUATED)}")

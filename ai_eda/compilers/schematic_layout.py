@@ -33,7 +33,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Sequence
 
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.library import SymbolDef, SymbolPin
@@ -43,6 +43,10 @@ __all__ = [
     "SYMBOL_PITCH_MM",
     "LAYOUT_ORIGIN_MM",
     "LAYOUT_COLUMNS",
+    "LAYOUT_MARGIN_CHANNEL_MM",
+    "LAYOUT_WIDE_GUTTER_EXTRA_MM",
+    "LAYOUT_WIDE_MARGIN_CHANNEL_MM",
+    "layout_channels",
     "LAYOUT_GAP_MM",
     "STUB_LENGTH_MM",
     "LABEL_CHAR_WIDTH_MM",
@@ -324,11 +328,16 @@ def layout_positions(
     columns: int | None = None,
     gap: float = LAYOUT_GAP_MM,
     min_pitch: float = SYMBOL_PITCH_MM,
+    order: Sequence[str] | None = None,
+    extra_columns: Sequence[float] = (),
+    extra_rows: Sequence[float] = (),
 ) -> dict[str, Vec]:
     """Symbol origins in a table whose column widths and row heights are derived from the symbols' measured extents.
 
-    Refs go row-major in natural order over ``columns`` columns
-    (:func:`layout_columns` when ``None``). The distance from column ``c``
+    Refs go row-major over ``columns`` columns (:func:`layout_columns` when
+    ``None``) in ``order`` - natural ref order by default, or the caller's
+    (the compiler orders by topology block so connected symbols sit in
+    neighbouring cells and their wires stay short). The distance from column ``c``
     to column ``c + 1`` is the right-most extent edge of column ``c`` minus
     the left-most extent edge of column ``c + 1`` plus ``gap`` (every row),
     rounded up to 2.54 mm and never below ``min_pitch``; rows likewise with
@@ -338,8 +347,15 @@ def layout_positions(
     wide instead of every cell (the uniform :func:`layout_pitch` grid did).
     Every origin stays a multiple of 2.54 mm from ``origin``, so library pin
     ends (multiples of 1.27 mm) stay on KiCad's connection grid.
+
+    ``extra_columns[c]`` / ``extra_rows[r]`` widen the gutter after column
+    ``c`` / row ``r`` by that much (rounded up to 2.54 mm; missing entries
+    are 0): the compiler widens exactly the gutters whose wire tracks ran
+    out (B11 W3), so a table whose wires fit keeps its coordinates.
     """
-    refs = sorted(extents, key=natural_ref_key)
+    refs = list(order) if order is not None else sorted(extents, key=natural_ref_key)
+    if set(refs) != set(extents) or len(refs) != len(extents):
+        raise ValueError("order must list every ref in extents exactly once")
     if not refs:
         return {}
     cols = layout_columns(len(refs)) if columns is None else columns
@@ -350,13 +366,61 @@ def layout_positions(
     for c in range(min(cols, len(refs)) - 1):
         right = max(extents[row[c]].xmax for row in rows if c < len(row))
         left = min(extents[row[c + 1]].xmin for row in rows if c + 1 < len(row))
-        xs.append(snap(xs[-1] + max(min_pitch, _ceil_grid(right - left + gap))))
+        extra = _ceil_grid(extra_columns[c]) if c < len(extra_columns) and extra_columns[c] > 0 else 0.0
+        xs.append(snap(xs[-1] + max(min_pitch, _ceil_grid(right - left + gap)) + extra))
     ys = [snap(origin[1])]
     for r in range(len(rows) - 1):
         bottom = max(extents[ref].ymax for ref in rows[r])
         top = min(extents[ref].ymin for ref in rows[r + 1])
-        ys.append(snap(ys[-1] + max(min_pitch, _ceil_grid(bottom - top + gap))))
+        extra = _ceil_grid(extra_rows[r]) if r < len(extra_rows) and extra_rows[r] > 0 else 0.0
+        ys.append(snap(ys[-1] + max(min_pitch, _ceil_grid(bottom - top + gap)) + extra))
     return {ref: (xs[c], ys[r]) for r, row in enumerate(rows) for c, ref in enumerate(row)}
+
+
+#: free corridor kept outside the table on each side for trunks of nets whose pins face the sheet margin
+LAYOUT_MARGIN_CHANNEL_MM = 12.7
+#: what a gutter between two columns / rows gains when its wire tracks ran out (16 more tracks), and the width of a margin
+#: corridor that ran out (it stays inside the 50.8 mm the sheet keeps free around the table) - B11 W3, measured on the
+#: ATmega128 board: capacity, not path shape, was what kept 28 of its 44 unrouted small nets from being drawn
+LAYOUT_WIDE_GUTTER_EXTRA_MM = 20.32
+LAYOUT_WIDE_MARGIN_CHANNEL_MM = 38.1
+
+
+def layout_channels(
+    placed: Mapping[str, Extent], order: Sequence[str], columns: int,
+    margins: tuple[float, float, float, float] = (LAYOUT_MARGIN_CHANNEL_MM,) * 4,
+) -> tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...]]:
+    """``(vertical, horizontal)`` free corridors of the table laid out by :func:`layout_positions` with the same ``order`` / ``columns``:
+    ``vertical`` = (xmin, xmax) between column ``c`` and ``c + 1`` (the right-most placed extent edge of column ``c`` to the
+    left-most of column ``c + 1``) plus a corridor left of the table and right of it; ``horizontal`` likewise between rows
+    plus above and below. ``margins`` = the widths of the (left, right, top, bottom) corridors, :data:`LAYOUT_MARGIN_CHANNEL_MM`
+    each by default. Absolute coordinates; a corridor may be empty (lo >= hi).
+    """
+    m_left, m_right, m_top, m_bottom = margins
+    refs = list(order)
+    rows = [refs[i : i + columns] for i in range(0, len(refs), columns)]
+    ncols = max((len(r) for r in rows), default=0)
+    vertical: list[tuple[float, float]] = []
+    horizontal: list[tuple[float, float]] = []
+    if not refs:
+        return (), ()
+    left = min(placed[r].xmin for r in refs)
+    right = max(placed[r].xmax for r in refs)
+    top = min(placed[r].ymin for r in refs)
+    bottom = max(placed[r].ymax for r in refs)
+    vertical.append((snap(left - m_left), left))
+    for c in range(ncols - 1):
+        lo = max(placed[row[c]].xmax for row in rows if c < len(row))
+        hi = min(placed[row[c + 1]].xmin for row in rows if c + 1 < len(row))
+        vertical.append((lo, hi))
+    vertical.append((right, snap(right + m_right)))
+    horizontal.append((snap(top - m_top), top))
+    for r in range(len(rows) - 1):
+        lo = max(placed[ref].ymax for ref in rows[r])
+        hi = min(placed[ref].ymin for ref in rows[r + 1])
+        horizontal.append((lo, hi))
+    horizontal.append((bottom, snap(bottom + m_bottom)))
+    return tuple(vertical), tuple(horizontal)
 
 
 #: the ISO sheets (landscape, mm) a schematic may use, smallest first: KiCad's own page sizes
@@ -367,8 +431,9 @@ LAYOUT_PAPERS: tuple[tuple[str, float, float], ...] = (
 LAYOUT_SHEET_MARGIN_MM = LAYOUT_ORIGIN_MM[0]
 
 
-def layout_paper(extents: Iterable[Extent], margin: float = LAYOUT_SHEET_MARGIN_MM) -> tuple[str, float, float]:
-    """``(name, width, height)`` of the smallest :data:`LAYOUT_PAPERS` sheet that holds every placed extent plus ``margin`` right and below.
+def layout_paper(extents: Iterable[Extent], margin: float = LAYOUT_SHEET_MARGIN_MM, grown: Vec = (0.0, 0.0)) -> tuple[str, float, float]:
+    """``(name, width, height)`` of the smallest :data:`LAYOUT_PAPERS` sheet that holds every placed extent plus ``margin`` right and below
+    (plus ``grown`` = what a widened right / bottom wire corridor gained over the default, so its wires sit no closer to the frame).
 
     The extents are absolute (already shifted to their symbol origins).
     Beyond A0 the sheet is ``User`` sized to the extents plus the margin,
@@ -376,8 +441,8 @@ def layout_paper(extents: Iterable[Extent], margin: float = LAYOUT_SHEET_MARGIN_
     the sheet, so a symbol outside it is off the page, never lost.
     """
     boxes = list(extents)
-    need_w = max((e.xmax for e in boxes), default=0.0) + margin
-    need_h = max((e.ymax for e in boxes), default=0.0) + margin
+    need_w = max((e.xmax for e in boxes), default=0.0) + margin + grown[0]
+    need_h = max((e.ymax for e in boxes), default=0.0) + margin + grown[1]
     for name, w, h in LAYOUT_PAPERS:
         if need_w <= w and need_h <= h:
             return name, w, h

@@ -73,6 +73,7 @@ from ai_eda.tools.calc.basic import (
     voltage_divider_output,
     voltage_divider_ratio,
 )
+from ai_eda.tools.calc.e_series import E_SERIES_CALCULATORS, SERIES_TOLERANCE, is_standard, series_of, standard_value
 from ai_eda.tools.calc.part_value import (
     PART_VALUE_DIGITS,
     PART_VALUE_VERSION,
@@ -306,6 +307,11 @@ __all__ = [
     "edge_coupled_z_odd",
     "find_quantities",
     "ipc2221_width_for_current",
+    "E_SERIES_CALCULATORS",
+    "SERIES_TOLERANCE",
+    "is_standard",
+    "series_of",
+    "standard_value",
     "format_part_value",
     "format_quantity",
     "format_spice_number",

@@ -1,3 +1,32 @@
+# Portions of this file - the N-layer negotiation schedule of routing.maze 0.9 (StackSearchParams, _NegotiationN.recompute / _count /
+# advance: the congestion cost base * acc * pres, the first-iteration free pass, pres_fac x pres_fac_mult capped at max_pres_fac, and
+# acc += overuse * acc_fac from the second iteration on) - are ported from VTR / VPR (https://github.com/verilog-to-routing/
+# vtr-verilog-to-routing: vpr/src/route/route_common.h get_single_rr_cong_cost / get_single_rr_cong_pres_cost, route_common.cpp
+# pathfinder_update_acc_cost_and_overuse_info, route.cpp's pres_fac update) under the MIT License:
+#
+#   Copyright 2012 VTR Developers
+#
+#   Permission is hereby granted, free of charge, to any person obtaining a copy of
+#   this software and associated documentation files (the "Software"), to deal in
+#   the Software without restriction, including without limitation the rights to
+#   use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+#   of the Software, and to permit persons to whom the Software is furnished to do
+#   so, subject to the following conditions:
+#
+#   The above copyright notice and this permission notice shall be included in all
+#   copies or substantial portions of the Software.
+#
+#   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+#   SOFTWARE.
+#
+# Changes: translated from C++ to Python onto this router's halo counts (a grid cell's capacity is one net; its occupancy is the number
+# of nets whose clearance halo covers it); see also THIRD_PARTY_NOTICES.md at the repository root.
+
 """Deterministic two-layer grid maze router with negotiated congestion and per-net rules (pure, no I/O beyond the KiCad library).
 
 Invariant: every track and via produced here is a function of the IR's
@@ -453,6 +482,311 @@ pads_box+margin``) and ``stats["fanout_room"]`` gives each room's box.
 Otherwise the board is 0.6's, byte for byte; a board 0.6 escapes
 completely, or that needs no escape, never runs it.
 
+**Via fan-out (routing.maze 0.8).** On a 0.5 mm-pitch QFP 0.6 and 0.7
+leave dozens of pads without an escape (measured 2026-11-12: the STM32F407's
+LQFP-100, 0.3 mm pads, at the fine rules - 51 of its 99 waiting pads, after
+684 s of static phase): an escape stub's claim (``clearance + track_width/2
++ grid/2`` around its copper) covers the next pad's lane, so at most about
+every other pad of a row leaves on its own layer, and the greedy orders do
+not find that pattern. When 0.6 / 0.7 leave a pad without an escape, the
+static phase runs once more from the same maps (0.7's rooms kept when 0.7
+was kept) with the footprints they left a pad of escaped in alternation:
+in each row of their waiting signal pads (one escape direction, one edge
+line, in order along the row) every other pad - the second, the fourth,
+... - tries a *via fan-out* first and an escape stub second, the others the
+stub first and the via fan-out second. A via fan-out is a stub from the pad
+centre along its axis out of its inner edge (then its outer edge) to a via:
+the via's site obeys the plane-via rules exactly (no plane zone needed: the
+edge, the pads under its disc, the via keep-outs, ``via_diameter/2 +
+clearance`` from every other net's copper, ``via_diameter + clearance`` from
+the plane vias, other footprints' fan-out rooms), the stub keeps every
+clearance exactly as an escape stub does, the via's cell is free or the
+net's own on the other outer layer and reserved for the net there, with a
+way out of the footprint's escape area (or room) on that layer. Under a
+QFP the inner side is free on the other layer, so the fanned-out pads leave
+there in a row of vias two pitches apart. The net's terminal is the via's
+cell on the other outer layer (the search starts and ends there; no other
+via may sit on it) and the via is emitted with the stub, both carrying the
+stub's ``escape:<pad>:dogbone:...`` entry. A net with a rule (width,
+clearance or length budget) and a coupled pair get no via fan-out. The run's
+result is kept only when it leaves fewer nets (then pads) unroutable; then
+every track and via is stamped :data:`ROUTER_DOGBONE_VERSION` ``"0.8"``,
+``derived_from`` names the footprints and the fanned-out pads
+(``via_fanout:<refs>;pads=<pads>;model=alternate+via``), each such row of
+``stats["escapes"]`` has kind ``"dogbone"`` and names the layer the net
+continues on (``continues_on``), and ``stats["via_fanout"]`` lists the
+footprints and pads. Otherwise the board is 0.6's or 0.7's, byte for byte;
+a board they escape completely never runs it.
+
+**Stack mode (routing.maze 0.9).** :func:`route_board` takes ``stack``, a
+:class:`~ai_eda.tools.routing.stack.RouterStack` (the board's copper, signal
+and plane layers and the via structures they allow, the through via first);
+without it nothing below runs and every board is routed as before, byte for
+byte. A stack whose signal layers are ``F.Cu`` / ``B.Cu`` and whose only
+signal via is the through via (the 4-layer rung of the layer escalation,
+signal / ground / power / signal) keeps the negotiation and the search
+above, unchanged: what the stack adds there is where a plane net's pads
+reach their planes. A stack with inner signal layers, or with a second via
+type that joins two signal layers, is routed by the N-layer search and
+negotiation below (**N signal layers**).
+
+* **The stack is checked first** (:class:`CompileError` naming the reason):
+  ``inner_layers=True`` and a stack together, a stack whose copper is not
+  ``ir.pcb.layers`` (same names, same order), signal layers without ``F.Cu``
+  and ``B.Cu``, a layer that is both signal and plane, a first via type
+  other than the through via ``F.Cu``-``B.Cu``, a via type whose span
+  :func:`ai_eda.ir.pcb.via_span_problem` refuses on the stack's copper (a
+  micro via joins two adjacent copper layers - it spans exactly one
+  dielectric, :data:`MICROVIA_SPAN_SOURCE`; a blind via has one outer end, a
+  buried via none), a via type listed twice, and a plane zone
+  (``plane_nets``) on a layer that is not a plane layer of that net in the
+  stack. Whether the spans can be laminated
+  is the stack's own rule (``ai_eda.design.stackup.stack_problems``, which
+  built the escalation stacks' via tables), not re-checked here.
+* **Via types.** Each via type's *layers* are the routing layers inside its
+  span, in stack order; a type that holds one signal layer (on the 4-layer
+  stack the micro vias ``F.Cu``-``In1.Cu`` and ``In2.Cu``-``B.Cu``) is a
+  *plane type*, used only for plane vias; a type that holds two or more is a
+  *signal type* (the through via first, then span length, then the upper
+  end). On the 4-layer rung the through via is the only signal type, so every
+  routed net keeps 0.2's through vias. Every type uses the board's one via
+  size (:attr:`RoutingParams.via_diameter_mm` / ``via_drill_mm``, after the
+  fab raise) and one :attr:`RoutingParams.via_cost`: no laser drill size is
+  assumed; a micro via of the board's size is a stated KiCad via kind, and
+  KiCad's DRC judges it by its own microvia rules.
+* **Typed plane vias.** An SMD pad of a plane net on outer layer ``L`` tries
+  the plane types whose layers hold ``L`` and whose span holds a plane layer
+  of the net's zones (span length ascending, then the upper end), then the
+  through via; each runs 0.4's whole axis walk before the next. A typed site
+  obeys 0.4's rules with the owner maps read only on the type's own signal
+  layers, and its disc lies inside one of the net's plane zones on a plane
+  layer of its span; it is claimed only on those signal layers, so a GND
+  micro via ``F.Cu``-``In1.Cu`` leaves ``B.Cu`` free beneath it for another
+  net's track (a through via would own both). Every other rule stays shared:
+  no via disc on any pad box of any layer, the via keep-outs on any layer,
+  ``via_diameter + clearance`` between the centres of any two plane vias.
+* **Stitch rule** (a net that is the plane of two or more of the stack's
+  layers and has no through-hole pad - a through-hole pad's barrel joins
+  them all): the
+  pads, in terminal order, try the through via first until one takes it -
+  it reaches every plane layer, so the planes are stitched once - and every
+  later pad tries the plane types first. When no pad's through walk finds a
+  site, every claim of the net is undone and it is placed exactly as 0.4
+  places it, through vias only. ``stats["stack"]["stitch"]`` names the pad
+  that took the stitching via, or ``"through-only"``.
+* **No stacked vias** (:data:`STACKED_VIA_SOURCE`: microvias are staggered by
+  default, stacked only when copper filled, at most two levels and never on
+  a buried via): this version stacks none - the compiler writes every via
+  ``(filling no)(capping no)`` - and keeps every via clear of every other in
+  x-y whatever their spans: the plane-via spacing above, the shared
+  ``via_pad_ok`` (no via disc on another via's box), and a signal via's
+  static check against the plane vias' claims; with N signal layers also
+  ``via_diameter + clearance`` from every plane and escape via whatever the
+  spans, every signal via counted in every type's via plane (below), and a
+  net's own signal vias ``via_drill`` + the hole gap apart centre to centre
+  whatever their spans (hole to hole: one net's copper may touch, its drills
+  may not; the hole gap is the larger of the router's clearance and the
+  hole-to-hole minimum kicad-cli DRC checks, KiCad's own 0.25 mm - the IR
+  records no hole-to-hole limit; see KiCad's minimums below;
+  ``net_hole_gap=<drill>+<gap>`` in the ``stack:`` entry). So no via sits on
+  a buried via either.
+* 0.6 escape vias and 0.8 via fan-outs stay through vias (they claim every
+  routing layer, and escape on ``F.Cu`` / ``B.Cu`` only); rule nets and
+  coupled pairs stay on ``F.Cu`` / ``B.Cu`` with through vias, as everywhere
+  in this version (their widths are solved for the outer layers).
+* **Emission.** A typed plane via is an IR :class:`~ai_eda.ir.Via` with its
+  ``kind`` and its span ``(top, bottom)``; a through via keeps ``kind=None``
+  and ``F.Cu`` / ``B.Cu``, as before. Every track and via of a board routed
+  with a stack is stamped :data:`ROUTER_STACK_VERSION` ``"0.9"`` (in place
+  of 0.2 - 0.8; the stack entry comes last in ``derived_from``:
+  ``stack:<label>;signal=...;planes=<layer>=<net>,...;vias=<kind>:<top>-<bottom>,...;
+  size=<diameter>/<drill>;cost=<via_cost>;model=span+barrel+xy_all_vias+no_stacked``),
+  the note names the signal layers and the via types, ``stats["stack"]``
+  gives the stack, each via type's count and the stitch rule's outcome, and
+  each plane-net row of ``stats["plane_nets"]`` lists its pads' ``via_kinds``.
+* **KiCad's minimums** (:func:`kicad_floor`): a stack board is routed
+  against the rules kicad-cli DRC checks it against - the compiled project
+  file's (``ir.pcb.manufacturing``'s authoritative limits), else KiCad's own
+  (:func:`ai_eda.compilers.project.checked_rules`: track 0.2 mm, clearance
+  0.2 mm, copper to edge 0.5 mm, via diameter 0.5 mm, via hole 0.3 mm, hole
+  to hole 0.25 mm; no IR limit maps onto the edge or the hole-to-hole one,
+  so those always apply). The track width, the narrowest escape stub, the
+  clearance, the edge clearance and the via diameter and drill are raised to
+  them (never lowered; one via size serves every via type, so a micro via is
+  held to the through via's minimums too), and a net's own vias keep the
+  hole-to-hole gap (above); measured on the STM32F407 example's 6-layer
+  board (2026-11-13), routed at the router's own 0.3 mm edge clearance and
+  0.1 mm narrowest stub, kicad-cli 10.0.6 found sixteen
+  ``copper_edge_clearance`` errors (copper 0.475 / 0.3 mm from the edge) and
+  four ``track_width`` errors (0.15 mm escape stubs); the via minimums were
+  measured on a probe board (:data:`ai_eda.compilers.project.
+  KICAD_DEFAULT_MIN_VIA_DIAMETER_MM`). The narrowest escape stub is raised
+  to the fab's ``min_track_width_mm`` first (recorded in ``stats["raised"]``
+  against the caller's value, as on every board with escapes), then to
+  KiCad's minimum. The stack entry gains
+  ``kicad_minimums=track:..,clearance:..,edge:..,via:<diameter>/<hole>,hole_to_hole:..``,
+  the note says so, and ``stats["kicad_minimums"]`` gives the minimums and
+  the raises (apart from the fab raises of ``stats["raised"]``). A board
+  without a stack keeps its parameters, although the same KiCad defaults
+  judge it (the same error pattern on a 2-layer board would have this cause;
+  not changed here).
+* **The plane web** (:func:`_plane_web_pass`, the check in
+  :mod:`ai_eda.tools.routing.plane_web`): TI SCAA082A sec. 2.5 - closely
+  spaced vias must not cut slots in a plane. After the negotiation (and the
+  end game, drop and recovery) every plane via and through-hole pad of each
+  plane net is checked against the fill KiCad will pour - each zone minus
+  each other net's copper on its layer grown by the zone's clearance as the
+  compiler writes it (the IR zone's own ``clearance_mm``, else 0.5 mm; never
+  below the clearance kicad-cli checks), pruned at its minimum thickness
+  (0.25 mm), its small islands deleted, touching zones of one net joined
+  (stricter than KiCad 10 in one respect, named in ``stats["plane_web"]``
+  ``stricter``: a cut may be a false one). On the STM32F407 board the
+  LQFP-100's ring of fan-out vias (antipads 1.6 mm wide at a 1.0 mm pitch) cut
+  the In1.Cu GND plane under the package into an island, and U1.10's and
+  U1.20's GND vias between fan-out vias touched no fill at all: kicad-cli
+  ``via_dangling`` x2, ``unconnected_items`` x2; the check calls exactly those
+  two cut off. For each item cut off, the nets whose negotiated vias cross its
+  plane within ``keep`` of its copper (``via_diameter/2`` + the largest zone
+  clearance + minimum thickness + the check's tolerance) are ripped up and
+  routed strictly, every via site of a type crossing that plane within
+  ``keep`` of it closed for every net, and the check runs again; a reroute
+  that fails, or a move that leaves the item cut off or cuts another one off,
+  is undone and named; an item with no such via (static copper cut it, or
+  vias farther away) stays and is named. Only a
+  board where the check found a cut changes: the stack entry ends with
+  ``plane_web=clearance:..,min_thickness:..,keep:..:<item>><nets>,..``
+  (``;cut=<items>`` for any left), the note says so, the moved nets' notes
+  say why, and ``stats["plane_web"]`` gives the check's outcome on every stack
+  board with plane zones.
+
+**N signal layers (routing.maze 0.9).** A stack with inner signal layers, or
+with a signal type besides the through via, routes every net without a rule
+on all of its signal layers. Routing index 0 is ``F.Cu`` and 1 ``B.Cu`` as
+before; the inner signal layers follow in stack order (``layer * n + k``
+ids, so every old id keeps its meaning and a two-layer literal left in the
+code still means the outer layers). The owner maps, the edge keep-out, the
+through-hole pads (their inner copper is the outer pad box) and the track
+keep-outs cover every routing layer they reach; via keep-outs any layer.
+
+* **The search** (:func:`_search_n`) runs over planar states ``(layer, cell,
+  direction)`` and one *barrel state* per signal via type and cell: from a
+  planar state a via of type ``t`` (its static check read on the type's own
+  layers, :meth:`_Board.via_static_at`) enters the barrel at the via plane's
+  cost, and the barrel exits onto any other layer of the type's span at that
+  cell's congestion. So a net changes layers by exactly one via whatever the
+  span, a branch of its tree may leave an earlier via's barrel on any layer
+  of that via's span without a second via (the barrel's cells are seeds of
+  the tree), and no via is drilled from a state a barrel reached nor within
+  ``via_drill + clearance`` of a via the net holds already (no stacked vias,
+  drills hole to hole apart). The heuristic
+  is ``base`` times the Manhattan distance plus ``via_cost`` on a layer no
+  target lies on - a lower bound, since every via type costs at least
+  ``via_cost`` and every step at least ``base`` - weighted by ``astar_fac``
+  (VPR's 1.2: weighted A*, so a path may cost up to that factor more than
+  the cheapest; 1 keeps it exact).
+  Push order: east, south, west, north, then the barrels (signal-type
+  order), then the barrel's exits (stack order); the heap counter breaks
+  ties.
+* **Costs** (:class:`StackSearchParams`, every number a stated choice in the
+  ``stack:`` entry): a via of each type costs ``via_cost`` times its kind's
+  factor, through 1 < blind = buried 1.5 < micro 2 (NXP AN10778 Rev. 2 sec.
+  4-5: prefer through vias; blind, buried and micro vias raise the board's
+  cost - the factors themselves are generic values, not a fab's), so a net
+  takes a blind, buried or micro via where the through via's occupancy of
+  every layer it crosses is congested; a step against a layer's preferred
+  direction (the stack's ``directions``) costs ``wrong_way`` (2.5) times the
+  cell's node cost - a cost term, never a ban (TI SPRAAR7J sec. 3.12 Table
+  3-1 note 1; TI SCAA082A sec. 2.5: adjacent signal layers routed
+  orthogonally).
+* **Negotiation** (:class:`_NegotiationN`): a path cell on layer ``r``
+  counts in the via plane of every type whose span holds ``r``; a via of
+  type ``t`` counts on the track planes of every layer of its span and in
+  every type's via plane (the conservative drill-to-drill rule: KiCad's
+  hole-to-hole check for disjoint spans was not verified), at 0.2's radii.
+  The schedule is VPR's (MIT, Copyright 2012 VTR Developers; the file
+  header): a node costs ``base * acc * pres`` with ``pres = 1 + pres_fac *
+  occupancy``; iteration 1 is a free pass (``pres_fac`` 0) that shows the
+  real demand, iteration 2 uses 0.5, then ``x1.3`` per iteration capped at
+  1000; from iteration 2 on every over-used cell gains ``acc += overuse *
+  acc_fac`` (1) - VPR's documented defaults, in place of ``present_cost`` /
+  ``present_growth`` / ``history_cost`` (PathFinder, McMurchie & Ebeling,
+  FPGA '95, DOI 10.1145/201310.201328, sec. 3.5: a gentle present factor
+  with a weighty history keeps the result from depending on net order).
+  After iteration 1 only the conflicting nets are rerouted, in a
+  permutation that changes every iteration and is fixed by its inputs:
+  sorted by ``sha256("<iteration>:<net>")`` (nextpnr router2's shuffled
+  failed nets, ISC, as an idea). Each ``stats["history"]`` row also gives
+  the present factor, the search states touched and the over-used via cells
+  per via type.
+* The per-state and per-cell arrays are :mod:`array` arrays (8-byte floats,
+  4-byte counts and predecessors), sized ``R * n * 5 + T * n`` states.
+* **Exact via sites** (:meth:`_Board._via_site_n`): where a signal via may
+  be drilled is measured exactly - its copper ``max(clearance, the other
+  net's)`` from every pad, escape stub and via, plane stub and via and
+  ordinary stub of the static phase on a layer of its span (each by its
+  exact shape or box), outside every track keep-out area on those layers,
+  clear of the edge and of every pad box, and ``via_diameter + clearance``
+  from every plane and escape via (above) - in place of 0.2's check, which
+  looks for another net's owner-map cell within ``via_diameter/2 +
+  clearance + width/2`` of the via although those cells already lie within
+  ``clearance + width/2 + grid/2`` of the copper (the clearance counted
+  twice: on the STM32F407 example no F.Cu via was legal 1.07 mm beyond a
+  decoupling capacitor's pad, where 0.2 mm is needed). Measured there (the
+  static maps of 210dba7): the exact check opens 7639 (8 layers) / 8729 (6
+  layers) of the cells 0.2's check had closed to a through via and closes
+  none; at iteration 40 PD5 and PD7 still competed for the few F.Cu via
+  sites 0.2's check left them (both drilled at (64.4, 53.2)) between the
+  LQFP-100's north row and its decoupling
+  capacitors: with the eleven nets there ripped up, routing them strictly
+  with either of the two first, or both after the other nine, never routed
+  both. With exact
+  sites (and the plane pads below) the example's 91 nets route legally on 6
+  and 8 layers at iteration 11 (210dba7: 87 and 88 after 40). The
+  ``stack:`` entry says ``via_sites=exact``.
+* **Plane pads under the package** (the static phase): when the via fan-out
+  (0.8) escapes a footprint in alternation, each of its waiting plane pads
+  looks for its escape via out of its inner edge - under the package, where
+  the fanned-out row leaves a site beside a plane pad - before its outer
+  edge, which is where 0.6 looks. In front of a 0.5 mm-pitch row such a via
+  (its disc and clearance wider than the pitch) closes its neighbours'
+  lanes: measured 2026-11-13 on the STM32F407 example (placement.core_ring
+  0.3, 6 and 8 layers), U1.20's GND via in front of the west row pushed
+  U1.21's stub into U1.23's lane, and U1.99's GND via, with PB9's way out
+  (bent round C7's +3V3 via), left U1.98 none - both pads were refused on
+  every stack; with the vias under the package both escape. Only a board
+  routed by the N-layer search does this (every other board keeps 0.6's
+  outer edge alone, byte for byte); the via stays a through via, as every
+  escape via of this version. The ``stack:`` entry ends with
+  ``planes_under_package=<pads>`` (``none`` when no via went there) and
+  ``stats["stack"]["search"]["planes_under_package"]`` lists them.
+* **The end game**: when the last negotiation iteration leaves nets in
+  conflict, each of them (net order) still in conflict when its turn comes
+  is ripped up and routed strictly, against every other net's copper as an
+  obstacle (as a dropped net is recovered, below); when no such route
+  exists it is routed at the negotiated costs - the cheapest route crosses
+  the least copper the present factor and the history charge for -, the
+  nets whose copper that route breaks, at most :data:`END_GAME_RIP_UP`
+  (a stated choice), are ripped up, it is added (legal: only they held
+  cells of it) and they are routed strictly, in net order; when one of them
+  finds no route every change is undone and the net keeps its route, still
+  in conflict; the pass is repeated while it moves a net. Every route it
+  adds is legal by construction (so each move leaves one net fewer in
+  conflict and the passes end); the board is legal (``stats["legal"]``)
+  when it leaves no conflict, else the drop phase handles what is left. TritonRoute's clipped rip-up-and-reroute repair
+  (OpenROAD, BSD-3) is the idea; no code was taken. Measured on the STM32F407
+  example's end states at 210dba7 (iteration 40, the present factor at its
+  cap; PD5 / PD7 on 8 layers and five nets on 6 layers still in conflict,
+  the drop phase recovering none of the nets it dropped): with the exact via
+  sites the end game leaves none in conflict on either (8 layers: PD5 made
+  room, PD3 / PD4 routed again; 6 layers: PB9 and PD7 made room). With the
+  exact via sites and the plane pads under the package the negotiation
+  itself ends legal there (iteration 11 on both stacks), so on that board
+  the end game is the safety net, not the fix.
+  ``stats["stack"]["search"]["end_game"]`` lists the nets it moved
+  (``rerouted``, or ``made room`` with the nets it ripped up), the ``stack:``
+  entry ends with ``end_game=rip_up<=<limit>:<nets>`` and the tracks of the
+  nets it routed say so in their notes.
+
 **Large boards.** :meth:`RoutingParams.for_board` gives a board with more
 than :data:`LARGE_BOARD_NETS` nets to route (:func:`routed_net_count`) a
 negotiation cap of :data:`LARGE_BOARD_ITERATIONS` in place of 40, recorded
@@ -473,8 +807,9 @@ only honours the widths, spacings and lengths it is given.
 Traceability: every :class:`~ai_eda.ir.Track` / :class:`~ai_eda.ir.Via`
 carries ``derived`` provenance naming this router (:data:`ROUTER_ID` /
 :data:`ROUTER_VERSION`, :data:`ROUTER_RULES_VERSION`, :data:`ROUTER_KEEPOUT_VERSION`,
-:data:`ROUTER_CUSTOM_PAD_VERSION`, :data:`ROUTER_ESCAPE_VERSION` or
-:data:`ROUTER_FANOUT_VERSION`), the net, the
+:data:`ROUTER_CUSTOM_PAD_VERSION`, :data:`ROUTER_ESCAPE_VERSION`,
+:data:`ROUTER_FANOUT_VERSION`, :data:`ROUTER_DOGBONE_VERSION` or
+:data:`ROUTER_STACK_VERSION`), the net, the
 placements of the net's components and every parameter in
 ``derived_from``; the note names the iteration count and how the net's route
 was obtained. ``Provenance.inputs`` stays empty: it is the calculator role
@@ -483,22 +818,29 @@ map, and a track is not a calculator output.
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import math
+from array import array
 from collections import deque
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
+from ai_eda.compilers.pcb import ZONE_CLEARANCE_MM, ZONE_MIN_THICKNESS_MM
+from ai_eda.compilers.project import checked_rules
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import CircuitIR, Net, Provenance, ProvenanceKind, Track, Via
+from ai_eda.ir.pcb import via_span_problem
 from ai_eda.tools.kicad.geometry import PadPart, _q, custom_pad_parts, pad_angle, pad_center, pad_layers
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary, Pad
 from ai_eda.tools.keepout import allowed_nets as keepout_allowed_nets
 from ai_eda.tools.keepout import area_bbox, area_points, covers_layer, forbids, keepout_id, point_area_distance, segment_area_distance
 from ai_eda.tools.routing.coupling import uncoupled_lengths
+from ai_eda.tools.routing.plane_web import WEB_STRICTER, WEB_TOLERANCE_MM, PlaneItem, plane_web
+from ai_eda.tools.routing.stack import THROUGH, RouterStack
 
 __all__ = [
     "ROUTER_ID",
@@ -508,6 +850,12 @@ __all__ = [
     "ROUTER_CUSTOM_PAD_VERSION",
     "ROUTER_ESCAPE_VERSION",
     "ROUTER_FANOUT_VERSION",
+    "ROUTER_DOGBONE_VERSION",
+    "ROUTER_STACK_VERSION",
+    "MICROVIA_SPAN_SOURCE",
+    "STACKED_VIA_SOURCE",
+    "STACK_SEARCH",
+    "StackSearchParams",
     "ESCAPE_ENTRY_PREFIX",
     "PLANE_VIA_REACH_MM",
     "LAYERS",
@@ -525,6 +873,7 @@ __all__ = [
     "fanout_margin",
     "finest_pad_pitch",
     "footprint_pad_pitch",
+    "kicad_floor",
     "route_board",
     "routed_net_count",
 ]
@@ -547,6 +896,21 @@ ROUTER_ESCAPE_VERSION = "0.6"
 #: the version stamped on every track and via of a board whose static phase ran under routing.maze 0.7's rules (module docstring:
 #: fan-out room); it takes the place of 0.6 on such a board, where 0.6 left a pad without an escape
 ROUTER_FANOUT_VERSION = "0.7"
+#: the version stamped on every track and via of a board whose static phase ran under routing.maze 0.8's rules (module docstring:
+#: via fan-out); it takes the place of 0.6 / 0.7 on such a board, where they left a pad without an escape
+ROUTER_DOGBONE_VERSION = "0.8"
+#: the version stamped on every track and via of a board routed with a :class:`~ai_eda.tools.routing.stack.RouterStack` (module
+#: docstring: stack mode); applied last, it takes the place of 0.2 - 0.8 on such a board, which no earlier version routed
+ROUTER_STACK_VERSION = "0.9"
+#: the rule that a micro via spans exactly one dielectric (joins two adjacent copper layers), which :func:`ai_eda.ir.pcb.via_span_problem`
+#: applies to every micro via type of a stack (research_synthesis.json, opened for the plan; the IPC text itself was not opened)
+MICROVIA_SPAN_SOURCE = ("IPC-T-50M's microvia definition as quoted by Kusiak & Bowles, IPC APEX 2022 / Circuits Assembly 26 Oct 2022, and by "
+                        "NCAB 'Microvias' (the IPC text itself was not opened)")
+#: the rule that microvias are staggered by default and stacked only when copper filled, at most two levels and never on a buried via;
+#: routing.maze 0.9 stacks no via at all (research_synthesis.json, opened for the plan; the IPC white paper was not opened)
+STACKED_VIA_SOURCE = ("NCAB 'Microvias'; Wurth Elektronik HDI poster v1.5 (which allows up to four stacked); Eurocircuits 'Designing for HDI pool' "
+                      "(2024, no stacked vias); "
+                      "IPC press release on IPC-WP-023, 6 Mar 2019 (the white paper itself was not opened); Kusiak & Bowles, IPC APEX 2022")
 #: how far (mm, along one axis from the terminal cell) a plane net's SMD pad looks for the site of its via
 PLANE_VIA_REACH_MM = 3.0
 #: the entries of the board's pad list a net rule's fence measures by their exact copper (module docstring: net rules), as the escape pass
@@ -570,6 +934,9 @@ _ESCAPE_TRIALS: tuple[tuple[str, str, str], ...] = (
     ("fan", "near", "plane"), ("fan", "near", "signal"), ("middle", "near", "plane"), ("middle", "near", "signal"), ("middle", "straight", "plane"), ("middle", "straight", "signal"),
     ("ends", "near", "plane"), ("ends", "near", "signal"), ("natural", "near", "plane"), ("natural", "near", "signal"),
 )
+#: routing.maze 0.8 (module docstring: via fan-out): the trial orders of a footprint 0.6 / 0.7 left a pad of - every other pad of a row
+#: by a via fan-out first, the pads nearest the copper centroid first; the candidates straight first, then nearest first
+_ESCAPE_TRIALS_08: tuple[tuple[str, str, str], ...] = (("alternate", "straight", "plane"), ("alternate", "near", "plane"))
 
 #: what a reserved cell of the escape pass is (routing.maze 0.6), as a refusal names it - after "it is" and after "would take": an
 #: ordinary or escape terminal cell, a cell on the way out reserved for an escape, a cell a fan holds for one of its pads while it is tried
@@ -751,6 +1118,73 @@ class RoutingParams:
         return base
 
 
+@dataclass(frozen=True, slots=True)
+class StackSearchParams:
+    """routing.maze 0.9, N signal layers (module docstring): the N-layer search's and negotiation's knobs, each a stated choice recorded
+    in the ``stack:`` entry of a board it routes (:meth:`derived_from_entry`); a board routed without a stack, or on the 4-layer rung,
+    never reads them.
+
+    The negotiation schedule is VPR's documented router defaults (docs.verilogtorouting.org, VPR command-line usage, router options:
+    ``--first_iter_pres_fac`` 0.0, ``--initial_pres_fac`` 0.5, ``--pres_fac_mult`` 1.3, ``--max_pres_fac`` 1000, ``--acc_fac`` 1,
+    ``--astar_fac`` 1.2; opened 2026-11-13), ported as the file header says: ``first_iter_pres_fac`` is the present factor of
+    iteration 1 (a free pass), ``initial_pres_fac`` that of iteration 2, then ``x pres_fac_mult`` per iteration up to
+    ``max_pres_fac``; ``acc_fac`` scales the history an over-used cell gains from iteration 2 on. ``astar_fac`` weights the A*
+    heuristic (VPR's docs: how aggressive the directed search is; research_synthesis.json: 1 to 2 is reasonable, higher trades path
+    quality for CPU; 1.0 keeps the search exact - a path at most ``astar_fac`` times the cheapest). ``wrong_way`` multiplies a step's
+    node cost against its layer's preferred direction: 2.5, the lower of the two reference ratios research_synthesis.json reports
+    (FreeRouting 2.5 : 1, Qrouter 10 : 1 - GPL programs, the values only; their sources were not opened here), a generic value, not a
+    fab's. ``via_factors`` multiply ``via_cost`` per via kind in the order NXP AN10778 Rev. 2 sec. 4-5 gives (prefer through vias:
+    blind, buried and micro vias raise the board's cost): the factors are generic values, not a fab's prices.
+    """
+
+    first_iter_pres_fac: float = 0.0
+    initial_pres_fac: float = 0.5
+    pres_fac_mult: float = 1.3
+    max_pres_fac: float = 1000.0
+    acc_fac: float = 1.0
+    astar_fac: float = 1.2
+    wrong_way: float = 2.5
+    via_factors: tuple[tuple[str, float], ...] = (("through", 1.0), ("blind", 1.5), ("buried", 1.5), ("micro", 2.0))
+
+    def check(self) -> None:
+        """Refuse knobs that make no sense (:class:`CompileError`): the search stays a lower-bound A* only with factors >= 1."""
+        for name in ("first_iter_pres_fac", "initial_pres_fac", "acc_fac"):
+            value = getattr(self, name)
+            if not (isinstance(value, (int, float)) and math.isfinite(value) and value >= 0):
+                raise CompileError(f"stack search parameter {name} must be >= 0 (got {value!r})")
+        for name in ("pres_fac_mult", "astar_fac", "wrong_way"):
+            value = getattr(self, name)
+            if not (isinstance(value, (int, float)) and math.isfinite(value) and value >= 1):
+                raise CompileError(f"stack search parameter {name} must be >= 1 (got {value!r})")
+        if not (isinstance(self.max_pres_fac, (int, float)) and math.isfinite(self.max_pres_fac) and self.max_pres_fac >= self.initial_pres_fac):
+            raise CompileError(f"stack search parameter max_pres_fac must be >= initial_pres_fac (got {self.max_pres_fac!r})")
+        if not isinstance(self.via_factors, tuple) or not all(isinstance(e, tuple) and len(e) == 2 for e in self.via_factors):
+            raise CompileError(f"stack search parameter via_factors must be (kind, factor) pairs (got {self.via_factors!r})")
+        kinds = [kind for kind, _f in self.via_factors]
+        if sorted(kinds) != sorted(("through", "blind", "buried", "micro")):
+            raise CompileError(f"stack search parameter via_factors must name through, blind, buried and micro once each (got {kinds})")
+        if any(not (isinstance(f, (int, float)) and math.isfinite(f) and f >= 1) for _k, f in self.via_factors):
+            raise CompileError(f"stack search parameter via_factors must all be >= 1 (got {list(self.via_factors)})")
+
+    def via_factor(self, kind: str) -> float:
+        """The factor on ``via_cost`` of a via of ``kind``."""
+        return dict(self.via_factors)[kind]
+
+    def derived_from_entry(self) -> str:
+        """The knobs as the ``stack:`` entry of an N-layer board records them (after its ``model=``)."""
+        return (f"search=barrel;astar_fac={self.astar_fac};wrong_way={self.wrong_way};"
+                f"via_factors={','.join(f'{kind}:{f}' for kind, f in self.via_factors)};"
+                f"negotiation=vpr:first_iter_pres_fac={self.first_iter_pres_fac},initial_pres_fac={self.initial_pres_fac},"
+                f"pres_fac_mult={self.pres_fac_mult},max_pres_fac={self.max_pres_fac},acc_fac={self.acc_fac};order=sha256(iteration:net)")
+
+
+#: the N-layer search's knobs every board with N signal layers is routed with (module docstring: N signal layers)
+STACK_SEARCH = StackSearchParams()
+#: routing.maze 0.9, N signal layers (module docstring: the end game): the most nets the end game rips up to make room for one net the
+#: last negotiation iteration left in conflict - a stated choice, not a source's number
+END_GAME_RIP_UP = 3
+
+
 def routed_net_count(ir: CircuitIR) -> int:
     """How many of the IR's nets name two or more distinct pins - the nets a router has to connect (:meth:`RoutingParams.for_board`)."""
     return sum(1 for net in ir.nets if len({(pin.component_ref, pin.pin_number) for pin in net.pins}) >= 2)
@@ -911,8 +1345,8 @@ class Routing:
 
     ``version`` is the ``tool_version`` stamped on the copper (:data:`ROUTER_VERSION`
     without net rules, :data:`ROUTER_RULES_VERSION` with; :data:`ROUTER_KEEPOUT_VERSION`,
-    :data:`ROUTER_CUSTOM_PAD_VERSION`, :data:`ROUTER_ESCAPE_VERSION` or
-    :data:`ROUTER_FANOUT_VERSION` on the boards the module docstring names), ``rules`` the effective rules (after
+    :data:`ROUTER_CUSTOM_PAD_VERSION`, :data:`ROUTER_ESCAPE_VERSION`,
+    :data:`ROUTER_FANOUT_VERSION` or :data:`ROUTER_DOGBONE_VERSION` on the boards the module docstring names), ``rules`` the effective rules (after
     the fab / board raises and the defaults).
     """
 
@@ -971,12 +1405,54 @@ def effective_params(ir: CircuitIR, params: RoutingParams | None = None) -> tupl
     return eff, raised
 
 
+#: routing.maze 0.9 (stack mode, module docstring: KiCad's minimums): each parameter :func:`kicad_floor` raises and the minimum
+#: (:func:`~ai_eda.compilers.project.checked_rules`) it is raised to
+_KICAD_FLOORS: tuple[tuple[str, str], ...] = (
+    ("track_width_mm", "min_track_width"), ("escape_min_width_mm", "min_track_width"), ("clearance_mm", "min_clearance"),
+    ("edge_clearance_mm", "min_copper_edge_clearance"), ("via_diameter_mm", "min_via_diameter"), ("via_drill_mm", "min_through_hole_diameter"),
+)
+
+
+def _fab_track_minimum(ir: CircuitIR) -> float:
+    """The fab's ``min_track_width_mm`` (any provenance), else 0: what raises the narrowest escape stub (routing.maze 0.6)."""
+    mfg = ir.pcb.manufacturing if ir.pcb is not None else None
+    return float(mfg.min_track_width_mm.value) if mfg is not None and mfg.min_track_width_mm is not None else 0.0
+
+
+def kicad_floor(ir: CircuitIR, p: RoutingParams) -> tuple[RoutingParams, dict[str, float], dict[str, tuple[float, float]]]:
+    """routing.maze 0.9 (stack mode, module docstring: KiCad's minimums): ``p`` with the track width, the narrowest escape stub, the
+    clearance, the edge clearance and the via diameter and drill raised to the minimums kicad-cli DRC checks the compiled board
+    against (:func:`~ai_eda.compilers.project.checked_rules`: the project file's rules, else KiCad's own), the minimums themselves,
+    and ``{parameter: (given, effective)}`` for the raised ones. A value already at or above its minimum is kept. The narrowest
+    escape stub is taken as the fab's ``min_track_width_mm`` raises it first (:class:`_Board`; :func:`route_board` records that
+    raise in ``stats["raised"]``), so only what KiCad's minimum adds beyond the fab's is this floor's. A via drill raised to or past
+    the via diameter is refused (:class:`CompileError`), as :func:`effective_params` refuses a fab's."""
+    checked = checked_rules(ir)
+    values: dict[str, float] = {}
+    raised: dict[str, tuple[float, float]] = {}
+    for name, rule in _KICAD_FLOORS:
+        given, floor = float(getattr(p, name)), float(checked[rule])
+        if name == "escape_min_width_mm":
+            given = max(given, _fab_track_minimum(ir))
+        if floor > given + _EPS:
+            values[name] = floor
+            raised[name] = (given, floor)
+    eff = replace(p, **values) if values else p
+    if eff.via_diameter_mm <= eff.via_drill_mm:
+        raise CompileError(
+            f"cannot route: KiCad's minimum via hole {checked['min_through_hole_diameter']} mm (kicad-cli DRC checks this board against it) "
+            f"leaves the via drill {eff.via_drill_mm} mm at or above the via diameter {eff.via_diameter_mm} mm; set a larger via_diameter_mm "
+            "instead of guessing an annular ring"
+        )
+    return eff, checked, raised
+
+
 def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _effective_rules(
-    ir: CircuitIR, p: RoutingParams, rules: Mapping[str, NetRule] | None,
+    ir: CircuitIR, p: RoutingParams, rules: Mapping[str, NetRule] | None, floor_width: float | None = None,
 ) -> tuple[dict[str, NetRule], dict[str, dict[str, list[float | None]]]]:
     """The non-empty rules with every number filled in, and ``{net: {field: [given, effective]}}`` for the raised ones.
 
@@ -990,7 +1466,10 @@ def _effective_rules(
     match group (not implemented in 0.3). Raises (recorded): a width or
     neck-down width below ``min_track_width_mm``, a clearance below the
     board's effective clearance. A neck-down that the raise brings to the
-    width is dropped (recorded with ``None``).
+    width is dropped (recorded with ``None``). ``floor_width`` (routing.maze
+    0.9, stack mode: the minimum track width kicad-cli DRC checks,
+    :func:`kicad_floor`) raises a width or neck-down width below it as the
+    fab minimum does.
     """
     if rules is None:
         return {}, {}
@@ -1020,6 +1499,8 @@ def _effective_rules(
             given[name] = rule
     mfg = ir.pcb.manufacturing if ir.pcb is not None else None
     min_width = float(mfg.min_track_width_mm.value) if mfg is not None and mfg.min_track_width_mm is not None else None
+    if floor_width is not None:
+        min_width = floor_width if min_width is None else max(min_width, floor_width)
     eff: dict[str, NetRule] = {}
     raised: dict[str, dict[str, list[float | None]]] = {}
     groups: dict[str, set[float]] = {}
@@ -1189,8 +1670,9 @@ class _Escape:
 
     ``kind``: ``"cell"`` - another grid point inside the pad's inscribed circle is usable, so the ordinary one-segment stub to the pad
     centre is kept and only the terminal cell moves; ``"stub"`` - a stub (``points``, from the pad centre, at ``width``) to the grid cell
-    ``cell`` where the net's track starts; ``"via"`` - a plane net's stub to its via at ``cell``. ``why``: ``"off-grid"``, ``"fenced"``
-    or ``"no via site"`` (a plane pad whose axis walk found none)."""
+    ``cell`` where the net's track starts; ``"via"`` - a plane net's stub to its via at ``cell``; ``"dogbone"`` (routing.maze 0.8,
+    module docstring: via fan-out) - a signal net's stub to a via at ``cell``, the net's track starting there on the other outer layer
+    (``exit`` lies on that layer). ``why``: ``"off-grid"``, ``"fenced"`` or ``"no via site"`` (a plane pad whose axis walk found none)."""
 
     kind: str
     why: str
@@ -1239,6 +1721,63 @@ class _PendingPlane:
     joined: list[str]
     deferred: list[tuple[int, _Terminal, int, str, str]]
     failed: list[str] = field(default_factory=list)
+    #: routing.maze 0.9 (stack mode): each slot's via type (an index into :attr:`_Board.vtypes`), ``None`` for a through via and for a
+    #: waiting pad (its escape's via is a through via), aligned with :attr:`links`
+    types: list[int | None] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _VType:
+    """One via type of a board routed with a stack (routing.maze 0.9, module docstring: stack mode).
+
+    ``index`` is its position in the stack's ``vias`` (0: the through via), ``lo`` / ``hi`` the stack positions of its ends, ``layers``
+    the routing indices inside its span (the through via's: every routing layer), ``planes`` the stack's plane layers inside it."""
+
+    index: int
+    kind: str
+    top: str
+    bottom: str
+    lo: int
+    hi: int
+    layers: tuple[int, ...]
+    planes: tuple[str, ...]
+
+    @property
+    def label(self) -> str:
+        """``kind:top-bottom``, as the ``stack:`` entry names the type."""
+        return f"{self.kind}:{self.top}-{self.bottom}"
+
+
+def _check_stack(ir: CircuitIR, stack: RouterStack, inner_layers: bool) -> None:
+    """Refuse a stack this router cannot route with (:class:`CompileError` naming the reason; module docstring: stack mode).
+
+    The spans are judged by name on the stack's copper (:func:`ai_eda.ir.pcb.via_span_problem`: a micro via joins two adjacent copper
+    layers, :data:`MICROVIA_SPAN_SOURCE`; a blind via has exactly one outer end, a buried via none), and a type listed twice is refused
+    (its vias would be counted twice); whether they can be laminated is the stack's own rule. An inner signal layer, or a via type
+    other than the through via that joins two signal layers, is routed by the N-layer search (module docstring: N signal layers).
+    """
+    if inner_layers:
+        raise CompileError("cannot route: pass either inner_layers=True or a stack, not both")
+    names = [layer.name for layer in ir.pcb.layers]
+    if list(stack.copper) != names:
+        raise CompileError(f"cannot route: the stack's copper {list(stack.copper)} is not ir.pcb.layers {names}")
+    if "F.Cu" not in stack.signal or "B.Cu" not in stack.signal:
+        raise CompileError(f"cannot route: the stack's signal layers must include F.Cu and B.Cu (got {list(stack.signal)})")
+    planes = [layer for layer, _net in stack.planes]
+    for layer in stack.signal:
+        if layer in planes:
+            raise CompileError(f"cannot route: {layer} is both a signal layer and a plane layer of the stack")
+    stray = [layer for layer in (*stack.signal, *planes) if layer not in stack.copper]
+    if stray:
+        raise CompileError(f"cannot route: the stack's signal / plane layer(s) {stray} are not among its copper {list(stack.copper)}")
+    if not stack.vias or (stack.vias[0].kind, stack.vias[0].top, stack.vias[0].bottom) != (THROUGH.kind, THROUGH.top, THROUGH.bottom):
+        raise CompileError("cannot route: the stack's first via type must be the through via F.Cu-B.Cu")
+    for i, v in enumerate(stack.vias[1:], 1):
+        problem = via_span_problem(v.kind, v.top, v.bottom, list(stack.copper))
+        if problem is not None:
+            raise CompileError(f"cannot route: via type {v.kind} {v.top}-{v.bottom}: {problem}")
+        if v in stack.vias[:i]:
+            raise CompileError(f"cannot route: via type {v.kind} {v.top}-{v.bottom} is listed twice")
 
 
 @dataclass(slots=True)
@@ -1255,11 +1794,12 @@ class _Doomed:
     withdrawn: list[tuple[int | None, str, str | None]]
 
 
-def _pad_copper_layers(placement, pad: Pad) -> tuple[int, ...]:
-    """Indices of the copper layers the pad is on: through-hole and ``*.Cu`` pads on both, SMD pads where they say."""
+def _pad_copper_layers(placement, pad: Pad, R: int = 2) -> tuple[int, ...]:
+    """Indices of the copper layers the pad is on: through-hole and ``*.Cu`` pads on all ``R`` routing layers (both, as today), SMD
+    pads where they say."""
     layers = pad_layers(placement, pad)
     if pad.pad_type in ("thru_hole", "np_thru_hole") or "*.Cu" in layers:
-        return (0, 1)
+        return tuple(range(R))
     return tuple(k for k, name in enumerate(LAYERS) if name in layers)
 
 
@@ -1321,6 +1861,17 @@ class _Board:
     whether the board is routing.maze 0.6's, :attr:`rules07` whether its
     static phase is routing.maze 0.7's (the fan-out rooms, :attr:`fanout_rooms`,
     and the plane pads whose via walk met one, :attr:`fanout_kept`).
+
+    ``stack`` (routing.maze 0.9, module docstring: stack mode) is the board's
+    :class:`~ai_eda.tools.routing.stack.RouterStack` (:func:`_check_stack`
+    refuses one this router cannot route with): its inner plane layers are
+    :attr:`inner_layers`, its via types :attr:`vtypes` (:attr:`signal_types`,
+    :attr:`plane_types`), and the plane vias take a typed via where one
+    reaches the net's plane (``plane_layer_areas``: net -> ``(layer,
+    polygon)`` of each plane zone, beside the flattened ``plane_areas``).
+    Its inner signal layers are routing layers (:attr:`layer_names`, after
+    F.Cu / B.Cu in stack order) and :attr:`search_n` says the N-layer search
+    runs (module docstring: N signal layers).
     """
 
     def __init__(
@@ -1328,14 +1879,18 @@ class _Board:
         *, keepouts: Sequence[Any] | None = None, ko_width: float | None = None, plane: Mapping[str, float] | None = None,
         plane_areas: Mapping[str, list[list[tuple[float, float]]]] | None = None, no_escape: Sequence[str] | None = None,
         net_rules: Mapping[int, tuple[float, float, float | None, float | None]] | None = None,
+        plane_layer_areas: Mapping[str, Sequence[tuple[str, list[tuple[float, float]]]]] | None = None, stack: RouterStack | None = None,
+        hole_gap: float | None = None,
     ) -> None:
         if ir.pcb is None:
             raise CompileError("cannot route: ir.pcb is None")
         if ir.pcb.outline is None:
             raise CompileError("cannot route: ir.pcb.outline is None; the grid needs a board outline")
+        if stack is not None:
+            _check_stack(ir, stack, inner_layers)
         names = [layer.name for layer in ir.pcb.layers]
         extra = [n for n in names if n not in LAYERS]
-        if extra and not inner_layers:
+        if extra and not inner_layers and stack is None:
             raise CompileError(f"cannot route: this router knows only {list(LAYERS)}, ir.pcb.layers also has {extra}")
         extra = [n for n in extra if not INNER_LAYER_RE.match(n)]
         if extra:
@@ -1346,8 +1901,13 @@ class _Board:
         missing = [n for n in LAYERS if n not in names]
         if missing:
             raise CompileError(f"cannot route: ir.pcb.layers lacks {missing}")
-        #: the inner copper layers the board lists (accepted, never routed)
+        #: the inner copper layers the board lists (accepted, never routed); with a stack, the stack's inner plane layers
         self.inner_layers = [n for n in names if INNER_LAYER_RE.match(n)]
+        #: routing.maze 0.9 (module docstring: stack mode): the board's stack, ``None`` on every board routed without one
+        self.stack = stack
+        if stack is not None:
+            plane_names = {layer for layer, _net in stack.planes}
+            self.inner_layers = [n for n in stack.copper if n in plane_names]
         self.p = p
         self.pad_clear: dict[int, float] = {k: float(v) for k, v in (pad_clearance or {}).items() if float(v) > p.clearance_mm}
         o = ir.pcb.outline
@@ -1358,8 +1918,45 @@ class _Board:
         self.nx = int(self.w / g + _EPS) + 1
         self.ny = int(self.h / g + _EPS) + 1
         self.n = self.nx * self.ny
+        #: the layer tables (a seam for N signal layers; on this board they are the two outer layers): the routing layers' names in
+        #: routing-index order (:data:`LAYERS` itself), their count ``R``, their indices, the via planes ``T`` per clearance (one: the
+        #: through via) and the search's extra barrel states (none). Every ``layer * n + k`` id indexes :attr:`layer_names`.
+        #: routing.maze 0.9, N signal layers (module docstring): a stack's inner signal layers follow F.Cu / B.Cu in stack order, the
+        #: N-layer search runs (``search_n``) when there are any or when a second via type joins two signal layers, and its barrel
+        #: states are ``T * n``
+        self.layer_names: tuple[str, ...] = LAYERS
+        if stack is not None:
+            inner_signal = [name for name in stack.copper if name in stack.signal and name not in LAYERS]
+            if inner_signal:
+                self.layer_names = (*LAYERS, *inner_signal)
+        self.R = len(self.layer_names)
+        self.route_layers: tuple[int, ...] = tuple(range(self.R))
+        self.T = 1
+        self.barrels = 0
+        self.search_n = False
+        #: routing.maze 0.9, N signal layers: each routing layer's signal via types (indices into :attr:`signal_types`, type order) and
+        #: its preferred direction (``"horizontal"`` / ``"vertical"``, ``None``: none stated); empty without a stack
+        self.types_of: tuple[tuple[int, ...], ...] = ()
+        self.layer_dirs: tuple[str | None, ...] = ()
+        #: routing.maze 0.9 (stack mode): each routing layer's stack position, the stack's via types (:class:`_VType`, the stack's order),
+        #: the signal types (two or more signal layers in the span: the through via first, then span length, then the upper end) and the
+        #: plane types (one signal layer: plane vias only), and each plane-via walk's areas by plane layer; empty without a stack
+        self.stack_pos: tuple[int, ...] = ()
+        self.vtypes: list[_VType] = []
+        self.signal_types: list[_VType] = []
+        self.plane_types: list[_VType] = []
+        self.plane_layer_areas: dict[str, list[tuple[str, list[tuple[float, float]]]]] = {
+            name: list(entries) for name, entries in (plane_layer_areas or {}).items()
+        }
+        self.plane_holes = {
+            name: [next((z.holes for z in ir.pcb.zones if z.net == name and z.layer == layer and z.polygon == poly), [])
+                   for layer, poly in entries]
+            for name, entries in self.plane_layer_areas.items()
+        }
+        if stack is not None:
+            self._stack_tables(stack)
         # static owner maps (pads and the board edge): one flat list per layer, None = free
-        self.owner: list[list[int | None]] = [[None] * self.n for _ in LAYERS]
+        self.owner: list[list[int | None]] = [[None] * self.n for _ in range(self.R)]
         self.via_edge_ok: list[bool] = [False] * self.n
         #: False where a via's copper disc would overlap a pad box (any net, any layer): no via-in-pad
         self.via_pad_ok: list[bool] = [True] * self.n
@@ -1368,8 +1965,8 @@ class _Board:
         for k in range(self.n):
             d = self._edge_distance(k)
             if d < edge_track - _EPS:
-                self.owner[0][k] = BLOCKED
-                self.owner[1][k] = BLOCKED
+                for r in range(self.R):
+                    self.owner[r][k] = BLOCKED
             self.via_edge_ok[k] = d >= edge_via - _EPS
         self.pad_radius = p.clearance_mm + p.track_width_mm / 2.0 + g / 2.0
         #: track-to-track: a foreign track centre closer than this to a path cell breaks the clearance (0.1's path mark)
@@ -1379,9 +1976,14 @@ class _Board:
         self.via_track_halo = _Halo(self.via_disc, self.nx)
         #: via-to-via: centres at least via_diameter + clearance apart
         self.via_via_halo = _Halo(_disc(p.via_diameter_mm + p.clearance_mm, g), self.nx)
+        #: routing.maze 0.9, N signal layers: one net's own vias, hole to hole - centres at least via_drill + the hole gap apart (the
+        #: clearance, or ``hole_gap``: :func:`route_board` gives a stack board the larger of it and KiCad's hole-to-hole minimum)
+        self.hole_gap = p.clearance_mm if hole_gap is None else hole_gap
+        self.net_hole_halo = _Halo(_disc(p.via_drill_mm + self.hole_gap, g), self.nx)
         #: halo discs by radius (the negotiation's per-profile radii; 0.2's three are among them)
         self._halos: dict[float, _Halo] = {}
         self.net_index = {net.name: k for k, net in enumerate(ir.nets)}
+        self.plane_cutout_zones = [z for z in ir.pcb.zones if z.holes]
         self.terminals: dict[str, list[_Terminal]] = {net.name: [] for net in ir.nets}
         #: every placed pad (the rule fences and the exact audits read them); a custom pad is one entry per part
         self.pads: list[_PadGeom] = []
@@ -1414,8 +2016,7 @@ class _Board:
         self.escape_ran = False
         #: net index -> (width, clearance, neck-down width, neck-down radius) of the nets a rule names (an escape cell obeys the rule)
         self.net_rules: dict[int, tuple[float, float, float | None, float | None]] = dict(net_rules or {})
-        mfg = ir.pcb.manufacturing
-        min_track = float(mfg.min_track_width_mm.value) if mfg is not None and mfg.min_track_width_mm is not None else 0.0
+        min_track = _fab_track_minimum(ir)
         #: the narrowest escape stub: ``escape_min_width_mm``, raised to the fab's ``min_track_width_mm`` (:func:`route_board` records the
         #: raise in ``stats["raised"]`` and the params entry of a 0.6 board)
         self.escape_min_width = max(p.escape_min_width_mm, min_track)
@@ -1437,6 +2038,11 @@ class _Board:
         self.via_ko: dict[int, frozenset[int]] | None = None
         self.track_keepouts: list[tuple[str, list[tuple[float, float]], frozenset[int], frozenset[int]]] = []
         self.plane_links: dict[str, list[tuple[_Terminal, int, int]]] = {}
+        #: routing.maze 0.9 (stack mode): each plane link's via type (an index into :attr:`vtypes`; ``None``: a through via), aligned
+        #: with :attr:`plane_links`, and the stitch rule's outcome per net it applied to (the pad that took the stitching through via, or
+        #: ``"through-only"``)
+        self.plane_link_types: dict[str, list[int | None]] = {}
+        self.plane_stitch: dict[str, str] = {}
         self.plane_tht: dict[str, list[str]] = {}
         #: SMD pads of a plane net joined to it by their own footprint's same-numbered through-hole pads (no stub, no via of ours)
         self.plane_joined: dict[str, list[str]] = {}
@@ -1445,14 +2051,29 @@ class _Board:
         #: clear of every other footprint's plane vias (the footprints 0.6 left a pad of), and the plane pads whose via it kept out
         self.rules07 = False
         self.fanout_rooms: dict[str, tuple[float, float, float, float]] = {}
+        #: routing.maze 0.8 (module docstring: via fan-out) is in force - the static phase's last run - and the footprints it escapes
+        #: in alternation (the footprints 0.6 / 0.7 left a pad of)
+        self.rules08 = False
+        self.dogbone_refs: list[str] = []
         self.fanout_kept: list[str] = []
         if keepouts:
             self._apply_keepouts(keepouts, p.track_width_mm if ko_width is None else max(p.track_width_mm, ko_width))
+        #: routing.maze 0.9, N signal layers (module docstring: exact via sites): each plane net's stub width, and the static copper by
+        #: bucket (built on first use, after the static phase)
+        self._plane_width: dict[str, float] = dict(plane or {})
+        self._site_index: dict[tuple[int, int], list[_PadGeom]] | None = None
+        self.plane_inset = False
+        self.plane_static_web: dict[str, int] | None = None
+        self.plane_clearances = _web_clearances(ir, self.plane_layer_areas, p.clearance_mm)
         self._static_phase(plane or {}, plane_areas or {})
         #: the static owner maps as one flat list over ``layer * n + k`` with :data:`_FREE` for free cells (the search reads this)
-        self.stat: list[int] = [_FREE if v is None else v for v in self.owner[0]] + [_FREE if v is None else v for v in self.owner[1]]
+        self.stat: list[int] = [_FREE if v is None else v for owner in self.owner for v in owner]
         #: per cell, lazily: BLOCKED / _FREE / the one net whose pads the via's keep-out touches (see :meth:`via_static_at`)
         self.via_static: list[int | None] = [None] * self.n
+        #: the same per signal via type (``t``: :attr:`signal_types` [t]); type 0 is the through via, whose map is :attr:`via_static`
+        self.via_static_n: list[list[int | None]] = [self.via_static, *([None] * self.n for _ in range(1, self.T))]
+        #: routing.maze 0.9, N signal layers: k -> 1 where a signal via would come too near a plane / escape via (:meth:`_static_via_near`)
+        self._via_near: bytearray | None = None
         #: per cell: _FREE, BLOCKED or the one net whose larger-clearance pads a via of any other net would come too near
         self.via_keep: list[int] | None = None
         if self.pad_clear:
@@ -1467,6 +2088,42 @@ class _Board:
                         self.via_keep[k] = geom.net if cur in (_FREE, geom.net) else BLOCKED
 
     # --- coordinates ---------------------------------------------------------
+
+    def layer_index(self, name: str) -> int:
+        """The routing index of copper layer ``name`` (its position in :attr:`layer_names`)."""
+        return self.layer_names.index(name)
+
+    def _stack_tables(self, stack: RouterStack) -> None:
+        """routing.maze 0.9 (module docstring: stack mode): :attr:`stack_pos`, :attr:`vtypes`, :attr:`signal_types`, :attr:`plane_types`
+        and ``T`` from the stack (:func:`_check_stack` passed it)."""
+        copper = list(stack.copper)
+        self.stack_pos = tuple(copper.index(name) for name in self.layer_names)
+        by_position = sorted(self.route_layers, key=lambda r: self.stack_pos[r])
+        plane_names = {layer for layer, _net in stack.planes}
+        for i, v in enumerate(stack.vias):
+            lo, hi = copper.index(v.top), copper.index(v.bottom)
+            # every type's layers in stack order (the through via's: every routing layer - F.Cu, B.Cu on the 4-layer rung)
+            layers = tuple(r for r in by_position if lo <= self.stack_pos[r] <= hi)
+            self.vtypes.append(_VType(i, v.kind, v.top, v.bottom, lo, hi, layers, tuple(n for n in copper[lo:hi + 1] if n in plane_names)))
+        order = lambda vt: (vt.index != 0, vt.hi - vt.lo, vt.lo)  # noqa: E731 - the through via first, then span length, then the upper end
+        self.signal_types = sorted((vt for vt in self.vtypes if len(vt.layers) >= 2), key=order)
+        self.plane_types = sorted((vt for vt in self.vtypes if len(vt.layers) == 1), key=order)
+        self.T = len(self.signal_types)
+        # routing.maze 0.9, N signal layers (module docstring)
+        self.types_of = tuple(tuple(t for t, vt in enumerate(self.signal_types) if r in vt.layers) for r in self.route_layers)
+        directions = dict(stack.directions)
+        self.layer_dirs = tuple(directions.get(name) for name in self.layer_names)
+        self.search_n = self.R > 2 or self.T > 1
+        self.barrels = self.T * self.n if self.search_n else 0
+
+    def via_layers_of(self, via: Via) -> tuple[int, ...]:
+        """The routing layers ``via``'s copper is on: every one for a through via (and on a board without a stack), else the routing
+        layers inside its span (routing.maze 0.9)."""
+        if via.kind is None or self.stack is None:
+            return self.route_layers
+        copper = list(self.stack.copper)
+        lo, hi = copper.index(via.layers[0]), copper.index(via.layers[1])
+        return tuple(r for r in self.route_layers if lo <= self.stack_pos[r] <= hi)
 
     def pos(self, k: int) -> tuple[float, float]:
         j, i = divmod(k, self.nx)
@@ -1553,7 +2210,7 @@ class _Board:
                         f"so this router models only {sorted(CONVEX_PAD_SHAPES)} and custom pads (by their primitives)"
                     )
                 net_name = pin_net.get((comp.ref, pad.number)) if pad.number else None
-                layers = _pad_copper_layers(placement, pad)
+                layers = _pad_copper_layers(placement, pad, self.R)
                 net_idx = self.net_index[net_name] if net_name else BLOCKED
                 if parts is None:
                     cx, cy, hw, hh, r_in = _pad_box(placement, pad)
@@ -1699,14 +2356,14 @@ class _Board:
         """Fold the track / via keep-outs into the static maps (module docstring); ``width`` is the widest copper of the board."""
         r_track = width / 2.0 + self.p.grid_mm / 2.0
         r_via = self.p.via_diameter_mm / 2.0
-        layers_all = [*LAYERS, *self.inner_layers]
+        layers_all = [*self.layer_names, *self.inner_layers]  # routing.maze 0.9: an inner signal layer's via keep-out applies too
         for ko in keepouts:
             pts = area_points(ko)
             names = keepout_allowed_nets(ko)
             allowed = frozenset(self.net_index[n] for n in names if n in self.net_index)
             row: dict[str, Any] = {"id": keepout_id(ko), "allowed_nets": list(names), "track_cells": {}, "via_cells": 0}
             if forbids(ko, "tracks"):
-                layers = [layer for layer, name in enumerate(LAYERS) if covers_layer(ko, name)]
+                layers = [layer for layer, name in enumerate(self.layer_names) if covers_layer(ko, name)]
                 if layers:
                     self.track_keepouts.append((keepout_id(ko), pts, frozenset(layers), allowed))
                 cells = self._cells_near_area(pts, r_track) if layers else []
@@ -1719,7 +2376,7 @@ class _Board:
                             owner[k] = only if cur in (None, only) else BLOCKED
                         else:
                             owner[k] = BLOCKED
-                    row["track_cells"][LAYERS[layer]] = len(cells)
+                    row["track_cells"][self.layer_names[layer]] = len(cells)
                 if len(allowed) > 1 and layers:
                     row["note"] = (f"allows {len(allowed)} nets ({', '.join(names)}); a grid cell holds one net, so none of them is routed "
                                    "through the area")
@@ -1767,28 +2424,42 @@ class _Board:
             else:
                 self.via_pad_ok[k] = old
 
-    def _plane_via_ok(self, k: int, net: int, placed: list[tuple[float, float]], areas: list[list[tuple[float, float]]]) -> bool:
+    def _plane_via_ok(
+        self, k: int, net: int, placed: list[tuple[float, float]], areas: list[list[tuple[float, float]]], via_layers: tuple[int, ...] | None = None,
+    ) -> bool:
         """Whether a via of plane net ``net`` may sit at cell ``k``: edge, pads, keep-outs, both layers' owners, plane-via spacing, and its
-        whole disc inside one of the net's plane zones (``areas``), so the fill can surround it."""
+        whole disc inside one of the net's plane zones (``areas``), so the fill can surround it. ``via_layers`` (routing.maze 0.9, a typed
+        via) are the routing layers whose owners are read: those of the via's span (default: every routing layer)."""
         if not self.via_edge_ok[k] or not self.via_pad_ok[k]:
             return False
         x, y = self.xy(k)
         r = self.p.via_diameter_mm / 2.0
-        if not any(point_area_distance((x, y), poly) == 0.0 and _edge_gap((x, y), poly) >= r - _EPS for poly in areas):
+        if not self._inside_plane((x, y), net, areas, r):
             return False
         if self.via_ko is not None and k in self.via_ko and net not in self.via_ko[k]:
             return False
         j, i = divmod(k, self.nx)
+        layers = self.route_layers if via_layers is None else via_layers
         for a, b in self.via_disc:
             ii, jj = i + a, j + b
             if not (0 <= ii < self.nx and 0 <= jj < self.ny):
                 return False
             kk = jj * self.nx + ii
-            for layer in (0, 1):
+            for layer in layers:
                 if self.owner[layer][kk] not in (None, net):
                     return False
         spacing = self.p.via_diameter_mm + self.p.clearance_mm
         return all(math.hypot(x - vx, y - vy) >= spacing - _EPS for vx, vy in placed)
+
+    def _inside_plane(self, point: tuple[float, float], idx: int, areas: Sequence[list[tuple[float, float]]], radius: float) -> bool:
+        """A via disc fits a zone's outer contour and stays outside its cut-outs (also for zone-only keep-outs)."""
+        for poly in areas:
+            if point_area_distance(point, poly) != 0.0 or _edge_gap(point, poly) < radius - _EPS:
+                continue
+            holes = [h for z in self.plane_cutout_zones if self.net_index.get(z.net) == idx and z.polygon == poly for h in z.holes]
+            if all(point_area_distance(point, hole) >= radius - _EPS for hole in holes):
+                return True
+        return False
 
     def _plane_vias(self, plane: Mapping[str, float], areas: Mapping[str, list[list[tuple[float, float]]]]) -> None:
         """Each plane net's SMD pads get a via beside them, claimed on the static maps (module docstring); a net that cannot is undone.
@@ -1796,71 +2467,158 @@ class _Board:
         routing.maze 0.6: a pad whose terminal cell is off its copper or fenced, or whose walk finds no via site, is not a failure here:
         it waits for its escape (:meth:`_escape_all`), its net pending - its other vias claimed and seen by the nets after it while the
         net may still succeed: a pending net one of whose pads gets no escape is left out of the next pass of :meth:`_static_phase`, so
-        no decision that stands was made beside its vias - until :meth:`_finish_planes`."""
+        no decision that stands was made beside its vias - until :meth:`_finish_planes`.
+
+        routing.maze 0.9 (module docstring: stack mode): on a board with a stack each pad tries the typed plane vias that reach its net's
+        plane before the through via (:meth:`_plane_candidates`), and a net that is the plane of two or more of the stack's layers and has
+        no through-hole pad follows the stitch rule: its pads try the through via first until one takes it; when none does, the net's claims are undone
+        and it is placed again through vias only, exactly as 0.4 places it. Without a stack every pad tries the through via alone."""
         g = self.p.grid_mm
         reach = max(1, int(PLANE_VIA_REACH_MM / g + _EPS))
         placed = self._plane_placed
         for name in sorted(plane):
             idx = self.net_index[name]
             width = float(plane[name])
-            log: list[tuple[str, int, int, Any]] = []
-            links: list[tuple[_Terminal, int, int] | None] = []
-            geoms: list[_PadGeom] = []
-            tht: list[str] = []
-            joined: list[str] = []
-            mine: list[tuple[float, float]] = []
-            deferred: list[tuple[int, _Terminal, int, str, str]] = []  # (slot in links, terminal, layer, why, the walk's reason)
-            barrels = [t.pad for t in self.terminals[name] if len(t.pad.layers) != 1]
-            for t in self.terminals[name]:
-                if len(t.pad.layers) != 1:
-                    tht.append(t.label)  # on both outer layers: a through-hole pad, whose barrel reaches the inner planes
+            # routing.maze 0.9: the stitch rule counts the net's plane layers in the stack (a plane the caller gave no zone is still
+            # filled from the stack and must be reached); the typed candidates need a zone on their plane layer (_plane_candidates)
+            stitch = (self.stack is not None and sum(1 for _layer, net in self.stack.planes if net == name) >= 2
+                      and all(len(t.pad.layers) == 1 for t in self.terminals[name]))
+            through_only = False
+            kept0 = len(self.fanout_kept)
+            while True:
+                log: list[tuple[str, int, int, Any]] = []
+                links: list[tuple[_Terminal, int, int] | None] = []
+                types: list[int | None] = []  # routing.maze 0.9: each link's via type (None: the through via)
+                geoms: list[_PadGeom] = []
+                tht: list[str] = []
+                joined: list[str] = []
+                mine: list[tuple[float, float]] = []
+                deferred: list[tuple[int, _Terminal, int, str, str]] = []  # (slot in links, terminal, layer, why, the walk's reason)
+                stitched: str | None = None
+                barrels = [t.pad for t in self.terminals[name] if len(t.pad.layers) != 1]
+                for t in self.terminals[name]:
+                    if len(t.pad.layers) != 1:
+                        tht.append(t.label)  # on both outer layers: a through-hole pad, whose barrel reaches the inner planes
+                        continue
+                    if any(b.ref == t.pad.ref and b.number == t.pad.number and abs(b.cx - t.pad.cx) <= t.pad.hw + _EPS
+                           and abs(b.cy - t.pad.cy) <= t.pad.hh + _EPS for b in barrels):
+                        if t.label not in joined:  # the F.Cu and B.Cu copies of one exposed pad are one logical pad
+                            joined.append(t.label)  # the footprint's own thermal vias (same pad number, on this pad's copper) reach the plane
+                        continue
+                    layer = t.pad.layers[0]
+                    site: tuple[int, int] | None = None
+                    vt: _VType | None = None
+                    if t.offgrid is not None:
+                        why, problem = "off-grid", t.offgrid
+                    elif self.owner[layer][t.cell] not in (None, idx):
+                        why = "fenced"
+                        problem = f"pad {t.label}: its terminal cell is inside a keep-out on {LAYERS[layer]} (a foreign pad, a keep-out area or the edge)"
+                    else:
+                        cands = [None] if through_only else self._plane_candidates(name, layer, through_first=stitch and stitched is None)
+                        for vt in cands:  # routing.maze 0.9: each candidate type walks fully before the next (None: the through via)
+                            if vt is None:
+                                site = self._plane_walk(t, idx, layer, width, reach, placed + mine, areas.get(name, []))
+                            else:
+                                site = self._plane_walk(t, idx, layer, width, reach, placed + mine,
+                                                        [poly for pl, poly in self.plane_layer_areas.get(name, ()) if pl in vt.planes], vt.layers)
+                            if site is not None:
+                                break
+                        why = "no via site"
+                        problem = (f"pad {t.label}: no legal via site within {PLANE_VIA_REACH_MM:g} mm beyond its copper along the grid axes from its "
+                                   f"terminal cell (pads, keep-outs, the edge, the other plane vias and the extent of its plane zone leave none)")
+                    if site is None:  # routing.maze 0.6 (module docstring: escape stubs): the escape pass looks for a stub to a via
+                        deferred.append((len(links), t, layer, why, problem))
+                        links.append(None)
+                        types.append(None)
+                        continue
+                    if stitch and stitched is None and vt is None:
+                        stitched = t.label  # routing.maze 0.9: the through via that stitches the net's planes
+                    via_layers = self.route_layers if vt is None else vt.layers
+                    k, d = site
+                    (x0, y0), (x1, y1) = self.xy(t.cell), self.xy(k)
+                    hv = self.p.via_diameter_mm / 2.0
+                    via = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-via", x1, y1, hv, hv, hv, via_layers, idx, kind="plane-via",
+                                   shape=("disc", (x1, y1), hv))
+                    run = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-stub", (x0 + x1) / 2.0, (y0 + y1) / 2.0,
+                                   abs(x1 - x0) / 2.0 + width / 2.0, abs(y1 - y0) / 2.0 + width / 2.0, width / 2.0, (layer,), idx,
+                                   kind="plane-stub", shape=("seg", (x0, y0), (x1, y1), width / 2.0))
+                    self._claim(via_layers, via, log)
+                    self._claim((layer,), run, log)
+                    geoms += [via, run]
+                    links.append((t, layer, k))
+                    types.append(None if vt is None else vt.index)
+                    mine.append((x1, y1))
+                if stitch and not through_only and stitched is None:
+                    # routing.maze 0.9, the stitch rule: no pad's through walk found a site - undo the net's claims (and the pads its walks
+                    # kept out of a fan-out room) and place it again exactly as 0.4 places it, through vias only
+                    self._undo(log)
+                    del self.fanout_kept[kept0:]
+                    through_only = True
                     continue
-                if any(b.ref == t.pad.ref and b.number == t.pad.number and abs(b.cx - t.pad.cx) <= t.pad.hw + _EPS
-                       and abs(b.cy - t.pad.cy) <= t.pad.hh + _EPS for b in barrels):
-                    if t.label not in joined:  # the F.Cu and B.Cu copies of one exposed pad are one logical pad
-                        joined.append(t.label)  # the footprint's own thermal vias (same pad number, on this pad's copper) reach the plane
-                    continue
-                layer = t.pad.layers[0]
-                site: tuple[int, int] | None = None
-                if t.offgrid is not None:
-                    why, problem = "off-grid", t.offgrid
-                elif self.owner[layer][t.cell] not in (None, idx):
-                    why = "fenced"
-                    problem = f"pad {t.label}: its terminal cell is inside a keep-out on {LAYERS[layer]} (a foreign pad, a keep-out area or the edge)"
-                else:
-                    site = self._plane_walk(t, idx, layer, width, reach, placed + mine, areas.get(name, []))
-                    why = "no via site"
-                    problem = (f"pad {t.label}: no legal via site within {PLANE_VIA_REACH_MM:g} mm beyond its copper along the grid axes from its "
-                               f"terminal cell (pads, keep-outs, the edge, the other plane vias and the extent of its plane zone leave none)")
-                if site is None:  # routing.maze 0.6 (module docstring: escape stubs): the escape pass looks for a stub to a via
-                    deferred.append((len(links), t, layer, why, problem))
-                    links.append(None)
-                    continue
-                k, d = site
-                (x0, y0), (x1, y1) = self.xy(t.cell), self.xy(k)
-                hv = self.p.via_diameter_mm / 2.0
-                via = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-via", x1, y1, hv, hv, hv, (0, 1), idx, kind="plane-via", shape=("disc", (x1, y1), hv))
-                run = _PadGeom(t.pad.ref, f"{t.pad.number}:plane-stub", (x0 + x1) / 2.0, (y0 + y1) / 2.0,
-                               abs(x1 - x0) / 2.0 + width / 2.0, abs(y1 - y0) / 2.0 + width / 2.0, width / 2.0, (layer,), idx,
-                               kind="plane-stub", shape=("seg", (x0, y0), (x1, y1), width / 2.0))
-                self._claim((0, 1), via, log)
-                self._claim((layer,), run, log)
-                geoms += [via, run]
-                links.append((t, layer, k))
-                mine.append((x1, y1))
+                break
+            if stitch:
+                self.plane_stitch[name] = "through-only" if through_only else stitched
             if deferred:
                 self.pads.extend(geoms)
                 placed.extend(mine)
-                self._pending[name] = _PendingPlane(idx, width, list(areas.get(name, [])), links, geoms, tht, joined, deferred)
+                self._pending[name] = _PendingPlane(idx, width, list(areas.get(name, [])), links, geoms, tht, joined, deferred, types=types)
                 self.escape_ran = True
                 continue
             self.pads.extend(geoms)
             placed.extend(mine)
             self.plane_links[name] = links
+            self.plane_link_types[name] = types
             self.plane_tht[name] = tht
             self.plane_joined[name] = joined
 
+    def _plane_candidates(self, name: str, layer: int, through_first: bool) -> list[_VType | None]:
+        """routing.maze 0.9: the via types a plane pad of net ``name`` on routing layer ``layer`` tries, in order (``None``: the through
+        via) - the plane types whose span holds the pad's layer and a plane layer of the net's zones (span length ascending, then the
+        upper end), then the through via; ``through_first`` (the stitch rule) puts the through via first. Without a stack: the through
+        via alone."""
+        if self.stack is None:
+            return [None]
+        planes = {pl for pl, _poly in self.plane_layer_areas.get(name, ())}
+        typed: list[_VType | None] = [vt for vt in self.plane_types if layer in vt.layers and planes.intersection(vt.planes)]
+        return [None, *typed] if through_first else [*typed, None]
+
     def _static_phase(self, plane: Mapping[str, float], areas: Mapping[str, list[list[tuple[float, float]]]]) -> None:
+        """Retry cut-off static plane vias deeper under the package before any signal routing."""
+        if not (self.search_n and self.plane_layer_areas):
+            self._static_escape_phase(plane, areas)
+            return
+        base = self._capture()
+        self._static_escape_phase(plane, areas)
+        if not (self.search_n and self.rules08 and self.plane_layer_areas):
+            return
+
+        def cuts() -> int:
+            routes = {name: _NetRoute(steps=[("stub", t, t.pad.layers[0]) for t in ts
+                      if t.escape is not None and t.escape.kind == "dogbone"])
+                      for name, ts in self.terminals.items()}
+            items, _ = _web_items(self, routes)
+            web = plane_web(self.plane_layer_areas, items, clearance=ZONE_CLEARANCE_MM,
+                            min_thickness=ZONE_MIN_THICKNESS_MM, clearances=self.plane_clearances, holes=self.plane_holes)
+            return sum(len(row) for row in web.cut.values())
+
+        before = cuts()
+        if not before:
+            return
+        kept, left = self._capture(fresh=False), self._left()
+        flags = self.rules07, self.fanout_rooms, self.rules08, self.dogbone_refs
+        self._restore(base)
+        self.rules07, self.fanout_rooms, self.rules08, self.dogbone_refs = False, {}, False, []
+        self.plane_inset = True
+        self._static_escape_phase(plane, areas)
+        after = cuts() if self._left() <= left else before
+        if after >= before:
+            self._restore(kept)
+            self.rules07, self.fanout_rooms, self.rules08, self.dogbone_refs = flags
+            self.plane_inset = False
+        else:
+            self.plane_static_web = {"cut_before": before, "cut_after": after}
+
+    def _static_escape_phase(self, plane: Mapping[str, float], areas: Mapping[str, list[list[tuple[float, float]]]]) -> None:
         """The plane vias and the escape pass (module docstring: escape stubs), repeated while a pass dooms a net.
 
         A pass dooms a plane net one of whose pads no escape reaches (its other vias were claimed while it waited), and a signal net with
@@ -1879,7 +2637,11 @@ class _Board:
         routing.maze 0.7 (module docstring: fan-out room): when these passes leave a pad without an escape, they run once more from the
         same maps with :attr:`rules07` set - the fan-out rooms (:attr:`fanout_rooms`) of the footprints left a pad of kept clear of every
         other footprint's plane vias, their escapes' ways out running to the rooms' edges - and that result is kept (:attr:`rules07` stays
-        set) only when it leaves fewer nets, then fewer pads, unroutable (:meth:`_left`); otherwise the first result is restored."""
+        set) only when it leaves fewer nets, then fewer pads, unroutable (:meth:`_left`); otherwise the first result is restored.
+
+        routing.maze 0.8 (module docstring: via fan-out): when the result kept so far still leaves a pad without an escape, they run once
+        more from the same maps with :attr:`rules08` set - the footprints left a pad of (:attr:`dogbone_refs`) escaped in alternation,
+        every other pad of a row by a via fan-out first - and that result is kept the same way."""
         base = self._capture()
         self._passes(plane, areas)
         if not self.escape_refused:
@@ -1896,11 +2658,25 @@ class _Board:
         if self._left() >= left:
             self._restore(first)
             self.rules07, self.fanout_rooms = False, {}
+        if not self.escape_refused:
+            return
+        # routing.maze 0.8 (module docstring: via fan-out): 0.6 / 0.7 left a pad without an escape - the static phase runs once more from
+        # the same maps with those pads' footprints escaped in alternation, every other pad of a row by a via, and its result is kept only
+        # when it leaves fewer nets (then pads) unroutable
+        refs = sorted({label.split(".", 1)[0] for label in self.escape_refused}, key=natural_ref_key)
+        first, left = self._capture(fresh=False), self._left()
+        self._restore(base)
+        self.rules08, self.dogbone_refs = True, refs
+        self._passes(plane, areas)
+        if self._left() >= left:
+            self._restore(first)
+            self.rules08, self.dogbone_refs = False, []
 
     #: the board state the static phase changes (:meth:`_capture` / :meth:`_restore`)
     _STATIC_STATE = (
         "owner", "via_pad_ok", "pads", "terminals", "escape_ran", "_eligible", "escapes", "escape_refused", "_reserved", "_reserved_why", "_bands",
         "_rule_guard", "_pending", "_plane_placed", "plane_links", "plane_tht", "plane_joined", "plane_problems", "fanout_kept", "doomed", "static_passes",
+        "plane_link_types", "plane_stitch",
     )
 
     def _capture(self, fresh: bool = True) -> dict[str, Any]:
@@ -1920,7 +2696,8 @@ class _Board:
         out["terminals"] = {name: list(terms) for name, terms in state["terminals"].items()}
         for name in ("_eligible", "escapes", "_bands", "_rule_guard", "_plane_placed", "fanout_kept"):
             out[name] = list(state[name])
-        for name in ("escape_refused", "_reserved_why", "_pending", "plane_links", "plane_tht", "plane_joined", "plane_problems", "doomed"):
+        for name in ("escape_refused", "_reserved_why", "_pending", "plane_links", "plane_tht", "plane_joined", "plane_problems", "doomed",
+                     "plane_link_types", "plane_stitch"):
             out[name] = dict(state[name])
         out["_reserved"] = None if state["_reserved"] is None else dict(state["_reserved"])
         return out
@@ -1987,6 +2764,7 @@ class _Board:
             self._reserved, self._reserved_why, self._bands, self._rule_guard = None, {}, [], []
             self._pending, self._plane_placed = {}, []
             self.plane_links, self.plane_tht, self.plane_joined, self.plane_problems = {}, {}, {}, {}
+            self.plane_link_types, self.plane_stitch = {}, {}
             self.fanout_kept = []
         self._finish_planes()
         for name, d in self.doomed.items():
@@ -2032,6 +2810,7 @@ class _Board:
         for name in sorted(self._pending):
             pend = self._pending[name]
             self.plane_links[name] = [link for link in pend.links if link is not None]
+            self.plane_link_types[name] = [ty for link, ty in zip(pend.links, pend.types, strict=True) if link is not None]
             self.plane_tht[name] = pend.tht
             self.plane_joined[name] = pend.joined
             for link in pend.links:
@@ -2040,8 +2819,10 @@ class _Board:
 
     def _plane_walk(
         self, t: _Terminal, idx: int, layer: int, width: float, reach: int, placed: list[tuple[float, float]], areas: list[list[tuple[float, float]]],
+        via_layers: tuple[int, ...] | None = None,
     ) -> tuple[int, int] | None:
-        """0.4's via site walk for one plane pad along the grid axes from its terminal cell: ``(cell, direction)`` or ``None``."""
+        """0.4's via site walk for one plane pad along the grid axes from its terminal cell: ``(cell, direction)`` or ``None``;
+        ``via_layers`` (routing.maze 0.9) are the routing layers of a typed via's span (:meth:`_plane_via_ok`)."""
         g = self.p.grid_mm
         rv = self.p.via_diameter_mm / 2.0
         j0, i0 = divmod(t.cell, self.nx)
@@ -2075,7 +2856,7 @@ class _Board:
                         if t.label not in self.fanout_kept:
                             self.fanout_kept.append(t.label)
                         continue
-                if self._plane_via_ok(k, idx, placed, areas):
+                if self._plane_via_ok(k, idx, placed, areas, via_layers):
                     return (k, d)
             if not any(open_dirs):
                 break
@@ -2150,6 +2931,8 @@ class _Board:
             rows = groups[ref]
             best: tuple[tuple[int, int, float, int], tuple[str, str, str]] | None = None
             trials = _ESCAPE_TRIALS if len(rows) > 1 else tuple(tr for tr in _ESCAPE_TRIALS if tr[0] == "middle" and tr[2] == "plane")
+            if self.rules08 and ref in self.dogbone_refs:  # routing.maze 0.8 (module docstring: via fan-out)
+                trials = _ESCAPE_TRIALS_08
             # one pad: its candidate orders only (no row to fan, nothing to go first)
             for n_trial, trial in enumerate(trials):
                 left_plane, left_signal, total = self._escape_group(rows, trial, commit=False)
@@ -2162,8 +2945,9 @@ class _Board:
 
     def _escape_group(self, rows: list[_Need], trial: tuple[str, str, str], *, commit: bool) -> tuple[int, int, float]:
         """Escape one footprint's pads by the trial - pad order ``"middle"`` (nearest its copper centroid first: a row fans out from its
-        middle), ``"ends"`` (farthest first), ``"natural"`` (pad order) or ``"fan"`` (:meth:`_fan` for each row of pads first, the rest
-        in the middle order); candidates ``"near"`` or ``"straight"`` (:meth:`_find_escape`); the plane pads (vias) or the signal pads
+        middle), ``"ends"`` (farthest first), ``"natural"`` (pad order), ``"fan"`` (:meth:`_fan` for each row of pads first, the rest
+        in the middle order) or ``"alternate"`` (routing.maze 0.8: the middle order, every other pad of a row - :meth:`_alternate` - trying a
+        via fan-out before a stub, the others after); candidates ``"near"`` or ``"straight"`` (:meth:`_find_escape`); the plane pads (vias) or the signal pads
         first - and return ``(plane pads left, signal pads left, total stub length)``. ``commit=False`` undoes every claim afterwards;
         ``commit=True`` applies them and records each escape or refusal."""
         order, cands, first_kind = trial
@@ -2172,20 +2956,22 @@ class _Board:
             row = rows[i]
             d = self._centroid_distance(row[3].pad)
             where = -d if order == "ends" else 0.0 if order == "natural" else d
-            return (0 if row[0] == first_kind else 1, where, natural_ref_key(row[3].pad.number), row[1], row[2])
+            # routing.maze 0.8: the pads that go first to a via are escaped first, so the row of vias is laid before any fallback
+            return (0 if row[0] == first_kind else 1, 0 if i in vias else 1, where, natural_ref_key(row[3].pad.number), row[1], row[2])
 
         log: list[tuple[str, int, int, Any]] | None = None if commit else []
         snap = self._snapshot()
         left_plane = left_signal = 0
         total = 0.0
         fanned = self._fan(rows, cands, log, snap[2]) if order == "fan" else {}
+        vias = self._alternate(rows) if order == "alternate" else set()
         for i, got in sorted(fanned.items()):
             total += got.length_mm()
             if commit:
                 self._keep(rows[i], got)
         for i in sorted((i for i in range(len(rows)) if i not in fanned), key=key):
             row = rows[i]
-            got = self._find_row_escape(row, cands)
+            got = self._find_row_escape(row, cands, dogbone=None if order != "alternate" else "first" if i in vias else "after")
             if isinstance(got, str):
                 kind, name, q, t, _layer, _why, problem = row
                 if kind == "plane":
@@ -2225,13 +3011,45 @@ class _Board:
             self._reserved_why.pop(c, None)
         snap[2].clear()
 
-    def _find_row_escape(self, row: _Need, cands: str, only: int | None = None) -> _Escape | str:
+    def _find_row_escape(self, row: _Need, cands: str, only: int | None = None, dogbone: str | None = None) -> _Escape | str:
+        """The escape of one waiting pad; ``dogbone`` (routing.maze 0.8, a signal pad outside a fan): ``"first"`` tries the via fan-out
+        (:meth:`_find_dogbone`) before the stub, ``"after"`` after it, and a pad neither reaches is refused with both reasons."""
         kind, name, _q, t, _layer, why, _problem = row
         idx = self.net_index[name]
         if kind == "plane":
             pend = self._pending[name]
-            return self._find_escape(t, idx, why, via=True, w_cap=pend.width, areas=pend.areas, placed=self._plane_placed, cands=cands, only=only)
-        return self._find_escape(t, idx, why, cands=cands, only=only)
+            return self._find_escape(t, idx, why, via=True, w_cap=pend.width, areas=pend.areas, placed=self._plane_placed, cands=cands, only=only,
+                                     inward=self._plane_inward(t.pad))
+        if dogbone is None or only is not None:
+            return self._find_escape(t, idx, why, cands=cands, only=only)
+        stub = lambda: self._find_escape(t, idx, why, cands=cands)  # noqa: E731
+        via = lambda: self._find_dogbone(t, idx, why)  # noqa: E731
+        tries = (via, stub) if dogbone == "first" else (stub, via)
+        a = tries[0]()
+        if not isinstance(a, str):
+            return a
+        b = tries[1]()
+        return b if not isinstance(b, str) else f"{a}; {b}"
+
+    def _plane_inward(self, geom: _PadGeom) -> bool:
+        """routing.maze 0.9, N signal layers (module docstring: plane pads under the package): whether a waiting plane pad's escape via
+        looks under its package (its inner edge) before in front of it - a pad of a footprint the via fan-out escapes in alternation
+        (:attr:`dogbone_refs`), on a board routed by the N-layer search. Every other pad looks in front of it only, as before."""
+        return self.search_n and self.rules08 and geom.ref in self.dogbone_refs
+
+    def planes_under_package(self) -> list[str]:
+        """routing.maze 0.9, N signal layers: the plane pads (:meth:`_plane_inward`) whose escape via the static phase put under their
+        package - nearer their footprint's copper centroid than the pad centre (escape order)."""
+        out: list[str] = []
+        for row in self.escapes:
+            ref = row["pad"].split(".", 1)[0]
+            if row["kind"] != "via" or not (self.search_n and self.rules08 and ref in self.dogbone_refs):
+                continue
+            fx, fy = self.fp_centroid[ref]
+            (cx, cy), (vx, vy) = row["points"][0], row["cell"]
+            if math.hypot(vx - fx, vy - fy) < math.hypot(cx - fx, cy - fy) - _EPS:
+                out.append(row["pad"])
+        return out
 
     def _take(self, row: _Need, got: _Escape, log: list[tuple[str, int, int, Any]] | None, added: list[int]) -> None:
         """Claim one escape (its stub and via), reserve a signal escape's cell for its net (``added`` collects the new reservations)."""
@@ -2243,7 +3061,7 @@ class _Board:
             self._plane_placed.append(self.xy(got.cell))
             return
         for k in (got.cell, *got.exit):
-            c = got.layer * self.n + k
+            c = (1 - got.layer if got.kind == "dogbone" else got.layer) * self.n + k  # 0.8: a via fan-out's cell and way out: the other layer
             if c not in self._reserved:
                 added.append(c)
                 self._reserved[c] = idx
@@ -2367,6 +3185,29 @@ class _Board:
                     added.remove(c)
         return got_map
 
+    def _alternate(self, rows: list[_Need]) -> set[int]:
+        """routing.maze 0.8 (module docstring: via fan-out): the waiting signal rows that try a via fan-out first - every other pad (the
+        second, the fourth, ...) of each row of the footprint's pads that leave in one direction from one edge line, counted along the
+        row over all its pads (a pad that needs no escape keeps its place, so two neighbours never both go first to a via)."""
+        lines: dict[tuple[str, int, int, float], list[_PadGeom]] = {}
+        refs = {row[3].pad.ref for row in rows}
+        for geom in self.pads:
+            if geom.kind != "pad" or geom.ref not in refs or len(geom.layers) != 1:
+                continue
+            dirs = self._escape_dirs(geom)
+            if len(dirs) != 1:
+                continue
+            dx, dy = _DIRS[dirs[0]]
+            ext = geom.hw if dx else geom.hh
+            lines.setdefault((geom.ref, dirs[0], geom.layers[0], round((geom.cx + dx * ext) * dx + (geom.cy + dy * ext) * dy, 4)), []).append(geom)
+        place: dict[tuple[str, str], int] = {}
+        for (_ref, d, _layer, _edge), geoms in lines.items():
+            along_y = _DIRS[d][0] != 0  # a row leaving along x runs along y
+            geoms.sort(key=lambda geom: ((geom.cy if along_y else geom.cx), natural_ref_key(geom.number)))
+            for k, geom in enumerate(geoms):
+                place[(geom.ref, geom.number)] = k
+        return {i for i, row in enumerate(rows) if row[0] == "signal" and place.get((row[3].pad.ref, row[3].pad.number), 0) % 2 == 1}
+
     def _fenced_words(self, t: _Terminal, idx: int) -> str:
         """Why the terminal cell of ``t`` is no seed on any layer of its pad (0.2's sentence, naming what reaches it)."""
         x, y = self.pos(t.cell)
@@ -2394,6 +3235,8 @@ class _Board:
         row: dict[str, Any] = {"pad": t.label, "net": name, "kind": esc.kind, "why": esc.why, "layer": LAYERS[esc.layer], "cell": list(self.pos(esc.cell))}
         if esc.kind != "cell":
             row.update(width_mm=esc.width, points=[list(pt) for pt in esc.points], length_mm=_q(esc.length_mm()))
+        if esc.kind == "dogbone":  # routing.maze 0.8: the layer the net's track starts on, at the via
+            row["continues_on"] = LAYERS[1 - esc.layer]
         self.escapes.append(row)
 
     def _escape_dirs(self, geom: _PadGeom) -> list[int]:
@@ -2437,7 +3280,7 @@ class _Board:
                 d = math.hypot(x - geom.cx, y - geom.cy)
                 if d > r - 1e-6:
                     continue
-                for layer in geom.layers:
+                for layer in [lay for lay in geom.layers if lay < 2]:  # routing.maze 0.9: F.Cu / B.Cu, as every escape
                     if (self.owner[layer][k] in (None, idx) and reserved.get(layer * self.n + k, idx) == idx and not self._rule_fenced(k, layer, idx, geom)
                             and self._stub_room([(x, y), centre], layer, idx, local)[0] >= half - _EPS):
                         key = (round(d, 9), k, layer)
@@ -2493,7 +3336,7 @@ class _Board:
             if gaps and min(gaps) < need:
                 px, py = self.pos(k)
                 return (f"its copper would put the terminal cell ({px:g}, {py:g}) of {self._label(pad)} (net {self._net_name(other)}) inside that "
-                        f"net rule's keep-out on {LAYERS[lay]}")
+                        f"net rule's keep-out on {self.layer_names[lay]}")
         return None
 
     def _near(self, x1: float, y1: float, x2: float, y2: float) -> list[_PadGeom]:
@@ -2563,7 +3406,7 @@ class _Board:
         out: set[int] = set()
         shapes: list[tuple[tuple[float, float], tuple[float, float], float, tuple[int, ...]]] = [(a, b, width / 2.0, layers) for a, b in zip(pts, pts[1:])]
         if via is not None:
-            shapes.append((via, via, self.p.via_diameter_mm / 2.0, (0, 1)))
+            shapes.append((via, via, self.p.via_diameter_mm / 2.0, self.route_layers))
         for a, b, half, lays in shapes:
             reach = r + half
             i0, j0 = self._nearest_cell(min(a[0], b[0]) - reach, min(a[1], b[1]) - reach)
@@ -2580,14 +3423,15 @@ class _Board:
     def _find_escape(
         self, t: _Terminal, idx: int, why: str, *, via: bool = False, w_cap: float | None = None,
         areas: Sequence[list[tuple[float, float]]] = (), placed: Sequence[tuple[float, float]] = (), cands: str = "near",
-        only: int | None = None,
+        only: int | None = None, inward: bool = False,
     ) -> _Escape | str:
         """The escape of one pad (module docstring: escape stubs), or why none exists (a sentence naming the nearest candidate's problem).
 
         A signal pad first tries another grid point inside its inscribed circle (``kind="cell"``), then a stub to a free grid cell with a
         way out; a plane pad (``via=True``) a stub to a via obeying the plane-via rules exactly (``areas``: the net's plane zones,
         ``placed``: the plane vias so far, ``w_cap``: the plane stubs' width). ``cands`` orders the candidates (``"near"`` /
-        ``"straight"``), ``only`` restricts them to one cell (a fan's)."""
+        ``"straight"``), ``only`` restricts them to one cell (a fan's). ``inward`` (routing.maze 0.9, :meth:`_plane_inward`) looks
+        out of the pad's inner edge, under its package, before its outer edge."""
         p, g, n = self.p, self.p.grid_mm, self.n
         geom = t.pad
         w_net = (p.track_width_mm if w_cap is None else w_cap) if via else self._net_width(idx)
@@ -2610,8 +3454,11 @@ class _Board:
         noun = "via site" if via else "cell"
         first: str | None = None
         free_seen = False
-        for layer in geom.layers:
-            for d in self._escape_dirs(geom):
+        dirs = self._escape_dirs(geom)
+        if inward:  # routing.maze 0.9, N signal layers: the inner edge first (module docstring: plane pads under the package)
+            dirs = [(e + 2) % 4 for e in dirs if (e + 2) % 4 not in dirs] + dirs
+        for layer in [lay for lay in geom.layers if lay < 2]:  # routing.maze 0.9: an escape stays on F.Cu / B.Cu (a through-hole pad's)
+            for d in dirs:
                 dx, dy = _DIRS[d]
                 lx, ly = -dy, dx
                 ext = geom.hw if dx else geom.hh
@@ -2635,6 +3482,8 @@ class _Board:
                         near = (round(math.hypot(f, lat), 9), round(abs(lat), 9), away, k)
                         found.append(((0 if abs(lat) < _EPS else 1, *near) if cands == "straight" else near, k, f, lat))
                 found.sort()
+                if via and inward and self.plane_inset and d not in self._escape_dirs(geom):
+                    found.sort(key=lambda row: (abs(row[3]) > _EPS, -row[2], abs(row[3]), row[0]))
                 for _key, k, f, lat in found:
                     ex, ey = self.pos(k)
                     if via:
@@ -2724,6 +3573,99 @@ class _Board:
                         queue.append(kk)
         return None
 
+    def _find_dogbone(self, t: _Terminal, idx: int, why: str) -> _Escape | str:
+        """routing.maze 0.8 (module docstring: via fan-out): a stub from the pad centre along its axis out of its inner edge (then its
+        outer edge) to a via whose cell is the net's terminal on the other outer layer, or why none exists. Candidates within
+        ``escape_reach_mm`` in front of the edge and within one grid step of the pad's axis, nearest first; the via site obeys the plane-via rules without a plane zone
+        (:meth:`_via_site_problem`), the cell is free or the net's own and reserved for no other net on the other layer, the stub keeps
+        every clearance exactly (:meth:`_stub_room`, :meth:`_guard_hit`), its claim takes no other net's reserved cell, and a way out of
+        the footprint's escape area (or room) exists on the other layer (:meth:`_exit_path`)."""
+        p, g, n = self.p, self.p.grid_mm, self.n
+        geom = t.pad
+        if len(geom.layers) != 1:
+            return "no via fan-out: the pad is on more than one layer"
+        if idx in self.net_rules:
+            return "no via fan-out: the net has a rule (its width, clearance or length budget is not applied to a fan-out via)"
+        layer = geom.layers[0]
+        other = 1 - layer
+        w_top = min(2.0 * geom.inscribed_r, self._net_width(idx))
+        w_min, step, reach = self.escape_min_width, p.escape_width_step_mm, p.escape_reach_mm
+        if w_top < w_min - _EPS:
+            return f"no via fan-out: its narrow side ({2.0 * geom.inscribed_r:g} mm) is below the narrowest stub {w_min:g} mm"
+        rv = p.via_diameter_mm / 2.0
+        reserved = self._reserve()
+        c_max = max(p.clearance_mm, *self.pad_clear.values()) if self.pad_clear else p.clearance_mm
+        margin = max(geom.hw, geom.hh) + 1.5 * reach + w_top + 2.0 * c_max + 2.0 * rv + g
+        local = self._near(geom.cx - margin, geom.cy - margin, geom.cx + margin, geom.cy + margin)
+        centre = (_q(geom.cx), _q(geom.cy))
+        outward = self._escape_dirs(geom)
+        first: str | None = None
+        free_seen = False
+        for d in [(e + 2) % 4 for e in outward if (e + 2) % 4 not in outward] + outward:  # the inner edge first
+            dx, dy = _DIRS[d]
+            lx, ly = -dy, dx
+            ext = geom.hw if dx else geom.hh
+            ox, oy = geom.cx + dx * ext, geom.cy + dy * ext
+            i0, j0 = self._nearest_cell(ox - reach, oy - reach)
+            i1, j1 = self._nearest_cell(ox + reach, oy + reach)
+            found: list[tuple[tuple, int, float, float]] = []
+            for j in range(max(0, j0 - 1), min(self.ny - 1, j1 + 1) + 1):
+                for i in range(max(0, i0 - 1), min(self.nx - 1, i1 + 1) + 1):
+                    k = j * self.nx + i
+                    x, y = self.xy(k)
+                    f = (x - ox) * dx + (y - oy) * dy
+                    lat = (x - ox) * lx + (y - oy) * ly
+                    if f < -_EPS or f > reach + _EPS or abs(lat) > g + _EPS:  # in front of its own pad: never in a neighbour's lane
+                        continue
+                    found.append(((round(math.hypot(f, lat), 9), round(abs(lat), 9), k), k, f, lat))
+            found.sort()
+            for _key, k, f, lat in found:
+                ex, ey = self.pos(k)
+                problem = self._via_site_problem(k, idx, None, self._plane_placed, local, geom.ref)
+                if problem is None and self.owner[other][k] not in (None, idx):
+                    problem = _SKIP
+                if problem is None and reserved.get(other * n + k, idx) != idx:
+                    problem = f"it is {self._reserved_words(other * n + k, False)} on {LAYERS[other]}"
+                if problem == _SKIP:
+                    continue
+                free_seen = True
+                if problem is not None:
+                    first = first or f"the nearest candidate via site ({ex:g}, {ey:g}): {problem}"
+                    continue
+                a_steps = [0] if abs(lat) < _EPS else list(range(0, int(f / (g / 2.0) + _EPS) + 1))
+                for a_i in a_steps:
+                    a = a_i * g / 2.0
+                    if abs(lat) < _EPS:
+                        pts = [centre, (ex, ey)]
+                    else:
+                        bend = (_q(ox + dx * a), _q(oy + dy * a))
+                        pts = [centre, bend, (ex, ey)] if bend != (ex, ey) else [centre, (ex, ey)]
+                    room, what = self._stub_room(pts, layer, idx, local)
+                    width = _q(min(w_top, math.floor((2.0 * room + 1e-9) / step) * step))
+                    if width < w_min - _EPS:
+                        first = first or (f"the nearest candidate via site ({ex:g}, {ey:g}): a stub keeping its clearance from {what} could be at "
+                                          f"most {max(2.0 * room, 0.0):.3f} mm wide, below the narrowest stub {w_min:g} mm")
+                        continue
+                    hit = self._guard_hit(pts, width / 2.0, layer, (ex, ey), idx)
+                    if hit is not None:
+                        first = first or f"the nearest candidate via site ({ex:g}, {ey:g}): {hit}"
+                        continue
+                    cells = self._claim_cells(pts, width, (layer,), idx, (ex, ey))
+                    taken = next((c for c in cells if reserved.get(c, idx) != idx), None)
+                    if taken is not None:
+                        first = first or (f"the nearest candidate via site ({ex:g}, {ey:g}): its clearance would take "
+                                          f"{self._reserved_words(taken, True)}")
+                        continue
+                    way = self._exit_path(k, other, idx, geom.ref)
+                    if way is None:
+                        first = first or (f"the nearest candidate via site ({ex:g}, {ey:g}): no way out of the footprint's escape area from it on "
+                                          f"{LAYERS[other]} (every path meets another net's copper, a claim or the edge clearance)")
+                        break
+                    return _Escape("dogbone", why, layer, k, width, tuple(pts), tuple(way))
+        if not free_seen:
+            return f"no via fan-out within {reach:g} mm of its edges: no via site is clear of the edge, every pad, the via keep-outs and the other layer's copper"
+        return f"no via fan-out within {reach:g} mm of its edges: {first or 'no candidate is legal'}"
+
     def _reserved_words(self, c: int, taken: bool) -> str:
         """What the reserved cell ``c`` (``layer * n + k``) is, as a refusal names it (:data:`_RESERVED_WORDS`; ``taken``: the form after
         "would take")."""
@@ -2740,13 +3682,14 @@ class _Board:
         ref: str = "",
     ) -> str | None:
         """Why a plane escape's via may not sit at cell ``k`` (exact rules, module docstring), :data:`_SKIP` when the cell is not even a
-        candidate (the edge, a pad under its disc, a via keep-out, outside the plane zones), ``None`` when it may."""
+        candidate (the edge, a pad under its disc, a via keep-out, outside the plane zones), ``None`` when it may. ``areas=None``
+        (routing.maze 0.8, a via fan-out's via) asks for no plane zone."""
         p = self.p
         rv = p.via_diameter_mm / 2.0
         if not self.via_edge_ok[k] or not self.via_pad_ok[k]:
             return _SKIP
         x, y = self.xy(k)
-        if not any(point_area_distance((x, y), poly) == 0.0 and _edge_gap((x, y), poly) >= rv - _EPS for poly in areas):
+        if areas is not None and not self._inside_plane((x, y), idx, areas, rv):
             return _SKIP
         if self.via_ko is not None and k in self.via_ko and idx not in self.via_ko[k]:
             return _SKIP
@@ -2770,7 +3713,7 @@ class _Board:
         """Claim the escape's cells on the owner maps (and, for a via, keep other vias off it), add its entries to :attr:`pads` and
         return them; ``log`` (a trial) records every change for the undo."""
         pts = list(esc.points)
-        via_xy = self.xy(esc.cell) if esc.kind == "via" else None
+        via_xy = self.xy(esc.cell) if esc.kind in ("via", "dogbone") else None
         for c in self._claim_cells(pts, esc.width, (esc.layer,), idx, via_xy):
             layer, k = divmod(c, self.n)
             cur = self.owner[layer][k]
@@ -2788,7 +3731,7 @@ class _Board:
             ))
         if via_xy is not None:
             rv = self.p.via_diameter_mm / 2.0
-            geoms.append(_PadGeom(t.pad.ref, f"{t.pad.number}:escape-via", via_xy[0], via_xy[1], rv, rv, rv, (0, 1), idx, kind="escape-via",
+            geoms.append(_PadGeom(t.pad.ref, f"{t.pad.number}:escape-via", via_xy[0], via_xy[1], rv, rv, rv, self.route_layers, idx, kind="escape-via",
                                   shape=("disc", via_xy, rv)))
             i0, j0 = self._nearest_cell(via_xy[0] - 2 * rv, via_xy[1] - 2 * rv)
             i1, j1 = self._nearest_cell(via_xy[0] + 2 * rv, via_xy[1] + 2 * rv)
@@ -2806,12 +3749,12 @@ class _Board:
 
     def usable_layers(self, terminal: _Terminal, net: int) -> tuple[int, ...]:
         """The pad's copper layers on which the terminal cell is free or the net's own (never BLOCKED / another net's); an escape stub's
-        own layer only (routing.maze 0.6)."""
+        own layer only (routing.maze 0.6); a via fan-out's other outer layer only (routing.maze 0.8)."""
         esc = terminal.escape
-        layers = terminal.pad.layers if esc is None or esc.kind == "cell" else (esc.layer,)
+        layers = terminal.pad.layers if esc is None or esc.kind == "cell" else (1 - esc.layer,) if esc.kind == "dogbone" else (esc.layer,)
         return tuple(layer for layer in layers if self.owner[layer][terminal.cell] in (None, net))
 
-    def via_static_at(self, k: int) -> int:
+    def via_static_at(self, k: int, t: int = 0) -> int:
         """:data:`BLOCKED`, :data:`_FREE` or the one net that may drill a via at cell ``k`` given the pads and the edge (memoised).
 
         BLOCKED when the via would be too near the edge, overlap any pad box,
@@ -2819,11 +3762,24 @@ class _Board:
         width/2`` is BLOCKED or owned by two nets on either layer; the owning
         net when some of those cells belong to one net's pads; free otherwise.
         With larger rule clearances, :attr:`via_keep` narrows it further.
+        ``t`` (routing.maze 0.9) is a signal via type (:attr:`signal_types`):
+        its owners are read on the layers of its span (type 0, the through
+        via: every routing layer, :attr:`via_static`). With N signal layers
+        (:attr:`search_n`) the site is measured exactly (:meth:`_via_site_n`,
+        module docstring: exact via sites) and a signal via also keeps
+        ``via_diameter + clearance`` from every plane and escape via, whatever
+        their spans (module docstring: no stacked vias).
         """
-        cached = self.via_static[k]
+        cache = self.via_static_n[t]
+        cached = cache[k]
         if cached is not None:
             return cached
-        value = self._via_static(k)
+        if self.search_n:  # routing.maze 0.9, N signal layers (module docstring: exact via sites)
+            value = self._via_site_n(k, self.signal_types[t].layers)
+        else:
+            value = self._via_static(k) if t == 0 else self._via_static(k, self.signal_types[t].layers)
+        if self.search_n and value != BLOCKED and self._static_via_near(k):
+            value = BLOCKED
         if self.via_keep is not None and value != BLOCKED:
             keep = self.via_keep[k]
             if keep == BLOCKED or (keep != _FREE and value != _FREE and value != keep):
@@ -2836,21 +3792,24 @@ class _Board:
                 value = next(iter(allowed)) if len(allowed) == 1 else BLOCKED
             elif value not in allowed:
                 value = BLOCKED
-        self.via_static[k] = value
+        cache[k] = value
         return value
 
-    def _via_static(self, k: int) -> int:
+    def _via_static(self, k: int, layers: tuple[int, ...] = (0, 1)) -> int:
+        """:meth:`via_static_at` before the rule clearances and keep-outs: the owners read on ``layers`` (the via's span), in order."""
         if not self.via_edge_ok[k] or not self.via_pad_ok[k]:
             return BLOCKED
         j, i = divmod(k, self.nx)
         stat, n = self.stat, self.n
+        bases = [r * n for r in layers]
         owner = _FREE
         for a, b in self.via_disc:
             ii, jj = i + a, j + b
             if not (0 <= ii < self.nx and 0 <= jj < self.ny):
                 return BLOCKED
             kk = jj * self.nx + ii
-            for o in (stat[kk], stat[n + kk]):
+            for base in bases:
+                o = stat[base + kk]
                 if o == _FREE:
                     continue
                 if o == BLOCKED or (owner != _FREE and owner != o):
@@ -2858,10 +3817,98 @@ class _Board:
                 owner = o
         return owner
 
+    #: routing.maze 0.9, N signal layers: the side (mm) of the buckets :meth:`_via_site_n` looks up the static copper in
+    _SITE_BUCKET_MM = 2.0
+
+    def _via_site_n(self, k: int, layers: tuple[int, ...]) -> int:
+        """routing.maze 0.9, N signal layers (module docstring: exact via sites): :meth:`_via_static` measured exactly - BLOCKED when
+        the via would be too near the edge or overlap a pad box (as before), when its copper would come nearer than the clearance
+        (``max(clearance, the copper's net's)``, as :meth:`_via_site_problem` measures an escape's via) to the copper of two nets or of a
+        net-less pad on a layer of its span (``layers``: the pads, the escape stubs and vias, the plane stubs and vias of :attr:`pads`
+        and every terminal's ordinary stub, each by its exact shape or box - :meth:`_build_site_index`), or enter a track keep-out
+        area on such a layer (unless the area allows exactly one net: then that net's); the one net whose copper alone is that near;
+        free otherwise. The site is any net's, so the drilling net's own clearance is the board's here; a rule net's larger one is
+        kept by its via fence (:meth:`rule_via_fence`, which :func:`_search_rules` reads beside this map), as before. 0.2's check
+        reads the owner map, whose cells already hold the track clearance and half a grid step around every pad, within the via's own
+        disc of ``via_diameter/2 + clearance + width/2``: it counts the clearance twice (measured on the STM32F407's LQFP-100: no F.Cu
+        via 1.07 mm beyond a capacitor's pad, where 0.2 mm is needed)."""
+        if not self.via_edge_ok[k] or not self.via_pad_ok[k]:
+            return BLOCKED
+        index = self._site_index
+        if index is None:
+            index = self._site_index = self._build_site_index()
+        x, y = self.xy(k)
+        rv = self.p.via_diameter_mm / 2.0
+        span = set(layers)
+        owner = _FREE
+        bucket = (int((x - self.ox) / self._SITE_BUCKET_MM), int((y - self.oy) / self._SITE_BUCKET_MM))
+        for geom in index.get(bucket, ()):
+            if span.isdisjoint(geom.layers):
+                continue
+            req = max(self.p.clearance_mm, self._clear_of(geom.net) if geom.net >= 0 else self.p.clearance_mm)
+            if self._pt_gap(x, y, geom) - rv < req - _EPS:
+                if geom.net < 0 or (owner != _FREE and owner != geom.net):
+                    return BLOCKED
+                owner = geom.net
+        for _ko, area, ko_layers, allowed in self.track_keepouts:
+            if span.isdisjoint(ko_layers) or point_area_distance((x, y), area) >= rv - _EPS:
+                continue
+            if len(allowed) != 1:
+                return BLOCKED
+            (only,) = allowed
+            if owner != _FREE and owner != only:
+                return BLOCKED
+            owner = only
+        return owner
+
+    def _build_site_index(self) -> dict[tuple[int, int], list[_PadGeom]]:
+        """The static copper by bucket of :data:`_SITE_BUCKET_MM` (each entry in every bucket its box grown by ``via_diameter/2`` plus
+        the largest clearance meets, so a via site reads its own bucket only): :attr:`pads` and every terminal's ordinary stub from its
+        cell to the pad centre (an escape's stub is in :attr:`pads`) at its net's width - a plane net's at its stubs' width."""
+        b = self._SITE_BUCKET_MM
+        grow = self.p.via_diameter_mm / 2.0 + max([self.p.clearance_mm, *self.pad_clear.values()])
+        stubs: list[_PadGeom] = []
+        for name, terms in self.terminals.items():
+            idx = self.net_index[name]
+            half = max(self._net_width(idx), self._plane_width.get(name, 0.0)) / 2.0
+            for t in terms:
+                if t.refusal is not None or (t.offgrid is not None and t.escape is None) or (t.escape is not None and t.escape.kind != "cell"):
+                    continue  # no copper, or an escape's (in pads)
+                a, c = self.pos(t.cell), (_q(t.pad.cx), _q(t.pad.cy))
+                stubs.append(_PadGeom(t.pad.ref, f"{t.pad.number}:stub", (a[0] + c[0]) / 2.0, (a[1] + c[1]) / 2.0, abs(c[0] - a[0]) / 2.0 + half,
+                                      abs(c[1] - a[1]) / 2.0 + half, half, t.pad.layers, idx, kind="stub", shape=("seg", a, c, half)))
+        index: dict[tuple[int, int], list[_PadGeom]] = {}
+        for geom in (*self.pads, *stubs):
+            i0 = int(max(geom.cx - geom.hw - grow - self.ox, 0.0) / b)
+            j0 = int(max(geom.cy - geom.hh - grow - self.oy, 0.0) / b)
+            i1 = int(max(geom.cx + geom.hw + grow - self.ox, 0.0) / b)
+            j1 = int(max(geom.cy + geom.hh + grow - self.oy, 0.0) / b)
+            for bj in range(j0, j1 + 1):
+                for bi in range(i0, i1 + 1):
+                    index.setdefault((bi, bj), []).append(geom)
+        return index
+
     def via_allowed(self, k: int, net: int) -> bool:
         """Whether the static map (pads, edge) lets ``net`` drill a via at cell ``k`` (other nets' copper is negotiated, not checked here)."""
         v = self.via_static_at(k)
         return v == _FREE or v == net
+
+    def _static_via_near(self, k: int) -> bool:
+        """routing.maze 0.9, N signal layers: whether a via centred on cell ``k`` would come closer than ``via_diameter + clearance`` to
+        a plane via or an escape via of the static phase, whatever the two spans (built on first use, after the static phase)."""
+        near = self._via_near
+        if near is None:
+            near = bytearray(self.n)
+            r = self.p.via_diameter_mm + self.p.clearance_mm
+            for geom in self.pads:
+                if geom.kind not in ("plane-via", "escape-via"):
+                    continue
+                for kk, _dist in self.cells_near_box(geom, r):
+                    x, y = self.xy(kk)
+                    if math.hypot(x - geom.cx, y - geom.cy) < r - _EPS:
+                        near[kk] = 1
+            self._via_near = near
+        return bool(near[k])
 
     def halo_cells(self, halo: _Halo, k: int, base: int, out: set[int]) -> None:
         """Add ``base + cell`` for every cell of ``halo`` around cell ``k`` that lies on the grid."""
@@ -2912,7 +3959,7 @@ class _Board:
         """``layer * n + k`` -> 1 where the net's track (neck-down width inside ``zone``) breaks its rule at a foreign pad, escape or the
         edge (each entry measured as :meth:`_fence_gap` measures it)."""
         n, g, e = self.n, self.p.grid_mm, self.p.edge_clearance_mm
-        fence = bytearray(2 * n)
+        fence = bytearray(self.R * n)  # every routing layer a pad is on (a rule net itself stays on F.Cu / B.Cu)
         for k in range(n):
             w = neck if zone is not None and zone[k] else width
             if self._edge_distance(k) < e + w / 2.0 - _EPS:
@@ -2962,9 +4009,10 @@ _Key = tuple[float, float]
 class _NetRoute:
     """The route of one net: the ordered steps (stubs and paths), its cells, and the halo it covers."""
 
-    steps: list[tuple[str, Any, int]] = field(default_factory=list)  # ("stub", terminal, layer) | ("path", path, 0) | ("pair", data, 0)
+    #: ("stub", terminal, layer) | ("path", path, 0) | ("pair", data, 0); routing.maze 0.9, N signal layers: ("path", path, via types)
+    steps: list[tuple[str, Any, Any]] = field(default_factory=list)
     path_cells: set[int] = field(default_factory=set)  # layer * n + k
-    via_cells: list[int] = field(default_factory=list)  # k, in path order
+    via_cells: list[int] = field(default_factory=list)  # k, in path order (routing.maze 0.9, N signal layers: t * n + k, t its signal type)
     cover_t: dict[_Key, set[int]] = field(default_factory=dict)  # per track profile: layer * n + k
     cover_v: dict[float, set[int]] = field(default_factory=dict)  # per via clearance: k
     how: str = "negotiated"  # "negotiated" or "recovered" (routed again against the legal copper after the cap)
@@ -3017,16 +4065,20 @@ class _Negotiation:
         self.vkey0 = p.clearance_mm
         self.track_keys = list(track_keys) if track_keys else [self.key0]
         self.via_keys = list(via_keys) if via_keys else [self.vkey0]
-        self.t_halo = {key: [0] * (2 * n) for key in self.track_keys}
-        self.t_ncost = {key: [p.base_cost] * (2 * n) for key in self.track_keys}
-        self.v_halo = {c: [0] * n for c in self.via_keys}
-        self.v_cost = {c: [p.via_cost] * n for c in self.via_keys}
-        self.hist = [0.0] * (2 * n)
-        self.vhist = [0.0] * n
+        R, T = board.R, board.T
+        #: the via planes per via clearance (``t * n + k``; one, the through via's, on this board)
+        self.T = T
+        self.t_halo = {key: [0] * (R * n) for key in self.track_keys}
+        self.t_ncost = {key: [p.base_cost] * (R * n) for key in self.track_keys}
+        self.v_halo = {c: [0] * (T * n) for c in self.via_keys}
+        self.v_cost = {c: [p.via_cost] * (T * n) for c in self.via_keys}
+        self.hist = [0.0] * (R * n)
+        self.vhist = [0.0] * (T * n)
         self.pres = p.present_cost
-        #: the search's per-state best cost and predecessor (``state = (layer * n + k) * 5 + direction``), reset after every search
-        self.g_best = [_INF] * (2 * n * _STATES_PER_CELL)
-        self.prev = [-1] * (2 * n * _STATES_PER_CELL)
+        #: the search's per-state best cost and predecessor (``state = (layer * n + k) * 5 + direction``, then the board's barrel
+        #: states, none here), reset after every search
+        self.g_best = [_INF] * (R * n * _STATES_PER_CELL + board.barrels)
+        self.prev = [-1] * (R * n * _STATES_PER_CELL + board.barrels)
         self._glen: list[float] | None = None
         self._alias()
 
@@ -3128,6 +4180,181 @@ class _Negotiation:
             cover_v[ck] |= cells
         route.cover_t = cover_t
         route.cover_v = cover_v
+
+
+class _NegotiationN(_Negotiation):
+    """routing.maze 0.9, N signal layers (module docstring): the negotiation of a board with :attr:`_Board.search_n`.
+
+    The arrays are 0.2's, per routing layer and per signal via type: ``t_halo`` / ``t_ncost`` / ``hist`` over ``R * n`` track cells,
+    ``v_halo`` / ``v_cost`` / ``vhist`` over ``T * n`` via planes (the plane of type ``t`` at ``t * n + k``), and the search's
+    ``g_best`` / ``prev`` over ``R * n * 5`` planar states plus ``T * n`` barrel states - :mod:`array` arrays, 8-byte floats and
+    4-byte counts and predecessors (a list holds an 8-byte pointer per slot plus a 24-byte float per distinct cost). :meth:`cover`
+    counts a path cell in the via plane of every type whose span holds its layer and a via on the track planes of its span and in
+    every type's via plane; a via of type ``t`` costs ``via_cost`` times its kind's factor (:class:`StackSearchParams`). The schedule
+    is VPR's (the file header): :attr:`pres` starts at ``first_iter_pres_fac`` and :meth:`advance` moves it and the history after
+    each iteration. ``overused`` / ``_partners`` / ``_drop_conflicts`` / ``_recover`` read it as they read :class:`_Negotiation`.
+    """
+
+    def __init__(self, board: _Board, p: RoutingParams, track_keys: list[_Key] | None = None, via_keys: list[float] | None = None,
+                 sp: StackSearchParams = STACK_SEARCH) -> None:
+        sp.check()
+        self.board = board
+        self.p = p
+        self.sp = sp
+        n = board.n
+        self.key0 = (p.track_width_mm, p.clearance_mm)
+        self.vkey0 = p.clearance_mm
+        self.track_keys = list(track_keys) if track_keys else [self.key0]
+        self.via_keys = list(via_keys) if via_keys else [self.vkey0]
+        R, T = board.R, board.T
+        self.T = T
+        #: each signal type's via cost before congestion: ``via_cost`` times its kind's factor
+        self.vbase = [p.via_cost * sp.via_factor(vt.kind) for vt in board.signal_types]
+        self.t_halo = {key: array("i", [0]) * (R * n) for key in self.track_keys}
+        self.t_ncost = {key: array("d", [p.base_cost]) * (R * n) for key in self.track_keys}
+        self.v_halo = {c: array("i", [0]) * (T * n) for c in self.via_keys}
+        self.v_cost = {c: self._via_plane(lambda t: array("d", [self.vbase[t]]) * n) for c in self.via_keys}
+        self.hist = array("d", [0.0]) * (R * n)
+        self.vhist = array("d", [0.0]) * (T * n)
+        self.pres = sp.first_iter_pres_fac
+        states = R * n * _STATES_PER_CELL + board.barrels
+        self.g_best = array("d", [_INF]) * states
+        self.prev = array("i", [-1]) * states
+        self._glen = None
+        #: how many search states every :func:`_search_n` so far touched (the history rows give it per iteration)
+        self.touched = 0
+        self._alias()
+
+    def _via_plane(self, make: Callable[[int], array]) -> array:
+        out = array("d")
+        for t in range(self.T):
+            out.extend(make(t))
+        return out
+
+    def lengths(self) -> array:
+        """The rule search's per-state path length (mm), allocated on first use (as an array)."""
+        if self._glen is None:
+            self._glen = array("d", [0.0]) * len(self.g_best)
+        return self._glen
+
+    def recompute(self) -> None:
+        """Every node / via cost from the present factor, the history and the counts: ``base * (1 + hist) * (1 + pres * occupancy)``
+        (VPR's ``base * acc * pres`` with ``acc = 1 + hist``, capacity one net), a via of type ``t`` from its own base cost."""
+        base, pres, n = self.p.base_cost, self.pres, self.board.n
+        for key in self.track_keys:
+            self.t_ncost[key] = array("d", (base * (1.0 + h) * (1.0 + pres * o) for h, o in zip(self.hist, self.t_halo[key])))
+        vhist = self.vhist
+        for c in self.via_keys:
+            vhalo = self.v_halo[c]
+
+            def plane(t: int) -> array:
+                vb, lo = self.vbase[t] + base, t * n
+                return array("d", (vb * (1.0 + h) * (1.0 + pres * o) - base for h, o in zip(vhist[lo:lo + n], vhalo[lo:lo + n])))
+
+            self.v_cost[c] = self._via_plane(plane)
+        self._alias()
+
+    def _count(self, route: _NetRoute, delta: int) -> None:
+        p = self.p
+        base, pres, hist, vhist, n = p.base_cost, self.pres, self.hist, self.vhist, self.board.n
+        for key, cells in route.cover_t.items():
+            halo, ncost = self.t_halo[key], self.t_ncost[key]
+            for c in cells:
+                o = halo[c] + delta
+                halo[c] = o
+                ncost[c] = base * (1.0 + hist[c]) * (1.0 + pres * o)
+        vb = [v + base for v in self.vbase]
+        for ck, cells in route.cover_v.items():
+            vhalo, vcost = self.v_halo[ck], self.v_cost[ck]
+            for v in cells:
+                o = vhalo[v] + delta
+                vhalo[v] = o
+                vcost[v] = vb[v // n] * (1.0 + vhist[v]) * (1.0 + pres * o) - base
+
+    def overuse(self, route: _NetRoute) -> tuple[dict[int, int], dict[int, int]]:
+        """``(track cell -> overuse, via cell -> overuse)`` of ``route``: its cells inside other nets' halos and by how many (VPR's
+        ``occ - capacity``, the route's own halo counted once)."""
+        track: dict[int, int] = {}
+        for key, cells in route.keyed:
+            halo = self.t_halo[key]
+            for c in cells:
+                o = halo[c] - 1
+                if o > 0 and o > track.get(c, 0):
+                    track[c] = o
+        vhalo = self.v_halo[route.via_key]
+        return track, {v: vhalo[v] - 1 for v in route.via_cells if vhalo[v] > 1}
+
+    def advance(self, iteration: int, over_t: Mapping[int, int], over_v: Mapping[int, int]) -> None:
+        """VPR's update after iteration ``iteration`` (the file header): from iteration 2 on every over-used cell's history gains
+        ``overuse * acc_fac`` and the present factor grows ``x pres_fac_mult`` up to ``max_pres_fac``; after iteration 1 (a free pass)
+        it becomes ``initial_pres_fac``. The costs are recomputed."""
+        sp = self.sp
+        if iteration >= 2:
+            for c, o in over_t.items():
+                self.hist[c] += o * sp.acc_fac
+            for v, o in over_v.items():
+                self.vhist[v] += o * sp.acc_fac
+            self.pres = min(self.pres * sp.pres_fac_mult, sp.max_pres_fac)
+        else:
+            self.pres = sp.initial_pres_fac
+        self.recompute()
+
+    def cover(self, route: _NetRoute) -> None:
+        """:meth:`_Negotiation.cover` over N routing layers and ``T`` via planes (module docstring: N signal layers), at 0.2's radii.
+
+        A path cell ``c`` counts on its own layer's track plane (``layer_base = (c // n) * n``) and, for each signal type whose span
+        holds its layer, in that type's via plane; a via ``t * n + k`` counts on the track planes of every layer of its span and in
+        every type's via plane. The extra covers (a coupled pair's breakouts) merge unchanged."""
+        board, p = self.board, self.p
+        n, g, dv = board.n, p.grid_mm, p.via_diameter_mm
+        types_of, signal_types, T = board.types_of, board.signal_types, self.T
+        cover_t: dict[_Key, set[int]] = {key: set() for key in self.track_keys}
+        cover_v: dict[float, set[int]] = {c: set() for c in self.via_keys}
+        for (wc, cc), cells in route.keyed:
+            if not cells:
+                continue
+            for key in self.track_keys:
+                halo = board.halo_for(wc / 2.0 + key[0] / 2.0 + max(cc, key[1]) + g / 2.0)
+                out = cover_t[key]
+                for c in cells:
+                    layer_base = (c // n) * n
+                    board.halo_cells(halo, c - layer_base, layer_base, out)
+            for ck in self.via_keys:
+                halo = board.halo_for(dv / 2.0 + max(cc, ck) + wc / 2.0)
+                out = cover_v[ck]
+                for c in cells:
+                    r, k = divmod(c, n)
+                    for t in types_of[r]:
+                        board.halo_cells(halo, k, t * n, out)
+        vias = set(route.via_cells)
+        if vias:
+            cv = route.via_key
+            for key in self.track_keys:
+                halo = board.halo_for(dv / 2.0 + max(cv, key[1]) + key[0] / 2.0)
+                out = cover_t[key]
+                for v in vias:
+                    t, k = divmod(v, n)
+                    for r in signal_types[t].layers:
+                        board.halo_cells(halo, k, r * n, out)
+            for ck in self.via_keys:
+                halo = board.halo_for(dv + max(cv, ck))
+                out = cover_v[ck]
+                for v in vias:
+                    k = v % n
+                    for t2 in range(T):
+                        board.halo_cells(halo, k, t2 * n, out)
+        for key, cells in route.extra_t.items():
+            cover_t[key] |= cells
+        for ck, cells in route.extra_v.items():
+            cover_v[ck] |= cells
+        route.cover_t = cover_t
+        route.cover_v = cover_v
+
+
+def _shuffle_key(iteration: int, name: str) -> str:
+    """routing.maze 0.9, N signal layers: a net's place in iteration ``iteration``'s reroute order - a permutation that changes every
+    iteration and is fixed by its inputs (no random module, no clock; nextpnr router2's shuffled failed nets, ISC, as an idea)."""
+    return hashlib.sha256(f"{iteration}:{name}".encode()).hexdigest()
 
 
 # --------------------------------------------------------------------------- the search
@@ -3401,6 +4628,178 @@ def _search_rules(
     return result
 
 
+def _search_n(
+    neg: _NegotiationN, net: int, seeds: list[int], targets: set[int], target_ij: tuple[int, int], window: tuple[int, int, int, int], strict: bool,
+    no_via: set[int] | frozenset[int] = frozenset(), astar_fac: float | None = None,
+) -> tuple[list[int], list[int]] | None:
+    """routing.maze 0.9, N signal layers (module docstring): the cheapest path from any seed to any target cell inside ``window`` over
+    every routing layer, as ``(path, types)`` - ``layer * n + cell`` ids, and the signal via type (an index into
+    :attr:`_Board.signal_types`) of each layer change in path order - or ``None`` when none is reachable.
+
+    States: planar ``(layer * n + k) * 5 + direction`` as :func:`_search`, and the barrel ``bb + t * n + k`` (``bb = R * n * 5``) of a
+    via of type ``t`` at cell ``k``. A planar pop tests the target first, then steps east, south, west, north exactly as
+    :func:`_search` (the static map, ``strict``'s halo, the bend cost; a step against the layer's preferred direction costs
+    ``wrong_way`` times the node cost), then - unless it is the far end of a via (no direction, its predecessor a barrel: no stacked
+    vias) or its cell is in ``no_via`` (within the hole-to-hole gap of a via the net holds already) - enters the barrel of each type
+    whose span holds its layer (type order) where the static map lets the net drill one (:meth:`_Board.via_static_at` on the type's
+    layers) at the type's via plane cost (``strict``: no other net's copper in that plane). A barrel pop exits onto every other
+    layer of the type's span (stack order) at that cell's node cost less ``base`` (``strict``: outside every halo). The heuristic
+    is ``astar_fac`` times ``base *
+    (|i - ti| + |j - tj|)`` plus ``via_cost`` on a layer no target lies on (a barrel: none). Unweighted it is a lower bound (every
+    via costs at least ``via_cost`` and every step at least ``base``: :meth:`RoutingParams.check`, :meth:`StackSearchParams.check`;
+    the targets are one terminal's cells, where it is 0), so with ``astar_fac`` 1 the path is the cheapest; ``astar_fac`` above 1
+    makes this weighted A* (VPR's default 1.2, a stated choice): the heuristic is no longer admissible and the path may cost more
+    than the cheapest - by the weighted-A* bound at most ``astar_fac`` times it, since a state is re-opened whenever a cheaper way
+    to it is found. Ties go to the heap counter, in push order.
+    The touched states are reset; their count is added to :attr:`_NegotiationN.touched`.
+    """
+    board = neg.board
+    p, sp = neg.p, neg.sp
+    n, nx, R = board.n, board.nx, board.R
+    bb = R * n * _STATES_PER_CELL
+    stat = board.stat
+    via_static_n = board.via_static_n
+    ncost, vcost, halo, vhalo = neg.ncost, neg.vcost, neg.halo, neg.vhalo
+    base, bend = p.base_cost, p.bend_cost
+    fac = sp.astar_fac if astar_fac is None else astar_fac
+    i0, j0, i1, j1 = window
+    tj, ti = target_ij
+    hx = [fac * base * abs(i - ti) for i in range(nx)]
+    hy = [fac * base * abs(j - tj) for j in range(board.ny)]
+    on_target = {c // n for c in targets}
+    hl = [0.0 if r in on_target else fac * p.via_cost for r in range(R)]
+    ww = sp.wrong_way
+    # per layer, the factor on a step's node cost east, south, west, north (a step against the preferred direction: wrong_way)
+    mult = [(1.0, ww, 1.0, ww) if dr == "horizontal" else (ww, 1.0, ww, 1.0) if dr == "vertical" else (1.0, 1.0, 1.0, 1.0)
+            for dr in board.layer_dirs] if board.layer_dirs else [(1.0, 1.0, 1.0, 1.0)] * R
+    types_of = board.types_of
+    spans = [vt.layers for vt in board.signal_types]
+    dirs = ((1, 1, 0), (nx, 0, 1), (-1, -1, 0), (-nx, 0, -1))  # (flat step, di, dj): east, south, west, north
+    g_best = neg.g_best
+    prev = neg.prev
+    touched: list[int] = []
+    heap: list[tuple[float, int, float, int]] = []
+    counter = 0
+    for c in seeds:
+        s = c * _STATES_PER_CELL + _NO_DIR
+        if g_best[s] == 0.0:
+            continue
+        g_best[s] = 0.0
+        prev[s] = -1
+        touched.append(s)
+        r, k = divmod(c, n)
+        j, i = divmod(k, nx)
+        heap.append((hx[i] + hy[j] + hl[r], counter, 0.0, s))
+        counter += 1
+    heapq.heapify(heap)
+    heappush, heappop = heapq.heappush, heapq.heappop
+    found = -1
+    while heap:
+        _, _, g, s = heappop(heap)
+        if g > g_best[s]:
+            continue
+        if s >= bb:  # a barrel: exit onto every other layer of the type's span
+            t, k = divmod(s - bb, n)
+            entry = prev[s] // _STATES_PER_CELL // n
+            j = k // nx
+            i = k - j * nx
+            h0 = hx[i] + hy[j]
+            for r2 in spans[t]:
+                if r2 == entry:
+                    continue
+                c2 = r2 * n + k
+                if strict and halo[c2]:
+                    continue
+                ng = g + ncost[c2] - base
+                s2 = c2 * _STATES_PER_CELL + _NO_DIR
+                if ng < g_best[s2]:
+                    if g_best[s2] == _INF:
+                        touched.append(s2)
+                    g_best[s2] = ng
+                    prev[s2] = s
+                    heappush(heap, (ng + h0 + hl[r2], counter, ng, s2))
+                    counter += 1
+            continue
+        c = s // _STATES_PER_CELL
+        d = s - c * _STATES_PER_CELL
+        if c in targets:
+            found = s
+            break
+        r = c // n
+        k = c - r * n
+        j = k // nx
+        i = k - j * nx
+        back = (d + 2) & 3 if d != _NO_DIR else -1
+        m = mult[r]
+        hr = hl[r]
+        for nd in range(4):
+            if nd == back:
+                continue  # no reversal onto the cell we came from
+            step, di, dj = dirs[nd]
+            ii = i + di
+            jj = j + dj
+            if ii < i0 or ii > i1 or jj < j0 or jj > j1:
+                continue
+            c2 = c + step
+            o = stat[c2]
+            if o != _FREE and o != net:
+                continue  # BLOCKED or another net's pad keep-out: never entered, a target cell included
+            if strict and halo[c2]:
+                continue
+            ng = g + ncost[c2] * m[nd]
+            if d != _NO_DIR and nd != d:
+                ng += bend
+            s2 = c2 * _STATES_PER_CELL + nd
+            if ng < g_best[s2]:
+                if g_best[s2] == _INF:
+                    touched.append(s2)
+                g_best[s2] = ng
+                prev[s2] = s
+                heappush(heap, (ng + hx[ii] + hy[jj] + hr, counter, ng, s2))
+                counter += 1
+        if (d == _NO_DIR and prev[s] >= bb) or k in no_via:
+            continue  # the far end of a via (no via drilled from it: no stacked vias), or a cell that holds a via of the net already
+        h0 = hx[i] + hy[j]
+        for t in types_of[r]:
+            v = via_static_n[t][k]
+            if v is None:
+                v = board.via_static_at(k, t)
+            if v != _FREE and v != net:
+                continue
+            vk = t * n + k
+            if strict and vhalo[vk]:
+                continue
+            ng = g + vcost[vk]
+            s2 = bb + vk
+            if ng < g_best[s2]:
+                if g_best[s2] == _INF:
+                    touched.append(s2)
+                g_best[s2] = ng
+                prev[s2] = s
+                heappush(heap, (ng + h0, counter, ng, s2))
+                counter += 1
+    neg.touched += len(touched)
+    result = None
+    if found >= 0:
+        path: list[int] = []
+        types: list[int] = []
+        s = found
+        while s >= 0:
+            if s >= bb:
+                types.append((s - bb) // n)  # the via between the cell before it and the one after it
+            else:
+                c = s // _STATES_PER_CELL
+                if not path or path[-1] != c:
+                    path.append(c)
+            s = prev[s]
+        path.reverse()
+        types.reverse()
+        result = (path, types)
+    for s in touched:
+        g_best[s] = _INF
+    return result
+
+
 def _path_length(board: _Board, path: list[int], via_len: float) -> float:
     """Grid length of a path (mm): ``grid`` per step on one layer, ``via_len`` per layer change."""
     n, g = board.n, board.p.grid_mm
@@ -3429,6 +4828,14 @@ def _route_net(
     search reads the negotiation, never changes it), and the first that fits
     is taken; the reason given is the first tree's. ``start`` fixes the
     first terminal (the retries).
+
+    routing.maze 0.9, N signal layers (module docstring): a net without a
+    rule is searched by :func:`_search_n` (no via within the hole-to-hole gap
+    ``via_drill + clearance`` of one its tree holds, and a branch that drills
+    two that close is searched again without them, :func:`_own_hole_clash`);
+    each via is recorded as ``t * n + k`` and its barrel's cells on
+    every layer of its span become seeds of the later branches; a rule net
+    keeps :func:`_search_rules` on ``F.Cu`` / ``B.Cu``.
     """
     board = neg.board
     n, nx = board.n, board.nx
@@ -3436,6 +4843,8 @@ def _route_net(
     if refused:  # routing.maze 0.6: a pad that needed an escape stub and has none (its refusal names it and why)
         return refused[0].refusal
     usable = [board.usable_layers(t, idx) for t in terms]
+    if rn is not None and board.search_n:  # routing.maze 0.9, N signal layers: a rule net stays on F.Cu / B.Cu (outer-layer widths)
+        usable = [tuple(layer for layer in layers if layer < 2) for layers in usable]
     # a terminal cell inside a keep-out (a foreign pad, a net-less pad, the board edge) is no seed and no target on that
     # layer; a terminal with no usable layer cannot be connected without breaking the router's own clearance
     fenced = [t for t, layers in zip(terms, usable) if not layers]
@@ -3457,7 +4866,7 @@ def _route_net(
             # what fences the cell on each layer the owner map left it (as the fence measures it: an escape by its exact copper)
             what = {layer: board.rule_blocker(t.cell, layer, idx, w, c, board._clear_of) or "its fence" for layer in before[fenced[0]]}
             names = list(dict.fromkeys(what.values()))
-            where = names[0] if len(names) == 1 else "; ".join(f"{LAYERS[layer]}: {name}" for layer, name in what.items())
+            where = names[0] if len(names) == 1 else "; ".join(f"{board.layer_names[layer]}: {name}" for layer, name in what.items())
             pitch = ": the pad pitch cannot take that width" if all(name.startswith("pad ") for name in names) else ""
             return (
                 f"{t.label} terminal cell ({x:g}, {y:g}) is inside its net rule's keep-out on every copper layer of the pad "
@@ -3521,7 +4930,7 @@ def _route_net(
                 continue
             tree_set.add(c)
             tree.append(c)
-            j, i = divmod(c - n if c >= n else c, nx)
+            j, i = divmod(c % n, nx)
             for q in remaining:
                 tj, ti = ij[q]
                 dd = abs(i - ti) + abs(j - tj)
@@ -3546,9 +4955,21 @@ def _route_net(
         targets = set(cells_of(target))
         grown = margin
         left = None if budget is None else budget - stubs - used
+        types: list[int] | None = None  # routing.maze 0.9, N signal layers: each layer change's signal via type
+        no_via: set[int] | None = None
+        if rn is None and board.search_n:  # no via within the hole-to-hole gap of one the tree holds (its own cell included)
+            no_via = set()
+            for v in route.via_cells:
+                board.halo_cells(board.net_hole_halo, v % n, 0, no_via)
         while True:
             window = (max(0, box[0] - grown), max(0, box[1] - grown), min(board.nx - 1, box[2] + grown), min(board.ny - 1, box[3] + grown))
-            if rn is None:
+            if no_via is not None:
+                got_n = _search_n(neg, idx, tree, targets, ij[target], window, strict, no_via)
+                while got_n is not None and (clash := _own_hole_clash(board, got_n[0])) is not None:
+                    no_via |= clash  # the branch drilled twice within the gap: search again without those cells (no_via only grows)
+                    got_n = _search_n(neg, idx, tree, targets, ij[target], window, strict, no_via)
+                path, types = (None, None) if got_n is None else got_n
+            elif rn is None:
                 path = _search(neg, idx, tree, targets, ij[target], window, strict)
             else:
                 got = _search_rules(neg, rn, [c * _STATES_PER_CELL + _NO_DIR for c in tree], targets, None, [ij[target]], window, strict, left)
@@ -3573,22 +4994,60 @@ def _route_net(
         seed = at_terminal.get(path[0])
         if seed is not None:
             stub(seed, path[0] // n)
-        route.steps.append(("path", path, 0))
-        for a, b in zip(path, path[1:]):
-            if a // n != b // n:
-                route.via_cells.append(a % n)
+        barrels: list[int] = []
+        if types is None:
+            route.steps.append(("path", path, 0))
+            for a, b in zip(path, path[1:]):
+                if a // n != b // n:
+                    route.via_cells.append(a % n)
+        else:  # routing.maze 0.9, N signal layers: each via as t * n + k; its barrel's cells on every layer of its span seed the tree
+            route.steps.append(("path", path, tuple(types)))
+            changes = iter(types)
+            for a, b in zip(path, path[1:]):
+                if a // n != b // n:
+                    t = next(changes)
+                    k = a % n
+                    route.via_cells.append(t * n + k)
+                    barrels.extend(r * n + k for r in board.signal_types[t].layers)
         route.path_cells.update(path)
         if budget is not None:
             used += _path_length(board, path, rn.via_len)
         stub(target, path[-1] // n)
         remaining.remove(target)
         grow(path)
+        grow(barrels)  # seeds of later branches, not path cells (the via's cover counts its span)
         attach(target)
     if budget is not None and used + stubs > budget + _EPS:
         return f"no route within max_length_mm {budget:g}: the routed tree is {used + stubs:.3f} mm"
     _key_route(neg, route, rn)
     neg.cover(route)
     return route
+
+
+def _own_hole_clash(board: _Board, path: list[int]) -> set[int] | None:
+    """routing.maze 0.9, N signal layers: the cells a branch must not drill at when ``path`` drills a via within the hole-to-hole gap of
+    one it drilled earlier (:attr:`_Board.net_hole_halo`), else ``None``.
+
+    The search keeps a branch's vias off the tree's (``no_via``), not off each
+    other: for the first such pair (path order) the answer is the earlier
+    via's disc without its own cell - it may stay, nothing else of the branch
+    comes that close - or that cell alone when the later via is drilled on it
+    again. The later via's cell is always in the answer, so the caller's
+    ``no_via`` grows on every retry and the retries end.
+    """
+    n = board.n
+    drilled: list[int] = []
+    for a, b in zip(path, path[1:]):
+        if a // n == b // n:
+            continue
+        k = a % n
+        for k0 in drilled:
+            disc: set[int] = set()
+            board.halo_cells(board.net_hole_halo, k0, 0, disc)
+            if k in disc:
+                return {k0} if k == k0 else disc - {k0}
+        drilled.append(k)
+    return None
 
 
 def _key_route(neg: _Negotiation, route: _NetRoute, rn: _RuleNet | None) -> None:
@@ -3668,7 +5127,7 @@ def _setup_pair(board: _Board, pr: _Pair, clear_of: Callable[[int], float], trac
     """The pair's fence, the matching of its pad ends and the launch candidates at each end (module docstring)."""
     p, n, g = board.p, board.n, board.p.grid_mm
     W, h = pr.width, pr.h
-    fence = bytearray(2 * n)
+    fence = bytearray(board.R * n)  # every routing layer a pad or keep-out is on (the pair itself stays on F.Cu / B.Cu)
     for k in range(n):
         if board._edge_distance(k) < p.edge_clearance_mm + W / 2.0 - _EPS:
             fence[k] = 1
@@ -3800,7 +5259,8 @@ def _launch_cover(neg: _Negotiation, pr: _Pair, lc: _Launch) -> None:
                         lc.cover_t[key].add(lc.layer * n + k)
                 for c, r in radii_v.items():
                     if d < r - _EPS:
-                        lc.cover_v[c].add(k)
+                        for t in range(neg.T):
+                            lc.cover_v[c].add(t * n + k)
 
 
 def _launch_conflicts(pr: _Pair, lc: _Launch, routes: Mapping[str, _NetRoute]) -> bool:
@@ -3971,14 +5431,16 @@ class _World:
                 self.buckets.setdefault((bi, bj), []).append(item)
 
     def add_track(self, net: int, t: Track, c: float) -> None:
-        layer = LAYERS.index(t.layer)
+        layer = self.board.layer_index(t.layer)
         r = t.width_mm / 2.0
         (ax, ay), (bx, by) = t.start, t.end
         self._add(("seg", net, frozenset((layer,)), (t.start, t.end), r, c, f"track of {t.net}"), (min(ax, bx) - r, min(ay, by) - r, max(ax, bx) + r, max(ay, by) + r))
 
     def add_via(self, net: int, v: Via, c: float) -> None:
+        """A via's disc on the routing layers of its span (every one for a through via; routing.maze 0.9: a typed via's span only)."""
         r = v.diameter_mm / 2.0
-        self._add(("disc", net, frozenset((0, 1)), (v.x_mm, v.y_mm), r, c, f"via of {v.net}"), (v.x_mm - r, v.y_mm - r, v.x_mm + r, v.y_mm + r))
+        self._add(("disc", net, frozenset(self.board.via_layers_of(v)), (v.x_mm, v.y_mm), r, c, f"via of {v.net}"),
+                  (v.x_mm - r, v.y_mm - r, v.x_mm + r, v.y_mm + r))
 
     def seg_problem(self, net: int, layer: int, a: tuple[float, float], b: tuple[float, float], w: float, c: float, what: str) -> str | None:
         """Why a segment of ``net`` breaks a clearance to a foreign item, or ``None``."""
@@ -4020,6 +5482,8 @@ class _Plan:
     note: str
     #: routing.maze 0.6: the board has an escape stub, so the params entry records the escape knobs
     escape: bool = False
+    #: the routing layers the note names (``None``: F.Cu/B.Cu; routing.maze 0.9: the stack's signal layers)
+    layers: str | None = None
 
 
 def _provenance(
@@ -4031,6 +5495,15 @@ def _provenance(
     if story is None:
         if how == "recovered":
             story = f"routed against the legal copper as an obstacle after {iterations} negotiation iteration(s) left it in conflict"
+        elif how == "rerouted":  # routing.maze 0.9, N signal layers (module docstring: the end game)
+            story = (f"routed again against the legal copper as an obstacle in the end game, after {iterations} negotiation iteration(s) "
+                     "left nets in conflict")
+        elif how == "made room":  # routing.maze 0.9, N signal layers (module docstring: the end game)
+            story = (f"routed at the negotiated costs in the end game, after {iterations} negotiation iteration(s) left it in conflict; "
+                     "the nets it crossed were ripped up and routed again around it")
+        elif how == "plane web":  # routing.maze 0.9, stack mode (module docstring: the plane web)
+            story = (f"routed again against the legal copper as an obstacle after {iterations} negotiation iteration(s): a via of its earlier "
+                     "route cut a plane via of another net off from its plane, so no via crossing that plane may come near it")
         else:
             story = f"negotiated-congestion route, {iterations} iteration(s)" + ("" if legal else ", kept after the conflicting nets were ripped up")
     derived = [f"net:{net.name}", *(f"placement:{r}" for r in refs), p.derived_from_entry(rules=rules_active, escapes=plan is not None and plan.escape)]
@@ -4041,12 +5514,13 @@ def _provenance(
         version = plan.version
         derived.extend(plan.derived)
         rule_text += f"; {plan.note}"
+    layers = plan.layers if plan is not None and plan.layers else "F.Cu/B.Cu"
     return Provenance(
         kind=ProvenanceKind.DERIVED,
         tool=ROUTER_ID,
         tool_version=version,
         derived_from=derived,
-        note=f"grid maze route on F.Cu/B.Cu ({story}){rule_text}; validity is decided by kicad-cli DRC (pcb.routing checks the IR geometry only)",
+        note=f"grid maze route on {layers} ({story}){rule_text}; validity is decided by kicad-cli DRC (pcb.routing checks the IR geometry only)",
     )
 
 
@@ -4068,15 +5542,17 @@ class _NetCopper:
         start, end = self.board.pos(a), self.board.pos(b)
         if start == end:
             return
-        self.tracks.append(Track(net=self.net.name, layer=LAYERS[layer], start=start, end=end, width_mm=width, provenance=self.prov))
+        self.tracks.append(Track(net=self.net.name, layer=self.board.layer_names[layer], start=start, end=end, width_mm=width, provenance=self.prov))
 
-    def add_path(self, path: list[int]) -> None:
-        """Merge the unit steps of ``path`` (``layer * n + cell`` ids) into tracks and vias."""
+    def add_path(self, path: list[int], types: tuple[int, ...] | None = None) -> None:
+        """Merge the unit steps of ``path`` (``layer * n + cell`` ids) into tracks and vias; ``types`` (routing.maze 0.9, N signal
+        layers) gives each layer change's signal via type (:attr:`_Board.signal_types`), ``None`` a through via at every one."""
         n, nx = self.board.n, self.board.nx
         zone = self.zone
         run_start: int | None = None
         run_dir: tuple[int, int] | None = None
         run_w = self.width
+        changes = iter(types) if types is not None else None
         for a, b in zip(path, path[1:]):
             la, ka = divmod(a, n)
             lb, kb = divmod(b, n)
@@ -4084,6 +5560,9 @@ class _NetCopper:
                 if run_start is not None:
                     self._track(la, run_start, ka, run_w)
                     run_start = run_dir = None
+                if changes is not None:
+                    self.add_via(ka, self.board.signal_types[next(changes)])
+                    continue
                 x, y = self.board.pos(ka)
                 self.vias.append(
                     Via(net=self.net.name, x_mm=x, y_mm=y, drill_mm=self.p.via_drill_mm, diameter_mm=self.p.via_diameter_mm, layers=LAYERS, provenance=self.prov)
@@ -4101,20 +5580,36 @@ class _NetCopper:
 
     def add_stub(self, terminal: _Terminal, layer: int) -> None:
         """One segment from the terminal cell to the exact pad centre (nothing when the cell is the centre); an escape stub's segments
-        (routing.maze 0.6) from its cell back to the pad centre, at its own width, each naming the escape in its provenance."""
+        (routing.maze 0.6) from its cell back to the pad centre, at its own width, each naming the escape in its provenance; a via
+        fan-out's via too (routing.maze 0.8), with the same provenance."""
         esc = terminal.escape
         if esc is not None and esc.kind != "cell":
             prov = _escape_provenance(self.prov, terminal, self.board.p)
             pts = list(reversed(esc.points))
             for a, b in zip(pts, pts[1:]):
                 if a != b:
-                    self.tracks.append(Track(net=self.net.name, layer=LAYERS[esc.layer], start=a, end=b, width_mm=esc.width, provenance=prov))
+                    self.tracks.append(Track(net=self.net.name, layer=self.board.layer_names[esc.layer], start=a, end=b, width_mm=esc.width, provenance=prov))
+            if esc.kind == "dogbone":
+                x, y = self.board.pos(esc.cell)
+                self.vias.append(Via(net=self.net.name, x_mm=x, y_mm=y, drill_mm=self.p.via_drill_mm, diameter_mm=self.p.via_diameter_mm, layers=LAYERS,
+                                     provenance=prov))
             return
         start = self.board.pos(terminal.cell)
         end = (_q(terminal.pad.cx), _q(terminal.pad.cy))
         width = self.neck if self.zone is not None and self.zone[terminal.cell] else self.width
         if start != end:
-            self.tracks.append(Track(net=self.net.name, layer=LAYERS[layer], start=start, end=end, width_mm=width, provenance=self.prov))
+            self.tracks.append(Track(net=self.net.name, layer=self.board.layer_names[layer], start=start, end=end, width_mm=width, provenance=self.prov))
+
+    def add_via(self, k: int, vt: _VType | None = None) -> None:
+        """A via at cell ``k`` of type ``vt`` (routing.maze 0.9): a typed via carries its kind and its span ``(top, bottom)``; the through
+        via (``None`` or the through type) is 0.2's via, ``F.Cu`` / ``B.Cu`` without a kind."""
+        x, y = self.board.pos(k)
+        p = self.p
+        if vt is None or vt.kind == "through":
+            self.vias.append(Via(net=self.net.name, x_mm=x, y_mm=y, drill_mm=p.via_drill_mm, diameter_mm=p.via_diameter_mm, layers=LAYERS, provenance=self.prov))
+            return
+        self.vias.append(Via(net=self.net.name, x_mm=x, y_mm=y, drill_mm=p.via_drill_mm, diameter_mm=p.via_diameter_mm, layers=(vt.top, vt.bottom),
+                             kind=vt.kind, provenance=self.prov))
 
     def length_mm(self) -> float:
         return sum(math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1]) for t in self.tracks)
@@ -4146,11 +5641,13 @@ def _escape_provenance(prov: Provenance, t: _Terminal, p: RoutingParams) -> Prov
     why = {"off-grid": "no grid point lies inside its inscribed circle", "fenced": "its grid cell is inside its neighbours' keep-out on every layer",
            "no via site": "the axis walk found no via site"}.get(esc.why, esc.why)
     path = " -> ".join(f"({x:g}, {y:g})" for x, y in esc.points)
-    target = "its via" if esc.kind == "via" else "the grid cell the track starts from"
+    target = ("its via" if esc.kind == "via" else f"a via, the track starting there on {LAYERS[1 - esc.layer]}" if esc.kind == "dogbone"
+              else "the grid cell the track starts from")
+    version = ROUTER_DOGBONE_VERSION if esc.kind == "dogbone" else ROUTER_ESCAPE_VERSION
     points = ";".join(f"{x!r},{y!r}" for x, y in esc.points)
     return prov.model_copy(update={
         "derived_from": [*prov.derived_from, f"{ESCAPE_ENTRY_PREFIX}{t.label}:{esc.kind}:width={esc.width}:points={points}"],
-        "note": (f"{prov.note}; escape stub of pad {t.label} (routing.maze {ROUTER_ESCAPE_VERSION}: {why}): {path} on {LAYERS[esc.layer]} at "
+        "note": (f"{prov.note}; escape stub of pad {t.label} (routing.maze {version}: {why}): {path} on {LAYERS[esc.layer]} at "
                  f"{esc.width:g} mm, from the pad centre out of its edge to {target} (every clearance checked exactly; "
                  f"escape_reach {p.escape_reach_mm:g} mm)"),
     })
@@ -4164,6 +5661,8 @@ def _emit(board: _Board, net: Net, route: _NetRoute, prov: Provenance, rn: _Rule
     for kind, item, layer in route.steps:
         if kind == "stub":
             copper.add_stub(item, layer)
+        elif isinstance(layer, tuple):  # routing.maze 0.9, N signal layers: the path's via types
+            copper.add_path(item, layer)
         else:
             copper.add_path(item)
     return copper
@@ -4308,6 +5807,7 @@ def route_board(
     ir: CircuitIR, library: KicadLibrary, params: RoutingParams | None = None, *,
     rules: Mapping[str, NetRule] | None = None, inner_layers: bool = False, progress: Callable[[dict[str, Any]], None] | None = None,
     keepouts: Sequence[Any] | None = None, plane_nets: Mapping[str, Sequence[tuple[str, Sequence[tuple[float, float]]]]] | None = None,
+    stack: RouterStack | None = None, corner_style: str = "orthogonal",
 ) -> Routing:
     """Route every net of the placed board on ``F.Cu`` / ``B.Cu``; pure (same IR + library + params + rules + keep-outs -> same result).
 
@@ -4333,18 +5833,45 @@ def route_board(
     routing.maze 0.4 (module docstring: keep-outs and plane nets); a plane
     net's rule width becomes its pad stubs' width and the rest of its rule
     does not apply (no track joins its pads; ``stats["plane_nets"]`` says
-    so), and a plane net in a coupled pair is refused. Raises
-    :class:`CompileError` for anything that would need a guess (module
-    docstring).
+    so), and a plane net in a coupled pair is refused. ``stack`` (a
+    :class:`~ai_eda.tools.routing.stack.RouterStack`, in place of
+    ``inner_layers``) routes the board with the stack's via types and stamps
+    it routing.maze 0.9 (module docstring: stack mode) - with inner signal
+    layers or a second signal via type on every signal layer, by the barrel
+    search and VPR's negotiation schedule (module docstring: N signal
+    layers); without it nothing changes. ``corner_style="miter45"`` mitres
+    the routed copper's right-angle corners last (routing.corners 0.1,
+    :mod:`ai_eda.tools.routing.corners`) and ``corner_style="arc"`` - the
+    PCB agent's style - first straightens the router's sidesteps (a track
+    shorter than 8 track widths between two right-angle corners, slid
+    along a neighbour where the copper may legally run without it) and
+    then rounds the corners into tangent arcs - tracks with ``mid`` -
+    mitring where no arc fits (routing.corners 0.2); the default
+    ``"orthogonal"`` keeps every result byte for byte (GOLDEN, P0
+    digests). Raises :class:`CompileError` for
+    anything that would need a guess (module docstring).
     """
+    from ai_eda.tools.routing import corners  # routing.corners (0.1, 0.2) imports this module, so it is imported here
+    corners.check_style(corner_style)
     p, raised = effective_params(ir, params)
-    eff, rule_raised = _effective_rules(ir, p, rules)
+    escape_given = p.escape_min_width_mm  # the caller's: the fab's raise of it is recorded against this one
+    # routing.maze 0.9 (stack mode, module docstring: KiCad's minimums): the widths, the clearance, the edge clearance and the via size
+    # kicad-cli DRC checks; every board routed without a stack keeps its parameters
+    checked: dict[str, float] = {}
+    floored: dict[str, tuple[float, float]] = {}
+    if stack is not None and ir.pcb is not None:
+        p, checked, floored = kicad_floor(ir, p)
+    eff, rule_raised = _effective_rules(ir, p, rules, checked.get("min_track_width"))
+    if stack is not None and ir.pcb is not None:
+        _check_stack(ir, stack, inner_layers)  # routing.maze 0.9: before any plane net is read (the board checks it again)
     index = {net.name: k for k, net in enumerate(ir.nets)}
     plan: _Plan | None = None
     plane_width: dict[str, float] = {}
     plane_rules: dict[str, NetRule] = {}
     plane_layers: dict[str, list[str]] = {}
     plane_areas: dict[str, list[list[tuple[float, float]]]] = {}
+    # routing.maze 0.9 (stack mode only): each plane net's zones with their layers, for the typed plane vias
+    plane_layer_areas: dict[str, list[tuple[str, list[tuple[float, float]]]]] = {}
     if keepouts or plane_nets:
         for name in sorted(plane_nets or {}):
             if name not in index:
@@ -4357,6 +5884,11 @@ def route_board(
                 raise CompileError(f"plane net {name!r}: no plane zone given (a pad via must land inside one)")
             plane_layers[name] = list(dict.fromkeys(str(layer) for layer, _ in entries))
             plane_areas[name] = [[(float(x), float(y)) for x, y in poly] for _, poly in entries]
+            if stack is not None:  # routing.maze 0.9: a zone lies on a plane layer the stack gives this net
+                for layer in plane_layers[name]:
+                    if (layer, name) not in stack.planes:
+                        raise CompileError(f"cannot route: plane net {name!r} has a zone on {layer}, which is not a plane layer of that net in the stack")
+                plane_layer_areas[name] = [(str(layer), area) for (layer, _), area in zip(entries, plane_areas[name], strict=True)]
             rule = eff.pop(name, None)
             if rule is not None:
                 plane_rules[name] = rule
@@ -4381,12 +5913,20 @@ def route_board(
         keepouts=list(keepouts or ()) or None, ko_width=max(widths), plane=plane_width or None, plane_areas=plane_areas or None,
         no_escape=pair_nets,
         net_rules={index[name]: (float(r.width_mm), float(r.clearance_mm), r.neckdown_width_mm, r.neckdown_radius_mm) for name, r in eff.items()},
+        plane_layer_areas=plane_layer_areas or None, stack=stack,
+        # routing.maze 0.9 (stack mode): one net's holes at least KiCad's hole-to-hole minimum apart, where it exceeds the clearance
+        hole_gap=max(p.clearance_mm, checked["min_hole_to_hole"]) if checked else None,
     )
-    if board.escape_ran and board.escape_min_width > p.escape_min_width_mm + _EPS:
+    fab_escape = max(escape_given, _fab_track_minimum(ir))
+    if board.escape_ran and fab_escape > escape_given + _EPS:
         # routing.maze 0.6: the fab's min_track_width_mm raised the narrowest escape stub - recorded like every other raise, and only on a
-        # board with escapes (the knob is in no other board's provenance)
-        raised["escape_min_width_mm"] = (p.escape_min_width_mm, board.escape_min_width)
+        # board with escapes (the knob is in no other board's provenance); on a stack board against the caller's value, before KiCad's
+        # minimum (kicad_floor records what that adds beyond the fab's)
+        raised["escape_min_width_mm"] = (escape_given, fab_escape)
+    if board.escape_ran and board.escape_min_width > p.escape_min_width_mm + _EPS:
         p = replace(p, escape_min_width_mm=board.escape_min_width)
+    if not board.escape_ran:  # routing.maze 0.9: like the fab's raise, the narrowest escape stub's is recorded on a board with escapes only
+        floored.pop("escape_min_width_mm", None)
     if board.custom_pads:  # routing.maze 0.5 (module docstring: custom pads): its own stamp and the pads it modelled, on every item
         entry = "custom_pads:" + ",".join(board.custom_pads) + ";model=anchor+primitive_boxes"
         words = (f"custom pad(s) {', '.join(board.custom_pads)} are obstacles as the box of their anchor plus one box around each copper "
@@ -4422,6 +5962,55 @@ def route_board(
         else:
             plan = _Plan(ROUTER_FANOUT_VERSION, (*plan.derived, entry), head + plan.note.removeprefix(f"routing.maze {plan.version}: ") + "; " + words,
                          escape=True)
+    if board.rules08:  # routing.maze 0.8 (module docstring: via fan-out): its own stamp, the footprints and the fanned-out pads, on every item
+        fanned = [row["pad"] for row in board.escapes if row["kind"] == "dogbone"]
+        entry = f"via_fanout:{','.join(board.dogbone_refs)};pads={','.join(fanned)};model=alternate+via"
+        words = (f"the waiting pads of {', '.join(board.dogbone_refs)} (0.6 / 0.7 left a pad of each without an escape) leave in alternation, every "
+                 f"other pad of a row by a stub to a via ({', '.join(fanned) or 'none'}), the track continuing on the other outer layer")
+        head = f"routing.maze {ROUTER_DOGBONE_VERSION}: "
+        if plan is None:
+            plan = _Plan(ROUTER_DOGBONE_VERSION, (entry,), head + words, escape=True)
+        else:
+            plan = _Plan(ROUTER_DOGBONE_VERSION, (*plan.derived, entry), head + plan.note.removeprefix(f"routing.maze {plan.version}: ") + "; " + words,
+                         escape=True)
+    if board.stack is not None:  # routing.maze 0.9 (module docstring: stack mode): its own stamp, last, and the stack on every item
+        st = board.stack
+        types = ", ".join(f"{v.kind} {v.top}-{v.bottom}" for v in st.vias)
+        entry = (f"stack:{st.label};signal={'+'.join(st.signal)};planes={','.join(f'{layer}={net}' for layer, net in st.planes)};"
+                 f"vias={','.join(f'{v.kind}:{v.top}-{v.bottom}' for v in st.vias)};size={p.via_diameter_mm}/{p.via_drill_mm};cost={p.via_cost};"
+                 "model=span+barrel+xy_all_vias+no_stacked;"
+                 f"kicad_minimums=track:{checked['min_track_width']},clearance:{checked['min_clearance']},edge:{checked['min_copper_edge_clearance']},"
+                 f"via:{checked['min_via_diameter']}/{checked['min_through_hole_diameter']},hole_to_hole:{checked['min_hole_to_hole']}")
+        words = (f"routed on the signal layers {', '.join(st.signal)} of the {st.label} stack; via types {types} (a generic stack's stated choice, "
+                 "not a fab's: one via size and one via cost for every type, every via kept clear of every other via in x-y, no stacked vias); "
+                 "rule nets and coupled pairs stay on F.Cu/B.Cu with through vias; every track and escape stub at least "
+                 f"{checked['min_track_width']:g} mm wide, {checked['min_clearance']:g} mm from other nets' copper and copper "
+                 f"{checked['min_copper_edge_clearance']:g} mm from the board edge, every via at least {checked['min_via_diameter']:g} mm across "
+                 f"with a hole of at least {checked['min_through_hole_diameter']:g} mm - the minimums kicad-cli DRC checks this board against (the "
+                 "project file's rules, else KiCad's own)")
+        if board.search_n:  # routing.maze 0.9, N signal layers (module docstring): the search's and the negotiation's stated knobs
+            STACK_SEARCH.check()
+            entry += f";net_hole_gap={p.via_drill_mm}+{board.hole_gap};via_sites=exact;" + STACK_SEARCH.derived_from_entry()
+            sp = STACK_SEARCH
+            dirs = ", ".join(f"{layer} {d}" for layer, d in st.directions) or "none stated"
+            words += (f"; N-layer search over barrel states: via cost x{', x'.join(f'{f:g} {kind}' for kind, f in sp.via_factors)} (NXP AN10778 "
+                      f"Rev. 2 sec. 4-5: prefer through vias), a wrong-way step x{sp.wrong_way:g} the node cost (preferred directions {dirs}; "
+                      f"TI SPRAAR7J sec. 3.12 Table 3-1 note 1, TI SCAA082A sec. 2.5), A* weight {sp.astar_fac:g}; VPR's negotiation schedule "
+                      f"(MIT, Copyright 2012 VTR Developers: present factor {sp.first_iter_pres_fac:g} in iteration 1, {sp.initial_pres_fac:g} in "
+                      f"iteration 2, x{sp.pres_fac_mult:g} per iteration up to {sp.max_pres_fac:g}, history + overuse x {sp.acc_fac:g} from "
+                      "iteration 2) in place of present_cost / present_growth / history_cost, the conflicting nets rerouted in a per-iteration "
+                      f"sha256 order; a net's own vias {p.via_drill_mm + board.hole_gap:g} mm apart centre to centre (via drill + the hole-to-hole "
+                      f"gap: the larger of the router's clearance and the {checked['min_hole_to_hole']:g} mm kicad-cli DRC checks - no hole-to-hole "
+                      "limit is in the IR); "
+                      "every via site measured exactly against the static copper of its span's layers (the clearance from each pad, stub and "
+                      "via by its exact shape, not the owner map's cells)")
+        head = f"routing.maze {ROUTER_STACK_VERSION}: "
+        layers = "/".join(st.signal)
+        if plan is None:
+            plan = _Plan(ROUTER_STACK_VERSION, (entry,), head + words, layers=layers)
+        else:
+            plan = _Plan(ROUTER_STACK_VERSION, (*plan.derived, entry), head + plan.note.removeprefix(f"routing.maze {plan.version}: ") + "; " + words,
+                         escape=plan.escape, layers=layers)
     clearance = {index[name]: r.clearance_mm for name, r in eff.items()}
 
     def clear_of(idx: int) -> float:
@@ -4474,7 +6063,9 @@ def route_board(
         via_keys.add(pr.c)
         _setup_pair(board, pr, clear_of, track_of)
     key0: _Key = (p.track_width_mm, p.clearance_mm)
-    neg = _Negotiation(board, p, [key0, *sorted(track_keys - {key0})], [p.clearance_mm, *sorted(via_keys - {p.clearance_mm})])
+    # routing.maze 0.9, N signal layers (module docstring): its own negotiation; every other board keeps 0.2's
+    negotiation = _NegotiationN if board.search_n else _Negotiation
+    neg = negotiation(board, p, [key0, *sorted(track_keys - {key0})], [p.clearance_mm, *sorted(via_keys - {p.clearance_mm})])
     if pairs:  # the pair's virtual net takes the place of the first of its two nets in the order
         placed: set[str] = set()
         new_order: list[Net] = []
@@ -4518,6 +6109,18 @@ def route_board(
             unrouted.pop(net.name, None)
             routes[net.name] = got
             neg.add(got)
+        if isinstance(neg, _NegotiationN):  # routing.maze 0.9, N signal layers (module docstring): VPR's schedule, a shuffled order
+            conflicting, row, over_n = _iteration_n(neg, order, routes, iterations, len(todo))
+            history.append(row)
+            if progress is not None:
+                progress(dict(row))
+            if not conflicting:
+                legal = True
+                break
+            neg.advance(iterations, *over_n)
+            names = set(conflicting)
+            todo = sorted((net for net in order if net.name in names), key=lambda net: _shuffle_key(iterations + 1, net.name))
+            continue
         over_t: set[int] = set()
         over_v: set[int] = set()
         conflicting: list[str] = []
@@ -4547,9 +6150,47 @@ def route_board(
         todo = [net for net in order if net.name in names]
     dropped: list[str] = []
     recovered: list[str] = []
+    end_game: list[dict[str, Any]] | None = None
+    if not legal and isinstance(neg, _NegotiationN):  # routing.maze 0.9, N signal layers (module docstring: the end game)
+        end_game = _end_game(neg, order, routes, route_one)
+        legal = not any(any(neg.overused(route)) for route in routes.values())
+    if board.search_n and plan is not None and (board.rules08 or end_game is not None):
+        # routing.maze 0.9, N signal layers: the stack entry (last) and the note name what the static phase and the end game did
+        extra, words = "", []
+        if board.rules08:
+            under = board.planes_under_package()
+            extra += f";planes_under_package={','.join(under) or 'none'}"
+            if board.plane_inset:
+                extra += ";plane_vias=deeper_under_package_after_static_web_cut"
+            words.append(f"the waiting plane pads of {', '.join(board.dogbone_refs)} looked for their via under the package first "
+                         f"({', '.join(under) or 'none'} took one there)")
+        if end_game is not None:
+            moved = [row["net"] for row in end_game]
+            extra += f";end_game=rip_up<={END_GAME_RIP_UP}:{','.join(moved) or 'none'}"
+            words.append(f"the end game rerouted the nets {iterations} iteration(s) left in conflict against the legal copper, ripping up at "
+                         f"most {END_GAME_RIP_UP} net(s) to make room for one ({', '.join(moved) or 'none'} moved)")
+        plan = replace(plan, derived=(*plan.derived[:-1], plan.derived[-1] + extra), note=f"{plan.note}; {'; '.join(words)}")
     if not legal:
         dropped = _drop_conflicts(neg, order, routes, iterations, unrouted)
         recovered = _recover(neg, order, routes, dropped, unrouted, route_one)
+    web: dict[str, Any] | None = None
+    if board.stack is not None and plan is not None and plane_layer_areas:
+        # routing.maze 0.9 (stack mode, module docstring: the plane web): the plane vias the fill still joins, the nets whose vias cut one
+        # off routed again; the stack entry (last) and the note say so only where the check found a via cut off
+        zone_clearances = _web_clearances(ir, plane_layer_areas, checked["min_clearance"])
+        web = _plane_web_pass(board, neg, order, routes, route_one, plane_layer_areas, zone_clearances)
+        if web["rerouted"] or web["cut"]:
+            moves = ",".join(row["item"] + ">" + "+".join(row["nets"]) for row in web["rerouted"]) or "none"
+            nets = ", ".join(dict.fromkeys(name for row in web["rerouted"] for name in row["nets"]))
+            extra = (f";plane_web=clearance:{web['clearance_mm']},min_thickness:{ZONE_MIN_THICKNESS_MM},keep:{web['keep_mm']}:{moves}"
+                     + (f";cut={','.join(web['cut'])}" if web["cut"] else ""))
+            upto = "" if len({c for row in zone_clearances.values() for c in row}) == 1 else "up to "
+            words = (f"the plane web check (TI SCAA082A sec. 2.5: closely spaced vias must not cut slots in a plane) found plane via(s) the "
+                     f"fill no longer joins - KiCad's zone fill at {upto}{web['clearance_mm']:g} mm clearance, pruned below {ZONE_MIN_THICKNESS_MM:g} mm; "
+                     + (f"the nets whose vias cut them off ({nets}) were routed again against the legal copper with no via crossing that plane "
+                        f"within {web['keep_mm']:g} mm of their copper" if nets else "no net's via could be moved")
+                     + (f"; still cut off: {', '.join(web['cut'])}" if web["cut"] else ""))
+            plan = replace(plan, derived=(*plan.derived[:-1], plan.derived[-1] + extra), note=f"{plan.note}; {words}")
     if plan is None:
         if not eff:
             result = _result_0_2(board, p, raised, order, routes, unrouted, skipped, iterations, legal, history, dropped, recovered)
@@ -4575,6 +6216,45 @@ def route_board(
         result.stats["escape_refused"] = dict(board.escape_refused)
     if board.rules07:  # routing.maze 0.7: the fan-out rooms kept and the plane pads whose via they kept out
         result.stats["fanout_room"] = {"rooms": {ref: [_q(v) for v in box] for ref, box in board.fanout_rooms.items()}, "kept_out": list(board.fanout_kept)}
+    if board.rules08:  # routing.maze 0.8: the footprints escaped in alternation and the pads that left by a via
+        result.stats["via_fanout"] = {"footprints": list(board.dogbone_refs), "pads": [row["pad"] for row in board.escapes if row["kind"] == "dogbone"]}
+    if board.stack is not None:  # routing.maze 0.9: the stack, how many vias of each type were emitted, the stitch rule's outcome
+        st = board.stack
+        counts: dict[tuple[str, str, str], int] = {}
+        for v in result.vias:
+            key = ("through", *LAYERS) if v.kind is None else (v.kind, *v.layers)
+            counts[key] = counts.get(key, 0) + 1
+        result.stats["stack"] = {
+            "label": st.label,
+            "signal_layers": list(st.signal),
+            "plane_layers": {layer: net for layer, net in st.planes},
+            "via_types": [{"kind": v.kind, "top": v.top, "bottom": v.bottom, "count": counts.get((v.kind, v.top, v.bottom), 0)} for v in st.vias],
+            "stitch": dict(board.plane_stitch),
+        }
+        if board.search_n:  # routing.maze 0.9, N signal layers: the routing layers, the signal via types and the search's knobs
+            sp = STACK_SEARCH
+            result.stats["stack"]["search"] = {
+                "routing_layers": list(board.layer_names),
+                "signal_types": [vt.label for vt in board.signal_types],
+                "directions": {name: d for name, d in zip(board.layer_names, board.layer_dirs) if d is not None},
+                "astar_fac": sp.astar_fac,
+                "wrong_way": sp.wrong_way,
+                "via_factors": dict(sp.via_factors),
+                "schedule": {"first_iter_pres_fac": sp.first_iter_pres_fac, "initial_pres_fac": sp.initial_pres_fac, "pres_fac_mult": sp.pres_fac_mult,
+                             "max_pres_fac": sp.max_pres_fac, "acc_fac": sp.acc_fac, "source": "VPR (MIT, Copyright 2012 VTR Developers)"},
+            }
+            if board.rules08:  # the via fan-out's plane pads whose via went under the package (module docstring: plane pads under the package)
+                result.stats["stack"]["search"]["planes_under_package"] = board.planes_under_package()
+            if board.plane_static_web is not None:
+                result.stats["stack"]["search"]["static_plane_web"] = board.plane_static_web
+            if end_game is not None:  # what the end game moved (module docstring: the end game)
+                result.stats["stack"]["search"]["end_game"] = {"rip_up_limit": END_GAME_RIP_UP, "moved": end_game}
+        # routing.maze 0.9 (stack mode): the minimums kicad-cli DRC checks and what they raised (module docstring: KiCad's minimums), and
+        # the plane web check's outcome (module docstring: the plane web)
+        result.stats["kicad_minimums"] = {"checked": dict(checked), "raised": {name: [given, effective] for name, (given, effective) in floored.items()}}
+        if web is not None:
+            result.stats["plane_web"] = web
+    corners.mitre_corners(result, board, corner_style)  # routing.corners 0.1 / 0.2: last, on the settled copper ("orthogonal": nothing)
     return result
 
 
@@ -4608,8 +6288,14 @@ def _add_planes(
                  + "; no track joins two pads")
         prov = _provenance(net, p, "plane", iterations, legal, story=story, plan=plan)
         copper = _NetCopper(board, net, prov, widths[name])
-        for t, layer, k in links:
+        types = board.plane_link_types.get(name, [None] * len(links))
+        for (t, layer, k), ti in zip(links, types, strict=True):
             copper.add_stub(t, layer)
+            if ti is not None:  # routing.maze 0.9 (stack mode): the stub, the run to the typed via on the pad's layer, the via
+                if t.escape is None:
+                    copper.add_path([layer * board.n + t.cell, layer * board.n + k])
+                copper.add_via(k, board.vtypes[ti])
+                continue
             if t.escape is not None:  # routing.maze 0.6: the escape stub ends on its via
                 copper.add_path([layer * board.n + k, (1 - layer) * board.n + k])
                 continue
@@ -4619,6 +6305,8 @@ def _add_planes(
         length = _q(copper.length_mm())
         lengths[name] = length
         row.update(vias=len(copper.vias), pads=[t.label for t, _, _ in links], through_hole=list(board.plane_tht.get(name, [])), length_mm=length)
+        if board.stack is not None:  # routing.maze 0.9: each pad's via type, aligned with "pads"
+            row["via_kinds"] = ["through:F.Cu-B.Cu" if ti is None else board.vtypes[ti].label for ti in types]
         if joined:
             row["joined_by_footprint_vias"] = joined
     ids = [k["id"] for k in board.keepout_stats]
@@ -4858,7 +6546,7 @@ def _result_rules(
         idx = board.net_index[name]
         problem = None
         for t in emitted[name].tracks:
-            problem = world.seg_problem(idx, LAYERS.index(t.layer), t.start, t.end, t.width_mm, track_clearance(name, t), f"the meandered track of {name}")
+            problem = world.seg_problem(idx, board.layer_index(t.layer), t.start, t.end, t.width_mm, track_clearance(name, t), f"the meandered track of {name}")
             if problem:
                 break
         if problem:
@@ -5117,6 +6805,41 @@ def _compensate(
     return f"the length difference {needed:.3f} mm was not compensated: {last}"
 
 
+def _iteration_n(
+    neg: _NegotiationN, order: list[Net], routes: dict[str, _NetRoute], iteration: int, rerouted: int,
+) -> tuple[list[str], dict[str, Any], tuple[dict[int, int], dict[int, int]]]:
+    """routing.maze 0.9, N signal layers: the conflicting nets after iteration ``iteration`` (``order``'s order), its history row and the
+    over-used cells with their overuse (VPR's ``occ - capacity``; a cell over-used by several routes counts once, at its largest).
+
+    The row is 0.2's (``iteration``, ``rerouted``, ``overused_cells``, ``conflicting``) plus the present factor the iteration ran at,
+    the search states it touched and its over-used via cells per signal via type (``kind:top-bottom`` -> count)."""
+    board = neg.board
+    n = board.n
+    over_t: dict[int, int] = {}
+    over_v: dict[int, int] = {}
+    conflicting: list[str] = []
+    for net in order:
+        route = routes.get(net.name)
+        if route is None:
+            continue
+        ct, cv = neg.overuse(route)
+        if ct or cv:
+            conflicting.append(net.name)
+            for c, o in ct.items():
+                if o > over_t.get(c, 0):
+                    over_t[c] = o
+            for v, o in cv.items():
+                if o > over_v.get(v, 0):
+                    over_v[v] = o
+    per_type = {vt.label: 0 for vt in board.signal_types}
+    for v in over_v:
+        per_type[board.signal_types[v // n].label] += 1
+    row = {"iteration": iteration, "rerouted": rerouted, "overused_cells": len(over_t) + len(over_v), "conflicting": list(conflicting),
+           "present_factor": neg.pres, "states_touched": neg.touched, "overused_vias": per_type}
+    neg.touched = 0
+    return conflicting, row, (over_t, over_v)
+
+
 def _partners(neg: _Negotiation, route: _NetRoute, routes: dict[str, _NetRoute], name: str) -> list[str]:
     """The other nets whose halo holds some of ``route``'s copper (sorted by name)."""
     out = []
@@ -5169,3 +6892,277 @@ def _recover(
         unrouted.pop(net.name, None)
         recovered.append(net.name)
     return recovered
+
+
+def _end_game(neg: _NegotiationN, order: list[Net], routes: dict[str, _NetRoute], route_one: Callable[..., _NetRoute | str]) -> list[dict[str, Any]]:
+    """routing.maze 0.9, N signal layers (module docstring: the end game): rip up and reroute the nets the last negotiation iteration
+    left in conflict, before any is dropped; one row per net it moved (``net``, ``how`` - ``"rerouted"`` or ``"made room"`` -, the
+    nets it ``ripped_up``).
+
+    Each net (``order``'s order) still in conflict when its turn comes is ripped up and routed strictly - every other net's copper an
+    obstacle, its own terminal cells included, as :func:`_recover` routes a dropped net. When no such route exists it is routed at the
+    negotiated costs (the cheapest route crosses the least of the others' copper the present factor and the history charge for), the
+    nets whose copper that route breaks (:func:`_partners`; at most :data:`END_GAME_RIP_UP`) are ripped up, it is added - legal now,
+    since only they held cells of it - and they are routed strictly in ``order``'s order. When one of them finds no route, every change
+    is undone and the net keeps its route, still in conflict (the drop phase decides). The pass is repeated while it moves a net: every
+    route it adds is legal by construction, so each move leaves one net fewer in conflict and the passes end. Fixed orders, no clock
+    (TritonRoute's clipped rip-up-and-reroute repair, OpenROAD, BSD-3, as an idea; no code taken)."""
+    pos = {net.name: i for i, net in enumerate(order)}
+    by_name = {net.name: net for net in order}
+    rows: list[dict[str, Any]] = []
+    while True:  # a pass over the conflicting nets, repeated while one moves (each move leaves one net fewer in conflict)
+        moved = len(rows)
+        for net in order:
+            if net.name in routes and any(neg.overused(routes[net.name])):
+                _end_game_net(neg, net, routes, route_one, pos, by_name, rows)
+        if len(rows) == moved:
+            return rows
+
+
+def _end_game_net(
+    neg: _NegotiationN, net: Net, routes: dict[str, _NetRoute], route_one: Callable[..., _NetRoute | str], pos: Mapping[str, int],
+    by_name: Mapping[str, Net], rows: list[dict[str, Any]],
+) -> None:
+    """One conflicting net's turn in :func:`_end_game`: rerouted strictly, or made room for, or left as it was; a row when it moved."""
+    name = net.name
+    old = routes.pop(name)
+    neg.remove(old)
+    got = route_one(net, True)
+    if not isinstance(got, str):
+        got.how = "rerouted"
+        routes[name] = got
+        neg.add(got)
+        rows.append({"net": name, "how": "rerouted", "ripped_up": []})
+        return
+    got = route_one(net)
+    crossed = [] if isinstance(got, str) else sorted(_partners(neg, got, routes, name), key=pos.__getitem__)
+    if isinstance(got, str) or len(crossed) > END_GAME_RIP_UP:
+        routes[name] = old  # no route at all, or one crossing more nets than the end game rips up
+        neg.add(old)
+        return
+    saved = {other: routes.pop(other) for other in crossed}
+    for route in saved.values():
+        neg.remove(route)
+    routes[name] = got
+    neg.add(got)
+    redone: list[str] = []
+    ok = not any(neg.overused(got))  # only the ripped-up nets held cells of it
+    for other in crossed if ok else ():
+        again = route_one(by_name[other], True)
+        if isinstance(again, str):
+            ok = False
+            break
+        again.how = "rerouted"
+        routes[other] = again
+        neg.add(again)
+        redone.append(other)
+    if ok:
+        got.how = "made room" if crossed else "rerouted"
+        rows.append({"net": name, "how": got.how, "ripped_up": crossed})
+        return
+    for other in redone:  # one of them found no route: every change undone, the net keeps its route
+        neg.remove(routes.pop(other))
+    neg.remove(routes.pop(name))
+    for other, route in saved.items():
+        routes[other] = route
+        neg.add(route)
+    routes[name] = old
+    neg.add(old)
+
+
+# --------------------------------------------------------------------------- the plane web (routing.maze 0.9, stack mode)
+
+
+def _web_items(board: _Board, routes: Mapping[str, _NetRoute]) -> tuple[list[PlaneItem], list[str | None]]:
+    """routing.maze 0.9 (stack mode, module docstring: the plane web): every through-hole pad and via of the board as the plane web
+    check reads it (:class:`~ai_eda.tools.routing.plane_web.PlaneItem`: the copper layers of the via's span, every copper layer of a
+    through-hole pad), and per item the net whose negotiated path drilled it - ``None`` for the static copper (pads, plane vias,
+    escape and fan-out vias), which no reroute moves. The vias are the ones the emission writes, at the cells it writes them. No
+    track is listed: every track of this router lies on a routing layer, and no routing layer is a plane layer (:func:`_check_stack`
+    refuses a layer that is both), so none knocks a plane out (the check would take one, ``kind="track"``)."""
+    copper = list(board.stack.copper)  # type: ignore[union-attr]
+    rv, n = board.p.via_diameter_mm / 2.0, board.n
+    names = {idx: name for name, idx in board.net_index.items()}
+    items: list[PlaneItem] = []
+    drilled: list[str | None] = []
+
+    def via(net: str, k: int, vt: _VType | None, label: str, owner: str | None) -> None:
+        x, y = board.pos(k)
+        span = copper if vt is None or vt.kind == "through" else copper[vt.lo:vt.hi + 1]
+        items.append(PlaneItem("via", label, net, x, y, rv, (x - rv, y - rv, x + rv, y + rv), frozenset(span)))
+        drilled.append(owner)
+
+    for geom in board.pads:
+        if geom.kind == "pad" and len(geom.layers) == board.R:  # a through-hole pad (or NPTH hole): on every copper layer
+            items.append(PlaneItem("pad", f"{geom.ref}.{geom.number}", names.get(geom.net) if geom.net >= 0 else None, geom.cx, geom.cy,
+                                   geom.inscribed_r, geom.box, frozenset(copper)))
+            drilled.append(None)
+    for name in sorted(board.plane_links):
+        if name in board.plane_problems:
+            continue  # no copper (_add_planes)
+        links = board.plane_links[name]
+        for (t, _layer, k), ti in zip(links, board.plane_link_types.get(name) or [None] * len(links), strict=True):
+            via(name, k, None if ti is None else board.vtypes[ti], f"{t.label}:via", None)
+    for name in sorted(routes):
+        if name not in board.net_index:
+            continue  # a coupled pair's virtual net: no vias
+        for kind, item, layer in routes[name].steps:
+            if kind == "stub":
+                if item.escape is not None and item.escape.kind == "dogbone":
+                    via(name, item.escape.cell, None, f"{item.label}:fan-out via", None)
+                continue
+            if kind != "path":
+                continue
+            types = iter(layer) if isinstance(layer, tuple) else None
+            for a, b in zip(item, item[1:]):
+                if a // n != b // n:  # a layer change: the via at the cell of a (_NetCopper.add_path)
+                    x, y = board.pos(a % n)
+                    via(name, a % n, board.signal_types[next(types)] if types is not None else None, f"{name}@{x:g}/{y:g}", name)
+    return items, drilled
+
+
+def _web_gap(item: PlaneItem, x: float, y: float) -> float:
+    """How far the point ``(x, y)`` lies from the item's copper (a via's disc, a pad's box)."""
+    if item.kind == "via":
+        return math.hypot(x - item.x, y - item.y) - item.r
+    x0, y0, x1, y1 = item.box
+    return math.hypot(max(x0 - x, 0.0, x - x1), max(y0 - y, 0.0, y - y1))
+
+
+def _web_clearances(
+    ir: CircuitIR, planes: Mapping[str, Sequence[tuple[str, Sequence[tuple[float, float]]]]], floor: float,
+) -> dict[str, list[float]]:
+    """routing.maze 0.9 (stack mode, module docstring: the plane web): per plane net, the clearance KiCad's fill of each of its zones
+    keeps from other nets' copper - the clearance the compiler writes for the IR zone of that net, layer and polygon (its own
+    ``clearance_mm``, else :data:`~ai_eda.compilers.pcb.ZONE_CLEARANCE_MM`; the latter too for a plane with no IR zone behind it),
+    never below ``floor`` (the clearance kicad-cli DRC checks, which KiCad's fill keeps as well)."""
+    zones = ir.pcb.zones if ir.pcb is not None else []
+    out: dict[str, list[float]] = {}
+    for net in sorted(planes):
+        row: list[float] = []
+        for layer, poly in planes[net]:
+            shape = [(float(x), float(y)) for x, y in poly]
+            own = [ZONE_CLEARANCE_MM if z.clearance_mm is None else float(z.clearance_mm) for z in zones
+                   if z.net == net and z.layer == layer and [(float(x), float(y)) for x, y in z.polygon] == shape]
+            row.append(max(max(own, default=ZONE_CLEARANCE_MM), floor))
+        out[net] = row
+    return out
+
+
+def _plane_web_pass(
+    board: _Board, neg: _Negotiation, order: list[Net], routes: dict[str, _NetRoute], route_one: Callable[..., _NetRoute | str],
+    planes: Mapping[str, Sequence[tuple[str, Sequence[tuple[float, float]]]]], clearances: Mapping[str, Sequence[float]] | None = None,
+) -> dict[str, Any]:
+    """routing.maze 0.9 (stack mode, module docstring: the plane web): check which plane vias and through-hole pads of each plane net
+    the fill still joins (:func:`~ai_eda.tools.routing.plane_web.plane_web` over :func:`_web_items`, each zone at its own clearance -
+    ``clearances``, :func:`_web_clearances`; :data:`~ai_eda.compilers.pcb.ZONE_CLEARANCE_MM` without) and move what cut them off.
+
+    For each item cut off (plane net name order, then item order), the *cutters* are the other nets whose negotiated vias cross one of
+    the item's plane layers nearer than ``keep`` to its copper - ``via_diameter/2 + the largest zone clearance + zone minimum
+    thickness`` plus the check's tolerance: a via farther away, its knockout grown by half the minimum thickness, leaves the item's
+    reach (its copper grown by half the minimum thickness) untouched. Every via site of a signal type crossing such a layer within
+    ``keep`` of the item is closed for every net (:attr:`_Board.via_static_n`), the cutters are ripped up and routed strictly in
+    ``order``'s order, every other net's copper an obstacle (as :func:`_recover`), and the check is run again: the move is kept only
+    when the item is joined and no item joined before is cut off; when one cutter finds no route, or the move left the item cut off
+    (static copper or vias farther than ``keep`` cut it too) or cut another item off, every change is undone. An item without
+    cutters (static copper - pads, plane, escape and fan-out vias - or vias farther away cut it off), or whose move was undone, is
+    tried once and stays cut off. If moving all nearby cutter nets fails, each is tried alone in that same order, with the same
+    exclusion and rollback checks: a nearby via need not be what cut the item off, and moving its net can cut another plane.
+    After a kept move the next round starts from the check that move ran, until a round moves none.
+    Fixed orders, no clock; every route it adds is legal by construction.
+
+    Returns the stats row: the fill model (``clearance_mm`` - the largest zone clearance -, ``min_thickness_mm``, and ``stricter``:
+    what the check leaves out of KiCad's fill, :data:`~ai_eda.tools.routing.plane_web.WEB_STRICTER`), ``keep_mm``, the items checked
+    per plane net, ``rerouted`` (``item``, plane ``net``, its position ``at`` and the ``nets`` routed again), ``cut`` (the items still
+    cut off) and ``why`` (per such item: ``"no negotiated via near it"``, the net that found no strict route, or what the undone move
+    did).
+    """
+    p = board.p
+    widest = max((c for row in (clearances or {}).values() for c in row), default=ZONE_CLEARANCE_MM)
+    keep = _q(p.via_diameter_mm / 2.0 + widest + ZONE_MIN_THICKNESS_MM + WEB_TOLERANCE_MM)
+    by_name = {net.name: net for net in order}
+    pos = {net.name: i for i, net in enumerate(order)}
+    g = p.grid_mm
+    tried: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    why: dict[str, str] = {}
+
+    def check() -> tuple[list[PlaneItem], list[str | None], Any, list[str]]:
+        items, drilled = _web_items(board, routes)
+        web = plane_web(planes, items, clearance=ZONE_CLEARANCE_MM, min_thickness=ZONE_MIN_THICKNESS_MM, clearances=clearances,
+                        holes=board.plane_holes)
+        return items, drilled, web, [items[i].label for net in sorted(web.cut) for i in web.cut[net]]
+
+    items, drilled, web, cut_now = check()
+    while True:
+        todo = [(net, items[i]) for net in sorted(web.cut) for i in web.cut[net] if items[i].label not in tried]
+        moved = False
+        for net, it in todo:  # one move per check: a move changes the copper the next item's cutters are read from
+            tried.add(it.label)
+            layers = [layer for layer, _poly in planes[net] if layer in it.layers]
+            cutters = sorted({drilled[j] for j, other in enumerate(items) if drilled[j] is not None and other.net != net
+                              and any(layer in other.layers for layer in layers) and _web_gap(it, other.x, other.y) < keep},
+                             key=lambda name: pos.get(name, len(pos)))
+            if not cutters or any(name not in by_name for name in cutters):
+                why[it.label] = "no negotiated via near it"  # static copper (pads, plane, escape and fan-out vias) or vias farther away
+                continue
+            # Nearby vias are only candidate cutters: moving all of them can cut another plane unnecessarily.
+            trials = [cutters, *([name] for name in cutters)] if len(cutters) > 1 else [cutters]
+            for moving in trials:
+                # close the via sites near it for every signal type that crosses one of its plane layers
+                types = [t for t, vt in enumerate(board.signal_types) if any(layer in vt.planes for layer in layers)]
+                reach = keep + max(it.box[2] - it.box[0], it.box[3] - it.box[1]) / 2.0
+                i0, i1 = max(0, int((it.x - reach - board.ox) / g)), min(board.nx - 1, int((it.x + reach - board.ox) / g) + 1)
+                j0, j1 = max(0, int((it.y - reach - board.oy) / g)), min(board.ny - 1, int((it.y + reach - board.oy) / g) + 1)
+                closed: list[tuple[int, int, int | None]] = []
+                for jj in range(j0, j1 + 1):
+                    for ii in range(i0, i1 + 1):
+                        k = jj * board.nx + ii
+                        if _web_gap(it, *board.xy(k)) < keep - _EPS:
+                            for t in types:
+                                cache = board.via_static_n[t]
+                                if cache[k] != BLOCKED:
+                                    closed.append((t, k, cache[k]))
+                                    cache[k] = BLOCKED
+                saved = {name: routes.pop(name) for name in moving}
+                for route in saved.values():
+                    neg.remove(route)
+                redone: list[str] = []
+                failed: str | None = None
+                for name in moving:
+                    got = route_one(by_name[name], True)
+                    if isinstance(got, str):
+                        failed = name
+                        break
+                    got.how = "plane web"
+                    routes[name] = got
+                    neg.add(got)
+                    redone.append(name)
+                if failed is None:
+                    after = check()
+                    worse = [label for label in after[3] if label not in cut_now]
+                    if it.label not in after[3] and not worse:  # the move joined it and cut nothing else off: kept
+                        rows.append({"item": it.label, "net": net, "at": [it.x, it.y], "nets": moving})
+                        items, drilled, web, cut_now = after
+                        moved = True
+                        break
+                    why[it.label] = (f"routing {', '.join(moving)} again cut {', '.join(worse)} off" if worse else
+                                     f"still cut off after routing {', '.join(moving)} again (static copper or vias farther than keep cut it too)")
+                else:
+                    why[it.label] = f"no strict route for {failed}"
+                for name in redone:  # one of them found no route, or the move did not help: every change undone
+                    neg.remove(routes.pop(name))
+                for name, route in saved.items():
+                    routes[name] = route
+                    neg.add(route)
+                for t, k, old in closed:
+                    board.via_static_n[t][k] = old
+            if moved:
+                break
+        if not moved:
+            break
+    return {
+        "clearance_mm": widest, "min_thickness_mm": ZONE_MIN_THICKNESS_MM, "stricter": WEB_STRICTER, "keep_mm": keep,
+        "checked": {net: len(web.items[net]) for net in sorted(web.items)}, "rerouted": rows, "cut": cut_now,
+        "why": {label: why.get(label, "not tried") for label in cut_now},
+    }

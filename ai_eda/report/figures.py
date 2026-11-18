@@ -64,7 +64,7 @@ from types import EllipsisType
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape
 
-from ai_eda.ir import CircuitIR, Expectation, SilkKind, ValidationStatus
+from ai_eda.ir import CircuitIR, Expectation, SilkKind, ValidationStatus, arc_geometry, arc_problem, track_length
 from ai_eda.tools.calc.si import parse_spice_number
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.geometry import custom_pad_parts, footprint_bbox, mirrored_layer, pad_angle, pad_center, pad_copper_center, pad_layers, to_board
@@ -1245,6 +1245,56 @@ def _plane_hatches(ir: CircuitIR, fig_id: str, X: Any, Y: Any) -> tuple[list[str
     return out, parts
 
 
+#: an arc - or the half of one - that rises less than this many px above its chord is drawn as the straight line between its ends:
+#: twice the 0.01 px every coordinate of a figure is written to, so the three points an arc is drawn through stay apart, and off
+#: one line, whatever the rounding does to the two ends
+_ARC_FLAT_PX = 0.02
+
+
+def _arc_path(start: tuple[float, float], mid: tuple[float, float], end: tuple[float, float], to_px: Any) -> str:
+    """The ``d`` of the SVG path that draws the circular arc from ``start`` through ``mid`` to ``end`` (board mm, as a track holds
+    them); ``to_px`` maps a board point to the figure's own coordinates (a scale and an offset; a mirrored view too).
+
+    ``M x1 y1 A r r 0 L S x2 y2``: the two ends at the figure's 0.01 px, written exactly as the end of a straight track there is.
+    Everything else is read from the points as drawn, never from the board's (a mirror turns an arc the other way): the radius is
+    that of the circle through the two ends *as written* and the arc's middle point - the path's arc then passes the middle whatever
+    the rounding did to its ends - to ten digits, because the middle of a half turn moves by ``sqrt(2 r e)`` for an error ``e`` of
+    the radius: under 0.01 px up to a radius of 1000 px, more than a figure holds; ``S`` is 1 for a positive sweep of that circle
+    (:func:`~ai_eda.ir.arc.arc_geometry`: toward larger angles with y down, the direction SVG calls positive), ``L`` 1 beyond a
+    half turn of it.
+
+    An arc that sweeps beyond a half turn is written as two such arcs through its middle (``... A .. xm ym A .. x2 y2``): the two
+    rounded ends of an arc that nearly closes do not fix its circle. An arc, or a half, that rises less than :data:`_ARC_FLAT_PX`
+    above its chord is the straight line between its ends at this resolution and is written ``L x2 y2``. ``ValueError`` for three
+    points that are no arc.
+    """
+    g = arc_geometry(start, mid, end)
+
+    def at(fraction: float) -> tuple[float, float]:
+        if fraction == 0.0:
+            return to_px((start[0], start[1]))
+        if fraction == 1.0:
+            return to_px((end[0], end[1]))
+        a = g.a0 + g.sweep * fraction
+        return to_px((g.cx + g.r * math.cos(a), g.cy + g.r * math.sin(a)))
+
+    cuts = (0.0, 1.0) if abs(g.sweep) <= math.pi else (0.0, 0.5, 1.0)
+    x0, y0 = at(0.0)
+    here = (_f(x0), _f(y0))
+    out = [f"M {here[0]} {here[1]}"]
+    for f0, f1 in zip(cuts, cuts[1:]):
+        p0, pm, p1 = at(f0), at((f0 + f1) / 2.0), at(f1)
+        there = (_f(p1[0]), _f(p1[1]))
+        if math.hypot(pm[0] - (p0[0] + p1[0]) / 2.0, pm[1] - (p0[1] + p1[1]) / 2.0) < _ARC_FLAT_PX:
+            out.append(f"L {there[0]} {there[1]}")
+        else:
+            w = arc_geometry((float(here[0]), float(here[1])), pm, (float(there[0]), float(there[1])))
+            r = _g(w.r, 10)
+            out.append(f"A {r} {r} 0 {1 if abs(w.sweep) > math.pi else 0} {1 if w.sweep > 0.0 else 0} {there[0]} {there[1]}")
+        here = there
+    return " ".join(out)
+
+
 def layer_class(layer: str) -> str:
     """The class of a copper layer's track group in a board figure: ``F.Cu`` -> ``layer-F_Cu`` (every character outside ``[A-Za-z0-9_-]`` becomes ``_``)."""
     return "layer-" + _ID_SAFE_RE.sub("_", layer)
@@ -1263,11 +1313,16 @@ def board_figure(
     from ``library``, ``ir.pcb.tracks`` / ``vias``) and refuses the same
     things with ``ValueError``: no ``ir.pcb`` / outline, a non-positive
     outline, a component without a footprint or placement, a footprint not
-    found in the library. Colours: F.Cu red, B.Cu blue (tracks to scale,
+    found in the library, an arc track whose three points are no arc.
+    Colours: F.Cu red, B.Cu blue (tracks to scale,
     round caps; SMD pads by their placed layer), through-hole pads yellow
     with a white drill, vias gray with a white drill. ``scale_px_per_mm`` is
     reduced when the board would be wider than ``max_width`` px. Every pad
-    is one ``<g class="pad">``, every track one ``<line class="track">``,
+    is one ``<g class="pad">``, every track one element of class ``track``
+    (a straight track a ``<line>``; an arc - ``Track.mid`` - a ``<path>``
+    holding a true SVG arc, :func:`_arc_path`, with the same data attributes
+    and stroke, never its chord; the copper length of the caption counts an
+    arc by its arc length, :func:`~ai_eda.ir.track_length`),
     every via one ``<g class="via">``. The layers are groups a viewer can
     toggle by class: ``outline`` (the board rect), one ``<g>`` per copper
     layer inside ``<g class="tracks">`` (:func:`layer_class`: ``layer-B_Cu``
@@ -1354,7 +1409,11 @@ def board_figure(
     other_layers = sorted({t.layer for t in tracks if t.layer not in COPPER_COLOURS})
     layer_order = ["B.Cu", *other_layers, "F.Cu"]
     # the caption line is wrapped to the figure's width before the height is known: every line must fit inside the SVG
-    length_mm = sum(math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1]) for t in tracks)
+    for t in tracks:  # the Track model refuses three points that are no arc; an arc broken by a later assignment is refused here, by name
+        problem = arc_problem(t.start, t.mid, t.end) if t.mid is not None else None
+        if problem is not None:
+            raise ValueError(f"track of {t.net!r} on {t.layer}: start {t.start} / mid {t.mid} / end {t.end} is no arc: {problem}")
+    length_mm = sum(track_length(t) for t in tracks)
     size = f"{_g(outline.width_mm)} × {_g(outline.height_mm)} mm"
     planes, plane_parts = _plane_hatches(ir, fig_id or kind, X, Y) if copper else ([], [])
     if by_class:
@@ -1411,6 +1470,13 @@ def board_figure(
                 opacity = "" if t.layer == "F.Cu" else ' stroke-opacity="0.5"'
             else:
                 stroke, opacity = COPPER_COLOURS.get(t.layer, OTHER_COPPER), ""
+            if t.mid is not None:  # an arc: one path with a straight track's classes, data attributes and stroke (never its chord)
+                d = _arc_path(t.start, t.mid, t.end, lambda p: (X(p[0]), Y(p[1])))
+                out.append(
+                    f'<path class="track" data-net="{esc(t.net)}" data-layer="{esc(t.layer)}"{cls_attr} d="{d}" fill="none" stroke="{stroke}"{opacity} '
+                    f'stroke-width="{_f(t.width_mm * scale)}" stroke-linecap="round"/>'
+                )
+                continue
             out.append(
                 f'<line class="track" data-net="{esc(t.net)}" data-layer="{esc(t.layer)}"{cls_attr} x1="{_f(X(t.start[0]))}" y1="{_f(Y(t.start[1]))}" '
                 f'x2="{_f(X(t.end[0]))}" y2="{_f(Y(t.end[1]))}" stroke="{stroke}"{opacity} '

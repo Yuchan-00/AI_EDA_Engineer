@@ -94,6 +94,23 @@ Invariants enforced here:
   budget of the per-call side.
 * **Logs carry no content and never the key.** INFO lines hold task, model,
   provider, status, token counts, cost and timings only.
+* **A local route is free and says so.** A member whose billing is
+  ``"local"`` (an ``openai_compat`` server on this machine) needs no budget,
+  like a subscription: construction records ``LOCAL_MODEL_USE`` with a detail
+  that names the server and says the route is free (a local proxy to a paid
+  upstream is not seen here), approved by the provider flag (``cli --llm
+  openai_compat``; a subscription member is approved by ``cli --llm claude``
+  / ``cli --llm codex``). Its calls are known zero charges (``cost_usd=0.0``,
+  ``billing`` ``"local"``), recorded as such even when the server reported no
+  usage.
+* **A cross-check runs every structured task again, never chooses.** With
+  ``crosscheck`` configs (``--llm-crosscheck``), :meth:`cross_structured`
+  sends the same messages and schema to each cross-check model
+  independently (no fallback; budget-checked per request; one feedback
+  turn) and returns every reply - a failed one included, with its reason.
+  The caller grounds and compares them (:mod:`ai_eda.llm.crosscheck`);
+  :meth:`structured` itself is unchanged. Without cross-check configs
+  nothing of this runs.
 """
 
 from __future__ import annotations
@@ -110,9 +127,18 @@ from pydantic import BaseModel, Field, ValidationError
 from ai_eda.errors import AiEdaError
 from ai_eda.llm.client import LLMClient, LLMError, LLMMessage, LLMResponse, ToolSpec, Usage
 from ai_eda.llm.prompts import json_only_system_message, rejection_feedback_message
-from ai_eda.llm.providers import ClientFactory, ProviderClient, build_client, check_providers, members_of, provider_names_of, subscription_detail
+from ai_eda.llm.providers import (
+    ClientFactory,
+    ProviderClient,
+    build_client,
+    check_providers,
+    local_detail,
+    members_of,
+    provider_names_of,
+    subscription_detail,
+)
 from ai_eda.llm.router import ModelConfig, ModelRouter, TaskKind, default_router, max_tokens_for
-from ai_eda.llm.usage import SUBSCRIPTION, UsageTracker
+from ai_eda.llm.usage import LOCAL, SUBSCRIPTION, UsageTracker
 from ai_eda.security.approval import ApprovalGate, ExternalAction, default_gate, require_approval
 
 log = logging.getLogger("ai_eda.llm.service")
@@ -180,6 +206,36 @@ class LLMAttempt(BaseModel):
         return self.usage.cost_usd if self.usage is not None else None
 
 
+class CrossCheckReply(BaseModel):
+    """One cross-check model's independent answer to a structured task (:meth:`LLMService.cross_structured`).
+
+    ``ok`` with ``data`` (the validated reply, as JSON) when the model produced
+    a reply the schema accepts; otherwise ``error`` says why (a provider error,
+    the budget, a schema failure on both turns) - a failed cross-check is
+    reported by the caller, never dropped. ``data`` is a proposal like the
+    primary's: the caller grounds it and compares (:mod:`ai_eda.llm.crosscheck`).
+    """
+
+    #: the cross-check spec the request was addressed to
+    spec: str
+    #: the served spec (``provider:<id reported>``) or the native id from a bare client
+    model_used: str | None = None
+    via: str | None = None
+    ok: bool
+    #: "served" | "validation" | "budget" | an ``LLMError.kind``
+    outcome: str
+    data: dict[str, Any] | None = None
+    error: str | None = None
+    #: summed over the attempts that carry a usage record; ``None`` when any of them is unknown (or none was billed)
+    cost_usd: float | None = None
+    attempts: list[dict[str, Any]] = Field(default_factory=list)
+
+    @property
+    def model(self) -> str:
+        """The model to name for this reply: the one that answered, else the one asked."""
+        return self.model_used or self.spec
+
+
 class LLMService:
     """See the module docstring for the invariants."""
 
@@ -193,9 +249,10 @@ class LLMService:
         gate: ApprovalGate | None = None,
         approved_by: str = "user",
         providers: Sequence[str] | None = None,
-        subscription_approved_by: str = SUBSCRIPTION_APPROVED_BY,
+        subscription_approved_by: str | None = None,
         backoff_cap: float = 3.0,
         sleep: Callable[[float], None] = time.sleep,
+        crosscheck: Sequence[ModelConfig] = (),
     ) -> None:
         self.client = client
         self.router = router
@@ -206,14 +263,18 @@ class LLMService:
         self._sleep = sleep
         self.attempts: list[LLMAttempt] = []
         self.last_attempts: list[LLMAttempt] = []
+        #: the cross-check models (``--llm-crosscheck``): every structured task is also run on each, independently
+        #: (:meth:`cross_structured`); empty = no cross-check, the service behaves exactly as without the feature
+        self.crosscheck: list[ModelConfig] = list(crosscheck)
         #: the configured providers in order ("openrouter", "claude", "script"; a mix lists both)
         self.providers: list[str] = list(providers) if providers else provider_names_of(client)
         #: a ProviderClient takes specs; a bare client is one provider and takes native ids
         self._routes_specs = isinstance(client, ProviderClient)
         members = members_of(client, self.providers)
-        #: providers billed per call (need the budget) and on a subscription (need the flag)
-        self.per_call_providers = [name for name, m in members if getattr(m, "billing", "per_call") != SUBSCRIPTION]
+        #: providers billed per call (need the budget), on a subscription (need the flag) and local (free; need the flag)
+        self.per_call_providers = [name for name, m in members if getattr(m, "billing", "per_call") not in (SUBSCRIPTION, LOCAL)]
         self.subscription_providers = [name for name, m in members if getattr(m, "billing", "per_call") == SUBSCRIPTION]
+        self.local_providers = [name for name, m in members if getattr(m, "billing", "per_call") == LOCAL]
         self.label = "+".join(self.providers)
         self.approval_detail = f"{self.label} budget {budget.describe()}"
         if self.per_call_providers:
@@ -223,12 +284,22 @@ class LLMService:
             require_approval(ExternalAction.PAID_API_CALL, self.approval_detail, self.gate)
         #: the SUBSCRIPTION_USE details recorded (one per subscription member; empty without one)
         self.subscription_details: list[str] = []
+        #: the LOCAL_MODEL_USE details recorded (one per local member: the record says the route is free)
+        self.local_details: list[str] = []
         for name, member in members:
-            if getattr(member, "billing", "per_call") == SUBSCRIPTION:
+            billing = getattr(member, "billing", "per_call")
+            # the provider flag is the approval: ``cli --llm claude`` / ``cli --llm codex`` / ``cli --llm openai_compat``
+            who = subscription_approved_by or f"cli --llm {name}"
+            if billing == SUBSCRIPTION:
                 detail = subscription_detail(name, member)
-                self.gate.grant(ExternalAction.SUBSCRIPTION_USE, detail, approved_by=subscription_approved_by)
+                self.gate.grant(ExternalAction.SUBSCRIPTION_USE, detail, approved_by=who)
                 require_approval(ExternalAction.SUBSCRIPTION_USE, detail, self.gate)
                 self.subscription_details.append(detail)
+            elif billing == LOCAL:
+                detail = local_detail(name, member)
+                self.gate.grant(ExternalAction.LOCAL_MODEL_USE, detail, approved_by=who)
+                require_approval(ExternalAction.LOCAL_MODEL_USE, detail, self.gate)
+                self.local_details.append(detail)
         log.info("llm service ready providers=%s budget=%s client=%s", self.label, budget.describe(), type(client).__name__)
 
     @property
@@ -249,6 +320,7 @@ class LLMService:
         approved_by: str = "user",
         providers: Sequence[str] = ("openrouter",),
         factories: Mapping[str, ClientFactory] | None = None,
+        crosscheck: Sequence[ModelConfig] = (),
         **client_kw: Any,
     ) -> "LLMService":
         """A service over the real clients of ``providers`` (the first is the default provider for unprefixed specs).
@@ -268,10 +340,13 @@ class LLMService:
         the app title is sent for attribution only. The CLI client gets
         ``max_budget_usd`` from the USD budget when it accepts that option (a
         second safety net; the service's own check remains the first).
+        ``crosscheck`` are the cross-check configs (``--llm-crosscheck``); their
+        providers must be configured too (the same ``ValueError``), so every
+        model a run may call is built - and approved - here.
         """
         names = check_providers(providers)
         router = router or default_router(default_provider=names[0])
-        check_router_providers(router, names)
+        check_router_providers(router, names, crosscheck)
         if "openrouter" in names:
             client_kw.setdefault("reasoning", {"effort": "none"})
             client_kw.setdefault("app_title", "AI EDA ENGINEER")
@@ -279,7 +354,7 @@ class LLMService:
         if "claude" in names and budget.max_usd is not None:
             soft_kw["max_budget_usd"] = budget.max_usd
         client = build_client(names, factories=factories, soft_kw=soft_kw, **client_kw)
-        return cls(client, router, usage or UsageTracker(), budget, gate=gate, approved_by=approved_by, providers=names)
+        return cls(client, router, usage or UsageTracker(), budget, gate=gate, approved_by=approved_by, providers=names, crosscheck=crosscheck)
 
     @classmethod
     def from_script(
@@ -291,6 +366,7 @@ class LLMService:
         *,
         gate: ApprovalGate | None = None,
         approved_by: str = "user",
+        crosscheck: Sequence[ModelConfig] = (),
     ) -> "LLMService":
         """A service over a :class:`~ai_eda.llm.fake.ScriptedLLMClient` (a JSON file path, a list of script items, or a client)."""
         from ai_eda.llm.fake import ScriptedLLMClient
@@ -301,7 +377,7 @@ class LLMService:
             client = ScriptedLLMClient.from_file(script)
         else:
             client = ScriptedLLMClient.from_spec(list(script))
-        return cls(client, router or default_router(), usage or UsageTracker(), budget, gate=gate, approved_by=approved_by)
+        return cls(client, router or default_router(), usage or UsageTracker(), budget, gate=gate, approved_by=approved_by, crosscheck=crosscheck)
 
     # ------------------------------------------------------------ budget
 
@@ -330,8 +406,9 @@ class LLMService:
         return self._via(None, cfg)
 
     def is_per_call(self, cfg: ModelConfig) -> bool:
-        """Whether a request to ``cfg`` is a charge (its provider bills per call); a subscription route is not."""
-        return self.provider_of(cfg) not in self.subscription_providers
+        """Whether a request to ``cfg`` is a charge (its provider bills per call); a subscription or local route is not."""
+        provider = self.provider_of(cfg)
+        return provider not in self.subscription_providers and provider not in self.local_providers
 
     def check_budget(self, cfg: ModelConfig | None = None) -> None:
         """Raise :class:`BudgetExceededError` when another request is not covered (see the module docstring).
@@ -397,7 +474,7 @@ class LLMService:
             cost += ")"
         budget = self.budget.describe()
         if not self.budget.granted and not self.budget_required:
-            budget += " (not required: subscription only)"
+            budget += " (not required: no per-call provider)" if self.local_providers else " (not required: subscription only)"
         text = f"{', '.join(parts)}, {tokens} tokens, cost {cost}; budget {budget}"
         sub_calls, sub_tokens, estimate = self.subscription_spent()
         if sub_calls:
@@ -469,8 +546,16 @@ class LLMService:
         A per-call route: ``usage`` as reported, else ``Usage()`` - cost unknown,
         never 0. A subscription route: a known zero charge (``cost_usd=0.0``,
         ``billing`` / ``cost_source`` ``"subscription"``) with whatever tokens and
-        estimate were reported - tokens 0 and no estimate when nothing was.
+        estimate were reported - tokens 0 and no estimate when nothing was. A
+        local route (a server on this machine): the same known zero charge with
+        ``billing`` / ``cost_source`` ``"local"``.
         """
+        if via is not None and via in self.local_providers:
+            if usage is None:
+                return Usage(cost_usd=0.0, cost_source=LOCAL, billing=LOCAL)
+            if usage.billing is None and usage.cost_source is None:
+                return usage.model_copy(update={"cost_usd": 0.0, "cost_source": LOCAL, "billing": LOCAL})
+            return usage
         if not self._on_subscription(via):
             return usage if usage is not None else Usage()
         if usage is None:
@@ -621,27 +706,16 @@ class LLMService:
         last_error: LLMError | None = None
         validation_errors: list[str] = []
         for cfg in self.router.candidates(task):
-            if cfg.supports_structured:
-                msgs, response_schema = list(messages), json_schema
-            else:
-                msgs, response_schema = [*messages, json_only_system_message(json_schema)], None
             try:
-                for turn in range(2):
-                    resp = self._call(task, cfg, msgs, tools=None, response_schema=response_schema, max_tokens=max_tokens)
-                    instance, problem = self._validate(schema, resp)
-                    if instance is not None:
-                        return instance, resp
-                    assert problem is not None
-                    validation_errors.append(f"{cfg.spec}: {problem.splitlines()[0][:200]}")
-                    self._note(task, cfg, "validation", problem)
-                    log.info("llm %s model=%s reply rejected by schema (turn %d)", task, cfg.spec, turn + 1)
-                    if turn == 0:
-                        msgs = [*msgs, LLMMessage(role="assistant", content=resp.content or ""), rejection_feedback_message(problem)]
+                got = self._structured_on(task, cfg, messages, schema, json_schema, max_tokens, validation_errors)
             except LLMError as e:
                 last_error = e
                 if not self._fallback_ok(e):
                     raise
                 log.info("llm %s model=%s failed (%s); trying next candidate", task, cfg.spec, e.kind)
+                continue
+            if got is not None:
+                return got
         if last_error is not None and not validation_errors:
             raise last_error
         raise StructuredOutputError(
@@ -649,6 +723,89 @@ class LLMService:
             + (f"; last transport error: {last_error}" if last_error is not None else ""),
             list(self.last_attempts),
         )
+
+    def _structured_on(
+        self, task: TaskKind, cfg: ModelConfig, messages: list[LLMMessage], schema: type[M], json_schema: dict[str, Any],
+        max_tokens: int | None, validation_errors: list[str],
+    ) -> tuple[M, LLMResponse] | None:
+        """One candidate of :meth:`structured`: the request, then one feedback turn on a schema failure; ``None`` when both failed
+        (the problems appended to ``validation_errors``). :class:`LLMError` / :class:`BudgetExceededError` propagate."""
+        if cfg.supports_structured:
+            msgs, response_schema = list(messages), json_schema
+        else:
+            msgs, response_schema = [*messages, json_only_system_message(json_schema)], None
+        for turn in range(2):
+            resp = self._call(task, cfg, msgs, tools=None, response_schema=response_schema, max_tokens=max_tokens)
+            instance, problem = self._validate(schema, resp)
+            if instance is not None:
+                return instance, resp
+            assert problem is not None
+            validation_errors.append(f"{cfg.spec}: {problem.splitlines()[0][:200]}")
+            self._note(task, cfg, "validation", problem)
+            log.info("llm %s model=%s reply rejected by schema (turn %d)", task, cfg.spec, turn + 1)
+            if turn == 0:
+                msgs = [*msgs, LLMMessage(role="assistant", content=resp.content or ""), rejection_feedback_message(problem)]
+        return None
+
+    def cross_structured(
+        self,
+        task: TaskKind,
+        messages: list[LLMMessage],
+        schema: type[BaseModel],
+        max_tokens: int | None = None,
+        *,
+        json_schema: dict[str, Any] | None = None,
+        specs: Sequence[str] | None = None,
+    ) -> list[CrossCheckReply]:
+        """The cross-check run of a structured task: the same ``messages`` and schema sent to every cross-check model, independently.
+
+        One :class:`CrossCheckReply` per configured cross-check model (only
+        those whose spec is in ``specs`` when given - a caller that cached
+        some replies asks for the rest), in configuration order. Each model
+        gets the request and one schema-feedback turn exactly like a
+        :meth:`structured` candidate; there is no fallback (the cross-check
+        model is the one the user named), and the budget is checked before
+        every request like any other (a refusal is that reply's ``budget``
+        outcome). A provider error, a budget refusal or a reply the schema
+        rejects twice is that model's failed reply - returned, never raised
+        and never dropped; the caller reports it. Nothing here compares or
+        chooses: the caller grounds each reply and compares
+        (:mod:`ai_eda.llm.crosscheck`). ``last_attempts`` afterwards holds the
+        attempts of every model asked here.
+        """
+        if json_schema is None:
+            json_schema = schema.model_json_schema()
+        wanted = None if specs is None else set(specs)
+        replies: list[CrossCheckReply] = []
+        every: list[LLMAttempt] = []
+        for cfg in self.crosscheck:
+            if wanted is not None and cfg.spec not in wanted:
+                continue
+            self.last_attempts = []
+            errors: list[str] = []
+            try:
+                got = self._structured_on(task, cfg, messages, schema, json_schema, max_tokens, errors)
+            except LLMError as e:
+                reply = CrossCheckReply(spec=cfg.spec, model_used=e.model, via=e.via or self._via(None, cfg), ok=False, outcome=e.kind, error=str(e))
+            except BudgetExceededError as e:
+                reply = CrossCheckReply(spec=cfg.spec, via=self._via(None, cfg), ok=False, outcome="budget", error=str(e))
+            else:
+                if got is None:
+                    reply = CrossCheckReply(spec=cfg.spec, via=self._via(None, cfg), ok=False, outcome="validation",
+                                            error="the reply did not match the schema on both turns: " + "; ".join(errors))
+                else:
+                    instance, resp = got
+                    reply = CrossCheckReply(spec=cfg.spec, model_used=resp.model_used or resp.model, via=self._via(resp.via, cfg), ok=True,
+                                            outcome="served", data=instance.model_dump(mode="json"))
+            billed = [a for a in self.last_attempts if a.usage is not None]
+            costs = [a.cost_usd for a in billed]
+            reply.cost_usd = None if not costs or any(c is None for c in costs) else float(sum(c for c in costs if c is not None))
+            reply.attempts = [a.model_dump(mode="json") for a in self.last_attempts]
+            every.extend(self.last_attempts)
+            replies.append(reply)
+            log.info("llm %s cross-check model=%s outcome=%s", task, cfg.spec, reply.outcome)
+        self.last_attempts = every
+        return replies
 
     @staticmethod
     def _validate(schema: type[M], resp: LLMResponse) -> tuple[M | None, str | None]:
@@ -724,9 +881,9 @@ class LLMService:
         self._record(task, cfg, resp, time.monotonic() - t0, outcome=outcome)
 
 
-def check_router_providers(router: ModelRouter, providers: Sequence[str]) -> None:
-    """``ValueError`` when a router config names a provider outside ``providers`` (before any client exists)."""
-    bad = sorted({c.spec for c in router.configs() if c.provider is not None and c.provider not in providers})
+def check_router_providers(router: ModelRouter, providers: Sequence[str], crosscheck: Sequence[ModelConfig] = ()) -> None:
+    """``ValueError`` when a router config (or a cross-check config) names a provider outside ``providers`` (before any client exists)."""
+    bad = sorted({c.spec for c in [*router.configs(), *crosscheck] if c.provider is not None and c.provider not in providers})
     if bad:
         raise ValueError(f"model spec(s) {', '.join(bad)} name a provider that is not configured (--llm {','.join(providers)})")
 
@@ -750,6 +907,7 @@ def _json_object(content: str | None) -> dict[str, Any] | None:
 
 __all__ = [
     "BudgetExceededError",
+    "CrossCheckReply",
     "LLMAttempt",
     "LLMBudget",
     "LLMService",

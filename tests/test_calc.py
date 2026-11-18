@@ -95,6 +95,26 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
         "calc.regulator.p_dissipation": (user_requirement(9.0), user_requirement(5.0), user_requirement(0.05)),
         "calc.crystal.load_capacitance": (user_requirement(22e-12), user_requirement(22e-12), user_requirement(4e-12)),
         "calc.lc.cutoff": (user_requirement(10e-6), user_requirement(100e-9)),
+        # D9a catalog (2026-11-04): the n = 2 Butterworth LC low-pass between Z0 terminations
+        "calc.lc.butterworth2.series_l": (user_requirement(1e5, "Hz"), user_requirement(50.0, "ohm")),
+        "calc.lc.butterworth2.shunt_c": (user_requirement(1e5, "Hz"), user_requirement(50.0, "ohm")),
+        "calc.lc.butterworth2.level_db": (user_requirement(1e5, "Hz"), user_requirement(1e5, "Hz")),
+        # D9a catalog (2026-11-04): the BJT low-side switch
+        "calc.bjt_switch.base_current": (user_requirement(0.05, "A"), user_requirement(10.0)),
+        "calc.bjt_switch.base_resistor": (user_requirement(5.0, "V"), user_requirement(0.7, "V"), user_requirement(5e-3, "A")),
+        "calc.bjt_switch.clamp_max": (user_requirement(12.0, "V"), user_requirement(1.0, "V")),
+        # D9a catalog (2026-11-04): I2C pull-ups
+        "calc.i2c.r_max": (user_requirement(300e-9, "s"), user_requirement(150e-12, "F")),
+        "calc.i2c.r_min": (user_requirement(3.3, "V"), user_requirement(0.4, "V"), user_requirement(3e-3, "A")),
+        "calc.i2c.r_pullup": (user_requirement(2360.0, "ohm"), user_requirement(966.7, "ohm"), user_requirement(0.8)),
+        "calc.i2c.v_ih": (user_requirement(3.3, "V"),),
+        "calc.i2c.t_low": (user_requirement(400e3, "Hz"),),
+        "calc.i2c.v_low_diode": (user_requirement(3.3, "V"), user_requirement(1888.0, "ohm")),
+        "calc.i2c.t_hold": (user_requirement(1.25e-6, "s"),),
+        "calc.i2c.t_30": (user_requirement(1888.0, "ohm"), user_requirement(150e-12, "F"), user_requirement(3.3, "V"), user_requirement(0.66, "V")),
+        "calc.i2c.t_check": (user_requirement(1.25e-6, "s"), user_requirement(64e-9, "s"), user_requirement(300e-9, "s")),
+        "calc.i2c.tran_step": (user_requirement(300e-9, "s"),),
+        "calc.i2c.tran_stop": (user_requirement(1.25e-6, "s"), user_requirement(1888.0, "ohm"), user_requirement(150e-12, "F")),
         # transmission lines (CALC_VERSION 0.8): mm, um copper, er
         "calc.tline.microstrip.z0": (user_requirement(0.35), user_requirement(0.2), user_requirement(35.0), user_requirement(4.5)),
         "calc.tline.microstrip.e_eff": (user_requirement(0.35), user_requirement(0.2), user_requirement(35.0), user_requirement(4.5)),
@@ -251,6 +271,8 @@ def test_every_calculator_is_registered_with_its_own_tool_id():
         "calc.power.rail_budget": (user_requirement(0.161, "A"), user_requirement(0.5, "A")),
         "calc.regulator.headroom": (user_requirement(6.4, "V"), user_requirement(5.0, "V"), user_requirement(1.2, "V"), user_requirement(0.441, "A"), user_requirement(0.17, "ohm")),
     }
+    # E series (CALC_VERSION 0.12): one input, the solved value; tests/test_e_series.py holds the values
+    sample.update({tool: (user_requirement(1591.5, "ohm"),) for tool in ROLES if tool.startswith("calc.e_series.")})
     assert set(CALCULATORS) == set(sample) == set(ROLES) == set(ROLE_UNITS)
     for tool, (fn, keys) in CALCULATORS.items():
         out = fn(*sample[tool], keys)
@@ -337,4 +359,4 @@ def test_regulator_crystal_lc_and_rc_window_calculators():
     for fn in (rc_tran_step, rc_tran_stop):
         with pytest.raises(ValueError, match="time constant must be positive"):
             fn(user_requirement(0.0, "s"))
-    assert CALC_VERSION == "0.11" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")
+    assert CALC_VERSION == "0.12" and ROLE_UNITS["calc.lc.cutoff"] == ("H", "F") and ROLE_UNITS["calc.regulator.p_dissipation"] == ("V", "V", "A")

@@ -45,6 +45,13 @@ the latest ``kicad.drc`` result, never a session tool):
   ``min_silk_line_width_mm``) are judged by ``pcb.silk.size``. They are listed
   under ``details["not_compared"]`` and named in the message, never counted
   as compared.
+* Blind / buried / micro vias (``Via.kind``) need a drilling process a
+  through-via board does not: controlled-depth or laser drilling, or
+  sequential lamination. No fab capability this system grounds states one,
+  so an IR with such a via gets a ``via_process`` row that is NOT_VERIFIED
+  naming the spans (their generic stack is a stated choice, not a fab's),
+  and the result is stamped 0.2; an IR without one gets no such row and
+  stays 0.1. The drill / diameter rows compare every via, typed or not.
 * The overall status is the worst row (NOT_APPLICABLE rows do not count);
   without ``ir.pcb`` the result is NOT_VERIFIED. There is no path to PASS
   without DRC evidence.
@@ -60,6 +67,8 @@ from ai_eda.ir import ArtifactKind, CircuitIR, ManufacturingConstraints, Provena
 
 TOOL_ID = "mfg.capability_check"
 TOOL_VERSION = "0.1"
+#: the version of a result that carries the ``via_process`` row (an IR with blind / buried / micro vias); every other result stays 0.1
+TYPED_VIA_VERSION = "0.2"
 CHECK_ID = "mfg.capability"
 REPAIR = "fab_capability_shortfall"
 
@@ -237,6 +246,21 @@ def _hole_to_edge_offenders(ir: CircuitIR, limit: float) -> list[str] | None:
     return out
 
 
+def _via_process_row(ir: CircuitIR) -> dict[str, Any] | None:
+    """The ``via_process`` row (NOT_VERIFIED) when the IR has blind / buried / micro vias, else ``None`` (module docstring)."""
+    assert ir.pcb is not None
+    typed = [v for v in ir.pcb.vias if getattr(v, "kind", None) is not None]
+    if not typed:
+        return None
+    spans = sorted({f"{v.kind} {v.layers[0]}-{v.layers[1]}" for v in typed})
+    return _row(
+        "via_process", ValidationStatus.NOT_VERIFIED,
+        f"{len(typed)} blind/buried/micro via(s) on span(s) {spans}: no grounded fab capability states controlled-depth, laser or "
+        "sequential-lamination drilling; the spans are a generic stack's stated choice, not a fab's",
+        limit_value=None, offenders=[], grounded=False, spans=spans,
+    )
+
+
 def check_capability(ir: CircuitIR) -> ValidationResult:
     """``mfg.capability`` for ``ir`` (module docstring): deterministic, reads only the IR, its artifacts and the latest ``kicad.drc``."""
     stamp = dict(check_id=CHECK_ID, tool=TOOL_ID, tool_version=TOOL_VERSION)
@@ -289,6 +313,10 @@ def check_capability(ir: CircuitIR) -> ValidationResult:
             rows.append(_row("min_hole_to_edge_mm", ValidationStatus.NOT_VERIFIED, "ir.pcb.outline is None: hole-to-edge distances can not be measured", limit_value=t.value, grounded=_grounded(t)))
         else:
             rows.append(_compared_row("min_hole_to_edge_mm", t, offenders, "IR via hole-to-edge distance(s)", compared=len(ir.pcb.vias), none="no vias in the IR"))
+    typed = _via_process_row(ir)
+    if typed is not None:
+        rows.append(typed)
+        stamp["tool_version"] = TYPED_VIA_VERSION
     # --- geometry only DRC proves ---------------------------------------------------
     rules, reason, drc = _drc_proof(ir)
     for name, keys in GEOMETRY_ROWS.items():
@@ -323,6 +351,7 @@ __all__ = [
     "REPAIR",
     "TOOL_ID",
     "TOOL_VERSION",
+    "TYPED_VIA_VERSION",
     "FabCapability",
     "check_capability",
     "jlcpcb_capability_unverified",

@@ -128,6 +128,14 @@ def simulation_assumptions(ir: CircuitIR) -> list[str]:
     setup = ir.simulation
     if setup is None:
         return out
+    for el in setup.elements:
+        note(f"simulation.elements[{el.id}]", el.provenance)
+        if el.value is not None:
+            note(f"simulation.elements[{el.id}].value", el.value.provenance)
+        if el.model_card is not None:
+            note(f"simulation.elements[{el.id}].model_card", el.model_card.provenance)
+        for k, t in el.params.items():
+            note(f"simulation.elements[{el.id}].params[{k}]", t.provenance)
     for s in setup.stimuli:
         note(f"simulation.stimuli[{s.id}]", s.provenance)
         if s.value is not None:

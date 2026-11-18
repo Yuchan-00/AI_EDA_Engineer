@@ -41,14 +41,36 @@ said, never replaced by a number:
   comes near the plane's edge the fringing field is not judged. A board
   without keep-outs is measured exactly as before.
 
-A via is a through via (the compiler writes it so): its barrel spans the
-stack from ``F.Cu`` to ``B.Cu`` (:meth:`~ai_eda.ir.Stackup.span_mm`) and its
-delay per length is bounded by the largest er of the dielectrics it crosses
-(the same bound as above: its field is in the dielectric). A net's routed
-length is its tracks plus one barrel per via - the length the router's
-``max_length_mm`` budget counts - and its delay is the sum over its segments
-and vias. Both are totals of the net's whole copper, an upper bound of any
-pad-to-pad path through it: summed branches are not a line.
+A via without a ``kind`` is a through via (the compiler writes it so): its
+barrel spans the stack from ``F.Cu`` to ``B.Cu``
+(:meth:`~ai_eda.ir.Stackup.span_mm`) and its delay per length is bounded by
+the largest er of the dielectrics it crosses (the same bound as above: its
+field is in the dielectric). A net's routed length is its tracks plus one
+barrel per via - the length the router's ``max_length_mm`` budget counts -
+and its delay is the sum over its segments and vias. Both are totals of the
+net's whole copper, an upper bound of any pad-to-pad path through it: summed
+branches are not a line. On a net with a blind / buried / micro via
+(``Via.kind``) each via counts its own barrel instead - a typed via
+``span_mm(*Via.layers)``, a through via the full ``F.Cu``-``B.Cu`` -, and the
+barrels' delay keeps the whole stack's er_max bound (``via_barrels_mm`` /
+``via_barrels_delay_s``); a net with through vias only is measured exactly as
+before (``vias * via_length_mm``, the same floats). What is measured on a
+board with a typed via is stamped :data:`SI_TYPED_VIA_VERSION` (``si.*``
+results, promotions: :func:`si_version`); every other board stays
+:data:`SI_VERSION`.
+
+A track with a ``mid`` point is a circular arc (:mod:`ai_eda.ir.arc`), and it
+is measured as one, never as the straight line between its ends: its length
+is the arc's length (:func:`~ai_eda.ir.track_length`) in every sum here - the
+net's routed length, its segments by layer and width, the length under a
+keep-out - and it is one edge of the path graph
+(:mod:`ai_eda.tools.si.paths`). Whether its copper reaches a keep-out that
+clears its plane is judged on the chords of its chain with the chain's bound
+on the reporting side (:func:`plane_keepout`). Its line model is the one of
+its layer and width, as a mitred corner's is: curvature is not modelled.
+What is measured on a board with an arc is stamped :data:`SI_ARC_VERSION`
+(it wins over the typed-via version on a board with both); a board without
+one is measured and stamped exactly as before.
 
 The *line* of a net (:attr:`NetMeasure.line`) is what the critical-length
 rule and ``spice.si`` measure: the longest pad-to-pad path through the copper
@@ -61,11 +83,21 @@ bound is known (``path_problem`` says why).
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
-from ai_eda.ir import CircuitIR, Stackup
-from ai_eda.tools.keepout import allowed_nets, area_bbox, area_points, covers_layer, forbids, keepout_id, keepouts_of, segment_area_distance
+from ai_eda.ir import CircuitIR, Stackup, track_length
+from ai_eda.ir.arc import ARC_SAGITTA_MM
+from ai_eda.tools.keepout import (
+    allowed_nets,
+    area_bbox,
+    area_points,
+    covers_layer,
+    forbids,
+    keepout_id,
+    keepouts_of,
+    segment_area_distance,
+    track_area_distance,
+)
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.si.paths import NetPath, longest_path, net_pads
 from ai_eda.tools.calc.tline import (
@@ -80,10 +112,28 @@ from ai_eda.tools.calc.tline import (
 #: tool id / version of the SI measurements and checks (IR geometry + calculators, never DRC)
 SI_TOOL = "si"
 SI_VERSION = "0.1"
+#: the version what is measured on a board with a blind / buried / micro via is stamped with (:func:`si_version`): each via its own
+#: barrel, no pad-to-pad path through a typed via - a mechanism that acts only on those boards stamps its own; every other board stays 0.1
+SI_TYPED_VIA_VERSION = "0.2"
+#: the version what is measured on a board with an arc track (``Track.mid``) is stamped with (:func:`si_version`): an arc's length is its
+#: arc length, it is one edge of the path graph and its keep-outs are judged on its chords - a mechanism that acts only on those boards
+#: stamps its own, and it wins over the typed-via version on a board with both; every other board stays 0.1 / 0.2
+SI_ARC_VERSION = "0.3"
 #: what every SI result says it is
 NOT_DRC = "IR geometry + calculators, not DRC; the fab's measured impedance is the only real one"
 #: how the reason of a track without a reference plane because of a keep-out begins (:func:`plane_keepout`)
 KEEPOUT_NO_PLANE = f"{NO_REFERENCE_PLANE} under keep-out"
+
+
+def si_version(ir: CircuitIR) -> str:
+    """The SI version ``ir``'s measurements are stamped with: :data:`SI_ARC_VERSION` when its board holds an arc track (``Track.mid``:
+    measured as an arc; it wins on a board that holds a typed via too), :data:`SI_TYPED_VIA_VERSION` when its board holds a via with a
+    ``kind`` (blind / buried / micro: measured as such), else :data:`SI_VERSION` - an IR without either is measured and stamped exactly
+    as before."""
+    pcb = ir.pcb
+    if pcb is not None and any(getattr(t, "mid", None) is not None for t in pcb.tracks):
+        return SI_ARC_VERSION
+    return SI_TYPED_VIA_VERSION if pcb is not None and any(getattr(v, "kind", None) is not None for v in pcb.vias) else SI_VERSION
 
 
 def _zone_keepouts(ir: CircuitIR) -> list:
@@ -92,13 +142,22 @@ def _zone_keepouts(ir: CircuitIR) -> list:
 
 
 def _track_plane_keepout(stackup: Stackup | None, track, keepouts: list) -> tuple[str, str] | None:
-    """``(keep-out id, reason)`` of the first zone keep-out that clears the track's plane from under its copper, or ``None``."""
+    """``(keep-out id, reason)`` of the first zone keep-out that clears the track's plane from under its copper, or ``None``.
+
+    A straight track's copper reaches the area when its centreline comes nearer than half its width. An arc (a track with ``mid``;
+    read with ``getattr``, so a track-like object without it is straight) is judged on the chords of its chain
+    (:func:`~ai_eda.tools.keepout.track_area_distance`): the arc lies within :data:`~ai_eda.ir.arc.ARC_SAGITTA_MM` of them, so it
+    counts as over the area when a chord comes nearer than half its width plus that bound. The bound is on the reporting side: an arc
+    over a cleared plane is always named with the keep-out (its row NOT_VERIFIED, its delay the no-plane bound), one whose chords come
+    within the bound of it is named too, and an arc judged as a microstrip is surely clear of the area.
+    """
     if not keepouts or stackup is None:
         return None
     geom, _why = line_geometry(stackup, track.layer)
     if geom is None:
         return None  # no plane in the stack under this layer anyway
     layer, net = geom.reference_layer, str(geom.reference_net)
+    arc = getattr(track, "mid", None) is not None
     a = (float(track.start[0]), float(track.start[1]))
     b = (float(track.end[0]), float(track.end[1]))
     half = float(track.width_mm) / 2.0
@@ -106,7 +165,12 @@ def _track_plane_keepout(stackup: Stackup | None, track, keepouts: list) -> tupl
         if not covers_layer(k, layer) or net in allowed_nets(k):
             continue
         x1, y1, x2, y2 = area_bbox(area_points(k))  # by its box, as the PCB agent clips the planes: the two never disagree
-        if segment_area_distance(a, b, [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]) < half - 1e-9:
+        box = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        if arc:  # its chords, with the chain's bound on the reporting side (docstring)
+            over = track_area_distance(track, box) < half - 1e-9 + ARC_SAGITTA_MM
+        else:
+            over = segment_area_distance(a, b, box) < half - 1e-9
+        if over:
             reason = str(getattr(k, "reason", "") or "").strip()
             return keepout_id(k), (f"{KEEPOUT_NO_PLANE} {keepout_id(k)}: it forbids zones on {layer} (the {net} plane) under this copper"
                                    + (f" ({reason})" if reason else ""))
@@ -120,7 +184,12 @@ def plane_keepout(ir: CircuitIR, track) -> str | None:
     (:func:`~ai_eda.tools.calc.tline.line_geometry`); a keep-out counts when
     it covers that layer, forbids ``zones``, does not allow the plane's net
     and the track's copper (centreline within half its width) reaches its
-    area (a polygon by its bounding box, as the plane clipping cuts it).
+    area (a polygon by its bounding box, as the plane clipping cuts it). An
+    arc is judged on the chords of its chain, within half its width plus the
+    chain's bound of 1 um (:data:`~ai_eda.ir.arc.ARC_SAGITTA_MM`): an arc
+    over the area is always named, one whose chords come within that bound
+    of it too, so an arc is judged as a microstrip only where it is surely
+    clear of the area.
     ``None`` for a board without such a keep-out or a track without a
     plane layer at all (that reason is the stackup's own).
     """
@@ -197,11 +266,14 @@ def _bound_er(stackup: Stackup, outer: int) -> tuple[float, int]:
 
 
 def via_model(stackup: Stackup | None) -> tuple[float, float] | None:
-    """``(barrel length mm, delay per length s/m)`` of a through via, or ``None`` without a stackup."""
+    """``(barrel length mm, delay per length s/m)`` of a through via, or ``None`` without a stackup or on one with no through via (one copper layer)."""
     if stackup is None:
         return None
+    span = stackup.through_via_span_mm()
+    if span is None:
+        return None
     er_max = max(float(d.er.value) for d in stackup.dielectrics)
-    return stackup.span_mm("F.Cu", "B.Cu"), propagation_delay(er_max)
+    return span, propagation_delay(er_max)
 
 
 @dataclass
@@ -275,6 +347,13 @@ class NetMeasure:
     #: the longest pad-to-pad path (``None``: not extracted, ``path_problem`` says why)
     path: NetPath | None = None
     path_problem: str | None = None
+    #: for a net with a blind / buried / micro via (and a stackup): every via's own barrel summed - a through via's ``F.Cu``-``B.Cu``,
+    #: a typed via's span (module docstring) - and its delay at the whole stack's er_max bound; ``None`` for every other net, whose
+    #: barrels are ``vias * via_length_mm`` as before
+    via_barrels_mm: float | None = None
+    via_barrels_delay_s: float | None = None
+    #: the net's blind / buried / micro vias
+    typed_vias: int = 0
 
     @property
     def routed(self) -> bool:
@@ -282,13 +361,17 @@ class NetMeasure:
 
     @property
     def length_mm(self) -> float:
-        """Tracks plus one barrel per via (the router's ``max_length_mm`` measure)."""
+        """Tracks plus each via's barrel (the router's ``max_length_mm`` measure); one through barrel per via on a net without a typed via."""
+        if self.via_barrels_mm is not None:
+            return self.track_length_mm + self.via_barrels_mm
         return self.track_length_mm + self.vias * self.via_length_mm
 
     @property
     def delay_s(self) -> float | None:
         if self.problems:
             return None
+        if self.via_barrels_delay_s is not None:
+            return sum(s.delay_s or 0.0 for s in self.segments) + self.via_barrels_delay_s
         return sum(s.delay_s or 0.0 for s in self.segments) + self.vias * self.via_delay_s
 
     @property
@@ -336,9 +419,10 @@ class NetMeasure:
         return None
 
     def summary(self) -> dict:
+        typed = {"typed_vias": self.typed_vias, "via_barrels_mm": _r(self.via_barrels_mm)} if self.via_barrels_mm is not None else {}
         return {
             "net": self.net, "length_mm": _r(self.length_mm), "track_length_mm": _r(self.track_length_mm), "vias": self.vias,
-            "via_length_mm": _r(self.via_length_mm), "delay_s": None if self.delay_s is None else float(f"{self.delay_s:.6e}"), "bound": self.bound,
+            "via_length_mm": _r(self.via_length_mm), **typed, "delay_s": None if self.delay_s is None else float(f"{self.delay_s:.6e}"), "bound": self.bound,
             "segments": [
                 {"layer": s.layer, "width_mm": s.width_mm, "length_mm": _r(s.length_mm),
                  "z0_ohm": None if s.model is None or s.model.z0_ohm is None else round(s.model.z0_ohm, 4),
@@ -378,7 +462,7 @@ def measure_nets(ir: CircuitIR, nets: list[str] | None = None, library: KicadLib
         m = out.get(t.net)
         if m is None:
             continue
-        length = math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1])
+        length = track_length(t)  # an arc at its arc length, a straight track end to end
         m.track_length_mm += length
         key = (t.net, t.layer, float(t.width_mm))
         per[key] = per.get(key, 0.0) + length
@@ -388,11 +472,15 @@ def measure_nets(ir: CircuitIR, nets: list[str] | None = None, library: KicadLib
                 row = under.setdefault(key, [0.0, hit[1], hit[0]])
                 row[0] += length
     vm = via_model(stackup)
+    net_vias: dict[str, list] = {}
     for v in pcb.vias:
         m = out.get(v.net)
         if m is None:
             continue
         m.vias += 1
+        net_vias.setdefault(v.net, []).append(v)
+        if getattr(v, "kind", None) is not None:
+            m.typed_vias += 1
     models: dict[tuple[str, float], tuple[LineModel | None, str | None]] = {}
     for (net, layer, width), length in sorted(per.items(), key=lambda kv: (names.index(kv[0][0]), kv[0][1], kv[0][2])):
         if (layer, width) not in models:
@@ -409,13 +497,40 @@ def measure_nets(ir: CircuitIR, nets: list[str] | None = None, library: KicadLib
         if vm is not None:
             m.via_length_mm, t_pd_via = vm
             m.via_delay_s = m.via_length_mm / 1000.0 * t_pd_via
+            if m.typed_vias:
+                m.via_barrels_mm = _via_barrels(stackup, net_vias[m.net], m)
+                m.via_barrels_delay_s = m.via_barrels_mm / 1000.0 * t_pd_via
         if stackup is None and m.routed:
             m.problems.append(NO_STACKUP)
+        elif stackup is not None and vm is None and m.vias:  # a stack without a through via (one copper layer on a metal base) holding a via
+            m.problems.append(f"{m.vias} via(s) on a stack with one copper layer: the stack has no through via, so its barrel has no length")
         for s in m.segments:
             if s.model is None:
                 m.problems.append(f"{s.layer} {s.width_mm:g} mm: {s.reason}")
     _paths(ir, out, library, models, vm)
     return out
+
+
+def _via_barrels(stackup: Stackup | None, vias: list, m: NetMeasure) -> float:
+    """The summed barrel length (mm) of ``vias`` (one net's, IR order): a through via's ``F.Cu``-``B.Cu``, a typed via's span.
+
+    A typed via whose ends are not layers of the stackup has no span length:
+    it adds a problem to ``m`` (so the net has no delay) and is counted at
+    the full ``F.Cu``-``B.Cu`` barrel, the longest a via of the board can be
+    (an upper bound, never a shorter guess).
+    """
+    assert stackup is not None
+    total = 0.0
+    for v in vias:
+        if getattr(v, "kind", None) is None:
+            total += stackup.span_mm("F.Cu", "B.Cu")
+            continue
+        try:
+            total += stackup.span_mm(*v.layers)
+        except ValueError as e:
+            m.problems.append(f"{v.kind} via {v.layers[0]}-{v.layers[1]}: {e} - counted at the full F.Cu-B.Cu barrel (an upper bound)")
+            total += stackup.span_mm("F.Cu", "B.Cu")
+    return total
 
 
 def _paths(ir: CircuitIR, out: dict[str, NetMeasure], library: KicadLibrary | None,
@@ -506,7 +621,9 @@ __all__ = [
     "KEEPOUT_NO_PLANE",
     "NOT_DRC",
     "NO_PLANE_ADVICE",
+    "SI_ARC_VERSION",
     "SI_TOOL",
+    "SI_TYPED_VIA_VERSION",
     "SI_VERSION",
     "LineModel",
     "NetLine",
@@ -516,6 +633,7 @@ __all__ = [
     "measure_nets",
     "no_plane_reason",
     "plane_keepout",
+    "si_version",
     "undefined_impedance_reason",
     "via_model",
 ]

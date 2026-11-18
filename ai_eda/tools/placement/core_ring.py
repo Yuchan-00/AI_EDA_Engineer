@@ -86,6 +86,24 @@ What this is: the placement the PCB agent uses when a part has at least
    not fit are refused. The inner band's size is set by the core, so an
    inner ring that cannot hold its parts is refused either way.
 
+5. **Fan-out room (placement.core_ring 0.3).** A core whose footprint's
+   finest pad pitch (:func:`~ai_eda.tools.routing.maze.footprint_pad_pitch`)
+   is below :data:`~ai_eda.tools.placement.rf_floorplan.FANOUT_PITCH_MM` - a
+   0.5 mm-pitch QFP or QFN - keeps every other part's extent at least
+   :func:`~ai_eda.tools.routing.maze.fanout_margin` from its pads' copper
+   box, the room the router's escapes and their ways out need (the RF
+   floorplan's rule, placement.rf_floorplan 0.2, with the same margin from
+   the same routing parameters: 2.2 mm at the fine rules): the inner band
+   starts at the larger of :data:`SPACING_MM` outside the core's extent and
+   the margin outside its pads. Measured 2026-11-12 on the STM32F407 board
+   (LQFP-100): with the inner band 1 mm outside the courtyard its
+   decoupling capacitors sat 1.9 mm past the pad ends, inside the escape
+   area, and their keep-outs closed the straight ways out of the pads under
+   them. Every placement of such a board is stamped
+   :data:`PLACER_FANOUT_VERSION` ``"0.3"`` with a ``fanout:<core>=<pitch>;
+   below_mm=...;margin_mm=...`` entry; every other board keeps 0.2 and its
+   placement, byte for byte.
+
 Before returning, the placed extents are re-measured with
 :func:`~ai_eda.tools.kicad.geometry.footprint_bbox`: any two that touch or
 overlap, or a part outside the outline, is a :class:`CompileError` - the
@@ -114,12 +132,15 @@ from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import BoardOutline, BoardSide, CircuitIR, NetKind, Placement, Provenance, ProvenanceKind
 from ai_eda.tools.kicad.geometry import footprint_bbox, pad_center, pads_bbox
+from ai_eda.tools.placement.rf_floorplan import FANOUT_PITCH_MM, _fanout_params
+from ai_eda.tools.routing.maze import fanout_margin, footprint_pad_pitch
 from ai_eda.tools.kicad.library import BBox, FootprintDef, KicadLibrary
 from ai_eda.tools.placement.grid import MARGIN_MM, SPACING_MM, _disjoint, _inside, _q, _resolve, footprint_extent
 
 __all__ = [
     "PLACER_ID",
     "PLACER_VERSION",
+    "PLACER_FANOUT_VERSION",
     "CORE_MIN_PADS",
     "INNER_MAX_PADS",
     "EDGE_REF_PREFIXES",
@@ -139,6 +160,8 @@ __all__ = [
 #: provenance ``tool`` / ``tool_version`` stamped on every placement
 PLACER_ID = "placement.core_ring"
 PLACER_VERSION = "0.2"
+#: ``tool_version`` of the placements of a board whose core keeps a fan-out room (module docstring, step 5)
+PLACER_FANOUT_VERSION = "0.3"
 #: a part with at least this many pads makes the PCB agent use this placer instead of the grid
 CORE_MIN_PADS = 32
 #: parts with more pads never go on the inner ring
@@ -178,6 +201,8 @@ class RingPlacement:
     bands: dict[str, BBox] = field(default_factory=dict)
     #: ref -> (run, start): the run (0 east, 1 north, 2 west, 3 south) and the mm along its ring's walk where the part begins
     walk: dict[str, tuple[int, float]] = field(default_factory=dict)
+    #: the core's fan-out room (module docstring, step 5): its margin (mm) and the ``fanout:...`` entry, ``None`` without one
+    fanout: tuple[float, str] | None = None
 
 
 def pad_count(fp: FootprintDef) -> int:
@@ -217,12 +242,15 @@ def find_core(parts: list[tuple[str, FootprintDef]]) -> tuple[str, FootprintDef,
     return best[0], best[1], best_n
 
 
-def ring_provenance(footprint_id: str, ring: str, angle: float | None, pull: str, core: str, spacing: float, margin: float) -> Provenance:
-    """``derived`` provenance of a placement this tool made (the ring, the pull angle and its source, the parameters)."""
+def ring_provenance(
+    footprint_id: str, ring: str, angle: float | None, pull: str, core: str, spacing: float, margin: float, fanout: str | None = None,
+) -> Provenance:
+    """``derived`` provenance of a placement this tool made (the ring, the pull angle and its source, the parameters; a board whose
+    core keeps a fan-out room: its entry and :data:`PLACER_FANOUT_VERSION`)."""
     return Provenance(
         kind=ProvenanceKind.DERIVED,
         tool=PLACER_ID,
-        tool_version=PLACER_VERSION,
+        tool_version=PLACER_VERSION if fanout is None else PLACER_FANOUT_VERSION,
         derived_from=[
             f"footprint:{footprint_id}",
             f"ring:{ring}",
@@ -231,6 +259,7 @@ def ring_provenance(footprint_id: str, ring: str, angle: float | None, pull: str
             f"core:{core}",
             f"spacing_mm:{spacing}",
             f"margin_mm:{margin}",
+            *([fanout] if fanout is not None else []),
         ],
         note="core in the centre, inner ring by pull angle, outer ring at the edge, from library footprint extents and the IR nets; "
         "validity is decided by kicad-cli DRC only",
@@ -569,6 +598,12 @@ def core_ring_placement(
         (inner if to_core and pad_count(fp) <= INNER_MAX_PADS and not part.edge else outer).append(part)
 
     r_in = _expand(core_box, spacing)
+    fanout = _core_fanout(ir, library, core, core_fp)
+    if fanout is not None:  # module docstring, step 5: no other part inside the router's fan-out room of a fine-pitch core
+        pads = pads_bbox(core_local, core_fp)
+        assert pads is not None
+        m = fanout[0]
+        r_in = BBox(min(r_in.x1, pads.x1 - m), min(r_in.y1, pads.y1 - m), max(r_in.x2, pads.x2 + m), max(r_in.y2, pads.y2 + m))
     d_in = max((p.depth for p in inner), default=0.0)
     band_in = _Band(r_in, d_in, spacing, "inner")
     _order(band_in, inner)
@@ -645,7 +680,7 @@ def core_ring_placement(
             y_mm=_q(cy + pl.y_mm),
             rotation_deg=pl.rotation_deg,
             side=BoardSide.TOP,
-            provenance=ring_provenance(fp.lib_id, ring, angle, pull, core, spacing, margin),
+            provenance=ring_provenance(fp.lib_id, ring, angle, pull, core, spacing, margin, None if fanout is None else fanout[1]),
         )
         box = footprint_bbox(final, fp)
         assert box is not None
@@ -676,7 +711,24 @@ def core_ring_placement(
         pulls={ref: pulls[ref][1] for ref in refs if ref != core},
         bands=bands,
         walk={p.ref: (p.run, _q(p.start)) for p in (*inner, *outer)},
+        fanout=fanout,
     )
+
+
+def _core_fanout(ir: CircuitIR, library: KicadLibrary, core: str, core_fp: FootprintDef) -> tuple[float, str] | None:
+    """The core's fan-out room (module docstring, step 5): ``(margin, entry)`` when its finest pad pitch is below
+    :data:`~ai_eda.tools.placement.rf_floorplan.FANOUT_PITCH_MM`, from the routing parameters the router will use; ``None`` otherwise,
+    and when those parameters are refused (the router refuses them again and the PCB agent says so)."""
+    pitch = footprint_pad_pitch(core_fp)
+    if pitch is None or pitch >= FANOUT_PITCH_MM:
+        return None
+    p, refused = _fanout_params(ir, library, None)
+    if p is None:
+        return None
+    m = fanout_margin(p)
+    entry = (f"fanout:{core}={pitch:g};below_mm={FANOUT_PITCH_MM:g};margin_mm={m:g};escape_reach={p.escape_reach_mm},grid={p.grid_mm},"
+             f"clearance={p.clearance_mm},width={p.track_width_mm},via={p.via_diameter_mm}" + (f";raised=refused({refused})" if refused else ""))
+    return m, entry
 
 
 def _order(band: _Band, parts: list[_Part]) -> None:

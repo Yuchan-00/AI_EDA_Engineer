@@ -382,8 +382,11 @@ CAPABILITY_HTML = (
     "<tr><td>Min trace width</td><td>0.127 mm</td></tr><tr><td>Min spacing</td><td>0.127 mm</td></tr>"
     "<tr><td>Min via hole size</td><td>0.3 mm</td></tr><tr><td>Min via diameter</td><td>0.5 mm</td></tr>"
     "<tr><td>Layers</td><td>1, 2, 4</td></tr><tr><td>Copper weight</td><td>1 oz</td></tr><tr><td>Board thickness</td><td>1.6 mm</td></tr>"
-    "</table></body></html>"
-)
+    "<tr><td>Hole to board edge</td><td>0.5 mm</td></tr><tr><td>Min silkscreen text height</td><td>0.8 mm</td></tr>"
+    "<tr><td>Min silkscreen line width</td><td>0.1 mm</td></tr><tr><td>Drill range</td><td>0.15 mm to 6.3 mm</td></tr>"
+    "<tr><td>Surface finish</td><td>HASL lead-free, ENIG</td></tr><tr><td>Solder mask</td><td>green, red, blue, black, white</td></tr>"
+    "</table><p>Values are our standard process minimums; tighter limits are reviewed per order.</p></body></html>"
+)  # the archive refuses a page with fewer than MIN_HTML_TEXT_CHARS of readable text as a script-rendered shell
 
 
 @pytest.mark.skipif(not (kicad.available() and kicad.version() in PROJECT_RULES_MEASURED_VERSIONS),

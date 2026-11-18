@@ -22,10 +22,11 @@ What the file contains (verified with kicad-cli 10.0.6 ``pcb drc
 -----------------------------------------------------------------
 * ``(kicad_pcb (version 20260206) (generator "pcbnew") (generator_version "10.0")``
   - the numbers KiCad 10.0.6 itself writes. In this format there is **no**
-  numeric ``(net N "NAME")`` table: pads, segments, vias and zones reference
-  nets by name, ``(net "VIN")``. :func:`net_numbers` still provides the
-  deterministic numbering (``0 ""`` then sorted IR nets from 1) for exporters
-  that need net codes (e.g. a KiCad-9 ``20241229`` writer or netlists).
+  numeric ``(net N "NAME")`` table: pads, segments, arcs, vias and zones
+  reference nets by name, ``(net "VIN")``. :func:`net_numbers` still provides
+  the deterministic numbering (``0 ""`` then sorted IR nets from 1) for
+  exporters that need net codes (e.g. a KiCad-9 ``20241229`` writer or
+  netlists).
 * Layers: copper layers from ``ir.pcb.layers`` (``F.Cu`` = 0, ``In<n>.Cu`` =
   ``2n + 2``, ``B.Cu`` = 2) followed by KiCad's standard non-copper set in the
   exact order KiCad writes it for an enabled 2-layer board.
@@ -92,6 +93,59 @@ What the file contains (verified with kicad-cli 10.0.6 ``pcb drc
   passes ``--refill-zones`` and ``KicadCli.export_gerbers`` ``--check-zones``,
   so DRC judges and the fab files contain the filled pour, and the gerber
   check verifies the pour's copper is really in the plot.
+* Tracks: a track without ``mid`` is written ``(segment (start ..) (end ..)
+  (width ..) (layer ..) (net ..) (uuid ..))``. A track with ``mid`` - the
+  circular arc from ``start`` through ``mid`` to ``end``
+  (:mod:`ai_eda.ir.arc`) - is written as KiCad's own track arc, ``(arc
+  (start ..) (mid ..) (end ..) (width ..) (layer ..) (net ..) (uuid ..))``,
+  in IR order between its neighbours and under the same uuid key
+  (``net_item_uuid(project, "track", index)``), so an arc moves no other
+  item's uuid. The three points must be an arc
+  (:func:`~ai_eda.ir.arc.arc_problem`: the IR checks them when a track is
+  built, but a track copied with an update or assigned to never met that
+  check), also as the file holds them - the writer rounds each point to 1 nm
+  on its own, and KiCad's arc is the one through the rounded points - and
+  the radius may not exceed :data:`ARC_MAX_RADIUS_MM`; otherwise a
+  CompileError names the track. Measured on kicad-cli 10.0.6
+  (``tests/test_arc_compile.py`` repeats it where kicad-cli exists): the
+  divider board with two rounded corners passes ``pcb drc
+  --schematic-parity`` with no violation, nothing unconnected and no parity
+  finding, and without the two arcs each of their nets is open, so the arcs
+  carry the connection; ``pcb upgrade`` writes both back with the same three
+  points; DRC judges an arc on its own copper, not on its chord (another
+  net's track 0.15 mm from the arc's copper is a ``clearance`` violation,
+  and none with the chord in the arc's place); the copper plot draws each
+  arc as one circular interpolation with the track's round aperture -
+  ``G75*``, ``G02*`` or ``G03*``, ``X..Y..I..J..D01*`` from the arc's start
+  to its end with the centre as the offset ``I`` / ``J``, then ``G01*`` -
+  and never as a filled region. The radius limit: an arc of radius
+  1073.737 mm was plotted so, one of 1073.751 mm as the straight line
+  between its ends, its 0.079 mm of bulge lost (between the two radii lies
+  2^30 nm = 1073.741824 mm, where the arc's diameter no longer fits KiCad's
+  signed 32-bit nanometre coordinate). An arc only nanometres across
+  (measured: its mid within 8.5 nm of both ends) was plotted as that line as
+  well; such an arc lies within 0.1 um of its chord, inside the bound every
+  reader of an arc works with (:data:`~ai_eda.ir.arc.ARC_SAGITTA_MM`), and
+  is written as it is. The compiler's ``version`` does not change with an
+  arc, as it did not with a typed via: it writes what the IR holds, and a
+  board without an arc compiles byte for byte as before.
+* Vias: a via without a ``kind`` is written ``(via (at ..) (size ..) (drill
+  ..) (layers "F.Cu" "B.Cu") (net ..) (uuid ..))`` - no type token, which
+  kicad-cli 10.0.6 builds as a through via ``F.Cu``-``B.Cu`` whatever the
+  two layer names say (an untyped ``F.Cu``-``In2.Cu`` via came back from
+  ``pcb upgrade`` as ``F.Cu``-``B.Cu``, measured), so a ``kind``-less via
+  on any other pair is a CompileError. A typed via (``Via.kind`` ``blind``
+  / ``buried`` / ``micro``) is written with KiCad 10's token after ``via``,
+  ``(via blind (at ..) .. (layers "F.Cu" "In2.Cu") ..)``, upper layer first,
+  after :func:`~ai_eda.ir.pcb.via_span_problem` against the board's copper
+  layers (a refused span is a CompileError). kicad-cli 10.0.6 ``pcb
+  upgrade`` keeps all three tokens and their layers, and needs no board
+  setup flag for them: the ``(setup)`` it writes for such a board is the one
+  above, and DRC with ``allow_blind_buried_vias`` / ``allow_microvias``
+  false in the ``.kicad_pro`` raised no via-type violation (measured probes;
+  ``tests/test_via_kinds.py`` repeats the upgrade where kicad-cli exists).
+  Every via stays unfilled and uncapped (``(filling no)`` / ``(capping
+  no)``): this version states no via-in-pad process.
 * Keep-outs (``ir.pcb.keepouts``, read through :mod:`ai_eda.tools.keepout`)
   become KiCad rule areas after the zones, in IR order: ``(zone (layers ..)
   (uuid ..) (name "keepout_<id>[_<n>]") ... (keepout (tracks ..) (vias ..)
@@ -103,7 +157,9 @@ What the file contains (verified with kicad-cli 10.0.6 ``pcb drc
   ``allowed_refs`` / ``allowed_nets`` is written with each exempt item's box
   cut out of its polygon (+ :data:`EXEMPTION_MARGIN_MM`): an allowed ref's
   footprint extent (for the ``footprints`` / ``pads`` bans), an allowed
-  net's pads (``pads``), tracks (``tracks``), vias (``vias``) and zones
+  net's pads (``pads``), tracks (``tracks``; an arc by its exact box,
+  :func:`~ai_eda.ir.pcb.track_bbox`: its two ends and every axis extreme its
+  sweep passes), vias (``vias``) and zones
   (``zones``) - the bans that need the same cuts share one rule area, and a
   cut area is split into simple polygons without holes
   (:func:`~ai_eda.tools.keepout.rect_difference`; a convex polygon keep-out
@@ -124,6 +180,8 @@ from ai_eda.compilers.base import CompileContext, Compiler, check_finite
 from ai_eda.compilers.pins import load_verified_symbol, pad_pin_types
 from ai_eda.errors import CompileError, NothingToCompileError
 from ai_eda.ir import ArtifactKind, ArtifactRef, BoardSide, CircuitIR, Component, Placement, SilkKind, SilkText, Track, Via, Zone
+from ai_eda.ir.arc import arc_geometry, arc_problem
+from ai_eda.ir.pcb import track_bbox, via_span_problem
 from ai_eda.tools.keepout import (
     KEEPOUT_ITEMS,
     allowed_nets,
@@ -155,6 +213,9 @@ __all__ = [
     "NON_COPPER_LAYERS",
     "MANUFACTURING_RULE_KEYS",
     "EXEMPTION_MARGIN_MM",
+    "ARC_MAX_RADIUS_MM",
+    "ZONE_CLEARANCE_MM",
+    "ZONE_MIN_THICKNESS_MM",
     "net_numbers",
     "design_rules",
     "copper_layer_index",
@@ -165,6 +226,10 @@ GENERATOR = "pcbnew"
 GENERATOR_VERSION = "10.0"
 #: how far (mm) beyond an exempt item's box a keep-out's rule area is cut back (module docstring: keep-outs)
 EXEMPTION_MARGIN_MM = 0.1
+#: the largest radius (mm) of a track arc this compiler writes (module docstring: tracks). kicad-cli 10.0.6 plots a track arc of
+#: radius 1073.737 mm as an arc and one of 1073.751 mm as the straight line between its ends (measured); between the two lies
+#: 2^30 nm = 1073.741824 mm, where the arc's diameter no longer fits KiCad's signed 32-bit nanometre coordinate
+ARC_MAX_RADIUS_MM = 1073.7
 #: KiCad's name of each keep-out item in a rule area's ``(keepout ..)``
 _RULE_AREA_ITEMS = {"tracks": "tracks", "vias": "vias", "pads": "pads", "zones": "copperpour", "footprints": "footprints"}
 
@@ -206,6 +271,11 @@ MANUFACTURING_RULE_KEYS: dict[str, str] = {
 
 DEFAULT_BOARD_THICKNESS_MM = 1.6
 EDGE_LINE_WIDTH_MM = 0.05
+#: the clearance a zone without its own ``clearance_mm`` is written with, and every zone's minimum thickness (mm): KiCad's zone fill
+#: keeps this far from other nets' copper and drops any web narrower than the minimum thickness (the router's plane web check,
+#: :mod:`ai_eda.tools.routing.plane_web`, reads both)
+ZONE_CLEARANCE_MM = 0.5
+ZONE_MIN_THICKNESS_MM = 0.25
 _BAD_STEM_RE = re.compile(r'[\\/:*?"<>|\s]')
 
 # footprint children that are rebuilt rather than copied from the library tree
@@ -452,7 +522,8 @@ class PCBCompiler(Compiler):
             for t in pcb.tracks:
                 if t.net in nets:
                     r = float(t.width_mm) / 2.0 + m
-                    boxes.append((min(t.start[0], t.end[0]) - r, min(t.start[1], t.end[1]) - r, max(t.start[0], t.end[0]) + r, max(t.start[1], t.end[1]) + r))
+                    x1, y1, x2, y2 = track_bbox(t)  # the two ends, and for an arc every axis extreme its sweep passes
+                    boxes.append((x1 - r, y1 - r, x2 + r, y2 + r))
         if item == "vias" and nets:
             for v in pcb.vias:
                 if v.net in nets:
@@ -703,9 +774,22 @@ class PCBCompiler(Compiler):
 
     @classmethod
     def _segment(cls, project_id: str, index: int, track: Track, net_names: set[str], copper_names: list[str]) -> list:
+        """One track: ``(segment ...)``, or ``(arc ...)`` for a track with ``mid`` (module docstring: tracks)."""
         cls._check_net_and_layer(f"track #{index}", track.net, track.layer, net_names, copper_names)
         if track.width_mm <= 0:
             raise CompileError(f"track #{index} ({track.net}) has non-positive width {track.width_mm}")
+        if getattr(track, "mid", None) is not None:
+            start, mid, end = cls._arc_points(index, track)
+            return S(
+                "arc",
+                S("start", *start),
+                S("mid", *mid),
+                S("end", *end),
+                S("width", float(track.width_mm)),
+                S("layer", Q(track.layer)),
+                S("net", Q(track.net)),
+                S("uuid", Q(ids.net_item_uuid(project_id, "track", index))),
+            )
         return S(
             "segment",
             S("start", float(track.start[0]), float(track.start[1])),
@@ -716,12 +800,55 @@ class PCBCompiler(Compiler):
             S("uuid", Q(ids.net_item_uuid(project_id, "track", index))),
         )
 
+    @staticmethod
+    def _arc_points(index: int, track: Track) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+        """``start`` / ``mid`` / ``end`` of an arc track as the file holds them, each coordinate at 1 nm; a CompileError names the
+        track whose three points KiCad would not build as the arc the IR holds (module docstring: tracks)."""
+        what = f"track #{index} ({track.net})"
+        raw = [(float(p[0]), float(p[1])) for p in (track.start, track.mid, track.end)]
+        problem = arc_problem(*raw)  # the IR checks this when a Track is built; one copied with an update or assigned to never met it
+        if problem is not None:
+            raise CompileError(f"{what}: start {raw[0]} / mid {raw[1]} / end {raw[2]} is no arc: {problem}")
+        start, mid, end = [(_q(x), _q(y)) for x, y in raw]  # the writer rounds each point on its own: KiCad's arc is the one through these
+        problem = arc_problem(start, mid, end)
+        if problem is not None:
+            raise CompileError(f"{what}: start {start} / mid {mid} / end {end}, the arc's points at the board file's 1 nm resolution, is no arc: {problem}")
+        radius = arc_geometry(start, mid, end).r
+        if radius > ARC_MAX_RADIUS_MM:
+            raise CompileError(
+                f"{what}: an arc of radius {sexpr.fmt_num(radius)} mm, above the limit of {ARC_MAX_RADIUS_MM} mm - kicad-cli 10.0.6 plots a track arc of "
+                "radius 1073.751 mm or more as the straight line between its ends (measured), which would contradict the IR"
+            )
+        return start, mid, end
+
     @classmethod
     def _via(cls, project_id: str, index: int, via: Via, net_names: set[str], copper_names: list[str]) -> list:
+        """One ``(via ...)``: a through via without a type token, a typed via with KiCad 10's token (module docstring: vias)."""
         for layer in via.layers:
             cls._check_net_and_layer(f"via #{index}", via.net, layer, net_names, copper_names)
         if via.drill_mm <= 0 or via.diameter_mm <= via.drill_mm:
             raise CompileError(f"via #{index} ({via.net}): diameter {via.diameter_mm} must exceed drill {via.drill_mm} > 0")
+        kind = getattr(via, "kind", None)
+        if kind is not None:
+            top, bottom = via.layers
+            problem = via_span_problem(kind, top, bottom, copper_names)
+            if problem is not None:
+                raise CompileError(f"via #{index} ({via.net}): {kind} via {top}-{bottom}: {problem}")
+            return S(
+                "via",
+                kind,
+                S("at", float(via.x_mm), float(via.y_mm)),
+                S("size", float(via.diameter_mm)),
+                S("drill", float(via.drill_mm)),
+                S("layers", Q(top), Q(bottom)),
+                S("net", Q(via.net)),
+                S("uuid", Q(ids.net_item_uuid(project_id, "via", index))),
+            )
+        if set(via.layers) != {"F.Cu", "B.Cu"}:
+            raise CompileError(
+                f"via #{index} ({via.net}): layers {list(via.layers)} without a via kind - KiCad builds a via without a type token as a through via "
+                "F.Cu-B.Cu (kicad-cli 10.0.6), so the board would contradict the IR"
+            )
         return S(
             "via",
             S("at", float(via.x_mm), float(via.y_mm)),
@@ -737,7 +864,9 @@ class PCBCompiler(Compiler):
         cls._check_net_and_layer(f"zone #{index}", zone.net, zone.layer, net_names, copper_names)
         if len(zone.polygon) < 3:
             raise CompileError(f"zone #{index} ({zone.net}) needs at least 3 polygon points")
-        clearance = 0.5 if zone.clearance_mm is None else float(zone.clearance_mm)
+        if any(len(hole) < 3 for hole in zone.holes):
+            raise CompileError(f"zone #{index} ({zone.net}) cut-outs need at least 3 polygon points")
+        clearance = ZONE_CLEARANCE_MM if zone.clearance_mm is None else float(zone.clearance_mm)
         pts = S("pts", *[S("xy", float(x), float(y)) for x, y in zone.polygon])
         return S(
             "zone",
@@ -746,9 +875,10 @@ class PCBCompiler(Compiler):
             S("uuid", Q(ids.net_item_uuid(project_id, "zone", index))),
             S("hatch", "edge", 0.5),
             S("connect_pads", "yes", S("clearance", clearance)),
-            S("min_thickness", 0.25),
+            S("min_thickness", ZONE_MIN_THICKNESS_MM),
             S("fill", "yes", S("thermal_gap", 0.5), S("thermal_bridge_width", 0.5)),
             S("polygon", pts),
+            *[S("polygon", S("pts", *[S("xy", float(x), float(y)) for x, y in hole])) for hole in zone.holes],
         )
 
     # --- footprint embedding ---------------------------------------------------------
@@ -813,7 +943,12 @@ class PCBCompiler(Compiler):
         node.append(S("sheetname", Q("/")))
         node.append(S("sheetfile", Q(sheetfile)))
         attr = sexpr.find(lib, "attr")
-        if attr is not None:
+        if comp.board_only:
+            attr = sexpr.deep_copy(attr) if attr is not None else S("attr")
+            if "board_only" not in attr:
+                attr.append("board_only")
+            node.append(attr)
+        elif attr is not None:
             node.append(sexpr.deep_copy(attr))
         # footprint-level settings KiCad writes between attr and the graphics (copied verbatim, library order)
         for child in lib:

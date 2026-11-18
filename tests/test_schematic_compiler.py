@@ -173,16 +173,39 @@ def test_structure_uuids_and_embedded_library_symbols(ir: CircuitIR, tmp_path: P
         assert props["Footprint"] == ("Resistor_SMD:R_0603_1608Metric" if ref.startswith("R") else "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical")
         assert all(sexpr.find(p, "effects") is not None for p in sexpr.find_all(sym, "property"))
     assert [str(p[1]) for p in sexpr.find_all(symbols["J1"], "pin")] == ["1", "2", "3"]
-    # one wire + one global label per (net, pin); labels named after the nets, anchored at wire ends
+    # one global label per (net, pin) anchored at a wire end (the pin's stub); the routed wires come on top (B11)
     labels = sexpr.find_all(sch, "global_label")
     wires = sexpr.find_all(sch, "wire")
-    assert len(labels) == len(wires) == sum(len(v) for v in EXPECTED_NETS.values())
+    pin_count = sum(len(v) for v in EXPECTED_NETS.values())
+    assert len(labels) == pin_count and len(wires) > pin_count
     assert sorted(str(l[1]) for l in labels) == sorted(n for n, pins in EXPECTED_NETS.items() for _ in pins)
     wire_ends = {tuple(str(a) for a in xy[1:3]) for w in wires for xy in sexpr.find_all(sexpr.find(w, "pts"), "xy")}
     for label in labels:
         at = sexpr.find(label, "at")
         assert (str(at[1]), str(at[2])) in wire_ends
-    assert not sexpr.find_all(sch, "no_connect") and not sexpr.find_all(sch, "junction")
+    assert not sexpr.find_all(sch, "no_connect")
+
+
+@needs_libs
+def test_every_small_net_is_drawn_as_wires_with_a_junction_where_three_pins_meet(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary):
+    """B11: VIN (2 pins), VOUT (3 pins) and GND (2 pins) each get a trunk + branches; VOUT's three branches meet at one junction.
+    The note says so; the labels stay on every pin, so the netlist (tested below with kicad-cli) is unchanged."""
+    node, notes = SchematicCompiler().build_with_notes(ir, lib)
+    wires = sexpr.find_all(node, "wire")
+    junctions = sexpr.find_all(node, "junction")
+    pin_count = sum(len(v) for v in EXPECTED_NETS.values())
+    assert len(wires) >= pin_count + 3 * 2  # every net adds at least a trunk and two branches beyond its stubs
+    assert len(junctions) == 1
+    assert notes == ["wiring: 3 of 3 net(s) drawn as wires (labels kept on every pin)"]
+    # every wire is orthogonal and on the 1.27 mm grid
+    for w in wires:
+        (ax, ay), (bx, by) = [tuple(float(v) for v in xy[1:3]) for xy in sexpr.find_all(sexpr.find(w, "pts"), "xy")]
+        assert ax == bx or ay == by
+        for v in (ax, ay, bx, by):
+            assert abs(v / 1.27 - round(v / 1.27)) < 1e-6, (ax, ay, bx, by)
+    # the compile stage carries the note
+    ref, _ = compile_to(ir, tmp_path, lib)
+    assert ref.notes == notes
 
 
 @needs_libs
@@ -197,6 +220,47 @@ def test_no_connect_pin_emits_marker(ir: CircuitIR, tmp_path: Path, lib: KicadLi
     at = sexpr.find(ncs[0], "at")
     j1_pos = sexpr.find(next(s for s in sexpr.find_all(sch, "symbol") if sexpr.get(s, "property", 2) == "J1"), "at")
     assert (float(at[1]), float(at[2])) == pytest.approx((float(j1_pos[1]) - 5.08, float(j1_pos[2]) + 2.54))  # pin 3 end
+
+
+@needs_libs
+def test_a_net_with_only_power_input_pins_gets_exactly_one_pwr_flag_and_a_driven_net_none(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary):
+    """B12: two L7805 in series and an NE555 on the divider. VIN (U1 IN, the NE555's inputs) and GND (both regulators' GND)
+    carry power-input pins and otherwise only input / passive pins, so each gets one ``power:PWR_FLAG`` with its own stub +
+    label. MID (U1 OUT -> U2 IN, U3 VCC) and VOUT (U2 OUT) have a power output and get none. X ties the NE555's ``output``
+    pin to its own GND pin: KiCad reports a flag there against the output (``pin_to_pin``), so X gets none and a note, and
+    ERC keeps its one honest error. The netlist is the IR's (no ``#FLG``)."""
+    prov = ir.component("R1").provenance
+    parts = {"U1": ("Regulator_Linear", "L7805"), "U2": ("Regulator_Linear", "L7805"), "U3": ("Timer", "NE555P")}
+    for ref, (library, name) in parts.items():
+        symbol = lib.resolve_symbol(LibraryRef(library=library, name=name))
+        if not symbol.verified:
+            pytest.skip(f"{library}:{name} not installed")
+        pins = [Pin(number=p.number, name=p.name, electrical_type=p.ir_type, provenance=prov) for p in lib.load_symbol(symbol).pins]
+        ir.components.append(ir.component("R1").model_copy(update={"ref": ref, "value": name, "symbol": symbol, "footprint": None, "pins": pins, "spice": None}))
+    more = {"VIN": [("U1", "1"), ("U3", "2"), ("U3", "4"), ("U3", "6"), ("U3", "7")], "GND": [("U1", "2"), ("U2", "2")], "VOUT": [("U2", "3"), ("U3", "5")]}
+    for name, pins in more.items():
+        ir.net(name).pins += [PinRef(component_ref=r, pin_number=p) for r, p in pins]
+    ir.nets += [_fake_net("MID", ("U1", "3"), ("U2", "1"), ("U3", "8")), _fake_net("X", ("U3", "1"), ("U3", "3"))]
+    node, notes = SchematicCompiler().build_with_notes(ir, lib)
+    assert sexpr.dumps(node) == sexpr.dumps(SchematicCompiler().build(ir, KicadLibrary()))  # flags included: the same bytes again
+    flags = [s for s in sexpr.find_all(node, "symbol") if sexpr.get(s, "lib_id") == "power:PWR_FLAG"]
+    assert [str(sexpr.get(s, "property", 2)) for s in flags] == ["#FLG01", "#FLG02"]  # net-name order: GND, VIN
+    assert all(sexpr.get(sexpr.find(s, "property"), "hide") is True for s in flags)  # the library hides a flag's reference, so the instance does
+    labels = [str(g[1]) for g in sexpr.find_all(node, "global_label")]
+    members = {n.name: len(n.pins) for n in ir.nets}
+    assert {n: labels.count(n) - members[n] for n in members} == {"VIN": 1, "GND": 1, "VOUT": 0, "MID": 0, "X": 0}
+    assert notes[-2] == "power flags: PWR_FLAG on 2 net(s) with a power-input pin and no power-output pin (GND, VIN)"
+    assert notes[-1].startswith("power flags: none on X (")
+    # GND's four IR pins are still drawn as wires: the flag's pin, a fifth, is not the router's (5 > MAX_WIRED_PINS would be "labels only")
+    assert notes[0].startswith("wiring: ") and " of 5 net(s)" in notes[0] and not any(n.startswith("not wired") and "GND" in n for n in notes)
+    if not _kicad.available():
+        return
+    _, path = compile_to(ir, tmp_path, lib)
+    result = _kicad.run_erc(path, tmp_path / "erc.json")
+    errors = result.details["errors"]  # X only (U3's GND pin behind its own output): not driven, and no pin_to_pin from a flag
+    assert [e["type"] for e in errors] == ["power_pin_not_driven"] and "U3" in errors[0]["items"][0]["description"], errors
+    assert result.details["warnings"] == [], result.details["warnings"]
+    assert netlist_nets(_kicad.export_netlist(path, tmp_path / "out.net", fmt="kicadsexpr")) == ir_net_map(ir)
 
 
 # --------------------------------------------------------------------------- refusals

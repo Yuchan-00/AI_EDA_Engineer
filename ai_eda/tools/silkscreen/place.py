@@ -76,6 +76,22 @@ Placement, in this order (each text is a keep-out for the next):
    says how far. No date, no hash (determinism; a hash would be circular).
    No free position: no title, and the note says so.
 
+**Kept texts (``silkscreen.place`` 0.2).** A template - or a design file's
+``board`` section - may put board texts on the silk before the board is
+placed (a keyboard's note names, a title: ``keep``, the ``user`` / ``title``
+texts the PCB agent recognises as a template's or a design file's; the notes
+name which, ``kept_by``). They stay exactly where they were put, ahead of
+the placed texts in :attr:`SilkPlacement.texts`, and each is a keep-out (its
+estimated box + ``text_gap``) for every text placed here, before step 1;
+when one of them is a ``title`` text, step 3 places no second title. A kept
+text the compiler would refuse (:func:`~ai_eda.tools.silkscreen.geometry.silk_text_problems`)
+or of another kind is refused (:class:`CompileError`). Whether the kept
+texts themselves keep clear of pads, the edge and the footprints' silk is
+the ``pcb.silk.*`` checks' to judge, not this placer's. Every text placed on
+such a board is stamped 0.2 and names the kept texts' count in
+``derived_from`` (``kept_texts:<n>``); every other board is placed exactly as
+0.1 did (byte for byte, stamp included).
+
 Every coordinate is rounded to 0.001 mm before its box is tested, so the
 texts written are the texts tested. Provenance: ``derived`` /
 ``silkscreen.place`` with the component / pad / net, the candidate index and
@@ -102,14 +118,19 @@ from ai_eda.tools.silkscreen.geometry import (
     Shape,
     footprint_silk,
     inside_box,
+    ir_text_box,
     pad_copper,
     shape_distance,
+    side_of_layer,
+    silk_text_problems,
     text_box,
     text_extent,
 )
 
 __all__ = [
+    "KEPT_KINDS",
     "PLACER_ID",
+    "PLACER_KEEP_VERSION",
     "PLACER_VERSION",
     "SilkParams",
     "SilkPlacement",
@@ -121,6 +142,10 @@ __all__ = [
 
 PLACER_ID = "silkscreen.place"
 PLACER_VERSION = "0.1"
+#: ``tool_version`` of every text placed on a board with kept template texts (module docstring); every other board keeps 0.1
+PLACER_KEEP_VERSION = "0.2"
+#: the silk text kinds a template may put on the board before it is placed (the placer adds references and pin labels itself)
+KEPT_KINDS: frozenset[SilkKind] = frozenset({SilkKind.USER, SilkKind.TITLE})
 #: KiCad's default silk text stroke; texts above 1 mm get 15 % of their size
 MIN_STROKE_MM = 0.15
 #: coordinates of placed texts are rounded to this many decimals (1 um) before they are tested
@@ -177,11 +202,17 @@ class SilkPlacement:
     title: str | None = None
     title_corner: str | None = None  # "at the top-left corner" / "on the bottom edge, 5 mm from the bottom-left corner"
     notes: list[str] = field(default_factory=list)
+    #: the template texts kept where they were (also the first entries of ``texts``); empty on every other board
+    kept: list[SilkText] = field(default_factory=list)
+    #: who put the kept texts on the board, as the notes name it: ``template``, or ``design file`` (a design file's board texts)
+    kept_by: str = "template"
 
     def description(self) -> str:
         """One line for the agent's note and the proposal description."""
         text = (
-            f"{PLACER_ID} {PLACER_VERSION}: {len(self.references_on_silk)} reference(s) on the silkscreen, "
+            f"{PLACER_ID} {PLACER_KEEP_VERSION if self.kept else PLACER_VERSION}: "
+            + (f"{len(self.kept)} {self.kept_by} text(s) kept where the {self.kept_by} put them, " if self.kept else "")
+            + f"{len(self.references_on_silk)} reference(s) on the silkscreen, "
             f"{len(self.references_on_fab)} on the fab layer"
             + (f" ({', '.join(self.references_on_fab)}: no free silk position at {'/'.join(f'{s:g}' for s in self.params.reference_sizes_mm)} mm)" if self.references_on_fab else "")
             + f", {len(self.labels_placed)} connector pin label(s) placed, {len(self.labels_skipped)} skipped"
@@ -635,23 +666,62 @@ def _place_title(ir: CircuitIR, board: _Board, out: SilkPlacement) -> None:
         out.notes.append(f"silkscreen title: no corner was free; placed on {where}")
 
 
-def place_silkscreen(ir: CircuitIR, library: KicadLibrary, params: SilkParams | None = None) -> SilkPlacement:
+def _kept(ir: CircuitIR, board: _Board, keep: list[SilkText]) -> SilkText | None:
+    """Make every kept template text a keep-out (module docstring, kept texts); the first kept ``title`` text, or ``None``."""
+    sides = {c.ref: (p.side if (p := ir.pcb.placement(c.ref)) is not None else None) for c in ir.components}  # type: ignore[union-attr]
+    problems = silk_text_problems(keep, sides)
+    for i, t in enumerate(keep):
+        if t.kind not in KEPT_KINDS:
+            raise CompileError(f"kept silk text {t.text!r} is a {t.kind} text; only {' / '.join(sorted(KEPT_KINDS))} texts are kept (the placer adds "
+                               "references and pin labels itself)")
+        if i in problems:
+            raise CompileError(f"kept silk text refused: {problems[i]}")
+        board.add_text(side_of_layer(t.layer), f"{t.kind} {t.text!r} (kept)", ir_text_box(t))
+    return next((t for t in keep if t.kind == SilkKind.TITLE), None)
+
+
+def _restamped(t: SilkText, kept: int, kept_by: str = "template") -> SilkText:
+    """A text placed on a board with ``kept`` template texts, stamped :data:`PLACER_KEEP_VERSION` (module docstring)."""
+    prov = t.provenance.model_copy(update={
+        "tool_version": PLACER_KEEP_VERSION, "derived_from": [*t.provenance.derived_from, f"kept_texts:{kept}"],
+        "note": f"{t.provenance.note}; the {kept_by}'s {kept} kept text(s) are keep-outs too",
+    })
+    return t.model_copy(update={"provenance": prov})
+
+
+def place_silkscreen(ir: CircuitIR, library: KicadLibrary, params: SilkParams | None = None, *, keep: list[SilkText] | None = None,
+                     kept_by: str = "template") -> SilkPlacement:
     """Place references, connector pin labels and the title on the placed board of ``ir`` (module docstring); pure.
 
-    Raises :class:`CompileError` when the board cannot be read: no
-    placements or outline, a component without a placement / footprint, a
+    ``keep`` (a template's ``user`` / ``title`` texts already on the board)
+    stay as they are, first in ``texts``, and every placed text keeps clear of
+    them (module docstring, kept texts); without it the placer works exactly
+    as 0.1 did. ``kept_by`` names who put them there in the notes and the
+    placed texts' provenance notes (``template``; ``design file`` for a design
+    file's board texts) - it changes no position. Raises
+    :class:`CompileError` when the board cannot be read: no placements or
+    outline, a component without a placement / footprint, a
     footprint not on disk or malformed, a pad whose copper is unknown (a
     trapezoid, a custom pad with an unread primitive) in a footprint without
-    a courtyard, a silk construct the geometry module does not read.
-    ``ir`` is never modified.
+    a courtyard, a silk construct the geometry module does not read, a kept
+    text that is not a ``user`` / ``title`` text or that the compiler would
+    refuse. ``ir`` is never modified.
     """
     params = params or SilkParams()
     board = _Board(ir, library, params)
     out = SilkPlacement(texts=[], params=params)
+    kept_title = _kept(ir, board, list(keep)) if keep else None
     connectors = _connectors(ir, board)
     _place_references(board, out, connectors)
     _place_pin_labels(board, out, connectors)
-    _place_title(ir, board, out)
+    if kept_title is None:
+        _place_title(ir, board, out)
+    else:
+        out.title, out.title_corner = kept_title.text, f"kept where the {kept_by} put it"
+        out.notes.append(f"silkscreen title: the {kept_by}'s title {kept_title.text!r} is kept where the {kept_by} put it; no second title placed")
+    if keep:
+        out.kept, out.kept_by = list(keep), kept_by
+        out.texts = [*keep, *(_restamped(t, len(keep), kept_by) for t in out.texts)]
     if out.references_in_courtyard:
         out.notes.append("silkscreen: reference(s) at another footprint's courtyard (no candidate outside every other courtyard): " + "; ".join(out.references_in_courtyard))
     if out.references_on_fab:

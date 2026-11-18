@@ -447,9 +447,24 @@ def test_judge_uses_the_looser_of_abs_and_rel_and_reduce_reports_problems():
     exp.at = user_requirement(5.0)
     assert reduce_result(res, exp, "x")[1].startswith("v-sweep=5.0 is outside")
     assert reduce_result(res, exp, "missing")[1].startswith("vector not produced")
-    for reduce, expected in ((Reduce.FINAL, 3.0), (Reduce.MAX, 3.0), (Reduce.MIN, 0.0)):
+    for reduce, expected in ((Reduce.FINAL, 3.0), (Reduce.MAX, 3.0), (Reduce.MIN, 0.0), (Reduce.PP, 3.0)):
         exp.reduce = reduce
         assert reduce_result(res, exp, "x") == (expected, None)
+
+
+def test_mean_is_the_time_average_of_the_interpolant_over_the_window():
+    # D9a: a tran vector 0 -> 2 over the first second, flat at 2 over the next: the interpolant's mean over [0, 2] is 1.5
+    from ai_eda.tools.spice import SpiceAnalysis, SpiceResult
+    from ai_eda.tools.spice.measure import window_mean
+
+    res = SpiceResult(engine="x", engine_version="x", netlist_path="n", netlist_hash="h", analysis=SpiceAnalysis.TRAN, command="tran 1 2",
+                      vectors={"time": [0.0, 1.0, 2.0], "x": [0.0, 2.0, 2.0]}, scale="time", n_points=3, succeeded=True)
+    exp = Expectation(id="e", analysis_id="a", vector="v(X)", reduce=Reduce.MEAN, nominal=user_requirement(1.5), tol_abs=user_requirement(0.01),
+                      params={"t_start": user_requirement(0.0, "s"), "t_stop": user_requirement(2.0, "s")}, provenance=USER)
+    assert reduce_result(res, exp, "x")[0] == pytest.approx(1.5)
+    # [0.5, 1.5]: the interpolant runs 1.0 -> 2.0 over the first half (area 0.75) and stays at 2.0 (area 1.0): mean 1.75
+    assert window_mean([0.0, 1.0, 2.0], [0.0, 2.0, 2.0], 0.5, 1.5).value == pytest.approx(1.75)
+    assert window_mean([0.0, 1.0, 2.0], [0.0, 2.0, 2.0], 1.0, 3.0).problem.startswith("the window")
 
 
 # --------------------------------------------------------------------------- a measured frequency (Reduce.FREQUENCY + tran uic)

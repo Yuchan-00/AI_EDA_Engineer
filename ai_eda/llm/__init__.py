@@ -6,13 +6,19 @@ user before anything downstream relies on them.
 
 Modules: ``client`` (provider-independent contract + typed ``LLMError``),
 ``openrouter`` (HTTP client, per-call billing), ``claude_cli`` (the Claude
-Code CLI on the user's subscription login; no per-call charge), ``providers``
+Code CLI on the user's subscription login; no per-call charge),
+``codex_cli`` (the Codex CLI on the user's ChatGPT login; a subscription
+too), ``openai_compat`` (any OpenAI-compatible chat-completions server:
+the OpenAI API, llama.cpp, Ollama, vLLM, LM Studio; free on this machine,
+per call elsewhere), ``providers``
 (``ProviderClient`` over several providers, ``describe_providers`` for the
 GUI), ``fake`` (in-process scripted client for tests and ``--llm
 fake:<json>``), ``router`` (``provider:model`` specs, task -> model
 candidates, explicit fallback only), ``usage`` (accounting; unknown cost stays
 unknown, a subscription call is a known zero charge), ``service`` (budget +
-approval + retry / fallback + schema validation), ``prompts`` (model-facing
+approval + retry / fallback + schema validation + the cross-check runs),
+``crosscheck`` (deterministic field-by-field comparison of grounded
+proposals from several models), ``prompts`` (model-facing
 text) and ``extraction`` (strict schemas + deterministic grounding of a
 requirement extraction).
 """
@@ -59,13 +65,22 @@ def __getattr__(name: str):
         from ai_eda.llm.claude_cli import ClaudeCodeClient
 
         return ClaudeCodeClient
+    if name == "CodexCliClient":
+        from ai_eda.llm.codex_cli import CodexCliClient
+
+        return CodexCliClient
+    if name == "OpenAICompatClient":
+        from ai_eda.llm.openai_compat import OpenAICompatClient
+
+        return OpenAICompatClient
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "LLMClient", "LLMError", "LLMMessage", "LLMResponse", "ToolCall", "ToolSpec", "Usage",
     "ModelConfig", "ModelRouter", "TaskKind", "default_router", "parse_model_spec", "same_model_fallback",
     "DEFAULT_CLAUDE_MODEL", "DEFAULT_FALLBACK_MODEL", "DEFAULT_PRIMARY_MODEL", "KNOWN_PROVIDERS",
-    "OpenRouterClient", "ClaudeCodeClient", "ScriptedLLMClient", "ProviderClient", "ProviderInfo", "describe_providers", "UsageTracker",
+    "OpenRouterClient", "ClaudeCodeClient", "CodexCliClient", "OpenAICompatClient",
+    "ScriptedLLMClient", "ProviderClient", "ProviderInfo", "describe_providers", "UsageTracker",
     "LLMService", "LLMBudget", "LLMAttempt", "BudgetExceededError", "StructuredOutputError",
     "CONFIRM_KEY", "GroundedExtraction", "RequirementExtraction", "build_extraction_messages",
     "confirmation_question", "ground_extraction", "is_confirmation", "json_schema", "request_hash", "upgrade_confirmed",

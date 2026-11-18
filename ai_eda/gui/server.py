@@ -118,6 +118,8 @@ from ai_eda.tools.kicad.library import KicadLibrary
 DEFAULT_PORT = 8766
 #: the largest POST body accepted (a form is a few hundred bytes)
 MAX_BODY_BYTES = 1 << 20
+#: how long a refused POST's unread body is waited for before the refusal is sent anyway (seconds)
+DRAIN_TIMEOUT_S = 2.0
 #: how long a ``describe_providers`` answer is reused (it runs ``claude --version`` / ``auth status``)
 PROVIDERS_TTL_S = 30.0
 #: the app page: its own script / style only, data: images, same-origin frames
@@ -651,17 +653,36 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(response)
 
     def do_POST(self) -> None:  # noqa: N802
-        self.close_connection = True  # a refused POST leaves its body unread: never reuse the connection
+        self.close_connection = True  # a refused POST is answered once and the connection closed
+        self._body_consumed = False
         if not host_allowed(self.headers.get("Host")):
+            self._drain_body()
             self._reply(text_response(421, "misdirected request: this server answers only for 127.0.0.1, localhost or [::1]"))
             return
         try:
             response = self._post()
         except HttpError as e:
+            self._drain_body()
             response = text_response(e.code, e.line)
         except Exception as e:  # noqa: BLE001
+            self._drain_body()
             response = text_response(503, f"unavailable: {e}")
         self._reply(response)
+
+    def _drain_body(self) -> None:
+        """Read and discard the request body a refusal did not consume (up to ``MAX_BODY_BYTES``): closing the socket with
+        the body still unread makes Windows reset the connection and the client sees WinError 10053 instead of the status."""
+        if getattr(self, "_body_consumed", False):
+            return
+        length = (self.headers.get("Content-Length") or "").strip()
+        if length.isdigit() and 0 < int(length) <= MAX_BODY_BYTES:
+            try:
+                # bounded: a client that declares a length and stalls must not hold the handler thread
+                self.connection.settimeout(DRAIN_TIMEOUT_S)
+                self.rfile.read(int(length))
+            except (OSError, ValueError):
+                pass
+        self._body_consumed = True
 
     def _post(self) -> Response:
         origin = self.headers.get("Origin")
@@ -682,6 +703,7 @@ class _Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             raise HttpError(413, f"request body too large (limit {MAX_BODY_BYTES} bytes)")
         raw = self.rfile.read(length)
+        self._body_consumed = True
         if len(raw) != length:
             raise HttpError(400, "the body ended before Content-Length")
         try:

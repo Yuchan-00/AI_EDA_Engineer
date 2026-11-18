@@ -19,6 +19,12 @@ optional input of every template, read by :func:`read_layer_count`: a plain
 integer, one of :data:`LAYER_COUNT_OPTIONS`; without one the template uses
 :data:`DEFAULT_LAYER_COUNT` and must show that choice in its confirmation
 table (:mod:`ai_eda.design.stackup` builds the stack for either count).
+Three more board keys choose or inform the board's base material
+(:mod:`ai_eda.design.materials` reads them): ``pcb_material`` (alias
+``board_material``, one material id), ``pcb_flexing`` (``static`` /
+``dynamic`` / ``none``) and ``power_dissipation`` (W, alias
+``heat_dissipation``). Like the layer count they are served by every
+template through the stack (:data:`BOARD_KEY_ALIASES`).
 
 RF keys (:data:`RF_KEY_ALIASES`, units in :data:`RF_UNIT_OF`) are read like
 every other key: ``carrier_frequency`` (Hz), ``tx_power`` (W - the conducted
@@ -91,6 +97,9 @@ KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "led_forward_current": ("led_forward_current", "forward_current", "led_current", "i_f", "if"),
     "oscillation_frequency": ("oscillation_frequency", "output_frequency", "f_osc", "fosc"),
     "clock_frequency": ("clock_frequency", "crystal_frequency", "mcu_clock", "f_clk", "fclk"),
+    "max_voltage_drop": ("max_voltage_drop", "on_voltage_drop", "v_ce_sat", "vce_sat", "switch_drop"),
+    "bus_capacitance": ("bus_capacitance", "line_capacitance", "c_bus", "c_b", "cb"),
+    "bus_rise_time": ("bus_rise_time", "rise_time", "t_rise", "t_r", "tr"),
 }
 #: canonical key -> the unit its value must carry
 UNIT_OF: dict[str, str] = {
@@ -102,6 +111,9 @@ UNIT_OF: dict[str, str] = {
     "led_forward_current": "A",
     "oscillation_frequency": "Hz",
     "clock_frequency": "Hz",
+    "max_voltage_drop": "V",
+    "bus_capacitance": "F",
+    "bus_rise_time": "s",
 }
 #: how the note of a value copied from a requirement starts (followed by the requirement id)
 PARSED_NOTE_PREFIX = "parsed from "
@@ -117,8 +129,22 @@ LAYER_COUNT_OPTIONS: tuple[int, ...] = (2, 4)
 DEFAULT_LAYER_COUNT = 2
 #: the ``unit`` of a copied layer count (``read_value(req, LAYER_UNIT)`` reads a plain integer)
 LAYER_UNIT = "layers"
+#: the board's base material, answered directly (``--answer pcb_material=rogers_ro4350b``): a categorical board key read by
+#: :func:`ai_eda.design.materials.read_material_answer` - one of :data:`ai_eda.design.materials.MATERIAL_IDS`, never mapped from a description
+MATERIAL_KEY = "pcb_material"
+MATERIAL_ALIASES: tuple[str, ...] = ("pcb_material", "board_material")
+#: how the board bends in the device: ``static`` (bent once to install), ``dynamic`` (bends in use) or ``none``; a categorical
+#: board key the material rule reads (:mod:`ai_eda.design.materials`)
+FLEXING_KEY = "pcb_flexing"
+FLEXING_ALIASES: tuple[str, ...] = ("pcb_flexing", "board_flexing")
+#: the heat the board's parts dissipate in total (W): a board key the material rule reads - it asks for the material, never decides
+POWER_DISSIPATION_KEY = "power_dissipation"
+POWER_DISSIPATION_ALIASES: tuple[str, ...] = ("power_dissipation", "heat_dissipation")
 #: board-level keys (canonical key -> the requirement keys that mean it); every template serves them through the stackup
-BOARD_KEY_ALIASES: dict[str, tuple[str, ...]] = {LAYER_COUNT_KEY: LAYER_COUNT_ALIASES}
+#: (the layer count, and the base material with the needs it is chosen from: :mod:`ai_eda.design.materials`)
+BOARD_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    LAYER_COUNT_KEY: LAYER_COUNT_ALIASES, MATERIAL_KEY: MATERIAL_ALIASES, FLEXING_KEY: FLEXING_ALIASES, POWER_DISSIPATION_KEY: POWER_DISSIPATION_ALIASES,
+}
 
 # --------------------------------------------------------------------------- RF keys
 # Added to KEY_ALIASES / UNIT_OF by mutation after their literals (below), so the literals above stay as they are.
@@ -617,7 +643,13 @@ __all__ = [
     "BOARD_KEY_ALIASES",
     "CATEGORICAL_KEYS",
     "DEFAULT_LAYER_COUNT",
+    "FLEXING_ALIASES",
+    "FLEXING_KEY",
     "KEY_ALIASES",
+    "MATERIAL_ALIASES",
+    "MATERIAL_KEY",
+    "POWER_DISSIPATION_ALIASES",
+    "POWER_DISSIPATION_KEY",
     "LAYER_COUNT_ALIASES",
     "LAYER_COUNT_KEY",
     "LAYER_COUNT_OPTIONS",

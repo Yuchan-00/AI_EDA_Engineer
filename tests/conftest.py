@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import ai_eda.llm.claude_cli as _claude_cli
+import ai_eda.llm.codex_cli as _codex_cli
 import ai_eda.report.stages as _stages
 from ai_eda.ir import (
     CircuitDomain,
@@ -78,6 +79,22 @@ def claude_cli_discovery_finds_only_the_fake(request: pytest.FixtureRequest, mon
         return found if found is not None and is_fake_claude_cli(found) else None
 
     monkeypatch.setattr(_claude_cli, "find_claude_cli", fake_only)
+
+
+@pytest.fixture(autouse=True)
+def codex_cli_discovery_finds_only_the_fake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``find_codex_cli`` finds only the fake ``codex`` of ``tests/fake_codex_cli.py`` (marker beside it), never the machine's
+    real Codex CLI: a model call on it would use the user's ChatGPT login. An explicit ``CodexCliClient(codex_cli=...)`` /
+    ``--llm-codex-cli`` is untouched."""
+    from tests.fake_codex_cli import is_fake_codex_cli
+
+    real = _codex_cli.find_codex_cli
+
+    def fake_only() -> str | None:
+        found = real()
+        return found if found is not None and is_fake_codex_cli(found) else None
+
+    monkeypatch.setattr(_codex_cli, "find_codex_cli", fake_only)
 
 
 def _pin(n: str) -> Pin:

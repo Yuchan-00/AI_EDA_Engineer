@@ -56,11 +56,66 @@ Both checks are conservative, so a claim is real:
   clearance limit. Without IR copper there is nothing to compare
   (NOT_APPLICABLE, never a vacuous PASS).
 
-A via is modelled as a **through** via: the compiler writes it without a via
-type, which KiCad reads as spanning every copper layer, so its copper is on
-every layer of ``ir.pcb.layers`` (the two names in ``Via.layers`` are only
-checked against that list), and a track of another net on an inner layer
-under it is a short.
+A via without a ``kind`` is modelled as a **through** via: the compiler
+writes it without a via type, which KiCad reads as spanning every copper
+layer, so its copper is on every layer of ``ir.pcb.layers`` (the two names
+in ``Via.layers`` are only checked against that list), and a track of
+another net on an inner layer under it is a short. A **typed** via
+(``Via.kind`` ``blind`` / ``buried`` / ``micro``) has its copper only on its
+span, the copper layers from ``Via.layers[0]`` to ``Via.layers[1]`` in stack
+order (:func:`~ai_eda.ir.pcb.via_span`): it joins, and is compared with,
+copper on those layers only - a blind ``F.Cu``-``In2.Cu`` via does not join
+an ``In3.Cu`` track, a blind ``F.Cu``-``In3.Cu`` via does join an ``In2.Cu``
+track (kicad-cli 10.0.6 DRC connected and left apart exactly these on a
+6-layer probe board, measured) -, it reaches a pour only on a layer of its
+span (a through via reaches every pour), and a keep-out judges it only where
+its span meets the covered layers. A typed via whose span the board cannot
+hold (:func:`~ai_eda.ir.pcb.via_span_problem` against ``ir.pcb.layers``: an
+end the board lacks, a blind via without exactly one outer end, ...) is a
+FAIL row naming the rule (the compiler refuses the same), and it joins
+nothing. Every ``pcb.routing`` and ``pcb.keepout`` result on an IR with a
+typed via is stamped :data:`TYPED_VIA_TOOL_VERSION` (0.2); every other
+result is judged and stamped as before (0.1), unless the IR has an arc.
+
+A track with ``mid`` is a circular **arc** from ``start`` through ``mid`` to
+``end`` (:mod:`ai_eda.ir.arc`) and is measured as one, never as the chord
+between its ends. It stays one item (one ``track[i:net]``). What is exact:
+its box (the arc's own, for the outline test and every prefilter), and its
+distance to a point - a via, a pad centre (connectivity), the disc that
+bounds a custom pad's part and the part's known copper, a track end
+(:func:`~ai_eda.ir.arc.point_arc_distance`). A segment, a pad's box, another
+arc and a keep-out area are measured against the arc's *chain*
+(:func:`~ai_eda.ir.arc.arc_points`): chords that lie within
+:data:`~ai_eda.ir.arc.ARC_SAGITTA_MM` (1 um, a stated choice of the IR) of
+the arc, and the arc within that of them. Such a distance is therefore known
+only to within that bound per arc involved - the *arc tolerance* - and a
+verdict is given only where the tolerance cannot change it:
+
+* clearance and ``pcb.keepout``: a violation when the pair is too close (or
+  touches) even with the tolerance added to the measured distance, clear
+  when it keeps the limit with the tolerance taken off; in between the pair
+  is a NOT_VERIFIED row naming the arc tolerance
+  (``details["arc_tolerance"]`` of the clearance result), never a FAIL and
+  never counted as clear. What is measured exactly stays a verdict: a custom
+  pad's known copper closer than the limit to an arc is a FAIL row, as it is
+  for a straight track, however the pad's box reads on the chords;
+* connectivity: two tracks are joined when an end of one lies closer to the
+  other's centreline than their half widths (exact; a shared end point is at
+  distance 0) or the copper on their chords overlaps by more than the
+  tolerance, and are apart when that copper is apart by at least the
+  tolerance; a pair in between joins nothing, and a net whose row would be
+  another one with every such pair joined is a NOT_VERIFIED row naming the
+  pairs (``arc_tolerance``), never a PASS or a FAIL. A via or a pad on an arc
+  is judged exactly.
+
+An arc whose three points are no arc (a non-finite coordinate, coinciding
+points, a mid point on the line through the ends: the ``Track`` model refuses
+them) cannot be copper: a FAIL row like every malformed track, never a
+crash. Every ``pcb.routing`` and ``pcb.keepout`` result on an IR with an arc
+is stamped :data:`ARC_TOOL_VERSION` (0.3), with or without a typed via, and
+one that read the board's copper names the model in ``details["arc_model"]``
+(:data:`ARC_MODEL`); an IR without an arc is judged and stamped exactly as
+before. The silkscreen checks read no track and keep their version.
 
 Pad geometry (board frame, mm, Y down, as :mod:`ai_eda.tools.kicad.geometry`
 defines it): the centre from ``pad_center``, the box exact for pads at
@@ -186,6 +241,8 @@ from typing import Any
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import BoardSide, CircuitIR, PCBDesign, Track, ValidationResult, ValidationStatus, Via
+from ai_eda.ir.arc import ARC_SAGITTA_MM, arc_bbox, arc_points, arc_problem, point_arc_distance
+from ai_eda.ir.pcb import copper_stack_order, via_span, via_span_problem
 from ai_eda.tools.kicad.geometry import _q, custom_pad_parts, pad_angle, pad_center, pad_layers
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError
 from ai_eda.tools.silkscreen.geometry import (
@@ -208,6 +265,8 @@ from ai_eda.validation.registry import default_registry
 __all__ = [
     "TOOL_ID",
     "TOOL_VERSION",
+    "TYPED_VIA_TOOL_VERSION",
+    "ARC_TOOL_VERSION",
     "CONNECTIVITY_CHECK",
     "CLEARANCE_CHECK",
     "RoutingValidator",
@@ -229,6 +288,12 @@ __all__ = [
 
 TOOL_ID = "pcb.routing"
 TOOL_VERSION = "0.1"
+#: the version of every ``pcb.routing`` / ``pcb.keepout`` result on an IR with a blind / buried / micro via (its copper on its span
+#: only); every other result keeps its own (0.1), unless the IR has an arc (below)
+TYPED_VIA_TOOL_VERSION = "0.2"
+#: the version of every ``pcb.routing`` / ``pcb.keepout`` result on an IR with an arc track (``Track.mid``; measured as an arc, module
+#: docstring), with or without a typed via; an IR without an arc keeps the versions above
+ARC_TOOL_VERSION = "0.3"
 CONNECTIVITY_CHECK = "pcb.routing.connectivity"
 CLEARANCE_CHECK = "pcb.routing.clearance"
 #: details["kind"] of both results: an IR geometry check, never ERC / DRC
@@ -238,8 +303,17 @@ NOT_DRC = "IR geometry, not DRC"
 NOT_COMPARED = ["pad-to-pad (footprint / placement geometry; DRC judges it)"]
 #: added to ``not_compared`` when ``ir.pcb.zones`` is not empty
 ZONES_NOT_COMPARED = "zone fills (KiCad fills a zone around the copper already there; DRC judges the fill)"
+#: added to ``not_compared`` when a typed via is on the board: copper is compared on shared layers only, so two vias whose spans share
+#: no copper layer are not compared at all
+TYPED_VIAS_NOT_COMPARED = "vias whose spans share no copper layer (no shared copper; their holes are KiCad DRC's hole checks)"
 #: pad shapes whose copper lies inside the ``(size)`` box; any other shape is unknown copper (module docstring)
 CONVEX_PAD_SHAPES = frozenset({"circle", "rect", "oval", "roundrect"})
+#: details["arc_model"] of every ``pcb.routing`` / ``pcb.keepout`` result on an IR with an arc: how the arc was measured (module docstring)
+ARC_MODEL = (
+    "an arc is measured as an arc: by its exact box, by the exact distance to a point (a via, a pad centre, a custom pad's disc, a track end), "
+    f"and on its chords against a segment, a pad box, another arc or a keep-out area - the chords lie within {ARC_SAGITTA_MM:g} mm of the arc "
+    "(a stated choice of the IR), and a pair that only this tolerance decides is NOT_VERIFIED, never PASS or FAIL"
+)
 
 Point = tuple[float, float]
 Box = tuple[float, float, float, float]
@@ -278,6 +352,16 @@ class _TrackItem:
     a: Point
     b: Point
     w: float
+    #: an arc's point between ``a`` and ``b`` (``Track.mid``); ``None``: the straight segment from ``a`` to ``b``
+    mid: Point | None = None
+    #: an arc's chain from ``a`` to ``b`` (:func:`~ai_eda.ir.arc.arc_points`, the points :func:`~ai_eda.ir.pcb.track_points` gives): its
+    #: chords are what a segment, a pad box, another arc and a keep-out area are measured against; empty for a straight segment, and
+    #: for three points that are no arc (:func:`_malformed_track` refuses them)
+    pts: tuple[Point, ...] = ()
+    #: how far the arc and its chain lie apart at most, either way (:data:`~ai_eda.ir.arc.ARC_SAGITTA_MM`); 0 for a straight segment
+    sag: float = 0.0
+    #: the exact box of an arc's centreline (:func:`~ai_eda.ir.arc.arc_bbox`); ``None`` for a straight segment
+    box: Box | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,8 +372,9 @@ class _ViaItem:
     y: float
     d: float
     drill: float
-    layers: frozenset[str]  # every copper layer of the board: a through via (module docstring)
+    layers: frozenset[str]  # every copper layer of the board for a through via, its span for a typed via (module docstring)
     named: tuple[str, str]  # the two names ``Via.layers`` carries, checked against ``ir.pcb.layers``
+    kind: str | None = None  # ``Via.kind``: None = a through via, else blind / buried / micro
 
 
 _Item = _PadItem | _TrackItem | _ViaItem
@@ -343,6 +428,54 @@ def _seg_box_distance(a: Point, b: Point, box: Box) -> float:
     return min(_seg_seg_distance(a, b, corners[i], corners[(i + 1) % 4]) for i in range(4))
 
 
+def _track_point_distance(t: _TrackItem, p: Point) -> float:
+    """Distance from ``p`` to the track's centreline: exact for a segment and for an arc (:func:`~ai_eda.ir.arc.point_arc_distance`)."""
+    if t.mid is None:
+        return _seg_point_distance(t.a, t.b, p)
+    return point_arc_distance(p, t.a, t.mid, t.b)
+
+
+def _track_track_distance(a: _TrackItem, b: _TrackItem) -> float:
+    """Distance between the centrelines of two tracks (0 when they cross or touch): exact for two segments; an arc is measured on the
+    chords of its chain, so the value lies within ``a.sag + b.sag`` of the true distance, either way (module docstring).
+
+    The least distance of any two chords. Two chords whose own boxes are at least as far apart as the least distance found so far
+    cannot be nearer and are not measured, so most chord pairs of two long arcs cost a box comparison only (the result is the same
+    minimum)."""
+    if a.mid is None and b.mid is None:
+        return _seg_seg_distance(a.a, a.b, b.a, b.b)
+    pa, pb = a.pts or (a.a, a.b), b.pts or (b.a, b.b)
+    other = [(min(r[0], s[0]), min(r[1], s[1]), max(r[0], s[0]), max(r[1], s[1]), r, s) for r, s in zip(pb, pb[1:])]
+    best = math.inf
+    for p, q in zip(pa, pa[1:]):
+        x1, y1, x2, y2 = min(p[0], q[0]), min(p[1], q[1]), max(p[0], q[0]), max(p[1], q[1])
+        for bx1, by1, bx2, by2, r, s in other:
+            gx, gy = max(bx1 - x2, x1 - bx2, 0.0), max(by1 - y2, y1 - by2, 0.0)
+            if gx * gx + gy * gy >= best * best:
+                continue
+            d = _seg_seg_distance(p, q, r, s)
+            if d < best:
+                best = d
+    return best
+
+
+def _track_box_distance(t: _TrackItem, box: Box) -> float:
+    """Distance from the track's centreline to the axis-aligned box (0 when it enters or crosses the box): exact for a segment; an arc is
+    measured on the chords of its chain (the least of them, a chord whose own box is too far to be nearer left out), so the value lies
+    within ``t.sag`` of the true distance, either way."""
+    if t.mid is None:
+        return _seg_box_distance(t.a, t.b, box)
+    best = math.inf
+    for p, q in zip(t.pts, t.pts[1:]):
+        gx, gy = max(box[0] - max(p[0], q[0]), min(p[0], q[0]) - box[2], 0.0), max(box[1] - max(p[1], q[1]), min(p[1], q[1]) - box[3], 0.0)
+        if gx * gx + gy * gy >= best * best:
+            continue
+        d = _seg_box_distance(p, q, box)
+        if d < best:
+            best = d
+    return best
+
+
 def _pad_box(pad: _PadItem) -> Box:
     return (pad.cx - pad.hw, pad.cy - pad.hh, pad.cx + pad.hw, pad.cy + pad.hh)
 
@@ -355,6 +488,8 @@ def _item_box(item: _Item) -> Box:
         r = item.d / 2.0
         return (item.x - r, item.y - r, item.x + r, item.y + r)
     r = item.w / 2.0
+    if item.box is not None:  # an arc: its exact box (the bulge lies outside the box of its two ends)
+        return (item.box[0] - r, item.box[1] - r, item.box[2] + r, item.box[3] + r)
     return (min(item.a[0], item.b[0]) - r, min(item.a[1], item.b[1]) - r, max(item.a[0], item.b[0]) + r, max(item.a[1], item.b[1]) + r)
 
 
@@ -363,25 +498,62 @@ def _item_layers(item: _Item) -> frozenset[str]:
 
 
 def _copper_distance(a: _Item, b: _Item) -> float:
-    """Distance between the copper of two items (0 when they overlap); pads as their bounding box, vias as circles."""
+    """Distance between the copper of two items (0 when they overlap); pads as their bounding box, vias as circles. An arc is measured
+    exactly against a via and on its chords against a track or a pad box: that value lies within :func:`_arc_tolerance` of the true
+    distance."""
     if isinstance(a, _PadItem):
         a, b = b, a
     if isinstance(a, _TrackItem):
         if isinstance(b, _TrackItem):
-            return _seg_seg_distance(a.a, a.b, b.a, b.b) - (a.w + b.w) / 2.0
+            return _track_track_distance(a, b) - (a.w + b.w) / 2.0
         if isinstance(b, _ViaItem):
-            return _seg_point_distance(a.a, a.b, (b.x, b.y)) - a.w / 2.0 - b.d / 2.0
-        return _seg_box_distance(a.a, a.b, _pad_box(b)) - a.w / 2.0
+            return _track_point_distance(a, (b.x, b.y)) - a.w / 2.0 - b.d / 2.0
+        return _track_box_distance(a, _pad_box(b)) - a.w / 2.0
     assert isinstance(a, _ViaItem)
     if isinstance(b, _TrackItem):
-        return _seg_point_distance(b.a, b.b, (a.x, a.y)) - b.w / 2.0 - a.d / 2.0
+        return _track_point_distance(b, (a.x, a.y)) - b.w / 2.0 - a.d / 2.0
     if isinstance(b, _ViaItem):
         return math.hypot(a.x - b.x, a.y - b.y) - (a.d + b.d) / 2.0
     return _point_box_distance((a.x, a.y), _pad_box(b)) - a.d / 2.0
 
 
-def _connected(a: _Item, b: _Item) -> bool:
-    """Whether the copper of two items of one net overlaps (conservative: touching is not connected)."""
+def _arc_tolerance(a: _Item, b: _Item) -> float:
+    """How far :func:`_copper_distance` of the two items may lie from the true distance of their copper, either way: the chain bound of
+    every arc measured on its chords (against a track or a pad box); 0 for a pair measured exactly (no arc, or an arc against a via)."""
+    if isinstance(a, _TrackItem):
+        if isinstance(b, _TrackItem):
+            return a.sag + b.sag
+        return 0.0 if isinstance(b, _ViaItem) else a.sag
+    if isinstance(b, _TrackItem):
+        return 0.0 if isinstance(a, _ViaItem) else b.sag
+    return 0.0
+
+
+def _arc_touch(a: _TrackItem, b: _TrackItem) -> bool | None:
+    """Whether two tracks of one net, at least one of them an arc, overlap; ``None`` when only the arc tolerance decides.
+
+    A point decides exactly: an end of one track closer to the other's centreline than the two half widths joins them (a shared end
+    point is at distance 0; the ends of an arc are its own stored points, and a point is measured against an arc exactly). Otherwise
+    the chords decide where they can: the true distance of the two centrelines lies within ``a.sag + b.sag`` of the chords' distance,
+    so the tracks overlap when the chords are closer than the half widths by more than that bound, and are apart when the chords are
+    apart by at least the half widths plus it. In between neither is measured. Tracks whose copper boxes are apart (an arc's box is
+    exact) cannot overlap: no chord of theirs is measured."""
+    box_a, box_b = _item_box(a), _item_box(b)
+    if box_a[0] > box_b[2] or box_b[0] > box_a[2] or box_a[1] > box_b[3] or box_b[1] > box_a[3]:
+        return False
+    reach = _q((a.w + b.w) / 2.0)
+    if _q(min(_track_point_distance(a, b.a), _track_point_distance(a, b.b), _track_point_distance(b, a.a), _track_point_distance(b, a.b))) < reach:
+        return True
+    chords, bound = _track_track_distance(a, b), a.sag + b.sag
+    if _q(chords + bound) < reach:
+        return True
+    return False if _q(chords - bound) >= reach else None
+
+
+def _connected(a: _Item, b: _Item) -> bool | None:
+    """Whether the copper of two items of one net overlaps (conservative: touching is not connected). ``None`` for two tracks, at least
+    one of them an arc, that only the arc tolerance joins or leaves apart (:func:`_arc_touch`): neither is measured. A via or a pad
+    centre is measured against an arc exactly."""
     if isinstance(a, _PadItem):
         a, b = b, a
     if isinstance(a, _PadItem):
@@ -393,13 +565,15 @@ def _connected(a: _Item, b: _Item) -> bool:
         return False
     if isinstance(a, _TrackItem):
         if isinstance(b, _TrackItem):
+            if a.mid is not None or b.mid is not None:
+                return _arc_touch(a, b)
             return _q(_seg_seg_distance(a.a, a.b, b.a, b.b)) < _q((a.w + b.w) / 2.0)
         if isinstance(b, _ViaItem):
-            return _q(_seg_point_distance(a.a, a.b, (b.x, b.y))) < _q(a.w / 2.0 + b.d / 2.0)
-        return _q(_seg_point_distance(a.a, a.b, (b.cx, b.cy))) < _q(a.w / 2.0 + b.r_in)
+            return _q(_track_point_distance(a, (b.x, b.y))) < _q(a.w / 2.0 + b.d / 2.0)
+        return _q(_track_point_distance(a, (b.cx, b.cy))) < _q(a.w / 2.0 + b.r_in)
     assert isinstance(a, _ViaItem)
     if isinstance(b, _TrackItem):
-        return _q(_seg_point_distance(b.a, b.b, (a.x, a.y))) < _q(b.w / 2.0 + a.d / 2.0)
+        return _q(_track_point_distance(b, (a.x, a.y))) < _q(b.w / 2.0 + a.d / 2.0)
     if isinstance(b, _ViaItem):
         return _q(math.hypot(a.x - b.x, a.y - b.y)) < _q((a.d + b.d) / 2.0)
     return _q(math.hypot(a.x - b.cx, a.y - b.cy)) < _q(a.d / 2.0 + b.r_in)
@@ -479,8 +653,10 @@ class _Board:
                 exact = pad.shape == "rect" and math.isclose(angle % 90.0, 0.0, abs_tol=1e-9)
                 self.pads.append(_PadItem(label, net, cx, cy, hw, hh, min(pad.size_w, pad.size_h) / 2.0, copper, exact))
         self.track_total, self.via_total = len(pcb.tracks), len(pcb.vias)
-        #: FAIL rows for tracks / vias that cannot be copper (non-finite coordinate, non-positive width / drill / diameter);
-        #: such an item is in neither ``tracks`` nor ``vias``: it joins nothing and is compared with nothing
+        #: the tracks that are arcs (``Track.mid``), well formed or not; 0 on a board whose every track is a straight segment
+        self.arc_total = sum(1 for t in pcb.tracks if getattr(t, "mid", None) is not None)
+        #: FAIL rows for tracks / vias that cannot be copper (non-finite coordinate, non-positive width / drill / diameter, three arc
+        #: points that are no arc); such an item is in neither ``tracks`` nor ``vias``: it joins nothing and is compared with nothing
         self.malformed: list[dict[str, Any]] = []
         self.tracks: list[_TrackItem] = []
         self.vias: list[_ViaItem] = []
@@ -493,7 +669,7 @@ class _Board:
                 self.malformed.append({"item": item.label, "status": str(ValidationStatus.FAIL), "message": f"{item.label} {why}"})
         for i, v in enumerate(pcb.vias):
             item = _via_item(i, v, self.copper_layers)
-            why = _malformed_via(item)
+            why = _malformed_via(item) or _via_span_problem(item, self.copper_layers)
             if why is None:
                 self.vias.append(item)
             else:
@@ -532,19 +708,73 @@ class _Board:
 
 
 def _track_item(i: int, t: Track) -> _TrackItem:
-    return _TrackItem(f"track[{i}:{t.net}]", t.net, t.layer, (float(t.start[0]), float(t.start[1])), (float(t.end[0]), float(t.end[1])), float(t.width_mm))
+    """The geometry item of ``ir.pcb.tracks[i]``: one item per track, a straight segment or - with ``Track.mid`` - an arc with its chain,
+    the chain's bound and its exact box. Three points that are no arc, or whose chain cannot be computed (numbers the arc geometry
+    cannot hold: a radius of about 1e13 mm and more, an overflow), get no chain: :func:`_malformed_track` refuses that item."""
+    label, a, b, w = f"track[{i}:{t.net}]", (float(t.start[0]), float(t.start[1])), (float(t.end[0]), float(t.end[1])), float(t.width_mm)
+    mid = getattr(t, "mid", None)
+    if mid is None:
+        return _TrackItem(label, t.net, t.layer, a, b, w)
+    m = (float(mid[0]), float(mid[1]))
+    if arc_problem(a, m, b) is None:
+        try:
+            return _TrackItem(label, t.net, t.layer, a, b, w, m, tuple(arc_points(a, m, b, ARC_SAGITTA_MM)), ARC_SAGITTA_MM, arc_bbox(a, m, b))
+        except (ArithmeticError, ValueError):
+            pass
+    return _TrackItem(label, t.net, t.layer, a, b, w, m)
 
 
 def _via_item(i: int, v: Via, copper_layers: list[str]) -> _ViaItem:
-    return _ViaItem(f"via[{i}:{v.net}]", v.net, float(v.x_mm), float(v.y_mm), float(v.diameter_mm), float(v.drill_mm), frozenset(copper_layers), (str(v.layers[0]), str(v.layers[1])))
+    kind = getattr(v, "kind", None)
+    named = (str(v.layers[0]), str(v.layers[1]))
+    if kind is None:
+        return _ViaItem(f"via[{i}:{v.net}]", v.net, float(v.x_mm), float(v.y_mm), float(v.diameter_mm), float(v.drill_mm), frozenset(copper_layers), named)
+    stack = copper_stack_order(copper_layers)
+    layers = frozenset(via_span(v, stack)) if via_span_problem(kind, *named, stack) is None else frozenset()
+    return _ViaItem(f"via[{i}:{v.net}]", v.net, float(v.x_mm), float(v.y_mm), float(v.diameter_mm), float(v.drill_mm), layers, named, kind)
+
+
+def _via_span_problem(v: _ViaItem, copper_layers: list[str]) -> str | None:
+    """Why a typed via's span is not legal on this board (the compiler refuses the same), or ``None`` (a through via has no span)."""
+    if v.kind is None:
+        return None
+    problem = via_span_problem(v.kind, v.named[0], v.named[1], copper_stack_order(copper_layers))
+    if problem is None:
+        return None
+    return f"is a {v.kind} via from {v.named[0]} to {v.named[1]}: {problem} (the compiler refuses the same)"
+
+
+def _stamp_typed_vias(ir: CircuitIR, results: list[ValidationResult]) -> list[ValidationResult]:
+    """``results`` stamped :data:`TYPED_VIA_TOOL_VERSION` when ``ir`` has a typed via; unchanged otherwise."""
+    if ir.pcb is not None and any(getattr(v, "kind", None) is not None for v in ir.pcb.vias):
+        for r in results:
+            r.tool_version = TYPED_VIA_TOOL_VERSION
+    return results
+
+
+def _stamp_arcs(ir: CircuitIR, results: list[ValidationResult]) -> list[ValidationResult]:
+    """``results`` stamped :data:`ARC_TOOL_VERSION` when ``ir`` has an arc track (also beside a typed via: applied last); unchanged
+    otherwise."""
+    if ir.pcb is not None and any(getattr(t, "mid", None) is not None for t in ir.pcb.tracks):
+        for r in results:
+            r.tool_version = ARC_TOOL_VERSION
+    return results
 
 
 def _malformed_track(t: _TrackItem) -> str | None:
-    """Why the track cannot be copper (the compiler refuses the same), or ``None``."""
+    """Why the track cannot be copper (the compiler refuses the same; the three points of an arc that are no arc the ``Track`` model
+    itself), or ``None``."""
+    if t.mid is not None and not all(math.isfinite(v) for v in (*t.a, *t.mid, *t.b, t.w)):
+        return f"has a non-finite coordinate or width (start {t.a}, mid {t.mid}, end {t.b}, width {t.w}): its copper cannot be measured"
     if not all(math.isfinite(v) for v in (*t.a, *t.b, t.w)):
         return f"has a non-finite coordinate or width (start {t.a}, end {t.b}, width {t.w}): its copper cannot be measured"
     if t.w <= 0.0:
         return f"has non-positive width {t.w:g} mm: no copper (the compiler refuses it too)"
+    if t.mid is not None and not t.pts:  # no chain (:func:`_track_item`)
+        problem = arc_problem(t.a, t.mid, t.b)
+        if problem is None:
+            return f"is an arc whose chain of chords cannot be computed (start {t.a}, mid {t.mid}, end {t.b}): its copper cannot be measured"
+        return f"is no arc (start {t.a}, mid {t.mid}, end {t.b}): {problem}; its copper cannot be measured (the Track model refuses these points too)"
     return None
 
 
@@ -628,15 +858,33 @@ def connectivity_rows(ir: CircuitIR, board: _Board) -> tuple[list[dict[str, Any]
                 uf.union(k, first_of[p.label])  # internally connected in KiCad: one logical pad
             else:
                 first_of[p.label] = k
+        near: list[tuple[int, int]] = []  # two tracks that only the arc tolerance joins or leaves apart (:func:`_arc_touch`)
         for i, a in enumerate(items):
             for j in range(i + 1, len(items)):
-                if _connected(a, items[j]):
+                joined = _connected(a, items[j])
+                if joined:
                     uf.union(i, j)
-        root = uf.find(0)
-        left_out = list(dict.fromkeys(p.label for k, p in enumerate(pads) if uf.find(k) != root))
-        maybe = _maybe_joined(pads, items, uf) if left_out else []
-        cut_off = _unreachable_by_pour(items, uf, len(pads), [layer for _, zone_net, layer in board.zones if zone_net == net.name]) if left_out and zones else []
-        if maybe:  # copper meets a custom pad's bound where its copper is not known: the open is neither measured nor excluded
+                elif joined is None:
+                    near.append((i, j))
+        zone_layers = [layer for _, zone_net, layer in board.zones if zone_net == net.name]
+        left_out, maybe, cut_off = _net_sets(pads, items, uf, zone_layers)
+        near = [(i, j) for i, j in near if uf.find(i) != uf.find(j)] if left_out else []
+        if near:  # would the row be another one with every such pair joined? Only then it depends on what is not measured
+            both = _UnionFind(len(items))
+            both.parent = list(uf.parent)
+            for i, j in near:
+                both.union(i, j)
+            if _net_sets(pads, items, both, zone_layers) == (left_out, maybe, cut_off):
+                near = []
+        if near:  # the net's copper sets depend on tracks within the arc tolerance of touching: neither joined nor open is measured
+            named = ", ".join(f"{items[i].label} / {items[j].label}" for i, j in near)
+            row.update(
+                status=str(ValidationStatus.NOT_VERIFIED), unconnected=left_out, arc_tolerance=[{"a": items[i].label, "b": items[j].label} for i, j in near],
+                message=(f"{', '.join(left_out)} not joined to {labels[0]} through copper measured to overlap; {named} lie within the arc tolerance "
+                         f"of touching (an arc is measured on its chords, which lie within {ARC_SAGITTA_MM:g} mm of it): whether they join the net "
+                         "is not measured here"),
+            )
+        elif maybe:  # copper meets a custom pad's bound where its copper is not known: the open is neither measured nor excluded
             row.update(
                 status=str(ValidationStatus.NOT_VERIFIED), unconnected=left_out, bounded_pads=maybe,
                 message=(f"{', '.join(left_out)} not joined to {labels[0]} through known copper; copper of the net reaches the bounding box of "
@@ -678,14 +926,15 @@ def _disc_distance(a: _Item, pad: _PadItem) -> float | None:
         return None
     x, y, r = pad.disc
     if isinstance(a, _TrackItem):
-        return _seg_point_distance(a.a, a.b, (x, y)) - a.w / 2.0 - r
+        return _track_point_distance(a, (x, y)) - a.w / 2.0 - r
     return math.hypot(a.x - x, a.y - y) - a.d / 2.0 - r
 
 
 def _maybe_joined(pads: list[_PadItem], items: list[_Item], uf: _UnionFind) -> list[str]:
     """The custom pads a track / via of the net meets only inside a bounding part (``joins`` False) while not joined to that pad through
     known copper: the contact is neither measured nor excluded (module docstring). Copper that meets the part's box but not its bounding
-    disc (a ring's box corner) cannot meet its copper: no contact."""
+    disc (a ring's box corner) cannot meet its copper: no contact. An arc that may meet the box within its arc tolerance counts as
+    meeting it (the contact is not excluded)."""
     out: list[str] = []
     for k, p in enumerate(pads):
         if p.joins or p.label in out:
@@ -695,23 +944,35 @@ def _maybe_joined(pads: list[_PadItem], items: list[_Item], uf: _UnionFind) -> l
             if uf.find(j) == uf.find(k) or not (_item_layers(c) & p.layers):
                 continue
             disc = _disc_distance(c, p)
-            if _q(_copper_distance(c, p)) <= 0.0 and (disc is None or _q(disc) <= 0.0):
+            if _q(_copper_distance(c, p) - _arc_tolerance(c, p)) <= 0.0 and (disc is None or _q(disc) <= 0.0):
                 out.append(p.label)
                 break
     return out
 
 
 def _unreachable_by_pour(items: list[_Item], uf: _UnionFind, n_pads: int, zone_layers: list[str]) -> list[str]:
-    """The pads of every copper set that no pour of the net can reach: none of its items is a via, a pad or a track on a pour layer."""
+    """The pads of every copper set that no pour of the net can reach: none of its items is a through via, a typed via whose span holds
+    a pour layer, a pad or a track on a pour layer."""
     layers = set(zone_layers)
     reach: dict[int, bool] = {}
     for k, item in enumerate(items):
         root = uf.find(k)
-        ok = isinstance(item, _ViaItem) or bool(_item_layers(item) & layers)
+        ok = (isinstance(item, _ViaItem) and item.kind is None) or bool(_item_layers(item) & layers)
         reach[root] = reach.get(root, False) or ok
     if len({uf.find(k) for k in range(n_pads)}) < 2:
         return []
     return list(dict.fromkeys(items[k].label for k in range(n_pads) if not reach[uf.find(k)]))
+
+
+def _net_sets(pads: list[_PadItem], items: list[_Item], uf: _UnionFind, zone_layers: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """What one net's row is decided by, for the copper sets ``uf`` holds (``items``: the net's pads first): the pads left out of the first
+    pad's set, the custom pads its copper may join (:func:`_maybe_joined`) and the pads no pour of the net can reach
+    (:func:`_unreachable_by_pour`; ``zone_layers``: the layers of the net's pours)."""
+    root = uf.find(0)
+    left_out = list(dict.fromkeys(p.label for k, p in enumerate(pads) if uf.find(k) != root))
+    maybe = _maybe_joined(pads, items, uf) if left_out else []
+    cut_off = _unreachable_by_pour(items, uf, len(pads), zone_layers) if left_out and zone_layers else []
+    return left_out, maybe, cut_off
 
 
 # --------------------------------------------------------------------------- clearance
@@ -726,7 +987,7 @@ def _bound_only(a: _Item, pad: _PadItem, limit: float) -> bool:
     if pad.r_in <= 0.0:
         return True
     if isinstance(a, _TrackItem):
-        known = _seg_point_distance(a.a, a.b, (pad.cx, pad.cy)) - a.w / 2.0 - pad.r_in
+        known = _track_point_distance(a, (pad.cx, pad.cy)) - a.w / 2.0 - pad.r_in
     else:
         known = math.hypot(a.x - pad.cx, a.y - pad.cy) - a.d / 2.0 - pad.r_in
     return _q(known) >= limit
@@ -738,7 +999,14 @@ def clearance_rows(board: _Board, limit: float) -> tuple[int, list[dict[str, Any
     A custom pad part with a bounding disc (``_PadItem.disc``) is measured to that disc, which bounds its copper more tightly than its
     box: a pair at least ``limit`` from it is clear, however close it comes to the part's box (a ring's box corner). A pair closer than
     ``limit`` only to the box / disc that merely bounds the part's copper (:func:`_bound_only`) is a NOT_VERIFIED row (``bound`` True),
-    never a FAIL: the copper inside that bound is not known."""
+    never a FAIL: the copper inside that bound is not known.
+
+    An arc measured on its chords (against a track or a pad box) is known to within :func:`_arc_tolerance`: such a pair is a FAIL row only
+    when it is closer than ``limit`` (or touches) even at the far end of that tolerance, and clear only when it keeps ``limit`` at the
+    near end. In between it is a NOT_VERIFIED row (``within_arc_tolerance`` True), neither a violation nor a clear pair. An arc against a
+    via, a custom pad's disc or a part's known copper is measured exactly, like every pair without an arc: known copper closer than
+    ``limit`` to an arc is a FAIL row whatever the part's box measures on the chords (the tolerance never turns a measured violation
+    into a NOT_VERIFIED row)."""
     copper: list[_Item] = [*board.tracks, *board.vias]
     others: list[_Item] = [*board.tracks, *board.vias, *board.pads]
     boxes = {id(item): _item_box(item) for item in others}
@@ -761,21 +1029,48 @@ def clearance_rows(board: _Board, limit: float) -> tuple[int, list[dict[str, Any
             # prefilter: copper boxes further apart than the limit on either axis cannot violate it
             if box_a[0] - limit > box_b[2] or box_b[0] - limit > box_a[2] or box_a[1] - limit > box_b[3] or box_b[1] - limit > box_a[3]:
                 continue
-            raw = _q(_copper_distance(a, b))
+            measured = _copper_distance(a, b)
+            raw = _q(measured)
+            tol = _arc_tolerance(a, b)  # above 0: an arc measured on its chords, the true distance lies within tol of the measured one
+            near, far = (_q(measured - tol), _q(measured + tol)) if tol else (raw, raw)
             disc = _disc_distance(a, b) if isinstance(b, _PadItem) else None
             if disc is not None:  # the disc bounds the part's copper more tightly than its box (a ring's box corner is not copper)
-                raw = max(raw, _q(disc))
+                raw, near, far = max(raw, _q(disc)), max(near, _q(disc)), max(far, _q(disc))
+            if tol and isinstance(a, _TrackItem) and isinstance(b, _PadItem) and b.part is not None and not b.exact and b.r_in > 0.0:
+                # an arc beside a custom pad's part whose box only bounds its copper: the part's known copper (the disc of radius ``r_in``
+                # around its centre, :func:`_bound_only`) is measured exactly, and the part's copper is at most that far away. So known
+                # copper closer than the limit is a violation whatever the box measures on the chords, as it is for a straight track
+                known = _q(_track_point_distance(a, (b.cx, b.cy)) - a.w / 2.0 - b.r_in)
+                raw, far = min(raw, known), min(far, known)
+                near = min(near, far)
+            if near == far:  # the disc or the known copper decides, and both are measured exactly (an arc too); without an arc tol is 0 already
+                tol = 0.0
             d = max(raw, 0.0)
-            if d < limit or raw <= 0.0:  # overlapping or touching copper of two nets is a short whatever the limit
+            # overlapping or touching copper of two nets is a short whatever the limit (a pair without an arc: near and far are raw, so
+            # this is ``d < limit or raw <= 0.0``)
+            if near < limit or near <= 0.0:
                 where = ",".join(sorted(shared))
                 if isinstance(b, _PadItem) and _bound_only(a, b, limit):
                     bound = "disc" if disc is not None else "box"
-                    rows.append({"a": a.label, "b": b.label, "layer": where, "distance_mm": d, "limit_mm": limit, "bound": True,
+                    least = max(near, 0.0)  # how near the bound may be: ``d`` for a pair without an arc, the near end of the tolerance with one
+                    rows.append({"a": a.label, "b": b.label, "layer": where, "distance_mm": least, "limit_mm": limit, "bound": True,
                                  "status": str(ValidationStatus.NOT_VERIFIED),
-                                 "message": (f"{a.label} vs {b.label} on {where}: {d:g} mm from the {bound} that bounds the copper of custom pad "
+                                 "message": (f"{a.label} vs {b.label} on {where}: {least:g} mm from the {bound} that bounds the copper of custom pad "
                                              f"{b.label} ({b.part}; its copper inside that {bound} is not known)")})
                     continue
+                if not (far < limit or far <= 0.0):  # the limit (or touching) lies inside the arc tolerance: neither a violation nor clear
+                    question = f"keeps the {limit:g} mm limit" if limit > 0.0 else f"touches (a short, whatever the {limit:g} mm limit)"
+                    rows.append({"a": a.label, "b": b.label, "layer": where, "distance_mm": d, "limit_mm": limit, "arc_tolerance_mm": tol,
+                                 "within_arc_tolerance": True, "status": str(ValidationStatus.NOT_VERIFIED),
+                                 "message": (f"{a.label} vs {b.label} on {where}: {d:g} mm measured on the chords of an arc, within {tol:g} mm of "
+                                             f"the true distance: only that arc tolerance decides whether the pair {question}")})
+                    continue
                 message = f"{a.label} vs {b.label} on {where}: {d:g} mm < {limit:g} mm" if d < limit else f"{a.label} vs {b.label} on {where}: copper overlaps (a short, whatever the {limit:g} mm limit)"
+                if tol:  # a violation at either end of the arc tolerance
+                    rows.append({"a": a.label, "b": b.label, "layer": where, "distance_mm": d, "limit_mm": limit, "arc_tolerance_mm": tol,
+                                 "status": str(ValidationStatus.FAIL),
+                                 "message": f"{message} (measured on the chords of an arc, within {tol:g} mm of the true distance)"})
+                    continue
                 rows.append({"a": a.label, "b": b.label, "layer": where, "distance_mm": d, "limit_mm": limit, "status": str(ValidationStatus.FAIL), "message": message})
     return compared, rows
 
@@ -810,6 +1105,9 @@ class RoutingValidator(Validator):
     description = "IR copper connects every net's pads and keeps the recorded clearance from foreign copper (IR geometry, not DRC)"
 
     def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
+        return _stamp_arcs(ir, _stamp_typed_vias(ir, self._validate(ir, ctx)))
+
+    def _validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
         pcb = ir.pcb
         if pcb is None:
             return self._both(ValidationStatus.NOT_APPLICABLE, "no ir.pcb: nothing routed to check")
@@ -843,11 +1141,15 @@ class RoutingValidator(Validator):
         failed = [r["net"] for r in rows if r["status"] == str(ValidationStatus.FAIL)]
         unread = [r["net"] for r in rows if r.get("unknown_pads")]
         bounded = [r["net"] for r in rows if r.get("bounded_pads")]
-        pour = [r["net"] for r in rows if r["status"] == str(ValidationStatus.NOT_VERIFIED) and not r.get("unknown_pads") and not r.get("bounded_pads")]
+        curved = [r["net"] for r in rows if r.get("arc_tolerance")]  # joined or open only within the arc tolerance (never without an arc)
+        pour = [r["net"] for r in rows if r["status"] == str(ValidationStatus.NOT_VERIFIED) and not r.get("unknown_pads") and not r.get("bounded_pads")
+                and not r.get("arc_tolerance")]
         connected = [r["net"] for r in rows if r["status"] == str(ValidationStatus.PASS)]
         details = {"nets": rows, "items": item_rows, "tracks": board.track_total, "vias": board.via_total, "zones": len(board.zones), "unknown": board.unknown}
         if board.custom_labels:  # read as the boxes of their anchor and primitives (module docstring)
             details["custom_pads"] = sorted(board.custom_labels, key=natural_ref_key)
+        if board.arc_total:  # measured as arcs (module docstring)
+            details.update(arcs=board.arc_total, arc_model=ARC_MODEL)
         # a FAIL row is a net whose every pad is known and whose own copper leaves a pad out: copper this check cannot read belongs to
         # other nets (a union joins only the net's own items), so it cannot join these pads - a measured open, whatever else is unknown
         if failed or item_rows:
@@ -863,6 +1165,8 @@ class RoutingValidator(Validator):
                 parts.append(f"{len(unread)} net(s) not judged because of pads whose geometry is unknown ({'; '.join(board.unknown)})")
             if bounded:
                 parts.append(f"{len(bounded)} net(s) not judged where copper meets a custom pad's bounding box only ({', '.join(bounded)})")
+            if curved:
+                parts.append(f"{len(curved)} net(s) not judged where tracks lie within the arc tolerance of touching ({', '.join(curved)})")
             return self._result(CONNECTIVITY_CHECK, ValidationStatus.FAIL, "; ".join(parts) + f" ({NOT_DRC})", **details)
         if board.unknown:  # never a PASS while a pad's copper is unknown: it may join or cut what the check measured
             tail = f"; {len(unread)} net(s) holding such a pad not judged" + (f", {len(connected)} other net(s) connected through IR copper" if connected else "")
@@ -872,6 +1176,12 @@ class RoutingValidator(Validator):
                 CONNECTIVITY_CHECK, ValidationStatus.NOT_VERIFIED,
                 f"{len(bounded)} net(s) whose copper meets a custom pad only inside the box that bounds its copper, where the copper itself is not "
                 "known: " + "; ".join(f"{r['net']}: {r['message']}" for r in rows if r["net"] in bounded) + f" ({NOT_DRC})", **details,
+            )
+        if curved:  # tracks within the arc tolerance of touching decide the net: neither joined nor open is measured, no PASS, no FAIL
+            return self._result(
+                CONNECTIVITY_CHECK, ValidationStatus.NOT_VERIFIED,
+                f"{len(curved)} net(s) joined or left open only by tracks within the arc tolerance of touching, which this check does not measure: "
+                + "; ".join(f"{r['net']}: {r['message']}" for r in rows if r["net"] in curved) + f" ({NOT_DRC})", **details,
             )
         if pour:
             return self._result(
@@ -895,7 +1205,7 @@ class RoutingValidator(Validator):
             "hole_to_edge_limit_mm": None if hole is None else float(hole.value),
             "outline": outline_rows,
             "malformed": board.malformed,
-            "not_compared": [*NOT_COMPARED, ZONES_NOT_COMPARED] if board.zones else NOT_COMPARED,
+            "not_compared": [*NOT_COMPARED, *([ZONES_NOT_COMPARED] if board.zones else []), *([TYPED_VIAS_NOT_COMPARED] if any(v.kind for v in board.vias) else [])],
             "tracks": board.track_total,
             "vias": board.via_total,
         }
@@ -903,6 +1213,8 @@ class RoutingValidator(Validator):
             details["unknown"] = board.unknown
         if board.custom_labels:
             details["custom_pads"] = sorted(board.custom_labels, key=natural_ref_key)
+        if board.arc_total:  # measured as arcs (module docstring)
+            details.update(arcs=board.arc_total, arc_model=ARC_MODEL)
         if board.malformed:  # copper the compiler refuses: FAIL whatever the limit, nothing else is claimed about the board
             return self._result(CLEARANCE_CHECK, ValidationStatus.FAIL, self._malformed_part(board) + f" ({NOT_DRC})", pairs_compared=0, violations=[], **details)
         if not board.tracks and not board.vias:  # pad-to-pad is DRC's even when every pad is known: nothing here to compare
@@ -922,9 +1234,14 @@ class RoutingValidator(Validator):
         compared, rows = clearance_rows(board, lim)
         violations = [r for r in rows if r["status"] == str(ValidationStatus.FAIL)]
         bounded = [r for r in rows if r.get("bound")]
+        curved = [r for r in rows if r.get("within_arc_tolerance")]  # only the arc tolerance decides (never without an arc)
         details.update(pairs_compared=compared, violations=violations)
         if bounded:
             details["custom_pad_bounds"] = bounded[:_MAX_ROWS]
+        if curved:
+            details["arc_tolerance"] = curved[:_MAX_ROWS]
+        arc_part = (f"{len(curved)} copper pair(s) with an arc that only the arc tolerance puts on either side of {lim:g} mm (not measured): "
+                    + "; ".join(r["message"] for r in curved[:5]) + (" ..." if len(curved) > 5 else "")) if curved else ""
         if violations or outline_rows:
             parts = []
             if violations:
@@ -934,13 +1251,17 @@ class RoutingValidator(Validator):
             return self._result(CLEARANCE_CHECK, ValidationStatus.FAIL, "; ".join(parts) + f" ({NOT_DRC})", **details)
         if board.unknown:  # the copper nobody read may be closer than the limit (or a short): no PASS
             return self._result(CLEARANCE_CHECK, ValidationStatus.NOT_VERIFIED,
-                                self._unknown_part(board) + f"; {compared} copper pair(s) of known items keep >= {lim:g} mm ({NOT_DRC})", **details)
+                                self._unknown_part(board) + f"; {compared - len(curved)} copper pair(s) of known items keep >= {lim:g} mm"
+                                + (f"; {arc_part}" if curved else "") + f" ({NOT_DRC})", **details)
         if bounded:  # closer than the limit only to a box that merely bounds a custom pad's copper: not measured, no PASS, no FAIL
             return self._result(
                 CLEARANCE_CHECK, ValidationStatus.NOT_VERIFIED,
                 f"{len(bounded)} copper pair(s) closer than {lim:g} mm only to the box / disc that bounds a custom pad's copper, where the copper is not "
-                "known: " + "; ".join(r["message"] for r in bounded[:5]) + (" ..." if len(bounded) > 5 else "") + f" ({NOT_DRC})", **details,
+                "known: " + "; ".join(r["message"] for r in bounded[:5]) + (" ..." if len(bounded) > 5 else "") + (f"; {arc_part}" if curved else "")
+                + f" ({NOT_DRC})", **details,
             )
+        if curved:  # the limit lies inside the arc tolerance of the measured distance: not measured, no PASS, no FAIL
+            return self._result(CLEARANCE_CHECK, ValidationStatus.NOT_VERIFIED, f"{arc_part} ({NOT_DRC})", **details)
         edge = "" if pcb.outline is None else f", {len(board.tracks)} track(s) / {len(board.vias)} via(s) inside the outline"
         if pcb.outline is None:
             return self._result(
@@ -1243,8 +1564,12 @@ class KeepoutValidator(Validator):
       reaches the area but whose inscribed circle does not is NOT_VERIFIED),
       unless its ref is in ``allowed_refs`` or its net in ``allowed_nets``;
     * **tracks** - a track on a covered layer whose centreline comes closer
-      than half its width; **vias** - a through via (on every copper layer)
-      whose disc reaches the area when any board layer is covered;
+      than half its width (an arc, ``Track.mid``, on its chords: FAIL only
+      when it reaches in even at the far end of the arc tolerance,
+      NOT_VERIFIED when only that tolerance decides - the routing checks'
+      rule, module docstring); **vias** - a through via (on every copper layer)
+      whose disc reaches the area when any board layer is covered, a typed
+      via (blind / buried / micro) only when its span meets a covered layer;
       **zones** - a zone on a covered layer whose polygon shares area with it
       (two non-convex polygons: NOT_VERIFIED, not computed) - each unless
       its net is in ``allowed_nets``;
@@ -1275,6 +1600,9 @@ class KeepoutValidator(Validator):
                                 tool_version=KEEPOUT_TOOL_VERSION, details={"kind": KIND, **details})
 
     def validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
+        return _stamp_arcs(ir, _stamp_typed_vias(ir, self._validate(ir, ctx)))
+
+    def _validate(self, ir: CircuitIR, ctx: ValidationContext) -> list[ValidationResult]:
         from ai_eda.tools import keepout as ko_geom
         from ai_eda.tools.kicad.geometry import footprint_bbox
         from ai_eda.tools.placement.rf_floorplan import placed_fence_box, region_box, rf_blocks
@@ -1359,13 +1687,25 @@ class KeepoutValidator(Validator):
                     if t.layer not in layers:
                         continue
                     info["compared"] += 1
-                    if ko_geom.segment_area_distance(t.a, t.b, pts) < t.w / 2.0 - 1e-9:
+                    if t.mid is None:
+                        dist, tol = ko_geom.segment_area_distance(t.a, t.b, pts), 0.0
+                    elif not near(_item_box(t)):  # an arc whose copper box (exact) does not meet the area's box stays out of the area
+                        continue
+                    else:  # an arc on its chords: its true distance from the area lies within tol of this one
+                        dist, tol = min(ko_geom.segment_area_distance(p, q, pts) for p, q in zip(t.pts, t.pts[1:])), t.sag
+                    if dist + tol < t.w / 2.0 - 1e-9:
                         if t.net in nets:
                             info["exempt"].append(t.label)
                         else:
                             row(ValidationStatus.FAIL, t.label, f"{at} forbids tracks on {t.layer}; {t.label} ({t.net}) reaches into it", keepout=kid)
+                    elif dist - tol < t.w / 2.0 - 1e-9 and t.net not in nets:  # only with an arc: its tolerance decides, so it is not judged
+                        row(ValidationStatus.NOT_VERIFIED, t.label,
+                            f"{at} forbids tracks on {t.layer}; whether {t.label} ({t.net}) reaches into it is decided only by the arc tolerance "
+                            f"(an arc is measured on its chords, which lie within {tol:g} mm of it): not measured here", keepout=kid)
             if ko_geom.forbids(k, "vias") and board is not None and layers:
                 for v in board.vias:
+                    if v.kind is not None and not (v.layers & set(layers)):
+                        continue  # a typed via's copper is on its span only: it meets no covered layer
                     info["compared"] += 1
                     if ko_geom.point_area_distance((v.x, v.y), pts) < v.d / 2.0 - 1e-9:
                         if v.net in nets:
@@ -1379,6 +1719,9 @@ class KeepoutValidator(Validator):
                     info["compared"] += 1
                     label = f"zone[{i}:{z.net}]"
                     area = ko_geom.polygon_overlap_area([(float(x), float(y)) for x, y in z.polygon], pts)
+                    if area is not None and z.holes:
+                        removed = [ko_geom.polygon_overlap_area(hole, pts) for hole in z.holes]
+                        area = None if any(a is None for a in removed) else max(0.0, area - sum(removed))
                     if area is None:
                         row(ValidationStatus.NOT_VERIFIED, label,
                             f"{at} forbids zones; {label} and the keep-out are both non-convex: their overlap is not computed here", keepout=kid)
@@ -1430,6 +1773,8 @@ class KeepoutValidator(Validator):
                     row(ValidationStatus.FAIL, f"can {can}: {ref}", f"{ref} of block {bid} is not inside the fence of its can {can} (by {gap:.3f} mm)", block=bid)
             regions.append({"block": bid, "can": can, "fence": [fence.x1, fence.y1, fence.x2, fence.y2], "ring_mm": None if ring is None else _q(ring)})
         details: dict[str, Any] = {"keepouts": summaries, "regions": regions, "rows": rows, "unknown": unknown}
+        if board is not None and board.arc_total:  # measured as arcs (module docstring)
+            details.update(arcs=board.arc_total, arc_model=ARC_MODEL)
         failed = [r for r in rows if r["status"] == str(ValidationStatus.FAIL)]
         open_rows = [r for r in rows if r["status"] == str(ValidationStatus.NOT_VERIFIED)]
         if failed:

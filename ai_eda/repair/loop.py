@@ -162,6 +162,12 @@ class RepairLoop:
         else:
             stopped = "all failures resolved" if iterations else stopped
 
+        # a review that only waits for the user has no failure to repair, but the design is not through: say so beside the stop
+        # reason, or "no failures" reads as a clean review (the areas stay USER_INPUT_REQUIRED in the final review)
+        waiting = [r.check_id for r in report.results if r.status == ValidationStatus.USER_INPUT_REQUIRED]
+        if waiting and not report.failures and not mutated:
+            stopped += f"; {len(waiting)} review area(s) wait for the user's answer ({', '.join(waiting)}) - blocked on the user; no repair resolves that"
+
         # Report still-failing checks; prefer the annotated copy that says *why* repair was refused.
         still_failing = [unresolved.get(f.check_id) or failed.get(f.check_id) or f for f in report.failures]
         if mutated:

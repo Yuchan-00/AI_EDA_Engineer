@@ -487,7 +487,11 @@ def _pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, template: Kr447Tx
     state = Orchestrator(AgentContext(workdir=tmp_path, tools={"kicad_library": _REAL},
                                       answers={"application": "bench", "jurisdiction": "KR", **answers})).run(ir, stop_after=Stage.ARCHITECTURE)
     assert state.blocked and [q.key for q in state.open_questions] == ["confirm_design"] and ir.components == []
-    confirm = {"confirm_design": "yes", **({"pcb.placement": "skip"} if skip_placement else {})}
+    # the router's grid corners (pcb.corners=orthogonal): the SI story below - PA_PD 89.73 mm, spice.si's ringing - is that copper's; the
+    # owner's 45-degree corners (routing.corners 0.1, pcb.corners=miter45 - the agent's default was this style until the arc style,
+    # routing.corners 0.2, replaced it) shorten PA_PD to 82.58 mm, under its 84.41 mm l_crit, and spice.si then has no long line to
+    # drive on this board
+    confirm = {"confirm_design": "yes", "pcb.corners": "orthogonal", **({"pcb.placement": "skip"} if skip_placement else {})}
     state = Orchestrator(AgentContext(workdir=tmp_path, tools=tools, answers=confirm)).run(ir, stop_after=stop)
     assert not state.blocked
     return ir, state
