@@ -372,7 +372,9 @@ def test_the_validator_applies_only_to_a_design_with_si_constraints(tmp_path: Pa
     assert not any(r.check_id.startswith("si.") for r in default_registry.run(ir, ctx))
     ir.si = si_of(*default_classes())
     got = [r for r in default_registry.run(ir, ctx) if r.check_id.startswith("si.")]
-    assert got and all(r.tool == "si" and r.tool_version and r.details["kind"] == "ir_geometry+calculators" and "not DRC" in r.message for r in got)
+    assert got and all(r.tool_version and r.details["kind"] == "ir_geometry+calculators" and "not DRC" in r.message for r in got)
+    # every si.* result is tool si, except the crosstalk rows: their own tool and version (never re-stamped)
+    assert {r.check_id for r in got if r.tool != "si"} == {"si.crosstalk"} and {(r.tool, r.tool_version) for r in got if r.tool != "si"} == {("si.crosstalk", "0.2")}
 
 
 #: the provenance the router gives a track of a net whose rule necks down to 0.25 mm within 1 mm of its pads (0.25 mm grid)
@@ -604,10 +606,16 @@ def test_a_copper_loop_leaves_the_path_unextracted(tmp_path: Path, lib):
     assert m.line is not None and m.line.how == "two-pad copper" and m.line.length_mm == pytest.approx(m.length_mm)
 
 
-def test_the_high_speed_domain_stub_now_speaks_only_of_crosstalk(tmp_path: Path, lib):
+def test_the_high_speed_domain_check_is_the_tool_backed_crosstalk_summary(tmp_path: Path, lib):
     from ai_eda.validation.domain import SignalIntegrityValidator
 
     v = SignalIntegrityValidator()
-    (r,) = v.validate(long_board(tmp_path, lib, 4), ValidationContext(workdir=tmp_path, tools={}))
-    assert r.status is S.NOT_VERIFIED and r.message.startswith("crosstalk analysis not implemented") and "si.*" in r.message
-    assert v.description.startswith("Crosstalk")
+    ir = long_board(tmp_path, lib, 4)
+    (r,) = v.validate(ir, ValidationContext(workdir=tmp_path, tools={}))
+    assert r.status is S.NOT_VERIFIED and r.is_tool_backed and (r.tool, r.tool_version) == ("domain.high_speed", "0.2")
+    assert r.message.startswith("crosstalk not judged: no ir.si") and r.details["missing"]
+    assert v.description.startswith("Crosstalk: the si.crosstalk rows") and "si.* / spice.si.*" in v.description
+    ir.si = si_of(*default_classes())
+    ir.pcb.tracks = [track("LONG", (5.0, 5.0), (95.0, 5.0)), track("SHORT", (5.0, 15.0), (15.0, 15.0))]
+    (r,) = v.validate(ir, ValidationContext(workdir=tmp_path, tools={}))
+    assert r.status is S.NOT_APPLICABLE and r.message.startswith("si.crosstalk: no victim has another net's copper") and r.details["rows"]

@@ -30,15 +30,36 @@ The graph of one net (board frame, mm, coordinates rounded to KiCad's 1e-6 mm):
   taken as reaching the pad and no line is shortened by it;
 * **edges** - the track pieces (length, layer, width) and the via barrels.
 
+An arc track (``Track.mid``, :mod:`ai_eda.ir.arc`) is one edge between its
+two ends, as long as the arc (:func:`~ai_eda.ir.arc.arc_length`), and never
+a chain of chords: a chain's vertices would be nodes that pad boxes and via
+discs contract, so the graph - and the line's length - would depend on how
+finely the arc was cut. Like a straight track it is split only where a
+track end or a via centre of the net lies on it: a point whose exact
+distance from the arc (:func:`~ai_eda.ir.arc.point_arc_fraction`) is at most
+:data:`PATH_TOL_MM`. The pieces end on that point itself (the node of the
+track that joins there) and share the arc's length by the fraction along the
+arc at which the point lies, so they add up to the arc's length; a point
+within the tolerance of one of the arc's ends, measured along the arc, is
+that end, not a split. A piece keeps a point of the arc between its ends
+(:attr:`PathEdge.mid`), so nothing that reads a path takes it for the chord.
+A pad contracts the nodes in its box and a via the nodes in its disc exactly
+as for straight copper: an arc that ends inside a pad box behaves like a
+segment ending there.
+
 The path is extracted only when every pad of the net is in one connected
 part of that graph and the part is a tree (``edges == nodes - 1``): then the
 pad-to-pad path is unique, and the longest one (by length; ties by the pad
 labels) is the net's *line* - its length, its delay (the sum of each piece's
 ``t_pd`` from :func:`~ai_eda.tools.si.measure.line_model`, a via's the
-barrel bound), whether any piece's delay is the no-plane upper bound, and the
-width with the most copper along it. Otherwise the reason is returned: a pad
+barrel bound), whether any piece's delay is the no-plane upper bound, the
+width with the most copper along it, and its ordered pieces
+(:attr:`NetPath.edges`, each with its end points and delay: where
+``spice.xtalk`` places a coupled span on the line). Otherwise the reason is returned: a pad
 the copper does not reach, a loop (the path is not unique), a track on an
-inner layer (the via barrel between layers is not split here), a pad whose
+inner layer (the via barrel between layers is not split here), a blind /
+buried / micro via (``Via.kind``: its barrel is not a ``F.Cu``-``B.Cu``
+edge, and it is not split either), a pad whose
 footprint is not on disk, a trapezoid (its ``rect_delta`` is not read) or a
 custom pad with a primitive the library reader does not read.
 """
@@ -51,6 +72,7 @@ from dataclasses import dataclass, field
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import CircuitIR, Stackup, Track, Via
+from ai_eda.ir.arc import arc_bbox, arc_length, arc_point_at, arc_problem, point_arc_fraction
 from ai_eda.tools.kicad.geometry import _q, custom_pad_parts, pad_angle, pad_copper_center, pad_layers
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError
 
@@ -60,6 +82,10 @@ PATH_TOL_MM = 1e-6
 CONVEX_PAD_SHAPES = frozenset({"circle", "rect", "oval", "roundrect"})
 #: the only layers a via end is joined on (the compiler writes through vias; the router routes these two)
 OUTER_LAYERS: tuple[str, str] = ("F.Cu", "B.Cu")
+#: why a net with a blind / buried / micro via (``Via.kind``) has no extracted path
+TYPED_VIA_NOT_SPLIT = "a blind/buried/micro via's barrel is not split in this path model"
+
+_Point = tuple[float, float]
 
 
 @dataclass(frozen=True)
@@ -163,6 +189,31 @@ def net_pads(ir: CircuitIR, library: KicadLibrary) -> NetPads:
 
 
 @dataclass(frozen=True)
+class PathEdge:
+    """One piece of a :class:`NetPath`, oriented from ``NetPath.ends[0]`` toward ``ends[1]``: a track piece (its layer and width,
+    ``start`` / ``end`` the centreline's ends in board mm) or a via barrel (``layer`` / ``width_mm`` ``None``, both points the via centre).
+    ``delay_s`` is the piece's delay as the path sums it (``None`` when it has no line model). ``mid`` is ``None`` for a straight piece
+    and for a barrel; a piece of an arc track carries a point of its arc there, so ``start`` / ``mid`` / ``end`` are the piece's arc as
+    a track's three points are (the same point whichever way the path walks the piece), and ``length_mm`` is its length along the arc -
+    a piece of an arc too flat to be an arc at the file resolution is straight (``None``). A piece without ``mid`` prints as it did
+    before the field existed (``mid`` is left out of its ``repr`` while it is ``None``)."""
+
+    layer: str | None
+    width_mm: float | None
+    length_mm: float
+    start: tuple[float, float]
+    end: tuple[float, float]
+    delay_s: float | None
+    mid: tuple[float, float] | None = None
+
+    def __repr__(self) -> str:
+        """The dataclass's own form, ``mid`` left out while it is ``None`` (class docstring)."""
+        text = (f"PathEdge(layer={self.layer!r}, width_mm={self.width_mm!r}, length_mm={self.length_mm!r}, start={self.start!r}, end={self.end!r}, "
+                f"delay_s={self.delay_s!r}")
+        return f"{text})" if self.mid is None else f"{text}, mid={self.mid!r})"
+
+
+@dataclass(frozen=True)
 class NetPath:
     """The longest pad-to-pad path of a net (module docstring). ``delay_s`` is ``None`` when a piece has no line model."""
 
@@ -174,6 +225,8 @@ class NetPath:
     bound: bool
     #: ``(layer, width_mm)`` with the most track length along the path
     main: tuple[str, float] | None
+    #: the path's pieces in order from ``ends[0]`` to ``ends[1]`` (what ``spice.xtalk`` places a coupled span on)
+    edges: tuple[PathEdge, ...] = ()
 
     @property
     def label(self) -> str:
@@ -190,6 +243,46 @@ def _pt_seg_t(px: float, py: float, a: tuple[float, float], b: tuple[float, floa
     return math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy)), t
 
 
+def _arc_pieces(t: Track, a: _Point, b: _Point, points: set[_Point]) -> tuple[list[tuple[_Point, _Point, float, _Point | None]], list[tuple[_Point, _Point]]]:
+    """The pieces of the arc track ``t`` (``a`` / ``b`` its rounded ends) between the ``points`` that lie on it, and the points that are
+    one of its ends (module docstring): ``(pieces, joins)``.
+
+    A piece is ``(start, end, length, mid)``: it ends on ``a`` / ``b`` or on the cutting points themselves, its length is its share
+    of the arc's length (the fraction along the arc between its two ends), and ``mid`` is a point of the arc in the middle of the
+    piece at the file resolution - the arc's own ``mid`` when nothing cuts it - or ``None`` when the piece is too flat to be an arc
+    at that resolution (:func:`~ai_eda.ir.arc.arc_problem`: the straight segment a file would hold). A join is ``(point, a or b)``:
+    a point within :data:`PATH_TOL_MM` of the arc and, along it, of that end.
+    """
+    start, mid, end = t.start, t.mid, t.end
+    assert mid is not None
+    total = arc_length(start, mid, end)
+    x1, y1, x2, y2 = arc_bbox(start, mid, end)
+    cuts: list[tuple[float, _Point]] = []
+    joins: list[tuple[_Point, _Point]] = []
+    for pt in points:
+        if pt in (a, b) or not (x1 - PATH_TOL_MM <= pt[0] <= x2 + PATH_TOL_MM and y1 - PATH_TOL_MM <= pt[1] <= y2 + PATH_TOL_MM):
+            continue
+        d, f = point_arc_fraction(pt, start, mid, end)
+        if d > PATH_TOL_MM:
+            continue
+        if f * total <= PATH_TOL_MM:
+            joins.append((pt, a))
+        elif (1.0 - f) * total <= PATH_TOL_MM:
+            joins.append((pt, b))
+        else:
+            cuts.append((f, pt))
+    stops = [(0.0, a), *sorted(cuts), (1.0, b)]
+    pieces: list[tuple[_Point, _Point, float, _Point | None]] = []
+    for (f0, p0), (f1, p1) in zip(stops, stops[1:]):
+        if len(stops) == 2:
+            m = (_q(mid[0]), _q(mid[1]))
+        else:
+            x, y = arc_point_at(start, mid, end, (f0 + f1) / 2.0)
+            m = (_q(x), _q(y))
+        pieces.append((p0, p1, (f1 - f0) * total, m if arc_problem(p0, m, p1) is None else None))
+    return pieces, sorted(joins)
+
+
 def longest_path(
     net: str, tracks: list[Track], vias: list[Via], pads: dict[str, list[PadBox]], stackup: Stackup | None,
     t_pd: dict[tuple[str, float], tuple[float | None, bool]], via_t_pd: float | None,
@@ -204,7 +297,10 @@ def longest_path(
     inner = sorted({t.layer for t in tracks if t.layer not in OUTER_LAYERS})
     if inner:
         return None, f"track(s) on inner layer(s) {inner}: the via barrel between layers is not split in this model"
-    barrel = stackup.span_mm("F.Cu", "B.Cu") if stackup is not None else 0.0
+    if any(getattr(v, "kind", None) is not None for v in vias):
+        return None, TYPED_VIA_NOT_SPLIT
+    span = stackup.through_via_span_mm() if stackup is not None else None  # None also on a one-copper-layer stack (no via can join it)
+    barrel = span if span is not None else 0.0
 
     def key(layer: str, pt: tuple[float, float]) -> tuple[str, float, float]:
         return (layer, _q(pt[0]), _q(pt[1]))
@@ -217,10 +313,18 @@ def longest_path(
     for v in vias:
         for layer in OUTER_LAYERS:
             points[layer].add((_q(v.x_mm), _q(v.y_mm)))
-    # edges: (node a, node b, length, (layer, width) or None for a barrel)
-    edges: list[tuple[tuple, tuple, float, tuple[str, float] | None]] = []
+    # edges: (node a, node b, length, (layer, width) or None for a barrel, (point a, point b), the mid point of an arc piece or None)
+    edges: list[tuple[tuple, tuple, float, tuple[str, float] | None, tuple[tuple[float, float], tuple[float, float]], tuple[float, float] | None]] = []
+    joins: list[tuple[tuple, tuple]] = []  # a point of the net that is an arc's end within the tolerance: the two nodes are one
     for t in tracks:
         a, b = (_q(t.start[0]), _q(t.start[1])), (_q(t.end[0]), _q(t.end[1]))
+        if getattr(t, "mid", None) is not None:  # an arc: one edge, split only where a point of the net lies on it (module docstring)
+            pieces, same = _arc_pieces(t, a, b, points[t.layer])
+            for p0, p1, length, mid in pieces:
+                if p0 != p1:
+                    edges.append((key(t.layer, p0), key(t.layer, p1), length, (t.layer, float(t.width_mm)), (p0, p1), mid))
+            joins.extend((key(t.layer, pt), key(t.layer, at)) for pt, at in same)
+            continue
         if a == b:
             continue
         cuts = sorted({tt for pt in points[t.layer] if pt not in (a, b) for d, tt in [_pt_seg_t(pt[0], pt[1], a, b)] if d <= PATH_TOL_MM and 0.0 < tt < 1.0}
@@ -229,13 +333,14 @@ def longest_path(
         stops[0], stops[-1] = a, b
         for p0, p1 in zip(stops, stops[1:]):
             if p0 != p1:
-                edges.append((key(t.layer, p0), key(t.layer, p1), math.hypot(p1[0] - p0[0], p1[1] - p0[1]), (t.layer, float(t.width_mm))))
+                edges.append((key(t.layer, p0), key(t.layer, p1), math.hypot(p1[0] - p0[0], p1[1] - p0[1]), (t.layer, float(t.width_mm)), (p0, p1), None))
     nodes: set[tuple] = set()
-    for a, b, _, _ in edges:
+    for a, b, _, _, _, _ in edges:
         nodes.update((a, b))
     for i, v in enumerate(vias):
         top, bottom = ("via", i, "F.Cu"), ("via", i, "B.Cu")
-        edges.append((top, bottom, barrel, None))
+        centre = (_q(v.x_mm), _q(v.y_mm))
+        edges.append((top, bottom, barrel, None, (centre, centre), None))
         nodes.update((top, bottom))
     # union-find: a via end joins the track ends within its radius; a pad contracts the nodes inside its box
     parent: dict[tuple, tuple] = {n: n for n in nodes}
@@ -251,6 +356,9 @@ def longest_path(
         if ra != rb:
             parent[max(ra, rb, key=repr)] = min(ra, rb, key=repr)
 
+    for n1, n2 in joins:
+        if n1 in parent and n2 in parent:
+            union(n1, n2)
     track_nodes = [n for n in nodes if n[0] in OUTER_LAYERS]
     for i, v in enumerate(vias):
         r = float(v.diameter_mm) / 2.0 + PATH_TOL_MM
@@ -270,14 +378,14 @@ def longest_path(
                 for layer in OUTER_LAYERS:
                     if layer in box.layers and box.contains(v.x_mm, v.y_mm):
                         union(me, ("via", i, layer))
-    # the contracted multigraph
-    adj: dict[tuple, list[tuple[tuple, float, tuple[str, float] | None]]] = {}
-    for a, b, length, what in edges:
+    # the contracted multigraph (each entry's points oriented from the node it is listed under; an arc piece's mid point is the same both ways)
+    adj: dict[tuple, list[tuple[tuple, float, tuple[str, float] | None, tuple[tuple[float, float], tuple[float, float]], tuple[float, float] | None]]] = {}
+    for a, b, length, what, (pa, pb), mid in edges:
         ra, rb = find(a), find(b)
         if ra == rb:
             continue  # copper inside one pad (or a via whose both ends one pad holds)
-        adj.setdefault(ra, []).append((rb, length, what))
-        adj.setdefault(rb, []).append((ra, length, what))
+        adj.setdefault(ra, []).append((rb, length, what, (pa, pb), mid))
+        adj.setdefault(rb, []).append((ra, length, what, (pb, pa), mid))
     reps = {label: find(n) for label, n in pad_node.items()}
     labels = sorted(reps, key=natural_ref_key)
     start = reps[labels[0]]
@@ -285,7 +393,7 @@ def longest_path(
     stack = [start]
     while stack:
         n = stack.pop()
-        for m, _, _ in adj.get(n, []):
+        for m, _, _, _, _ in adj.get(n, []):
             if m not in seen:
                 seen.add(m)
                 stack.append(m)
@@ -297,17 +405,17 @@ def longest_path(
         return None, f"the copper forms a loop ({n_edges} pieces on {len(seen)} nodes): the pad-to-pad path is not unique"
     # the tree: from every pad, the distance to every node; the longest pad-to-pad pair (ties: the pad labels)
     best: tuple[float, str, str] | None = None
-    parents: dict[str, dict[tuple, tuple[tuple, float, tuple[str, float] | None] | None]] = {}
+    parents: dict[str, dict[tuple, tuple[tuple, float, tuple[str, float] | None, tuple, tuple[float, float] | None] | None]] = {}
     for i, a in enumerate(labels):
         dist = {reps[a]: 0.0}
-        par: dict[tuple, tuple[tuple, float, tuple[str, float] | None] | None] = {reps[a]: None}
+        par: dict[tuple, tuple[tuple, float, tuple[str, float] | None, tuple, tuple[float, float] | None] | None] = {reps[a]: None}
         order = [reps[a]]
         while order:
             n = order.pop()
-            for m, length, what in adj.get(n, []):
+            for m, length, what, pts, mid in adj.get(n, []):
                 if m not in dist:
                     dist[m] = dist[n] + length
-                    par[m] = (n, length, what)
+                    par[m] = (n, length, what, pts, mid)
                     order.append(m)
         parents[a] = par
         for b in labels[i + 1:]:
@@ -326,14 +434,17 @@ def longest_path(
     delay: float | None = 0.0
     bound = False
     per_width: dict[tuple[str, float], float] = {}
+    pieces: list[PathEdge] = []  # walked from b back to a; reversed below
     while par[n] is not None:
-        prev, length, what = par[n]  # type: ignore[misc]
+        prev, length, what, (p_prev, p_here), mid = par[n]  # type: ignore[misc]
         if what is None:
             n_vias += 1
+            piece_delay = None if via_t_pd is None or stackup is None else length / 1000.0 * via_t_pd
             if via_t_pd is None or stackup is None:
                 delay = None
             elif delay is not None:
                 delay += length / 1000.0 * via_t_pd
+            pieces.append(PathEdge(None, None, length, p_prev, p_here, piece_delay))
         else:
             tracks_len += length
             per_width[what] = per_width.get(what, 0.0) + length
@@ -343,9 +454,11 @@ def longest_path(
                 delay = None
             elif delay is not None:
                 delay += length / 1000.0 * tp
+            pieces.append(PathEdge(what[0], what[1], length, p_prev, p_here, None if tp is None else length / 1000.0 * tp, mid))
         n = prev
     main = max(per_width.items(), key=lambda kv: (kv[1], -kv[0][1], kv[0][0]))[0] if per_width else None
-    return NetPath(ends=(a, b), length_mm=tracks_len + n_vias * barrel, track_length_mm=tracks_len, vias=n_vias, delay_s=delay, bound=bound, main=main), None
+    return NetPath(ends=(a, b), length_mm=tracks_len + n_vias * barrel, track_length_mm=tracks_len, vias=n_vias, delay_s=delay, bound=bound, main=main,
+                   edges=tuple(reversed(pieces))), None
 
 
-__all__ = ["CONVEX_PAD_SHAPES", "PATH_TOL_MM", "NetPads", "NetPath", "PadBox", "longest_path", "net_pads"]
+__all__ = ["CONVEX_PAD_SHAPES", "PATH_TOL_MM", "TYPED_VIA_NOT_SPLIT", "NetPads", "NetPath", "PadBox", "PathEdge", "longest_path", "net_pads"]

@@ -15,6 +15,7 @@ refresh. The IR is never saved.
 
 from __future__ import annotations
 
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -96,13 +97,21 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
 
 
+class _LoopbackServer(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` whose handler threads never keep the process alive; no ``SO_REUSEADDR`` on Windows, where it
+    would let a second listener bind a port that is already serving (so ``serve()`` on a taken port would never fail).
+    Same rule as the GUI server's (:mod:`ai_eda.gui.server`); kept here so the report package does not import the GUI."""
+
+    daemon_threads = True
+    allow_reuse_address = os.name != "nt"
+
+
 class ReportServer:
     """``ThreadingHTTPServer`` on 127.0.0.1 serving :func:`render_page` of one ir.json (``port`` 0 = ephemeral)."""
 
     def __init__(self, ir_path: Path, port: int = 0) -> None:
         self.ir_path = Path(ir_path)
-        self._server = ThreadingHTTPServer((LOOPBACK, port), _Handler)
-        self._server.daemon_threads = True
+        self._server = _LoopbackServer((LOOPBACK, port), _Handler)
         self._server.ir_path = self.ir_path  # type: ignore[attr-defined]
 
     @property

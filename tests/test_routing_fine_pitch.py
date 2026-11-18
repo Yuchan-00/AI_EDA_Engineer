@@ -39,7 +39,12 @@ checked here, on a synthetic library (the routing fixtures of ``tests/test_routi
 * a board that needs none of it is 0.2's: no escape stats, the params entry character for character;
 * with the packed KiCad 10.0.6 libraries (``KICAD10_SYMBOL_DIR``; skipped without them): the real ``QFN-12-1EP_3x3mm_P0.5mm_EP1.6x1.6mm
   _ThermalVias`` (the transceiver's PA, off the grid as the floorplan puts it) and ``DFN-14-1EP_3x3mm_P0.4mm_EP1.78x2.35mm`` (the
-  MAX9814) with every pin wired to its own 0603 resistor: every pad escapes, every net routes at the fine rules, clearance clean.
+  MAX9814) with every pin wired to its own 0603 resistor: every pad escapes, every net routes at the fine rules, clearance clean;
+* the via fan-out (routing.maze 0.8) on the real ``LQFP-48_7x7mm_P0.5mm``, every pin wired to its own 0603 resistor in a row on its
+  side outside the fan-out room: 0.6 escapes every pad and 0.8 never runs; with 0.6's trial orders cut to the greedy pad order (so 0.6
+  and 0.7 leave pads of it without an escape) the third run escapes every pad - every other pad of a side by a stub to a via inside
+  the pad ring, the net continuing on B.Cu, the others by a stub out of the pad's edge - and every net routes, clearance clean,
+  stamped 0.8 with the fanned-out pads named; each such via is emitted once, at the stub's end.
 
 Nothing here claims DRC: the router's clearances are its parameters, and the checks measure the IR geometry it promised.
 """
@@ -79,6 +84,7 @@ from ai_eda.tools.routing.maze import (
     FINE_RULES,
     LARGE_BOARD_ITERATIONS,
     LARGE_BOARD_NETS,
+    ROUTER_DOGBONE_VERSION,
     ROUTER_ESCAPE_VERSION,
     ROUTER_FANOUT_VERSION,
     ROUTER_KEEPOUT_VERSION,
@@ -97,6 +103,8 @@ from ai_eda.validation.layout import _Board as LayoutBoard
 from ai_eda.validation.layout import clearance_rows
 from ai_eda.validation.si import _neckdown
 from tests.test_routing import DEFAULT_ENTRY, NET_P, board_ir, fixture_library
+from tests.test_routing_baseline_digests import BASELINE
+from tests.test_routing_rules import digest
 from tests.test_si_checks import stacked
 
 #: one side of a QFN: five 0.7 x 0.25 mm pads at a 0.5 mm pitch along y, and a net-less exposed pad east of them (so the row leaves west)
@@ -321,6 +329,7 @@ def test_a_fenced_plane_pad_in_the_row_gets_a_stub_to_its_own_via_and_the_rest_f
     x.pcb.tracks, x.pcb.vias = list(r.tracks), list(r.vias)
     _, bad = clearance_rows(LayoutBoard(x, lib), FINE.clearance_mm)
     assert bad == []
+    assert digest(r) == BASELINE["fine_fenced_plane_row"]  # tests/test_routing_baseline_digests.py
 
 
 def test_a_plane_pad_whose_axis_walk_finds_no_via_site_gets_a_diagonal_stub_to_one(tmp_path: Path, lib: KicadLibrary):
@@ -335,6 +344,7 @@ def test_a_plane_pad_whose_axis_walk_finds_no_via_site_gets_a_diagonal_stub_to_o
     (cx, cy), (vx, vy) = row["points"][0], row["cell"]
     assert (cx, cy) == (6.0, 6.0) and vx != cx and vy != cy  # off every axis of the pad: the walk could not find it
     assert any((v.x_mm, v.y_mm) == (vx, vy) for v in r.vias if v.net == "GND")
+    assert digest(r) == BASELINE["fine_plane_diagonal_stub"]  # tests/test_routing_baseline_digests.py
 
 
 def test_a_plane_net_with_a_pad_no_escape_reaches_is_unrouted_and_leaves_no_trace_on_the_static_maps(tmp_path: Path, lib: KicadLibrary):
@@ -386,6 +396,7 @@ def test_a_doomed_plane_nets_via_is_gone_before_the_next_plane_net_walks(tmp_pat
     vcc_only = _Board(ir, lib, p, None, True, plane={"VCC": p.track_width_mm}, plane_areas={"VCC": [PLANE]})
     assert both.static_passes == 2 and list(both.doomed) == ["GND"] and not both.escape_ran
     assert both.plane_links["VCC"] == vcc_only.plane_links["VCC"] and both.owner == vcc_only.owner and both.via_pad_ok == vcc_only.via_pad_ok
+    assert digest(r) == BASELINE["fine_doomed_plane_net"]  # tests/test_routing_baseline_digests.py
 
 
 # --------------------------------------------------------------------------- the fan-out room (routing.maze 0.7)
@@ -445,6 +456,7 @@ def test_a_neighbours_plane_via_is_kept_out_of_the_fan_out_room_when_0_6_leaves_
     assert bad == []
     again = route_board(ir, lib, FINE, inner_layers=True, plane_nets=GND_PLANES)
     assert [design_data(t) for t in again.tracks] == [design_data(t) for t in r.tracks] and again.stats == r.stats  # deterministic
+    assert digest(r) == BASELINE["fanout_room_0_7"]  # tests/test_routing_baseline_digests.py
 
 
 def test_a_board_the_fan_out_room_does_not_help_keeps_0_6_byte_for_byte(tmp_path: Path, lib: KicadLibrary, monkeypatch: pytest.MonkeyPatch):
@@ -459,6 +471,7 @@ def test_a_board_the_fan_out_room_does_not_help_keeps_0_6_byte_for_byte(tmp_path
     plain = route_board(ir, lib, FINE, inner_layers=True, plane_nets=GND_PLANES)
     assert [design_data(t) for t in plain.tracks] == [design_data(t) for t in r.tracks] and [design_data(v) for v in plain.vias] == [design_data(v) for v in r.vias]
     assert plain.stats == r.stats and plain.unrouted == r.unrouted
+    assert digest(r) == BASELINE["fanout_room_kept_0_6"]  # tests/test_routing_baseline_digests.py
 
 
 def test_a_large_board_negotiates_longer_and_says_so_every_other_board_keeps_40(tmp_path: Path, lib: KicadLibrary):
@@ -671,3 +684,72 @@ def test_the_real_fine_pitch_packages_escape_and_route(tmp_path: Path, lib_id, p
     assert bad == [], bad[:3]
     checks = _routing_checks(ir, r.tracks, r.vias, REAL, tmp_path, params.clearance_mm)
     assert checks == {"pcb.routing.connectivity": "PASS", "pcb.routing.clearance": "PASS"}, checks
+
+
+LQFP48 = ("Package_QFP", "LQFP-48_7x7mm_P0.5mm")
+HAS_QFP = all(REAL.footprint_file(*fp) is not None for fp in (LQFP48, ("Resistor_SMD", "R_0603_1608Metric")))
+
+
+def _qfp_board(tmp_path: Path) -> CircuitIR:
+    """The LQFP-48 in the middle of a 34 x 34 mm board, pin i wired to its own 0603 resistor in a row 11 mm out on the pin's side,
+    the pins' order kept (3 mm apart), each resistor turned across its row - outside the router's fan-out room (2.2 mm at the fine
+    rules), as placement.core_ring 0.3 keeps it."""
+    ir = CircuitIR(project=ProjectMeta(id="qfp", name="qfp", workdir=str(tmp_path)))
+    ir.components.append(_part("U1", LQFP48, [str(i) for i in range(1, 49)]))
+    c = 17.0
+    placements = [Placement(component_ref="U1", x_mm=c, y_mm=c, provenance=NET_P)]
+    fp = REAL.load_footprint(LibraryRef(library=LQFP48[0], name=LQFP48[1]))
+    for pad in fp.pads:
+        if not pad.number:
+            continue
+        i = int(pad.number)
+        ir.components.append(_part(f"R{i}", ("Resistor_SMD", "R_0603_1608Metric"), ["1", "2"]))
+        if abs(pad.x) > abs(pad.y):
+            x, y, rot = c + math.copysign(11.0, pad.x), c + 3.0 * pad.y, 0.0
+        else:
+            x, y, rot = c + 3.0 * pad.x, c + math.copysign(11.0, pad.y), 90.0
+        placements.append(Placement(component_ref=f"R{i}", x_mm=round(x, 2), y_mm=round(y, 2), rotation_deg=rot, provenance=NET_P))
+    ir.nets = [Net(name=f"P{i}", pins=[PinRef(component_ref="U1", pin_number=str(i)), PinRef(component_ref=f"R{i}", pin_number="1")], provenance=NET_P)
+               for i in range(1, 49)]
+    ir.pcb = PCBDesign(outline=BoardOutline(width_mm=34.0, height_mm=34.0), placements=placements)
+    return ir
+
+
+@pytest.mark.skipif(not HAS_QFP, reason="KiCad 10 footprint libraries with the LQFP-48 not installed (set KICAD10_SYMBOL_DIR)")
+def test_a_0_5_mm_pitch_qfp_fans_out_by_vias_in_alternation_when_0_6_and_0_7_leave_pads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    ir = _qfp_board(tmp_path)
+    params = RoutingParams.for_board(ir, REAL)
+    assert params.rules == "fine" and params.grid_mm == 0.2
+    # with its fan-out room free 0.6's trial orders escape every pad of the LQFP-48: 0.8 never runs
+    first = route_board(ir, REAL, params)
+    assert first.unrouted == {} and first.version == ROUTER_ESCAPE_VERSION and "via_fanout" not in first.stats
+    # 0.6's greedy pad-order trial alone leaves pads of it without an escape, 0.7 frees none, so the third run escapes it in alternation
+    monkeypatch.setattr(maze, "_ESCAPE_TRIALS", (("natural", "near", "plane"),))
+    r = route_board(ir, REAL, params)
+    assert r.unrouted == {} and r.version == ROUTER_DOGBONE_VERSION == "0.8" and r.stats["escape_refused"] == {}
+    rows = {row["pad"]: row for row in r.stats["escapes"]}
+    fanned = sorted((p for p, row in rows.items() if row["kind"] == "dogbone"), key=lambda p: int(p.split(".")[1]))
+    assert r.stats["via_fanout"] == {"footprints": ["U1"], "pads": [row["pad"] for row in r.stats["escapes"] if row["kind"] == "dogbone"]}
+    assert len(fanned) >= 12 and all(rows[p]["continues_on"] == "B.Cu" and rows[p]["layer"] == "F.Cu" for p in fanned)
+    assert {row["kind"] for row in rows.values()} == {"dogbone", "stub"}
+    # every fanned-out pad's via sits at the end of its stub and is emitted exactly once; the inner edge is tried first, so all but
+    # the pads next to a corner (whose inner sites the other side's vias take) fan out inside the pad ring
+    via_at = [(v.x_mm, v.y_mm) for v in r.vias]
+    inside = []
+    for p in fanned:
+        end = tuple(rows[p]["points"][-1])
+        assert tuple(rows[p]["cell"]) == end and via_at.count(end) == 1, p
+        if max(abs(end[0] - 17.0), abs(end[1] - 17.0)) < 4.15 - 0.75:  # nearer the centre than the pads' inner ends
+            inside.append(p)
+    assert len(inside) >= len(fanned) - 4, sorted(set(fanned) - set(inside))
+    entry = next(e for e in r.tracks[0].provenance.derived_from if e.startswith("via_fanout:"))
+    assert entry == f"via_fanout:U1;pads={','.join(r.stats['via_fanout']['pads'])};model=alternate+via"
+    x2 = copy.deepcopy(ir)
+    x2.pcb.tracks, x2.pcb.vias = list(r.tracks), list(r.vias)
+    _, bad = clearance_rows(LayoutBoard(x2, REAL), params.clearance_mm)
+    assert bad == [], bad[:3]
+    checks = _routing_checks(ir, r.tracks, r.vias, REAL, tmp_path, params.clearance_mm)
+    assert checks == {"pcb.routing.connectivity": "PASS", "pcb.routing.clearance": "PASS"}, checks
+    assert digest(first) == BASELINE["qfp48_escape_0_6"]  # tests/test_routing_baseline_digests.py
+    assert digest(r) == BASELINE["qfp48_dogbone_0_8"]
+

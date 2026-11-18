@@ -124,6 +124,7 @@ from ai_eda.tools.calc.basic import (
     rc_time_constant,
     voltage_divider_output,
 )
+from ai_eda.tools.calc.e_series import standard_value, values_between
 from ai_eda.tools.calc.part_value import PART_VALUE_DIGITS, format_part_value
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.spice import SpiceAnalysis
@@ -339,6 +340,52 @@ def nearest_e12(value: float | None) -> float | None:
     return min(candidates, key=lambda c: abs(math.log(c / value)))
 
 
+#: IEC 60063 series a template tries for a solved part value, coarsest first: the first one whose result fits the
+#: template's tolerance is placed (:func:`~ai_eda.tools.calc.e_series.standard_value`); resistors are sold in E24 and E96
+#: (1 %), capacitors and inductors mostly in E12, less often in E24
+RESISTOR_SERIES: tuple[str, ...] = ("e24", "e96")
+CAPACITOR_SERIES: tuple[str, ...] = ("e12", "e24")
+INDUCTOR_SERIES: tuple[str, ...] = ("e12", "e24")
+#: the share of an expectation's tolerance a standard value may use up; the rest is left to the simulation
+STANDARD_SHARE = 0.5
+_SERIES_MODE_TEXT = {"nearest": "에 가장 가까운 값", "at_most": "를 넘지 않는 가장 큰 값", "at_least": "보다 작지 않은 가장 작은 값"}
+
+
+def standard_of(ir: CircuitIR, key: str) -> tuple[str, str, float | None] | None:
+    """``(series, mode, solved value)`` when ``ir.parameters[key]`` is the E series value of another parameter, else ``None``.
+
+    ``None`` for a design built before the templates placed standard values
+    (the part then carries the calculator's number as it is) and for a value
+    that is a choice or a hand edit: a report says "standard value" only
+    where the IR's own provenance says so.
+    """
+    t = ir.parameters.get(key)
+    tool = t.provenance.tool if t is not None and t.provenance.kind is ProvenanceKind.DERIVED else None
+    if not tool or not tool.startswith("calc.e_series.") or len(t.provenance.derived_from) != 1:
+        return None
+    series, mode = tool.split(".")[2:4]
+    return series.upper(), mode, parameter_value(ir, t.provenance.derived_from[0])
+
+
+def _standard_text(standard: tuple[str, str, float | None], unit: str) -> str:
+    series, mode, ideal = standard
+    return f"{series} 표준값(IEC 60063): 계산값 {quantity(ideal, unit)} {_SERIES_MODE_TEXT.get(mode, mode)}"
+
+
+def _solved(ir: CircuitIR, key: str) -> float | None:
+    """The number the solving calculator gave for part parameter ``key``: its ``<key>_ideal`` when the part is a standard value, else the parameter itself."""
+    standard = standard_of(ir, key)
+    return parameter_value(ir, key) if standard is None else standard[2]
+
+
+def _placed_line(ir: CircuitIR, key: str, unit: str) -> str:
+    """The theory line that names the placed standard value of ``key`` (ending in a newline); empty for a design whose part is the solved number."""
+    standard = standard_of(ir, key)
+    if standard is None:
+        return ""
+    return f"    부품값 = {quantity(parameter_value(ir, key), unit)}   ({_standard_text(standard, unit)}; `{ir.parameters[key].provenance.tool}`)\n"
+
+
 def _is_choice(ir: CircuitIR, key: str) -> bool:
     """Whether ``ir.parameters[key]`` is a template choice the user confirmed (:func:`~ai_eda.design.base.choice_provenance`), not a calculator output."""
     t = ir.parameters.get(key)
@@ -381,7 +428,10 @@ def _spelled(ir: CircuitIR, *refs: str) -> bool:
     return all(ref in parts and display_spelled(parts[ref]) is True for ref in refs)
 
 
-def _resistor_criteria(value: float | None, dissipation: float | None, tolerance: str, *, chosen: bool = False, spelled: bool = False) -> list[str]:
+def _resistor_criteria(
+    value: float | None, dissipation: float | None, tolerance: str, *, chosen: bool = False, spelled: bool = False,
+    standard: tuple[str, str, float | None] | None = None,
+) -> list[str]:
     """What any substitute resistor must satisfy: the value, twice the computed dissipation, the tolerance class.
 
     ``chosen`` says the value is a template choice the user confirmed (the
@@ -391,8 +441,13 @@ def _resistor_criteria(value: float | None, dissipation: float | None, tolerance
     number, :func:`_spelled`), that the part value shows it to 5 significant
     digits while the netlist keeps the exact number
     (:data:`VALUE_SPELLING_NOTE`); a v0.1 netlist spelling keeps v0.1's line.
+    ``standard`` (:func:`standard_of`) says the value is the E series value of
+    the calculator's number, and the line names the series and that number.
     """
-    origin = "템플릿 선택값, 사용자 확인" if chosen else "계산값 그대로: E 계열 반올림은 하지 않았음" + (f"; {VALUE_SPELLING_NOTE}" if spelled else "")
+    if standard is not None:
+        origin = _standard_text(standard, "ohm")
+    else:
+        origin = "템플릿 선택값, 사용자 확인" if chosen else "계산값 그대로: E 계열 반올림은 하지 않았음" + (f"; {VALUE_SPELLING_NOTE}" if spelled else "")
     return [
         f"저항값 {quantity(value, 'ohm')} ({origin})",
         f"정격 전력 ≥ 2 × 계산 소비전력 = 2 × {quantity(dissipation, 'W')} = {quantity(_mul(2.0, dissipation), 'W')}",
@@ -460,7 +515,13 @@ class DividerTemplate(Template):
     needs = ("input_voltage", "output_voltage")
     serves = ("input_voltage", "output_voltage", "output_current")
 
+    def triggered_by(self, ir: CircuitIR, inputs: dict[str, DesignInput]) -> bool:
+        # a control level, a load supply and an allowed ON drop describe a switch (ai_eda.design.catalog.bjt_lowside_switch), not a divider
+        return self.triggered(inputs) and "max_voltage_drop" not in inputs
+
     R2_OHM = 10_000.0
+    #: the E24 values R2 may move to when no standard R1 reaches the stated output with :data:`R2_OHM` (the same decade)
+    R2_MIN_OHM, R2_MAX_OHM = 4_700.0, 22_000.0
     TOL_REL = 0.01
     #: asked with the table when no load current is stated at all: an answer then enters the IR and is read before the build
     LOAD_QUESTION = (
@@ -520,12 +581,35 @@ class DividerTemplate(Template):
         plan.choices = [r2_choice, tol_choice]
         params: dict[str, Traced] = {"v_in": v_in.traced, "v_out_target": v_out.traced, "r2": r2}
         try:
-            params["r1"] = divider_r1_for_v_out(params["v_in"], params["v_out_target"], params["r2"], ("v_in", "v_out_target", "r2"))
+            # the solved R1 is not a part: R1 is the first E series value whose output is within the tolerance of the stated
+            # output; when none reaches it with the 10 kohm R2, R2 moves to the nearest E24 value with which one does
+            target, allowed = v_out.traced.value, self.TOL_REL * abs(v_out.traced.value)
+
+            def place(r2_t: Traced) -> tuple[Traced, Traced, bool]:
+                def fits(r: Traced) -> bool:
+                    return abs(voltage_divider_output(params["v_in"], r, r2_t).value - target) <= allowed
+
+                ideal = divider_r1_for_v_out(params["v_in"], params["v_out_target"], r2_t, ("v_in", "v_out_target", "r2"))
+                placed = standard_value(ideal, "r1_ideal", RESISTOR_SERIES, accept=fits)
+                return ideal, placed, fits(placed)
+
+            params["r1_ideal"], params["r1"], reached = place(params["r2"])
+            if not reached:
+                others = (v for v in values_between(self.R2_MIN_OHM, self.R2_MAX_OHM, "e24") if v != self.R2_OHM)
+                for value in sorted(others, key=lambda v: (abs(math.log(v / self.R2_OHM)), v)):
+                    alt_choice, alt = _choice(
+                        t, "r2", value, "ohm", "lower resistor of the unloaded reference divider (the E24 value nearest to 10 kohm with which a standard R1 reaches the stated output)", confirmed,
+                    )
+                    ideal, placed, reached = place(alt)
+                    if reached:
+                        params["r2"], params["r1_ideal"], params["r1"] = alt, ideal, placed
+                        plan.choices = [alt_choice, tol_choice]
+                        break
             params["v_out"] = voltage_divider_output(params["v_in"], params["r1"], params["r2"], ("v_in", "r1", "r2"))
         except (ValueError, ZeroDivisionError) as e:
             return _refused(plan, f"{e} ({v_in.requirement.id} = {v_in.traced.value:.12g} V, {v_out.requirement.id} = {v_out.traced.value:.12g} V)")
         params["tol_rel"] = tol
-        plan.computed = [("r1", params["r1"]), ("v_out", params["v_out"])]
+        plan.computed = [("r1_ideal", params["r1_ideal"]), ("r1", params["r1"]), ("v_out", params["v_out"])]
         try:
             r1 = library_component(library, "R1", _value_text(params["r1"].value), "upper divider resistor", *RESISTOR, structural_provenance(t, "upper divider resistor"), serves_out)
             r2c = library_component(library, "R2", _value_text(params["r2"].value), "lower divider resistor", *RESISTOR, structural_provenance(t, "lower divider resistor"), serves_out)
@@ -583,7 +667,9 @@ class DividerTemplate(Template):
             TheorySection("동작 원리", (
                 "저항 두 개를 직렬로 두고 가운데에서 전압을 꺼내는 분압기입니다. 같은 전류 I 가 R1, R2 를 차례로 흐르므로 각 저항의 전압은 저항값에 비례합니다.\n\n"
                 "    V_out = V_in·R2/(R1+R2)\n\n"
-                f"이 설계에서 R2 = {quantity(r2, 'ohm')} 는 템플릿의 선택값(사용자 확인)이고, R1 은 목표 출력 V_out = {quantity(v_target, 'V')} 에서 계산기 `calc.divider.r1_for_v_out` 가 풉니다.\n\n"
+                f"이 설계에서 R2 = {quantity(r2, 'ohm')} 는 템플릿의 선택값(사용자 확인)이고, R1 은 목표 출력 V_out = {quantity(v_target, 'V')} 에서 계산기 `calc.divider.r1_for_v_out` 가 풉니다"
+                + (".\n\n" if standard_of(ir, "r1") is None else f"(풀린 값 {quantity(_solved(ir, 'r1'), 'ohm')}). 풀린 값은 실제로 파는 저항값이 아닐 수 있으므로 R1 은 "
+                   f"{_standard_text(standard_of(ir, 'r1'), 'ohm')}인 {quantity(r1, 'ohm')} 으로 놓고, 출력은 그 부품값으로 다시 계산합니다.\n\n") +
                 "    R1 = R2·(V_in − V_out)/V_out\n"
                 f"       = {quantity(r2, 'ohm')}·({quantity(v_in, 'V')} − {quantity(v_target, 'V')})/{quantity(v_target, 'V')} = {quantity(r1, 'ohm')}\n\n"
                 f"검산 (`calc.divider.v_out`): V_out = {quantity(v_in, 'V')}·{quantity(r2, 'ohm')}/({quantity(r1, 'ohm')} + {quantity(r2, 'ohm')}) = {quantity(v_out, 'V')}"
@@ -635,7 +721,7 @@ class DividerTemplate(Template):
             "R1": PartNote(
                 role="R1: 상단 분압 저항 (VIN–VOUT), 출력 비율을 정함",
                 why=f"R2 = {quantity(r2, 'ohm')} 선택값에서 R1 = R2·(V_in − V_out)/V_out = {quantity(r1, 'ohm')} 로 계산. 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트(소형·자동 조립).",
-                criteria=_resistor_criteria(r1, _mul(i, i, r1), tol_text, chosen=_is_choice(ir, "r1"), spelled=_spelled(ir, "R1")),
+                criteria=_resistor_criteria(r1, _mul(i, i, r1), tol_text, chosen=_is_choice(ir, "r1"), spelled=_spelled(ir, "R1"), standard=standard_of(ir, "r1")),
                 substitutes=_resistor_substitutes(r1, "Resistor_SMD"),
             ),
             "R2": PartNote(
@@ -660,7 +746,8 @@ class LedTemplate(Template):
     needs = ("input_voltage", "led_forward_voltage", "led_forward_current")
     serves = ("input_voltage", "led_forward_voltage", "led_forward_current")
 
-    TOL_REL = 0.01
+    #: 2 %: the nearest E96 value is within 1.2 % of any solved resistance, so a standard resistor always reaches the stated current
+    TOL_REL = 0.02
     MODEL = (
         "ideal constant-V_f LED: D1 is excluded from the netlist and replaced by the stimulus VLED = v_f between LED_A and GND; "
         "the expectation i(VLED) measures the current through that ideal source, not through a diode model (no authoritative model card)"
@@ -676,14 +763,21 @@ class LedTemplate(Template):
         plan.inputs = {"input_voltage": v_in, "led_forward_voltage": v_f, "led_forward_current": i_f}
         params: dict[str, Traced] = {"v_in": v_in.traced, "v_f": v_f.traced, "i_f": i_f.traced}
         try:
-            params["r_led"] = led_series_resistor(params["v_in"], params["v_f"], params["i_f"], ("v_in", "v_f", "i_f"))
+            # the solved R is not a part: R1 is the first E series value whose current is within the tolerance of the stated one
+            params["r_led_ideal"] = led_series_resistor(params["v_in"], params["v_f"], params["i_f"], ("v_in", "v_f", "i_f"))
+            target, allowed = i_f.traced.value, self.TOL_REL * abs(i_f.traced.value)
+
+            def fits(r: Traced) -> bool:
+                return abs(led_current(params["v_in"], params["v_f"], r).value - target) <= allowed
+
+            params["r_led"] = standard_value(params["r_led_ideal"], "r_led_ideal", RESISTOR_SERIES, accept=fits)
             params["i_led"] = led_current(params["v_in"], params["v_f"], params["r_led"], ("v_in", "v_f", "r_led"))
         except (ValueError, ZeroDivisionError) as e:
             return _refused(plan, f"{e} ({v_in.requirement.id} = {v_in.traced.value:.12g} V, {v_f.requirement.id} = {v_f.traced.value:.12g} V, {i_f.requirement.id} = {i_f.traced.value:.12g} A)")
-        tol_choice, tol = _choice(t, "tol_rel", self.TOL_REL, None, "relative tolerance of the i(VLED) expectation (1 %)", confirmed)
+        tol_choice, tol = _choice(t, "tol_rel", self.TOL_REL, None, "relative tolerance of the i(VLED) expectation (2 %: the nearest E96 resistor is within 1.2 % of any solved value)", confirmed)
         params["tol_rel"] = tol
         plan.choices = [Choice("led_model", self.MODEL), tol_choice]
-        plan.computed = [("r_led", params["r_led"]), ("i_led", params["i_led"])]
+        plan.computed = [("r_led_ideal", params["r_led_ideal"]), ("r_led", params["r_led"]), ("i_led", params["i_led"])]
         req_v, req_i = v_f.requirement.id, i_f.requirement.id
         model_prov = choice_provenance(t, f"led_model: {self.MODEL}", confirmed)
         try:
@@ -740,7 +834,8 @@ class LedTemplate(Template):
             TheorySection("동작 원리와 식", (
                 "LED 는 순방향 전압 V_f 근처에서 전류가 급격히 늘어나는 비선형 소자라 전압원에 바로 달 수 없습니다. 직렬 저항이 남는 전압을 받아 전류를 정합니다.\n\n"
                 "    R = (V_in − V_f)/I_f\n"
-                f"      = ({quantity(v_in, 'V')} − {quantity(v_f, 'V')})/{quantity(i_f, 'A')} = {quantity(r, 'ohm')}   (`calc.led.R`)\n\n"
+                f"      = ({quantity(v_in, 'V')} − {quantity(v_f, 'V')})/{quantity(i_f, 'A')} = {quantity(_solved(ir, 'r_led'), 'ohm')}   (`calc.led.R`)\n"
+                f"{_placed_line(ir, 'r_led', 'ohm')}\n"
                 "    I = (V_in − V_f)/R\n"
                 f"      = {quantity(drop, 'V')}/{quantity(r, 'ohm')} = {quantity(i_led, 'A')}   (`calc.led.I`)"
             )),
@@ -786,8 +881,12 @@ class LedTemplate(Template):
         return {
             "R1": PartNote(
                 role="R1: LED 직렬 전류 제한 저항",
-                why=f"R = (V_in − V_f)/I_f = {quantity(r, 'ohm')} (계산기 값 그대로). 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트.",
-                criteria=_resistor_criteria(r, _mul(drop, i_led), tol_text, chosen=_is_choice(ir, "r_led"), spelled=_spelled(ir, "R1")),
+                why=(
+                    f"R = (V_in − V_f)/I_f = {quantity(r, 'ohm')} (계산기 값 그대로). 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트."
+                    if standard_of(ir, "r_led") is None else
+                    f"R = (V_in − V_f)/I_f = {quantity(_solved(ir, 'r_led'), 'ohm')} 를 풀고, 실제로 파는 값 {quantity(r, 'ohm')} 으로 놓음. 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트."
+                ),
+                criteria=_resistor_criteria(r, _mul(drop, i_led), tol_text, chosen=_is_choice(ir, "r_led"), spelled=_spelled(ir, "R1"), standard=standard_of(ir, "r_led")),
                 substitutes=_resistor_substitutes(r, "Resistor_SMD"),
             ),
             "D1": PartNote(
@@ -867,6 +966,10 @@ class RcLowpassTemplate(Template):
     #: the cutoff frequencies (Hz) the ideal RC model with the 100 nF choice is stated valid for (engineering bounds, not measured)
     F_MIN, F_MAX = 2.0, 100_000.0
 
+    def triggered_by(self, ir: CircuitIR, inputs: dict[str, DesignInput]) -> bool:
+        # a cutoff stated with a system impedance is a terminated LC filter (ai_eda.design.catalog.lc_lowpass), not this unloaded RC
+        return self.triggered(inputs) and "system_impedance" not in inputs
+
     def build(self, ir: CircuitIR, inputs: dict[str, DesignInput], unusable: dict[str, str], library: KicadLibrary, *, confirmed: bool) -> Plan:
         t = self.id
         plan = Plan(template=t, title=self.title)
@@ -889,16 +992,27 @@ class RcLowpassTemplate(Template):
         plan.choices = [c_choice, tol_choice, probe_choice, var_choice, pts_choice]
         params: dict[str, Traced] = {"f_c": f_c.traced, "c": c}
         try:
-            params["r"] = rc_r_for_cutoff(params["f_c"], params["c"], ("f_c", "c"))
-            params["tau"] = rc_time_constant(params["r"], params["c"], ("r", "c"))
-            params["h_fc"] = rc_lowpass_magnitude(params["f_c"], params["tau"], ("f_c", "tau"))
+            # the solved R is not a part: R1 is the first E series value that keeps |H(f_c)| within half the tolerance of the
+            # target 1/sqrt(2) (the other half is the sweep's); the expectation's nominal stays the target, so the
+            # simulation of the placed parts is judged against what the requirement asks for
+            params["r_ideal"] = rc_r_for_cutoff(params["f_c"], params["c"], ("f_c", "c"))
+            params["tau_ideal"] = rc_time_constant(params["r_ideal"], params["c"], ("r_ideal", "c"))
+            params["h_fc"] = rc_lowpass_magnitude(params["f_c"], params["tau_ideal"], ("f_c", "tau_ideal"))
             params["tol_rel"] = tol
+            target, allowed = params["h_fc"].value, STANDARD_SHARE * self.TOL_REL * params["h_fc"].value
+
+            def fits(r: Traced) -> bool:
+                return abs(rc_lowpass_magnitude(params["f_c"], rc_time_constant(r, params["c"])).value - target) <= allowed
+
+            params["r"] = standard_value(params["r_ideal"], "r_ideal", RESISTOR_SERIES, accept=fits)
+            params["tau"] = rc_time_constant(params["r"], params["c"], ("r", "c"))
+            params["h_fc_placed"] = rc_lowpass_magnitude(params["f_c"], params["tau"], ("f_c", "tau"))
             params["ac_fstart"] = rc_ac_fstart(params["f_c"], ("f_c",))
             params["ac_fstop"] = rc_ac_fstop(params["f_c"], ("f_c",))
         except (ValueError, ZeroDivisionError) as e:
             return _refused(plan, f"{e} ({f_c.requirement.id} = {f_c.traced.value:.12g} Hz)")
         params["ac_probe"] = probe
-        plan.computed = [(k, params[k]) for k in ("r", "tau", "h_fc", "ac_fstart", "ac_fstop")]
+        plan.computed = [(k, params[k]) for k in ("r_ideal", "r", "tau", "h_fc", "h_fc_placed", "ac_fstart", "ac_fstop")]
         req = f_c.requirement.id
         try:
             r1 = library_component(library, "R1", _value_text(params["r"].value), "series resistor", *RESISTOR, structural_provenance(t, "series resistor"), [req])
@@ -911,7 +1025,7 @@ class RcLowpassTemplate(Template):
             return _refused(plan, str(e))
         r1.electrical["resistance"] = params["r"]
         c1.electrical["capacitance"] = params["c"]
-        r1.spice = SpiceBinding(device=SpiceDevice.R, value=params["r"], pin_order=[p.number for p in r1.pins], provenance=structural_provenance(t, "ideal resistor at the design value"))
+        r1.spice = SpiceBinding(device=SpiceDevice.R, value=params["r"], pin_order=[p.number for p in r1.pins], provenance=structural_provenance(t, "ideal resistor at the placed (E series) value"))
         c1.spice = SpiceBinding(device=SpiceDevice.C, value=params["c"], pin_order=[p.number for p in c1.pins], provenance=structural_provenance(t, "ideal capacitor at the design value"))
         j1.spice = SpiceBinding(exclude=True, exclude_reason="connector, no electrical model", provenance=structural_provenance(t, "header excluded from the netlist"))
         nets = [
@@ -935,7 +1049,7 @@ class RcLowpassTemplate(Template):
         )
         topology = Topology(
             name="rc low-pass", domains=[CircuitDomain.ANALOG],
-            rationale="first-order RC low-pass whose cutoff frequency f_c is where |H(f_c)| = 1/sqrt(2) (-3 dB); C chosen, R = 1 / (2 pi f_c C)",
+            rationale="first-order RC low-pass whose cutoff frequency f_c is where |H(f_c)| = 1/sqrt(2) (-3 dB); C chosen, R = the E series value of 1 / (2 pi f_c C)",
             provenance=structural_provenance(t, "selected by cutoff_frequency"),
             blocks=[Block(id="lowpass", function="first-order RC low-pass", domain=CircuitDomain.ANALOG, component_refs=["R1", "C1"], input_nets=["IN"], output_nets=["OUT"], provenance=structural_provenance(t, "block"))],
         )
@@ -956,6 +1070,21 @@ class RcLowpassTemplate(Template):
     def theory(self, ir: CircuitIR) -> list[TheorySection]:
         f_c, c, r, tau, h_fc, tol, f_start, f_stop, probe = (parameter_value(ir, k) for k in ("f_c", "c", "r", "tau", "h_fc", "tol_rel", "ac_fstart", "ac_fstop", "ac_probe"))
         f_check = _div(1.0, _mul(2.0 * math.pi, r, c))
+        standard = standard_of(ir, "r")
+        if standard is None:  # a design built before R1 was a standard value: the calculator's number is the part
+            solve = f"    R = 1/(2π·f_c·C) = 1/(2π·{quantity(f_c, 'Hz')}·{quantity(c, 'F')}) = {quantity(r, 'ohm')}\n"
+            placed = ""
+        else:
+            h_placed = parameter_value(ir, "h_fc_placed")
+            solve = (
+                f"    R(계산) = 1/(2π·f_c·C) = 1/(2π·{quantity(f_c, 'Hz')}·{quantity(c, 'F')}) = {quantity(standard[2], 'ohm')}\n"
+                f"    R(부품) = {quantity(r, 'ohm')}   ({_standard_text(standard, 'ohm')}; `{ir.parameters['r'].provenance.tool}`)\n"
+            )
+            placed = (
+                f"\n\n계산값은 실제로 파는 저항값이 아니므로 R1 은 표준값으로 놓습니다. 그 부품값에서 |H(f_c)| = {number(h_placed, 5)} (`calc.rc.lowpass_magnitude`), "
+                f"목표 1/√2 = {number(h_fc, 5)} 와의 차이가 허용치의 절반 안에 드는 가장 성긴 계열({' → '.join(s.upper() for s in RESISTOR_SERIES)} 순)을 골랐고, "
+                "시뮬레이션은 이 부품값으로 돌려 목표값에 대해 판정합니다."
+            )
         variation = points = NO_RECORD
         if ir.simulation is not None:
             for a in ir.simulation.analyses:
@@ -968,9 +1097,10 @@ class RcLowpassTemplate(Template):
                 "직렬 저항 R 과 병렬 커패시터 C 로 된 1차 저역통과 필터입니다. 커패시터의 임피던스 1/(j2πfC) 가 주파수에 반비례하므로 높은 주파수일수록 출력이 줄어듭니다.\n\n"
                 "    H(f) = 1/(1 + j2πfRC),   τ = RC,   f_c = 1/(2πRC)\n\n"
                 f"이 설계에서 C = {quantity(c, 'F')} 는 템플릿의 선택값(사용자 확인)이고 R 은 차단 주파수에서 계산기 `calc.rc.r_for_cutoff` 가 풉니다.\n\n"
-                f"    R = 1/(2π·f_c·C) = 1/(2π·{quantity(f_c, 'Hz')}·{quantity(c, 'F')}) = {quantity(r, 'ohm')}\n"
+                f"{solve}"
                 f"    τ = R·C = {quantity(tau, 's')}   (`calc.rc.tau`)\n"
                 f"    검산: f_c = 1/(2π·R·C) = {quantity(f_check, 'Hz')}"
+                f"{placed}"
             )),
             TheorySection("주파수 응답", (
                 "    |H(f)| = 1/√(1 + (f/f_c)²),   위상 φ(f) = −atan(f/f_c)\n\n"
@@ -1015,8 +1145,14 @@ class RcLowpassTemplate(Template):
         return {
             "R1": PartNote(
                 role="R1: 직렬 저항 (IN–OUT), C1 과 함께 τ = RC 를 정함",
-                why=f"C = {quantity(c, 'F')} 선택값에서 R = 1/(2π·f_c·C) = {quantity(r, 'ohm')} 로 계산. 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트.",
-                criteria=_resistor_criteria(r, p_r, "1 % 이하 (Δf_c/f_c ≈ −ΔR/R: 저항 오차가 그대로 차단 주파수 오차가 됨)", chosen=_is_choice(ir, "r"), spelled=_spelled(ir, "R1")),
+                why=(
+                    f"C = {quantity(c, 'F')} 선택값에서 R = 1/(2π·f_c·C) = {quantity(r, 'ohm')} 로 계산. 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트."
+                    if standard_of(ir, "r") is None else
+                    f"C = {quantity(c, 'F')} 선택값에서 R = 1/(2π·f_c·C) = {quantity(standard_of(ir, 'r')[2], 'ohm')} 를 풀고, 실제로 파는 값 {quantity(r, 'ohm')} 으로 놓음. 0603 SMD 는 이 SMD 템플릿의 기본 풋프린트."
+                ),
+                criteria=_resistor_criteria(
+                    r, p_r, "1 % 이하 (Δf_c/f_c ≈ −ΔR/R: 저항 오차가 그대로 차단 주파수 오차가 됨)", chosen=_is_choice(ir, "r"), spelled=_spelled(ir, "R1"), standard=standard_of(ir, "r"),
+                ),
                 substitutes=_resistor_substitutes(r, "Resistor_SMD"),
             ),
             "C1": PartNote(
@@ -1080,7 +1216,14 @@ class AstableTemplate(Template):
     0.05 % with a 10x finer step; the deviation grows as Vcc falls (V_CE(sat)
     is a larger share of the base swing) and shrinks as f rises (the storage
     time delays the edges). ``tol_rel`` = 10 % is chosen from that range:
-    the worst admitted point uses half of it. The grid is what was measured;
+    the worst admitted point uses half of it. The anchor is recorded per
+    engine (:attr:`MEASURED_DEVIATION_MAX_BY_ENGINE`): ngspice-46 (KiCad
+    10.0.6's library, 72-point grid, 2026-11-04) gives +1.7 % .. +5.03 %
+    (anchor recorded as 0.0504, rounded up) with the worst point at
+    (3 V, 200 Hz), just over half the tolerance and
+    well inside it; the tolerance is not widened for an engine, and a
+    version without a measured anchor is reported as uncalibrated, never
+    judged against a neighbour's number. The grid is what was measured;
     the range between grid points is stated as valid on the strength of the
     monotone behaviour across it, not measured pointwise.
     """
@@ -1097,8 +1240,13 @@ class AstableTemplate(Template):
     V_BE_V = 0.7
     #: measured on ngspice-42 over the validity range: +1.6 % (6 V, 20 kHz) .. +4.9 % (3 V, 100 Hz); 10 % leaves the worst point half
     TOL_REL = 0.10
-    #: the largest measured deviation of the simulated frequency from the period expression inside the validity range
-    MEASURED_DEVIATION_MAX = 0.049
+    #: the largest measured deviation of the simulated frequency from the period expression inside the validity range, per
+    #: engine version as ``NgspiceShared.version()`` spells it (ngspice-42: the 70-point grid the tolerance was chosen from;
+    #: ngspice-46: the 72-point grid of 2026-11-04, worst at 3 V / 200 Hz). A version missing here has no anchor: the
+    #: tolerance still applies, the anchor assertion does not (decision 17: never widen the tolerance to fit an engine)
+    MEASURED_DEVIATION_MAX_BY_ENGINE: dict[str, float] = {"ngspice-42": 0.049, "ngspice-46": 0.0504}
+    #: the ngspice-42 anchor the tolerance was chosen from (the worst admitted point used half of it)
+    MEASURED_DEVIATION_MAX = MEASURED_DEVIATION_MAX_BY_ENGINE["ngspice-42"]
     C2_IC_V = -1.0
     SWING_TOL_ABS_V = 0.25
     V_IN_MIN, V_IN_MAX = 3.0, 6.0
@@ -1405,7 +1553,9 @@ class AstableTemplate(Template):
                 "- T_R(저장시간): 꺼짐이 지연되어 반주기가 길어진다 → 주파수 하강.\n\n"
                 f"템플릿 개발 시 ngspice-42 로 유효 범위 70개 격자점을 측정한 결과 순효과는 +1.6 % ({quantity(self.V_IN_MAX, 'V')}, {quantity(self.F_MAX, 'Hz')}: 저장시간 비중 최대)에서 "
                 f"+{number(self.MEASURED_DEVIATION_MAX * 100, 2)} % ({quantity(self.V_IN_MIN, 'V')}, {quantity(self.F_MIN, 'Hz')}: V_CE(sat) 비중 최대)까지였고, "
-                f"그래서 허용오차를 {number(_mul(100.0, n['tol_rel']), 3)} % 로 잡았습니다(최악점도 허용치의 절반). 이 설계 자체의 측정 편차는 최종 보고서에 있습니다."
+                f"그래서 허용오차를 {number(_mul(100.0, n['tol_rel']), 3)} % 로 잡았습니다(최악점도 허용치의 절반). "
+                f"ngspice-46(KiCad 10.0.6 동봉, 2026-11-04, 72점)에서는 +1.7 % .. +{number(self.MEASURED_DEVIATION_MAX_BY_ENGINE['ngspice-46'] * 100, 3)} % (3 V, 200 Hz; 측정 5.032 %를 올림한 앵커)로 절반을 살짝 넘지만 허용치 안입니다; "
+                "엔진마다 앵커를 기록할 뿐 허용오차를 엔진에 맞춰 넓히지 않습니다. 이 설계 자체의 측정 편차는 최종 보고서에 있습니다."
             )),
         ]
 
@@ -1557,6 +1707,18 @@ def rf_templates(module: str = RF_REGISTRY_MODULE) -> list[Template]:
 def all_templates() -> list[Template]:
     """:data:`TEMPLATES` followed by :func:`rf_templates` - every template the selection considers; ``ValueError`` on a repeated id."""
     return _with_rf(rf_templates())
+
+
+# the catalog (PLAN D9: one module per common circuit) imports this module's helpers, so it is registered after they exist
+from ai_eda.design.catalog.lc_lowpass import LcLowpassTemplate  # noqa: E402
+
+TEMPLATES.append(LcLowpassTemplate())
+from ai_eda.design.catalog.bjt_lowside_switch import BjtLowsideSwitchTemplate  # noqa: E402
+
+TEMPLATES.append(BjtLowsideSwitchTemplate())
+from ai_eda.design.catalog.i2c_pullup import I2cPullupTemplate  # noqa: E402
+
+TEMPLATES.append(I2cPullupTemplate())
 
 
 def _with_rf(rf: list[Template]) -> list[Template]:

@@ -14,7 +14,12 @@ for completeness, not for classification).
 
 Completeness is judged against the board the IR describes: ``layer_count``
 copper plots ``Copper,L1 .. Copper,L<n>`` (KiCad numbers them top to bottom,
-so ``B.Cu`` is ``L<n>``), both solder masks and the profile. A board whose
+so ``B.Cu`` is ``L<n>``), both solder masks and the profile. A copper plot
+is matched exactly on its first two fields (0.4: version 0.3 matched by
+prefix, so on a board of 10 or more copper layers ``Copper,L10`` .. ``L12``
+hid a missing ``Copper,L1``; such results, and any whose verdict the prefix
+match would have given differently, are stamped 0.4, every other one stays
+0.3). A board whose
 IR has a zone on a copper layer must have at least one filled region
 (``G36``) in that layer's plot - the sign that the pour was really exported
 (``--check-zones``) rather than silently omitted.
@@ -34,15 +39,26 @@ from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, Evidence, Validation
 
 TOOL_ID = "mfg.output_check"
 TOOL_VERSION = "0.3"
+#: ``mfg.gerber``'s version where the exact copper match decides (module docstring): every set of a board with 10 or more copper
+#: layers, and any set whose verdict the 0.3 prefix match would have given differently
+EXACT_COPPER_VERSION = "0.4"
 
 #: Gerber X2 file-function prefixes every board needs besides its copper plots.
 _REQUIRED_NON_COPPER = ("Soldermask,Top", "Soldermask,Bot", "Profile")
+#: how a copper plot's function begins (``Copper,L<k>``, matched exactly)
+_COPPER = "Copper,"
 #: Gerber region start (filled polygon): what a filled zone plots as.
 _REGION_START = "G36*"
 
 
 def required_functions(layer_count: int) -> set[str]:
-    """``Copper,L1 .. Copper,L<n>`` plus masks and profile (prefix match against ``%TF.FileFunction``)."""
+    """``Copper,L1 .. Copper,L<n>`` plus masks and profile.
+
+    :func:`check_gerber_set` matches a ``Copper,L<k>`` exactly against the
+    first two fields of a plot's ``%TF.FileFunction`` (``Copper,L1`` is not
+    satisfied by ``Copper,L10``), the others by prefix (``Profile`` by
+    ``Profile,NP``).
+    """
     if layer_count < 2 or layer_count % 2:
         raise ValueError(f"a KiCad board has an even copper layer count >= 2, got {layer_count}")
     return {f"Copper,L{i}" for i in range(1, layer_count + 1)} | set(_REQUIRED_NON_COPPER)
@@ -110,7 +126,10 @@ def check_gerber_set(files: list[Path], layer_count: int = 2, zone_layers: Itera
     except ValueError as exc:
         problems.append(str(exc))
         required = set()
-    missing = {r for r in required if not any(fn.startswith(r) for fn in functions)}
+    missing = {r for r in required if not (r in functions if r.startswith(_COPPER) else any(fn.startswith(r) for fn in functions))}
+    # 0.3 matched the copper plots by prefix too, so Copper,L10..L12 satisfied a missing Copper,L1: the verdict differs exactly there
+    prefix_missing = {r for r in required if not any(fn.startswith(r) for fn in functions)}
+    version = EXACT_COPPER_VERSION if layer_count >= 10 or missing != prefix_missing else TOOL_VERSION
     if missing:
         problems.append(f"missing layers: {sorted(missing)}")
     zones_checked: list[str] = []
@@ -133,7 +152,7 @@ def check_gerber_set(files: list[Path], layer_count: int = 2, zone_layers: Itera
         status=status,
         message="; ".join(problems) or f"{len(files)} files, {layer_count} copper layers, functions: {sorted(functions)}",
         tool=TOOL_ID,
-        tool_version=TOOL_VERSION,
+        tool_version=version,
         evidence=[Evidence(description="gerber file", path=str(f)) for f in files],
         details={"functions": sorted(functions), "layer_count": layer_count, "zone_layers_with_copper": zones_checked},
     )

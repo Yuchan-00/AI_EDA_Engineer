@@ -23,6 +23,8 @@ class ExternalAction(StrEnum):
     NETWORK_FETCH = "network_fetch"
     #: using the user's own subscription login (the Claude Code CLI) for model calls: no per-call charge, quota is used
     SUBSCRIPTION_USE = "subscription_use"
+    #: model calls to a server on this machine (an OpenAI-compatible llama.cpp / Ollama / LM Studio on localhost): free, no budget
+    LOCAL_MODEL_USE = "local_model_use"
 
 
 class Approval(BaseModel):

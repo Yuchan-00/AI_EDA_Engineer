@@ -61,6 +61,33 @@
                                          path to an existing file, then `claude` on PATH); needs --llm claude
         --llm-claude-fallback-model LIST passthrough to the CLI's own --fallback-model (its cross-model
                                          fallback; off by default); needs --llm claude
+        --llm codex                      the locally installed Codex CLI (`codex exec`) on the user's ChatGPT
+                                         login: a subscription like claude (no budget required; the flag is
+                                         the SUBSCRIPTION_USE approval; tokens shown, no cost estimate - the CLI
+                                         prints none). Model spec codex:<slug> (default codex:gpt-6-luna).
+                                         --llm-codex-cli PATH names the binary (default $AI_EDA_CODEX_CLI, then
+                                         codex on PATH, then the Codex app's newest codex.exe); needs --llm codex
+        --llm openai_compat              any OpenAI-compatible chat-completions server: the OpenAI API, llama.cpp
+                                         llama-server, Ollama, vLLM, LM Studio. --llm-openai-base-url URL (or
+                                         $AI_EDA_OPENAI_BASE_URL; https://, or http:// on this machine) and a
+                                         model are required (--llm-model openai_compat:<id>);
+                                         --llm-openai-key-env NAME names the key's environment variable (default
+                                         OPENAI_API_KEY; optional on this machine). A server on this machine
+                                         (localhost / 127.0.0.1 / ::1) is free: no budget required, recorded as
+                                         a LOCAL_MODEL_USE approval that says so; a remote one is billed per
+                                         call and needs a budget flag (its cost is unknown: give a token budget)
+        --llm-crosscheck SPEC            cross-check ("complement") model, repeatable: every LLM task is also
+                                         run on it, independently, with the same prompt and schema (its
+                                         provider must be in --llm). The grounded replies are compared field by
+                                         field, deterministically (no model judges another): agreed fields
+                                         proceed with both models in the provenance; a differing field is
+                                         withheld and asked as a question showing every model's proposal; a
+                                         failed cross-check model is reported (requirements.crosscheck
+                                         NOT_VERIFIED). Every model called is covered by the budget / approvals.
+                                         Applied to the requirement extraction; the part-candidate, datasheet-fact
+                                         and regulation-proposal stages say in their notes that they were not
+                                         cross-checked. These four flags are outside RUN_OPTIONS (like --design):
+                                         the GUI's run form does not offer them
         --llm-budget-usd X / --llm-budget-tokens N   the budget you grant (= the PAID_API_CALL approval);
                                          required whenever a per-call provider (openrouter, fake) is
                                          configured - without one no call is made (0 USD allows only the free
@@ -193,7 +220,7 @@ from ai_eda.workdir import project_workdir  # re-export: the one "where does thi
 
 FAKE_PREFIX = "fake:"
 #: the ``--llm`` provider names that are real routes (the fake is ``fake:<json>``, provider name ``script``)
-LLM_PROVIDER_CHOICES = ("openrouter", "claude")
+LLM_PROVIDER_CHOICES = ("openrouter", "claude", "codex", "openai_compat")
 #: ``--llm-fallback`` words that are not specs
 FALLBACK_NONE = "none"
 FALLBACK_SAME = "same"
@@ -225,11 +252,13 @@ RUN_OPTIONS: tuple[RunOption, ...] = (
         "confirm_facts=yes|no decides the model's datasheet-facts table; accept_regulations=id1,id2 / reject_regulations=id3 decide shown model proposals",
     ),
     RunOption(
-        "--llm", "llm", "str", "openrouter|claude|openrouter,claude|claude,openrouter|fake:<json>",
+        "--llm", "llm", "str", "openrouter|claude|codex|openai_compat[,...]|fake:<json>",
         "extract requirements from the request with a model. Comma-separated providers are all built and the first is the default "
         "provider of an unprefixed model spec: openrouter needs OPENROUTER_API_KEY and a budget flag (billed per call); claude is the "
         "Claude Code CLI on your own login (a subscription: no per-call charge, so no budget is needed - the flag is the SUBSCRIPTION_USE "
-        "approval - but the tokens and the CLI's API-equivalent cost estimate are shown); fake:<json> replays a script offline "
+        "approval - but the tokens and the CLI's API-equivalent cost estimate are shown); codex is the Codex CLI on your ChatGPT login "
+        "(a subscription like claude; tokens shown); openai_compat is any OpenAI-compatible server (--llm-openai-base-url; free and "
+        "budget-free on this machine, billed per call elsewhere); fake:<json> replays a script offline "
         "(provider name script; needs a budget flag, 0 USD allows it)",
     ),
     RunOption(
@@ -273,6 +302,26 @@ RUN_OPTIONS: tuple[RunOption, ...] = (
     RunOption("--fab-capability", "fab_capability", "str", "FILE", "JSON file naming the fab's capability page (source.url, or source.file + retrieved_at for a saved page) and its limits (key, value, unit, page, quote); the URL is trusted exactly, the limits are grounded verbatim on the archived page"),
     RunOption("--no-pdf", "no_pdf", "flag", None, "write the stage reports as .md + .html only (no headless browser print)"),
     RunOption("--browser", "browser", "str", "PATH", "the Chromium / Chrome / Edge binary that prints the stage reports to PDF (default: discovered - $AI_EDA_BROWSER, PATH, Playwright, install paths)"),
+)
+
+
+#: ``ai-eda run`` options of the codex / openai_compat providers and the cross-check: ``(flag, dest, argparse action, metavar, help)``.
+#: Outside :data:`RUN_OPTIONS` (like ``--design``), so the GUI's run form - whose fields are exactly RUN_OPTIONS - is unchanged.
+LLM_EXTRA_OPTIONS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("--llm-crosscheck", "llm_crosscheck", "append", "SPEC",
+     "a cross-check model (repeatable; its provider must be in --llm): every LLM task is also run on it with the same prompt and schema; "
+     "the grounded replies are compared field by field, deterministically - agreed fields proceed with both models in the provenance, a "
+     "differing field is withheld and asked as a question showing every model's proposal, a failed cross-check model is reported. "
+     "Applied to the requirement extraction; the part-candidate, datasheet-fact and regulation-proposal stages note that they were not cross-checked"),
+    ("--llm-codex-cli", "llm_codex_cli", "store", "PATH",
+     "the codex binary (default $AI_EDA_CODEX_CLI when it is an absolute path to an existing file, else codex on PATH, else the Codex "
+     "app's newest codex.exe); needs --llm codex"),
+    ("--llm-openai-base-url", "llm_openai_base_url", "store", "URL",
+     "the OpenAI-compatible server's base URL, e.g. http://127.0.0.1:8080/v1 (llama-server), http://localhost:11434/v1 (Ollama), "
+     "https://api.openai.com/v1 (default $AI_EDA_OPENAI_BASE_URL; https://, or http:// on this machine); needs --llm openai_compat"),
+    ("--llm-openai-key-env", "llm_openai_key_env", "store", "NAME",
+     "the environment variable that holds the OpenAI-compatible server's API key (default OPENAI_API_KEY; optional on this machine; "
+     "the key itself is never printed); needs --llm openai_compat"),
 )
 
 
@@ -321,7 +370,6 @@ def run_option_flags(**values: Any) -> list[str]:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     from ai_eda.errors import ToolUnavailableError
-    from ai_eda.llm.openrouter import OpenRouterClient
     from ai_eda.tools.kicad import KicadCli, KicadLibrary
     from ai_eda.tools.spice import NgspiceRunner, NgspiceShared
 
@@ -372,8 +420,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     batch = NgspiceRunner()
     print(f"ngspice exe: {batch.binary or 'not on PATH (optional; the shared library is the engine used)'}")
     print(_browser_line())
-    key_set = OpenRouterClient.key_present()
-    print(f"LLM key   : {'set' if key_set else 'OPENROUTER_API_KEY not set'}")
+    # the OpenRouter client needs httpx, which only the [llm] / [parts] extras install: a plain `pip install -e .` must still
+    # get a doctor report, with the missing package named instead of a traceback
+    try:
+        from ai_eda.llm.openrouter import OpenRouterClient
+    except ModuleNotFoundError as e:
+        if e.name != "httpx":  # any other missing module is a defect, not a missing extra
+            raise
+        no_client: str | None = "httpx not installed (pip install 'ai-eda-engineer[llm]')"
+        key_set = False
+        print(f"LLM key   : {no_client}: --llm openrouter is unavailable")
+    else:
+        no_client = None
+        key_set = OpenRouterClient.key_present()
+        print(f"LLM key   : {'set' if key_set else 'OPENROUTER_API_KEY not set'}")
     print(_claude_cli_line())
     if key_set and getattr(args, "online", False):
         from ai_eda.llm.client import LLMError
@@ -400,7 +460,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         finally:
             client.close()
     elif getattr(args, "online", False):
-        print("LLM account: not fetched (no key)")
+        print(f"LLM account: not fetched ({no_client or 'no key'})")
     if missing:
         print(f"missing   : {', '.join(missing)} (the pipeline still runs, and reports every check that needs them as NOT_VERIFIED)")
     else:
@@ -569,6 +629,20 @@ def _load(path: str):
     return CircuitIR.load(path)
 
 
+def _load_or_explain(path: str):
+    """The IR at ``path``, or ``None`` after one stderr line saying why it could not be loaded (exit 2 for the caller).
+
+    A missing / unreadable file, a file that is not JSON or not an IR, an unknown key or another schema
+    version is a usage error, not a design verdict: ``run`` and ``review`` refuse it the way ``report`` does
+    (:func:`_report_inputs`) instead of raising a traceback with exit 1.
+    """
+    try:
+        return _load(path)
+    except (OSError, ValueError, IRSchemaError) as e:
+        print(f"{path}: {e}" if isinstance(e, (OSError, ValueError)) else str(e), file=sys.stderr)
+        return None
+
+
 def _lock_project(workdir: Path, command: str):
     """The held :class:`~ai_eda.workdir.ProjectLock` of ``workdir``, or ``None`` after printing why (busy, a linked lock file: exit 2).
 
@@ -594,7 +668,9 @@ def _reload_locked(ir_path: str):
     command may have saved ir.json between that load and the lock, and a
     run on the older copy would overwrite its work when it saves.
     """
-    ir = _load(ir_path)
+    ir = _load_or_explain(ir_path)  # the file may have become unreadable since the first load: still one line, exit 2
+    if ir is None:
+        return None
     try:
         project_workdir(ir, ir_path)
     except IRSchemaError as e:
@@ -618,6 +694,8 @@ class LLMOptions:
     allow_model_change: bool
     #: constructor options routed to the clients by signature (``cli`` / ``fallback_model`` for the CLI client)
     client_kw: dict[str, Any] = field(default_factory=dict)
+    #: the cross-check model configs (``--llm-crosscheck``); empty without the flag
+    crosscheck: list[Any] = field(default_factory=list)
 
     @property
     def primary_spec(self) -> str:
@@ -626,14 +704,19 @@ class LLMOptions:
 
     @property
     def per_call_providers(self) -> list[str]:
-        """The configured providers billed per call (they need the budget flags)."""
-        from ai_eda.llm.providers import PROVIDER_BILLING
-        from ai_eda.llm.usage import SUBSCRIPTION
+        """The configured providers billed per call (they need the budget flags): an ``openai_compat`` server on this machine is not."""
+        from ai_eda.llm.providers import OPENAI_COMPAT_ENV_BASE_URL, PROVIDER_BILLING, compat_billing
+        from ai_eda.llm.usage import LOCAL, SUBSCRIPTION
 
-        return [p for p in self.providers if PROVIDER_BILLING.get(p, "per_call") != SUBSCRIPTION]
+        def billing(p: str) -> str:
+            if p == "openai_compat":
+                return compat_billing(self.client_kw.get("openai_base_url") or os.environ.get(OPENAI_COMPAT_ENV_BASE_URL, ""))
+            return PROVIDER_BILLING.get(p, "per_call")
+
+        return [p for p in self.providers if billing(p) not in (SUBSCRIPTION, LOCAL)]
 
     def describe(self) -> str:
-        """One line for the run log: the primary spec, the explicit fallbacks and the task overrides."""
+        """One line for the run log: the primary spec, the explicit fallbacks, the task overrides and the cross-check models."""
         text = self.primary_spec
         fallbacks = [c.spec for c in self.router.fallbacks]
         if fallbacks:
@@ -641,6 +724,8 @@ class LLMOptions:
         overrides = [f"{task}={cfg.spec}" for task, cfg in self.router.by_task.items() if cfg.spec != self.primary_spec]
         if overrides:
             text += f"; task models: {', '.join(overrides)}"
+        if self.crosscheck:
+            text += f"; cross-check by --llm-crosscheck: {', '.join(c.spec for c in self.crosscheck)}"
         return text
 
 
@@ -655,7 +740,8 @@ def _llm_providers(spec: str) -> tuple[tuple[str, ...], str | None]:
     bad = [n for n in names if n not in LLM_PROVIDER_CHOICES]
     if bad or not names:
         raise ValueError(
-            f"unknown --llm {spec!r}: use 'openrouter', 'claude', 'openrouter,claude', 'claude,openrouter' or 'fake:<json file>'"
+            f"unknown --llm {spec!r}: use 'openrouter', 'claude', 'openrouter,claude', 'claude,openrouter' or 'fake:<json file>' "
+            f"(any comma-separated list of {', '.join(LLM_PROVIDER_CHOICES)})"
         )
     if len(set(names)) != len(names):
         raise ValueError(f"--llm {spec!r} names a provider twice")
@@ -704,19 +790,26 @@ def parse_llm_options(args: argparse.Namespace) -> LLMOptions | None:
             continue
         fallbacks.append(same_model_fallback(primary, providers).spec if word.lower() == FALLBACK_SAME else word)
     router = default_router(model, fallback=fallbacks, default_provider=default_provider, by_task=_task_models(getattr(args, "llm_task_model", None)))
-    check_router_providers(router, providers)
+    crosscheck = [parse_model_spec(item.strip(), default_provider) for item in getattr(args, "llm_crosscheck", None) or []]
+    check_router_providers(router, providers, crosscheck)
     client_kw: dict[str, Any] = {}
-    for flag, dest, key in (("--llm-claude-cli", "llm_claude_cli", "cli"), ("--llm-claude-fallback-model", "llm_claude_fallback_model", "fallback_model")):
+    for flag, dest, key, needs in (
+        ("--llm-claude-cli", "llm_claude_cli", "cli", "claude"),
+        ("--llm-claude-fallback-model", "llm_claude_fallback_model", "fallback_model", "claude"),
+        ("--llm-codex-cli", "llm_codex_cli", "codex_cli", "codex"),
+        ("--llm-openai-base-url", "llm_openai_base_url", "openai_base_url", "openai_compat"),
+        ("--llm-openai-key-env", "llm_openai_key_env", "openai_key_env", "openai_compat"),
+    ):
         value = getattr(args, dest, None)
         if value:
-            if "claude" not in providers:
-                raise ValueError(f"{flag} needs --llm claude (configured: {spec})")
-            if key == "cli" and not Path(value).is_file():
+            if needs not in providers:
+                raise ValueError(f"{flag} needs --llm {needs} (configured: {spec})")
+            if key in ("cli", "codex_cli") and not Path(value).is_file():
                 raise ValueError(f"{flag} {value}: not a file")
             client_kw[key] = value
     options = LLMOptions(
         label=spec, providers=providers, script=script, router=router, budget=budget,
-        allow_model_change=bool(getattr(args, "llm_allow_model_change", False)), client_kw=client_kw,
+        allow_model_change=bool(getattr(args, "llm_allow_model_change", False)), client_kw=client_kw, crosscheck=crosscheck,
     )
     per_call = options.per_call_providers
     if per_call and not budget.granted:
@@ -745,8 +838,9 @@ def build_llm_service(options: LLMOptions | argparse.Namespace | None):
 
     approved_by = "cli --llm-budget-usd/--llm-budget-tokens"
     if options.script is not None:
-        return LLMService.from_script(options.script, options.budget, router=options.router, approved_by=approved_by)
-    return LLMService.from_env(options.budget, router=options.router, providers=options.providers, approved_by=approved_by, **options.client_kw)
+        return LLMService.from_script(options.script, options.budget, router=options.router, approved_by=approved_by, crosscheck=options.crosscheck)
+    return LLMService.from_env(options.budget, router=options.router, providers=options.providers, approved_by=approved_by,
+                               crosscheck=options.crosscheck, **options.client_kw)
 
 
 def model_pin_refusal(pinned: str, configured: str) -> str:
@@ -836,7 +930,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if browser_option is None:
         return 2
     browser, pdf = browser_option
-    ir = _load(args.ir)
+    ir = _load_or_explain(args.ir)
+    if ir is None:
+        return 2
     try:
         workdir = project_workdir(ir, args.ir)
     except IRSchemaError as e:  # a copied / moved project is refused here: nothing is run or created anywhere
@@ -886,11 +982,21 @@ def _run_locked(args: argparse.Namespace, ir, workdir: Path, answers: dict[str, 
     print(session.summary())
     for note in session.notes:
         print(f"  note: {note}")
+    design_tools: dict = {}
+    if getattr(args, "design", None) is not None:
+        from ai_eda.design.design_file import DesignFileError, load_design_file
+
+        try:
+            design_tools["design_file"] = load_design_file(args.design, library)
+        except DesignFileError as e:
+            session.close()
+            print(str(e), file=sys.stderr)
+            return 2
     if llm is not None and llm_options is not None:
         print(_model_line(ir, llm_options))
     ctx = AgentContext(
         workdir=workdir,
-        tools={"kicad_cli": KicadCli(), "kicad_library": library, "spice": NgspiceShared(), **session.tools()},
+        tools={"kicad_cli": KicadCli(), "kicad_library": library, "spice": NgspiceShared(), **session.tools(), **design_tools},
         answers=answers,
         llm=llm,
     )
@@ -935,6 +1041,9 @@ def _run_locked(args: argparse.Namespace, ir, workdir: Path, answers: dict[str, 
     _print_existence(ir)
     if state.blocked:
         _print_questions(state.open_questions, header="\nBLOCKED - answer these to continue (pass with --answer key=value):")
+        note = blocked_fail_note(state)
+        if note is not None:
+            print(note)
     _print_questions(state.optional_questions, header="\nOPTIONAL QUESTIONS (not blocking; answer with --answer key=value to decide more):")
     return run_exit_code(state)
 
@@ -1023,6 +1132,23 @@ def _print_existence(ir) -> None:
                 print(f"    - {c.get('name')}: {c.get('status')}: {c.get('message')}")
 
 
+def blocked_fail_note(state) -> str | None:
+    """The line under the BLOCKED questions when the stage that asked them is also FAIL, else ``None``.
+
+    A required question stops the pipeline even when a FAIL in the same stage
+    outranks USER_INPUT_REQUIRED in the stage's aggregated status, so the
+    table shows FAIL and the run then asks questions: without this line the
+    user reads the questions as the way to clear the failure.
+    """
+    from ai_eda.ir import ValidationStatus
+
+    last = state.outcomes[-1] if state.outcomes else None
+    if not state.blocked or last is None or last.status is not ValidationStatus.FAIL:
+        return None
+    return (f"  note: {last.stage} is FAIL and, separately, blocked by the question(s) above: an answer lets the run continue, "
+            f"it does not clear the failure (see the {last.stage} line in the table)")
+
+
 def run_exit_code(state) -> int:
     """``ai-eda run``'s exit status: 0 only when the pipeline neither blocked nor ended in FAIL.
 
@@ -1044,7 +1170,9 @@ def cmd_review(args: argparse.Namespace) -> int:
     from ai_eda.parts.identity import open_archive
     from ai_eda.review import IndependentReviewer
 
-    ir = _load(args.ir)
+    ir = _load_or_explain(args.ir)
+    if ir is None:
+        return 2
     try:
         workdir = project_workdir(ir, args.ir)
     except IRSchemaError as e:
@@ -1293,6 +1421,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("ir")
     for option in RUN_OPTIONS:
         _add_run_option(r, option)
+    r.add_argument("--design", metavar="FILE", help="JSON file with the circuit (components, nets, topology, simulation) to start an empty design from; give it on the run that shows the confirm_design table and on the run that confirms it")
+    # the provider extensions below are, like --design, outside RUN_OPTIONS: the GUI's run form does not offer them
+    for flag, dest, action, metavar, text in LLM_EXTRA_OPTIONS:
+        r.add_argument(flag, dest=dest, action=action, metavar=metavar, help=text)
     r.set_defaults(fn=cmd_run)
 
     v = sub.add_parser("review", help="independent review only")

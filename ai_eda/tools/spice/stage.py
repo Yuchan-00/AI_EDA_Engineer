@@ -44,7 +44,12 @@ Invariants:
   is auditable, and a waveform without three countable edges, or whose swing
   is within the engine's own resolution (``reltol`` * level + ``vntol`` for a
   voltage, + ``abstol`` for a current: numerical ripple is not an
-  oscillation), is FAIL ("no oscillation detected"), never PASS. The level
+  oscillation), is FAIL ("no oscillation detected"), never PASS. A
+  ``frequency`` with a window (``params`` ``t_start`` / ``t_stop``) counts
+  only the crossings of that window
+  (:func:`ai_eda.tools.spice.measure.window_frequency`), records the window in
+  ``details["frequency"]`` beside the edges, and a window with fewer than
+  three crossings is the same FAIL naming the window. The level
   and window reductions (``db_at`` / ``rms`` / ``db_rms`` / ``harmonic_dbc``
   / ``am_depth``, :mod:`ai_eda.tools.spice.measure`) put their audit data -
   the window, the largest sample step and its limit, the amplitudes, the
@@ -100,8 +105,9 @@ Invariants:
   recorded earlier for an expectation that is no longer in the setup gets a
   superseding NOT_APPLICABLE result (:func:`retire_expectation_results`), so
   ``ir.validation.overall()`` reflects the current setup. The SI transients
-  (``spice.si.*``, :data:`SI_CHECK_PREFIX`) and the RF fixture networks
-  (``spice.rf.*``, :data:`RF_CHECK_PREFIX`) are not design-deck
+  (``spice.si.*``, :data:`SI_CHECK_PREFIX`), the RF fixture networks
+  (``spice.rf.*``, :data:`RF_CHECK_PREFIX`) and the crosstalk decks
+  (``spice.xtalk.*``, :data:`XTALK_CHECK_PREFIX`) are not design-deck
   expectations: their own runners retire them, never this stage.
 """
 
@@ -111,6 +117,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -129,9 +136,9 @@ from ai_eda.ir import (
     ValidationStatus,
     worst_status,
 )
-from ai_eda.ir.simulation import EXPECTATION_BOUNDS
+from ai_eda.ir.simulation import EXPECTATION_BOUNDS, StimulusKind
 from ai_eda.tools.kicad.cli import fresh_artifact
-from ai_eda.tools.spice.measure import ABSTOL, VNTOL, am_depth, harmonic_level, rising_edge_frequency, window_rms
+from ai_eda.tools.spice.measure import ABSTOL, VNTOL, am_depth, harmonic_level, rising_edge_frequency, window_frequency, window_mean, window_rms
 from ai_eda.tools.spice.runner import Interpolation, SpiceAnalysis, SpiceResult, SpiceRunner
 
 CHECK_ID = "spice"
@@ -140,6 +147,9 @@ SI_CHECK_PREFIX = "spice.si"
 #: the RF fixture networks' check ids (``spice.rf.<network>`` summaries and ``spice.rf.<network>[.<state>].<expectation>``):
 #: not design-deck expectations, never retired here (the fixture runner retires its own)
 RF_CHECK_PREFIX = "spice.rf"
+#: the coupled-line crosstalk decks' check ids (``spice.xtalk.<victim>``, :mod:`ai_eda.tools.spice.xtalk_check`): not expectations,
+#: never retired here (that check retires its own)
+XTALK_CHECK_PREFIX = "spice.xtalk"
 #: subdirectory of the workdir that holds ``results.json`` and one rawfile directory per analysis id
 RESULTS_DIR = "spice"
 RESULTS_FILE = "results.json"
@@ -205,9 +215,9 @@ def _frequency_details(edges: list[float], **scalars: float | None) -> dict[str,
 
 
 #: reductions that read the result's scale (``time`` / ``frequency``)
-_SCALE_REDUCES = frozenset({Reduce.AT, Reduce.FREQUENCY, Reduce.DB_AT, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH})
+_SCALE_REDUCES = frozenset({Reduce.AT, Reduce.FREQUENCY, Reduce.DB_AT, Reduce.MEAN, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH})
 #: the level / window reductions (:func:`_level`)
-_LEVEL_REDUCES = frozenset({Reduce.DB_AT, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH})
+_LEVEL_REDUCES = frozenset({Reduce.DB_AT, Reduce.MEAN, Reduce.RMS, Reduce.DB_RMS, Reduce.HARMONIC_DBC, Reduce.AM_DEPTH})
 
 
 def _param(exp: Expectation, key: str) -> float:
@@ -257,6 +267,12 @@ def _level(res: SpiceResult, exp: Expectation, vector: str, reference: str | Non
     times, values = res.scale_values(), res.vector(vector)
     t0, t1 = _param(exp, "t_start"), _param(exp, "t_stop")
     window = {"t_start": t0, "t_stop": t1}
+    if kind == Reduce.MEAN:
+        mean = window_mean(times, values, t0, t1)
+        extra = {**window, "mean": mean.value, "samples": mean.samples, "max_step": mean.max_step}
+        if mean.problem is not None or mean.value is None:
+            return Reduction(None, mean.problem or "no mean measured", extra=extra)
+        return Reduction(mean.value, None, extra=extra)
     if kind in (Reduce.RMS, Reduce.DB_RMS):
         if "f_max" not in exp.params:  # the compiler refuses it; a hand-built expectation says so here, never "vector not produced"
             return Reduction(None, f"reduce={kind.value} needs params['f_max'] (the highest frequency the RMS must include): no grid guard without it")
@@ -346,14 +362,25 @@ def reduce_expectation(res: SpiceResult, exp: Expectation, vector: str, referenc
             measured = res.max(vector)
         elif exp.reduce == Reduce.MIN:
             measured = res.min(vector)
+        elif exp.reduce == Reduce.PP:
+            measured = res.max(vector) - res.min(vector)
         elif exp.reduce == Reduce.FREQUENCY:
             if res.analysis != SpiceAnalysis.TRAN:
                 return Reduction(None, f"reduce=frequency needs a tran result, this is {res.analysis.value}")
             # the flatness floor's absolute part is the engine's resolution for the vector's kind: a current vector
             # (``i(...)``) is measured in amperes
             abs_floor = ABSTOL if exp.vector.strip().lower().startswith("i") else VNTOL
-            edge = rising_edge_frequency(res.scale_values(), res.vector(vector), abs_floor=abs_floor)
-            extra = _frequency_details(edge.edges, low=edge.low, mid=edge.mid, high=edge.high, vmin=edge.vmin, vmax=edge.vmax, floor=edge.floor)
+            window_keys = [k for k in ("t_start", "t_stop") if k in exp.params]
+            if window_keys:  # the optional window (Reduce.FREQUENCY): only the crossings inside [t_start, t_stop] count
+                if len(window_keys) != 2:  # the compiler refuses it; a hand-built expectation says so here
+                    return Reduction(None, f"reduce=frequency takes its window as both params t_start and t_stop or neither, got only {window_keys}")
+                t0, t1 = _param(exp, "t_start"), _param(exp, "t_stop")
+                edge = window_frequency(res.scale_values(), res.vector(vector), t0, t1, abs_floor=abs_floor)
+                window: dict[str, Any] = {"t_start": t0, "t_stop": t1}
+            else:
+                edge = rising_edge_frequency(res.scale_values(), res.vector(vector), abs_floor=abs_floor)
+                window = {}
+            extra = {**window, **_frequency_details(edge.edges, low=edge.low, mid=edge.mid, high=edge.high, vmin=edge.vmin, vmax=edge.vmax, floor=edge.floor)}
             if edge.problem is not None or edge.frequency is None:
                 return Reduction(None, edge.problem or "no frequency measured", extra=extra)
             measured = edge.frequency
@@ -533,8 +560,10 @@ def retire_expectation_results(ir: CircuitIR, keep: set[str], status: Validation
     expectation and is left to :func:`ai_eda.tools.spice.si_check.spice_si_results`;
     nor is ``spice.rf.<network>[.<state>].<expectation>`` (:data:`RF_CHECK_PREFIX`,
     the RF fixture networks of ``ir.rf``), which the fixture runner retires
-    itself. An expectation id is a plain identifier without a dot, so a
-    design expectation named ``rf`` (``spice.rf``) is still retired here.
+    itself, nor ``spice.xtalk.<victim>`` (:data:`XTALK_CHECK_PREFIX`, the
+    coupled-line crosstalk decks), which retire their own. An expectation id
+    is a plain identifier without a dot, so a design expectation named ``rf``
+    (``spice.rf``) or ``xtalk`` (``spice.xtalk``) is still retired here.
     """
     out: list[ValidationResult] = []
     prefix = f"{CHECK_ID}."
@@ -545,6 +574,8 @@ def retire_expectation_results(ir: CircuitIR, keep: set[str], status: Validation
             continue  # the SI transients (ai_eda.tools.spice.si_check) retire their own results
         if check_id.startswith(RF_CHECK_PREFIX + "."):
             continue  # the RF fixture networks (ai_eda.tools.spice.rf_fixture) retire their own results
+        if check_id.startswith(XTALK_CHECK_PREFIX + "."):
+            continue  # the crosstalk decks (ai_eda.tools.spice.xtalk_check) retire their own results
         if last.status is status or last.status is ValidationStatus.NOT_APPLICABLE:
             continue  # already superseded
         out.append(ValidationResult(check_id=check_id, status=status, message=why, details={"superseded": last.status.value}, **stamp))
@@ -558,6 +589,16 @@ def _uses_code_models(netlist_text: str) -> bool:
         if s and s[0] in "aA" and not s.startswith("."):
             return True
     return False
+
+
+#: the first ngspice that reads the compiler's AM spelling ``AM(VO VMO VMA FM FC TD)`` (ngspice-42 reads it as a zero source)
+AM_MIN_ENGINE_MAJOR = 43
+
+
+def engine_major(version: str) -> int | None:
+    """The major number of an ``ngspice-NN`` version string; ``None`` for any other engine (nothing is gated on it)."""
+    m = re.fullmatch(r"ngspice-(\d+)", version.strip())
+    return int(m.group(1)) if m else None
 
 
 def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> list[ValidationResult]:
@@ -577,6 +618,17 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
     runner = tools.get("spice")
     if not isinstance(runner, SpiceRunner) or not runner.available():
         raise ToolUnavailableError("no SPICE engine available (tools['spice'] is missing or unavailable)")
+    if any(s.kind is StimulusKind.AM for s in setup.stimuli):
+        version = runner.version()
+        major = engine_major(version)
+        if major is None and runner.engine.startswith("ngspice"):
+            # fail closed: an ngspice whose version did not parse ("unknown") may be one that reads the new form as silence
+            raise ToolUnavailableError(f"ngspice version {version!r} could not be read: an AM source needs ngspice {AM_MIN_ENGINE_MAJOR} or newer (it is written in that form)")
+        if major is not None and major < AM_MIN_ENGINE_MAJOR:
+            raise ToolUnavailableError(
+                f"{version} cannot run this setup: its AM source is written in ngspice {AM_MIN_ENGINE_MAJOR}+'s form AM(VO VMO VMA FM FC TD), "
+                "which an older ngspice reads by its own formula as a zero source; run it on ngspice 43 or newer"
+            )
     art = fresh_artifact(ir, ArtifactKind.SPICE_NETLIST)
     netlist = Path(art.path)
     ir_hash = ir.content_hash()
@@ -585,8 +637,12 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     results: dict[str, SpiceResult] = {}
+    # an op keeps the device quantities the compiler names (a transistor's dissipation and junction values) when
+    # the engine can; no other runner is asked, and component.fit says "not computed" without them
+    probes = tuple(v for per_ref in report["device_probes"].values() for v in per_ref.values()) if getattr(runner, "device_probes", False) else ()
     for spec in setup.analyses:
-        results[spec.id] = runner.run(netlist, spec.kind, out_dir / spec.id, command=report["analyses"][spec.id])
+        extra = {"probes": probes} if probes and spec.kind is SpiceAnalysis.OP else {}
+        results[spec.id] = runner.run(netlist, spec.kind, out_dir / spec.id, command=report["analyses"][spec.id], **extra)
     engine_info = dict(runner.engine_info())
     engine_version = next((r.engine_version for r in results.values()), None) or str(engine_info.get("version") or runner.version())
     engine_info.setdefault("engine", runner.engine)
@@ -612,7 +668,7 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
         "netlist_report": {
             k: report[k]
             for k in (
-                "elements", "excluded", "ignored_pins", "nets_touching_only_excluded", "ground_net", "models", "value_sources",
+                "elements", "excluded", "ignored_pins", "nets_touching_only_excluded", "ground_net", "models", "model_cards", "device_probes", "value_sources",
                 "accepted_provenance_kinds", "assumptions", "inexact_numbers", "unmodelled_numbers", "stimuli", "temperature_c",
             )
         },
@@ -675,6 +731,8 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
             "engine": engine_stamp,
             "assumptions": assumptions,
         }
+        if report["model_cards"]:
+            details["model_cards"] = report["model_cards"]
         if exp.params:
             details["params"] = {k: _num(t) for k, t in sorted(exp.params.items())}
         if exp.reference_vector is not None:
@@ -795,6 +853,7 @@ def run_spice_for(ir: CircuitIR, tools: dict[str, Any], workdir: Path | str) -> 
         "expectations": {r.check_id.removeprefix(f"{CHECK_ID}."): r.status.value for r in expectation_results},
         "netlist_provenance_kinds": report["accepted_provenance_kinds"],
         "assumptions": assumptions,
+        "model_cards": report["model_cards"],
         "excluded": report["excluded"],
         "ignored_pins": report["ignored_pins"],
         "value_sources": report["value_sources"],
@@ -853,6 +912,7 @@ __all__ = [
     "RESULTS_FILE",
     "RESULTS_FORMAT",
     "RF_CHECK_PREFIX",
+    "XTALK_CHECK_PREFIX",
     "Reduction",
     "SI_CHECK_PREFIX",
     "bound_message",

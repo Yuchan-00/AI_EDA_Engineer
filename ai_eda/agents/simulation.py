@@ -10,7 +10,10 @@ each with the netlist hash, the engine version and the rawfiles) produced by
 loop's ``RerunTool`` uses. A design with SI constraints (``ir.si``) also gets
 ``spice.si.<net>`` - one lossless-line transient per electrically long net
 over a plane (:func:`ai_eda.tools.spice.si_check.spice_si_results`), whatever
-the circuit's own setup says; a design with RF fixture networks (``ir.rf``)
+the circuit's own setup says, and ``spice.xtalk.<victim>`` - coupled-line
+transients of the victims ``si.crosstalk`` hands off, judged against a
+budget (:func:`ai_eda.tools.spice.xtalk_check.spice_xtalk_results`, a
+separate call so ``spice_si_results`` is unchanged); a design with RF fixture networks (``ir.rf``)
 then gets ``spice.rf.<network>`` and ``spice.rf.<network>[.<state>].<exp>`` -
 an ac sweep of each network's own members between its ports
 (:func:`ai_eda.tools.spice.rf_fixture.spice_rf_results`), a network verdict,
@@ -36,6 +39,7 @@ from ai_eda.tools.spice import SpiceRunner
 from ai_eda.tools.spice.rf_fixture import rf_note, spice_rf_results
 from ai_eda.tools.spice.si_check import spice_si_results
 from ai_eda.tools.spice.stage import CHECK_ID, retire_expectation_results, run_spice_for
+from ai_eda.tools.spice.xtalk_check import spice_xtalk_results, xtalk_note
 
 
 class SimulationAgent(Agent):
@@ -63,6 +67,12 @@ class SimulationAgent(Agent):
                 judged[r.status.value] = judged.get(r.status.value, 0) + 1
             result.validation.extend(si)
             result.notes.append(f"spice.si: {len(si)} electrically long net(s) as lossless lines: " + ", ".join(f"{n} {s}" for s, n in sorted(judged.items())))
+        xt = spice_xtalk_results(ir, ctx.tools, ctx.workdir)
+        if xt:
+            result.validation.extend(xt)
+            note = xtalk_note(xt)
+            if note:
+                result.notes.append(note)
         rf = spice_rf_results(ir, ctx.tools, ctx.workdir)
         if rf:
             result.validation.extend(rf)

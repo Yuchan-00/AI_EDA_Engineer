@@ -26,7 +26,9 @@ from ai_eda.ir.provenance import Traced, derived
 #: their recorded version and hash; the recompute never compares the version)
 #: 0.11: the top-C network between loaded ports (``calc.rf.resonator.top_c.port_r`` / ``.port_x`` / ``.c_tap_reactive`` /
 #: ``.ported_s21_db`` / ``.ported_rel_s21_db``: a collector feed choke on the source port, a base divider on the load port)
-CALC_VERSION = "0.11"
+#: 0.12: the IEC 60063 preferred-value calculators of :mod:`ai_eda.tools.calc.e_series` (``calc.e_series.<series>.<mode>``):
+#: a part value is the series value of the solved number, and the recompute proves it
+CALC_VERSION = "0.12"
 
 #: tool id -> input roles, in the calculator's parameter order
 ROLES: dict[str, tuple[str, ...]] = {
@@ -58,6 +60,25 @@ ROLES: dict[str, tuple[str, ...]] = {
     "calc.regulator.p_dissipation": ("v_in", "v_out", "i_load"),
     "calc.crystal.load_capacitance": ("c1", "c2", "c_stray"),
     "calc.lc.cutoff": ("l", "c"),
+    "calc.lc.butterworth2.series_l": ("f_c", "z0"),
+    "calc.lc.butterworth2.shunt_c": ("f_c", "z0"),
+    "calc.lc.butterworth2.level_db": ("f", "f_c"),
+    # BJT low-side switch (ai_eda.design.catalog.bjt_lowside_switch)
+    "calc.bjt_switch.base_current": ("i_c", "beta_forced"),
+    "calc.bjt_switch.base_resistor": ("v_ctl", "v_be", "i_b"),
+    "calc.bjt_switch.clamp_max": ("v_load", "v_f"),
+    # I2C pull-ups (ai_eda.design.catalog.i2c_pullup)
+    "calc.i2c.r_max": ("t_r", "c_b"),
+    "calc.i2c.r_min": ("v_dd", "v_ol", "i_ol"),
+    "calc.i2c.r_pullup": ("r_max", "r_min", "fraction"),
+    "calc.i2c.v_ih": ("v_dd",),
+    "calc.i2c.t_low": ("f_scl",),
+    "calc.i2c.v_low_diode": ("v_dd", "r"),
+    "calc.i2c.t_hold": ("t_low",),
+    "calc.i2c.t_30": ("r", "c_b", "v_dd", "v_low"),
+    "calc.i2c.t_check": ("t_low", "t_30", "t_r"),
+    "calc.i2c.tran_step": ("t_r",),
+    "calc.i2c.tran_stop": ("t_low", "r", "c_b"),
     # transmission lines (ai_eda.tools.calc.tline): lengths in mm, copper thickness in um (as the stackup states them)
     "calc.tline.microstrip.z0": ("w", "h", "t", "er"),
     "calc.tline.microstrip.e_eff": ("w", "h", "t", "er"),
@@ -198,6 +219,9 @@ ROLES: dict[str, tuple[str, ...]] = {
     "calc.power.rail_budget": ("i_load", "i_rating"),
     "calc.regulator.headroom": ("v_in_min", "v_out", "v_dropout", "i_load", "r_path"),
 }
+#: the E series calculators (:mod:`ai_eda.tools.calc.e_series`): one input, the solved value
+E_SERIES_TOOLS: tuple[str, ...] = tuple(f"calc.e_series.{s}.{m}" for s in ("e6", "e12", "e24", "e96") for m in ("nearest", "at_most", "at_least"))
+ROLES.update({tool: ("x",) for tool in E_SERIES_TOOLS})
 #: tool id -> the unit each role's input is expected to carry (``None``: any); an input whose unit is set
 #: and differs is refused by the recompute (a swapped voltage / resistance would otherwise be computed)
 ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
@@ -229,6 +253,23 @@ ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.regulator.p_dissipation": ("V", "V", "A"),
     "calc.crystal.load_capacitance": ("F", "F", "F"),
     "calc.lc.cutoff": ("H", "F"),
+    "calc.lc.butterworth2.series_l": ("Hz", "ohm"),
+    "calc.lc.butterworth2.shunt_c": ("Hz", "ohm"),
+    "calc.lc.butterworth2.level_db": ("Hz", "Hz"),
+    "calc.bjt_switch.base_current": ("A", None),
+    "calc.bjt_switch.base_resistor": ("V", "V", "A"),
+    "calc.bjt_switch.clamp_max": ("V", "V"),
+    "calc.i2c.r_max": ("s", "F"),
+    "calc.i2c.r_min": ("V", "V", "A"),
+    "calc.i2c.r_pullup": ("ohm", "ohm", None),
+    "calc.i2c.v_ih": ("V",),
+    "calc.i2c.t_low": ("Hz",),
+    "calc.i2c.v_low_diode": ("V", "ohm"),
+    "calc.i2c.t_hold": ("s",),
+    "calc.i2c.t_30": ("ohm", "F", "V", "V"),
+    "calc.i2c.t_check": ("s", "s", "s"),
+    "calc.i2c.tran_step": ("s",),
+    "calc.i2c.tran_stop": ("s", "ohm", "F"),
     "calc.tline.microstrip.z0": ("mm", "mm", "um", None),
     "calc.tline.microstrip.e_eff": ("mm", "mm", "um", None),
     "calc.tline.stripline.z0": ("mm", "mm", "um", None),
@@ -368,6 +409,8 @@ ROLE_UNITS: dict[str, tuple[str | None, ...]] = {
     "calc.power.rail_budget": ("A", "A"),
     "calc.regulator.headroom": ("V", "V", "V", "A", "ohm"),
 }
+#: an E series value keeps the unit of the solved value (ohm, F, H): any unit is taken
+ROLE_UNITS.update({tool: (None,) for tool in E_SERIES_TOOLS})
 
 
 def _derived(value: float, tool: str, ids: tuple[str, ...], unit: str | None, note: str) -> Traced[float]:
@@ -629,6 +672,158 @@ def crystal_load_capacitance(c1: Traced[float], c2: Traced[float], c_stray: Trac
         raise ValueError("stray capacitance must not be negative")
     total = c1.value + c2.value
     return _derived(c1.value * c2.value / total + c_stray.value, "calc.crystal.load_capacitance", ids, "F", "C_L = C1 * C2 / (C1 + C2) + C_stray")
+
+
+def _lc2_inputs(f_c: Traced[float], z0: Traced[float]) -> float:
+    if f_c.value <= 0:
+        raise ValueError("cutoff frequency must be positive")
+    if z0.value <= 0:
+        raise ValueError("system impedance must be positive")
+    return 2.0 * math.pi * f_c.value
+
+
+def lc2_series_l(f_c: Traced[float], z0: Traced[float], ids: tuple[str, str] = ("f_c", "z0")) -> Traced[float]:
+    """The series inductor of the n = 2 Butterworth low-pass between Z0 terminations: L = g1 Z0 / (2 pi f_c), g1 = sqrt 2."""
+    omega = _lc2_inputs(f_c, z0)
+    return _derived(math.sqrt(2.0) * z0.value / omega, "calc.lc.butterworth2.series_l", ids, "H", "L = sqrt(2) Z0 / (2 pi f_c)")
+
+
+def lc2_shunt_c(f_c: Traced[float], z0: Traced[float], ids: tuple[str, str] = ("f_c", "z0")) -> Traced[float]:
+    """The shunt capacitor of the n = 2 Butterworth low-pass between Z0 terminations: C = g2 / (2 pi f_c Z0), g2 = sqrt 2."""
+    omega = _lc2_inputs(f_c, z0)
+    return _derived(math.sqrt(2.0) / (omega * z0.value), "calc.lc.butterworth2.shunt_c", ids, "F", "C = sqrt(2) / (2 pi f_c Z0)")
+
+
+def lc2_butterworth_level_db(f: Traced[float], f_c: Traced[float], ids: tuple[str, str] = ("f", "f_c")) -> Traced[float]:
+    """The n = 2 Butterworth low-pass's level at ``f`` relative to its passband: -10 log10(1 + (f / f_c)^4) dB (-3.0103 dB at f_c)."""
+    if f.value < 0:
+        raise ValueError("frequency must not be negative")
+    if f_c.value <= 0:
+        raise ValueError("cutoff frequency must be positive")
+    x = f.value / f_c.value
+    return _derived(-10.0 * math.log10(1.0 + x ** 4), "calc.lc.butterworth2.level_db", ids, "dB", "level = -10 log10(1 + (f / f_c)^4)")
+
+
+def bjt_switch_base_current(i_c: Traced[float], beta_forced: Traced[float], ids: tuple[str, str] = ("i_c", "beta_forced")) -> Traced[float]:
+    """The base current that saturates a BJT switch at ``i_c`` with the forced gain: I_B = I_C / beta_forced."""
+    if i_c.value <= 0:
+        raise ValueError("collector current must be positive")
+    if beta_forced.value <= 0:
+        raise ValueError("forced beta must be positive")
+    return _derived(i_c.value / beta_forced.value, "calc.bjt_switch.base_current", ids, "A", "I_B = I_C / beta_forced")
+
+
+def bjt_switch_base_resistor(v_ctl: Traced[float], v_be: Traced[float], i_b: Traced[float], ids: tuple[str, str, str] = ("v_ctl", "v_be", "i_b")) -> Traced[float]:
+    """The base resistor from a control level: R_B = (V_ctl - V_BE) / I_B."""
+    if v_ctl.value <= v_be.value:
+        raise ValueError("control level must exceed V_BE")
+    if i_b.value <= 0:
+        raise ValueError("base current must be positive")
+    return _derived((v_ctl.value - v_be.value) / i_b.value, "calc.bjt_switch.base_resistor", ids, "ohm", "R_B = (V_ctl - V_BE) / I_B")
+
+
+def bjt_switch_clamp_max(v_load: Traced[float], v_f: Traced[float], ids: tuple[str, str] = ("v_load", "v_f")) -> Traced[float]:
+    """The highest collector voltage a flyback diode allows: V_clamp = V_load + V_F."""
+    if v_f.value < 0:
+        raise ValueError("diode forward voltage must not be negative")
+    return _derived(v_load.value + v_f.value, "calc.bjt_switch.clamp_max", ids, "V", "V_clamp = V_load + V_F")
+
+
+#: ln(0.7 / 0.3): the 30 % -> 70 % part of an RC charge in units of R C - I2C's rise-time thresholds
+I2C_RISE_LN = math.log(0.7 / 0.3)
+#: V_IH of an I2C input as a fraction of V_DD
+I2C_VIH_FRACTION = 0.7
+
+
+def _positive(x: Traced[float], what: str) -> float:
+    if x.value <= 0:
+        raise ValueError(f"{what} must be positive")
+    return float(x.value)
+
+
+def i2c_r_max(t_r: Traced[float], c_b: Traced[float], ids: tuple[str, str] = ("t_r", "c_b")) -> Traced[float]:
+    """The largest pull-up that charges the bus from 0.3 to 0.7 V_DD within ``t_r``: R_max = t_r / (ln(0.7/0.3) C_b)."""
+    return _derived(_positive(t_r, "rise time") / (I2C_RISE_LN * _positive(c_b, "bus capacitance")), "calc.i2c.r_max", ids, "ohm", "R_max = t_r / (ln(0.7/0.3) C_b)")
+
+
+def i2c_r_min(v_dd: Traced[float], v_ol: Traced[float], i_ol: Traced[float], ids: tuple[str, str, str] = ("v_dd", "v_ol", "i_ol")) -> Traced[float]:
+    """The smallest pull-up a driver sinking ``i_ol`` can still pull to ``v_ol``: R_min = (V_DD - V_OL) / I_OL."""
+    if v_ol.value < 0 or v_dd.value <= v_ol.value:
+        raise ValueError("V_OL must be at least 0 and below V_DD")
+    return _derived((v_dd.value - v_ol.value) / _positive(i_ol, "sink current"), "calc.i2c.r_min", ids, "ohm", "R_min = (V_DD - V_OL) / I_OL")
+
+
+def i2c_r_pullup(r_max: Traced[float], r_min: Traced[float], fraction: Traced[float], ids: tuple[str, str, str] = ("r_max", "r_min", "fraction")) -> Traced[float]:
+    """The pull-up inside the window: R = max(fraction x R_max, R_min), 0 < fraction <= 1; refused when R_min > R_max (no value serves the bus)."""
+    if not 0 < fraction.value <= 1:
+        raise ValueError("pull-up fraction must be in (0, 1]")
+    hi, lo = _positive(r_max, "R_max"), _positive(r_min, "R_min")
+    if lo > hi:
+        raise ValueError(f"no pull-up satisfies this bus: R_min = {lo:.12g} ohm exceeds R_max = {hi:.12g} ohm")
+    return _derived(max(fraction.value * hi, lo), "calc.i2c.r_pullup", ids, "ohm", "R = max(fraction R_max, R_min)")
+
+
+#: the generic ngspice diode (``.model DOD D``: IS = 1e-14 A, N = 1) at ngspice's default 27 degC (V_T = k T / q)
+DIODE_IS_A, DIODE_N, VT_27C_V = 1e-14, 1.0, 0.025852
+
+
+def i2c_v_low_diode(v_dd: Traced[float], r: Traced[float], ids: tuple[str, str] = ("v_dd", "r")) -> Traced[float]:
+    """The level the idealised open-drain driver (a generic diode to a 0 V node) holds the line at: the forward drop of
+    ``.model DOD D`` (IS = 1e-14 A, N = 1, 27 degC) at the current the pull-up feeds it, V = N V_T ln(1 + (V_DD - V) / (R IS)),
+    solved as a fixed point (30 iterations; it converges in a few). The template's ``held_low`` expectation measures it."""
+    v_dd_v, r_ohm = _positive(v_dd, "V_DD"), _positive(r, "pull-up")
+    v = 0.6
+    for _ in range(30):
+        i = (v_dd_v - v) / r_ohm
+        if i <= 0:
+            raise ValueError("the pull-up feeds the driver no current: V_DD is below the diode drop")
+        v = DIODE_N * VT_27C_V * math.log1p(i / DIODE_IS_A)
+    return _derived(v, "calc.i2c.v_low_diode", ids, "V", "V_low = N V_T ln(1 + (V_DD - V_low) / (R IS)), IS = 1e-14 A, N = 1, 27 degC")
+
+
+def i2c_t_hold(t_low: Traced[float], ids: tuple[str] = ("t_low",)) -> Traced[float]:
+    """When the held-low level is read: 0.9 t_low, inside the hold and before the release."""
+    return _derived(0.9 * _positive(t_low, "t_low"), "calc.i2c.t_hold", ids, "s", "t_hold = 0.9 t_low")
+
+
+def i2c_v_ih(v_dd: Traced[float], ids: tuple[str] = ("v_dd",)) -> Traced[float]:
+    """An I2C input's high threshold: V_IH = 0.7 V_DD."""
+    return _derived(I2C_VIH_FRACTION * _positive(v_dd, "V_DD"), "calc.i2c.v_ih", ids, "V", "V_IH = 0.7 V_DD")
+
+
+def i2c_t_low(f_scl: Traced[float], ids: tuple[str] = ("f_scl",)) -> Traced[float]:
+    """Half a clock period: how long the driver holds the line low before the release that is simulated."""
+    return _derived(0.5 / _positive(f_scl, "clock frequency"), "calc.i2c.t_low", ids, "s", "t_low = 1 / (2 f_SCL)")
+
+
+def i2c_t_30(r: Traced[float], c_b: Traced[float], v_dd: Traced[float], v_low: Traced[float], ids: tuple[str, str, str, str] = ("r", "c_b", "v_dd", "v_low")) -> Traced[float]:
+    """The time from the release (the line at V_low) to the 0.3 V_DD point of the RC charge: t_30 = R C_b ln((V_DD - V_low) / (0.7 V_DD))."""
+    v = _positive(v_dd, "V_DD")
+    if v_low.value < 0 or v - v_low.value <= I2C_VIH_FRACTION * v:
+        raise ValueError("V_low must be at least 0 and below 0.3 V_DD (else the line never starts under the 30 % point)")
+    return _derived(_positive(r, "pull-up") * _positive(c_b, "bus capacitance") * math.log((v - v_low.value) / (I2C_VIH_FRACTION * v)), "calc.i2c.t_30", ids, "s", "t_30 = R C_b ln((V_DD - V_low) / (0.7 V_DD))")
+
+
+def i2c_t_check(t_low: Traced[float], t_30: Traced[float], t_r: Traced[float], ids: tuple[str, str, str] = ("t_low", "t_30", "t_r")) -> Traced[float]:
+    """When the line must have reached V_IH: the release, plus the time to the 30 % point, plus the allowed rise time."""
+    return _derived(_positive(t_low, "t_low") + _positive(t_30, "t_30") + _positive(t_r, "rise time"), "calc.i2c.t_check", ids, "s", "t_check = t_low + t_30 + t_r")
+
+
+def _sig(x: float, digits: int, *, up: bool) -> float:
+    """``x`` > 0 rounded to ``digits`` significant digits, away from zero (``up``) or toward it: a netlist timing spelled short."""
+    exp = math.floor(math.log10(x)) - (digits - 1)
+    scale = 10.0 ** exp
+    return (math.ceil(x / scale) if up else math.floor(x / scale)) * scale
+
+
+def i2c_tran_step(t_r: Traced[float], ids: tuple[str] = ("t_r",)) -> Traced[float]:
+    """The transient step: at least 50 points per rise time (t_r / 50 rounded down to 2 significant digits, so the netlist spells it short)."""
+    return _derived(_sig(_positive(t_r, "rise time") / 50.0, 2, up=False), "calc.i2c.tran_step", ids, "s", "step = t_r / 50, rounded down to 2 significant digits")
+
+
+def i2c_tran_stop(t_low: Traced[float], r: Traced[float], c_b: Traced[float], ids: tuple[str, str, str] = ("t_low", "r", "c_b")) -> Traced[float]:
+    """The transient end: the release plus at least six RC (the charge is complete to 0.25 %), rounded up to 2 significant digits."""
+    return _derived(_sig(_positive(t_low, "t_low") + 6.0 * _positive(r, "pull-up") * _positive(c_b, "bus capacitance"), 2, up=True), "calc.i2c.tran_stop", ids, "s", "stop = t_low + 6 R C_b, rounded up to 2 significant digits")
 
 
 def lc_cutoff(l: Traced[float], c: Traced[float], ids: tuple[str, str] = ("l", "c")) -> Traced[float]:

@@ -39,7 +39,7 @@ from ai_eda.ir import CircuitIR, NetKind, Promotion, Provenance, ProvenanceKind,
 from ai_eda.tools.calc.tline import critical_length_mm
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.si.driver import driver_value
-from ai_eda.tools.si.measure import SI_VERSION, NetMeasure, measure_nets
+from ai_eda.tools.si.measure import NetMeasure, measure_nets, si_version
 
 #: provenance ``tool`` of a promotion
 PROMOTE_TOOL = "si.promote"
@@ -181,7 +181,7 @@ def promote(
             f"promoted from {cls.name} to {cls.promote_to}"
         )
         prov = Provenance(
-            kind=ProvenanceKind.DERIVED, tool=PROMOTE_TOOL, tool_version=SI_VERSION,
+            kind=ProvenanceKind.DERIVED, tool=PROMOTE_TOOL, tool_version=si_version(ir),  # si 0.3 on a board with an arc track, 0.2 with a typed via
             derived_from=[f"pcb.tracks[net={row.net}]", f"pcb.vias[net={row.net}]", row.t_rise_source.split(" ")[0], "si.critical_fraction", *stack_ids],
             note=note,
         )

@@ -37,8 +37,8 @@ SLOT_SI_STEP = "si_step"
 NO_SI = "이 설계에는 신호 무결성 제약(`ir.si`: 넷 클래스·타이밍 경로)이 없어 임피던스·타이밍 검사를 하지 않았습니다"
 #: the routing layers (routing.maze's ``LAYERS``)
 ROUTING_LAYERS: tuple[str, str] = ("F.Cu", "B.Cu")
-#: the check-id prefixes the SI section copies
-SI_PREFIXES: tuple[str, ...] = ("si.", "spice.si.")
+#: the check-id prefixes the SI section copies (``spice.xtalk.*``: the crosstalk subsection, never a reflection result)
+SI_PREFIXES: tuple[str, ...] = ("si.", "spice.si.", "spice.xtalk.")
 _CRITICAL = "si.critical_length"
 _STATUS_ORDER = {s: i for i, s in enumerate((ValidationStatus.FAIL, ValidationStatus.NOT_VERIFIED, ValidationStatus.PASS, ValidationStatus.NOT_APPLICABLE))}
 
@@ -146,10 +146,18 @@ def stackup_lines(stack: Stackup | None) -> list[str]:
         if i < len(stack.dielectrics):
             d = stack.dielectrics[i]
             freq = f" @ {quantity(float(d.er_frequency_hz.value), 'Hz', 4)}" if d.er_frequency_hz is not None else " (주파수 기록 없음)"
-            rows.append([f"({c.name} / {stack.copper[i + 1].name})", f"유전체 ({d.kind.value})", f"{float(d.thickness_mm.value):g} mm", f"{float(d.er.value):g}{freq}", "-", _origin(d.er)])
+            below = stack.copper[i + 1].name if i + 1 < len(stack.copper) else "금속 베이스"
+            kind = f"유전체 ({d.kind.value})" if d.material is None else f"유전체 ({d.kind.value}, {d.material})"
+            rows.append([f"({c.name} / {below})", kind, f"{float(d.thickness_mm.value):g} mm", f"{float(d.er.value):g}{freq}", "-", _origin(d.er)])
+    if stack.metal_base is not None:
+        rows.append(["금속 베이스", stack.metal_base.material, f"{float(stack.metal_base.thickness_mm.value):g} mm", "-", "넷 없음 (평면 아님)", _origin(stack.metal_base.thickness_mm)])
     out = [st._table(["층", "종류", "두께", "εr", "역할", "출처"], rows), ""]
     out.append(f"- 적층 두께 합 (바깥 구리 면 사이): {stack.board_thickness_mm():.4g} mm, 구리 {stack.layer_count}층, 평면 층 "
                + (", ".join(f"{c.name} = `{c.plane_net.value}`" for c in stack.plane_layers()) or "없음"))
+    if stack.metal_base is not None:
+        out.append(f"- 금속 베이스를 더한 전체 두께: {stack.total_thickness_mm():.4g} mm (구리 1층 IMS: B.Cu 에는 구리가 없음)")
+    if stack.material is not None:
+        out.append(f"- 기판 재료: {st._cell(stack.material.name)} ({stack.material.kind}) — {st._cell(stack.material.reason)}")
     note = stack.provenance.note or ""
     if note:
         out.append(f"- 적층 전체의 출처: {_prov_origin(stack.provenance)} — {st._cell(note)}")
@@ -307,10 +315,13 @@ def formula_lines(ir: CircuitIR) -> list[str]:
                 line += f",  l_crit = {fraction:g} × {quantity(t_r, 's')} / t_pd = {critical_length_mm(t_r, t_pd, fraction):.2f} mm"
             out.append(line)
         out.append("")
-    via = stack.span_mm("F.Cu", "B.Cu")
+    via = stack.through_via_span_mm()
     er_max = max(float(d.er.value) for d in stack.dielectrics)
-    out += [f"- **비아**: 관통 비아 배럴 길이 = F.Cu..B.Cu = {via:.4g} mm, 지연 상한 √εr,max / c0 = √{er_max:g} / c0 = {propagation_delay(er_max) * 1e9:.4f} ps/mm "
-            "(비아 하나마다 넷의 길이와 지연에 더함).", ""]
+    if via is None:
+        out += ["- **비아**: 구리 1층 적층(금속 베이스)에는 관통 비아가 없습니다 (B.Cu 는 keep-out 으로 막혀 있음).", ""]
+    else:
+        out += [f"- **비아**: 관통 비아 배럴 길이 = F.Cu..B.Cu = {via:.4g} mm, 지연 상한 √εr,max / c0 = √{er_max:g} / c0 = {propagation_delay(er_max) * 1e9:.4f} ps/mm "
+                "(비아 하나마다 넷의 길이와 지연에 더함).", ""]
     for c in si.net_classes:
         r = ir.validation.latest(f"si.impedance.{c.name}")
         if c.target_z0_ohm is None or r is None or not isinstance(r.details, dict) or r.details.get("width_derivation") is None:
@@ -495,6 +506,91 @@ def timing_lines(ir: CircuitIR) -> list[str]:
     return out
 
 
+#: rows / computed pieces the crosstalk subsection lists (the result itself carries every one)
+XT_ROWS_SHOWN = 40
+XT_PIECES_SHOWN = 20
+
+
+def _pct(value: Any) -> str:
+    v = _num(value)
+    return "-" if v is None else f"{v * 100:.3f}"
+
+
+def crosstalk_lines(ir: CircuitIR) -> list[str]:
+    """The ``si.crosstalk`` result, its victim rows and its largest computed pieces, copied (the formulas named; every number the record's)."""
+    from ai_eda.validation.si import XT_CHECK
+
+    st = _st()
+    out = ["### 누화 (`si.crosstalk` 기록)", "",
+           "피해 넷(victim)마다 같은 층에서 가장자리 간격 s ≤ 10 h(h: 그 층 마이크로스트립의 유전체 두께) 안에 있는 다른 넷의 구리를 찾고, 폭이 같은 평행 구간마다 "
+           "정합 종단을 가정한 닫힌 식으로 근단(NEXT)·원단(FEXT) 누화를 계산합니다(공격 넷의 계단 1 V 당):", "",
+           "      Kb = (Z_even − Z_odd) / (Z_even + Z_odd + 2·Z_even·Z_odd / Z_term),  Z_term = √(Z_even·Z_odd)   (Simonovich 2022, 식 8·식 2)",
+           "      L_sat = t_r / (2·t_pd,even),  NEXT = Kb·min(1, L / L_sat)   (식 4·식 6; 느린 even 모드를 쓰는 것은 선택 — 짧은 L_sat, 큰 쪽의 추정)",
+           "      FEXT = −min(L·|√e_eff,even − √e_eff,odd| / (2·c0·t_r), 1/2)   (Polar AP8164 의 속도 식과 LaMeres 의 1/2; 1/2 상한은 Macnica 127093 그림 4)", "",
+           "Z_even·Z_odd·e_eff 는 `calc.tline.edge_coupled_microstrip`(Kirschning & Jansen, 준정적) 값이고, t_r 은 공격 넷 클래스의 에지(0–100 % 선형 램프)입니다. "
+           "이 식은 모두 피해 넷의 **양 끝이 Z0 로 종단**되었다고 가정하는데, 이 시스템의 넷은 R_drive 로 구동되어 C_load 로 끝나므로 식은 넷을 판정하지 못합니다: "
+           "숫자(넷별 합 `matched_estimate_rel`)는 순위와 설명용이고, 결과는 PASS 도 FAIL 도 아닌 NOT_VERIFIED 입니다. 기준 평면이 없는 층·내층, 폭이 다른 쌍, "
+           "평면 없이 맞닿은 신호층의 broadside, 평행하지 않은 이웃, 다른 넷의 존은 계산하지 않고 그 이유를 행에 적습니다. 패드·비아는 공격원으로 보지 않습니다.", ""]
+    r = ir.validation.latest(XT_CHECK)
+    if r is None:
+        return out + [f"`{XT_CHECK}` {NO_RECORD}: 배치·배선된 보드의 IR_BUILD 검증이 아직 없습니다.", ""]
+    out += [_result_line(r), ""]
+    d = r.details if isinstance(r.details, dict) else {}
+    rows = [x for x in d.get("rows") or [] if isinstance(x, dict)]
+    live = [x for x in rows if x.get("status") != ValidationStatus.NOT_APPLICABLE.value]
+    live.sort(key=lambda x: (-(_num(x.get("matched_estimate_rel")) or 0.0), str(x.get("net"))))
+    if live:
+        table = [[f"`{x.get('net')}`", x.get("class") or "-", x.get("status", "?"), _pct(x.get("matched_estimate_rel")), x.get("beyond_window", 0),
+                  st._cell(x.get("reason") or "-")] for x in live[:XT_ROWS_SHOWN]]
+        out += [st._table(["피해 넷", "클래스", "행 판정", "정합 종단 추정 합 (%)", "창 밖의 넷 수", "이유 (기록)"], table), ""]
+        if len(live) > XT_ROWS_SHOWN:
+            out += [f"(추정 합이 큰 순서로 {XT_ROWS_SHOWN} 행만 보입니다; 나머지 {len(live) - XT_ROWS_SHOWN} 행은 검사 결과의 기록에 있습니다.)", ""]
+    pieces = [(x.get("net"), p) for x in rows for p in x.get("aggressors") or [] if isinstance(p, dict) and _num(p.get("next_rel")) is not None]
+    pieces.sort(key=lambda vp: (-(abs(float(vp[1]["next_rel"])) + abs(float(vp[1].get("fext_rel") or 0.0))), str(vp[0]), str(vp[1].get("net"))))
+    if pieces:
+        table = [[f"`{v}`", f"`{p.get('net')}`", p.get("layer", "-"), f"{float(p['length_mm']):.3f}", f"{float(p['gap_mm']):.3f}", f"{float(p['s_over_h']):.3g}",
+                  _pct(p.get("kb")), f"{float(p['l_sat_mm']):.2f}", _pct(p.get("next_rel")), _pct(p.get("fext_rel")),
+                  quantity(float(p["t_r_s"]), "s") if _num(p.get("t_r_s")) is not None else "-"] for v, p in pieces[:XT_PIECES_SHOWN]]
+        out += ["계산한 평행 구간 (|NEXT| + |FEXT| 가 큰 순서, 기록 그대로):", "",
+                st._table(["피해 넷", "공격 넷", "층", "길이 L (mm)", "간격 s (mm)", "s/h", "Kb (%)", "L_sat (mm)", "NEXT (%)", "FEXT (%)", "t_r"], table), ""]
+    na = [x for x in rows if x.get("status") == ValidationStatus.NOT_APPLICABLE.value and not x.get("judged_by")]
+    if na:
+        out += [f"해당 없음 {len(na)} 넷 (전원·접지 넷, 배선이 없는 넷, 창 안에 다른 넷의 구리가 없는 넷).", ""]
+    return out + xtalk_spice_lines(ir)
+
+
+def xtalk_spice_lines(ir: CircuitIR) -> list[str]:
+    """The ``spice.xtalk.<victim>`` results (coupled-line decks), copied: status, message, each deck's peak - never a reflection result."""
+    out = ["#### 결합선 시뮬레이션 (`spice.xtalk.<피해 넷>`, ngspice CPL)", "",
+           "모든 이웃이 닫힌 식으로 계산되고 덱을 만들 수 있는 피해 넷은 `si.crosstalk` 행이 NOT_APPLICABLE \"judged by spice.xtalk.<넷>\" 이 되고, "
+           "피해·공격 넷 한 쌍의 결합 구간마다 ngspice 의 결합선(CPL) 덱으로 과도 해석합니다: 공격 넷은 자기 클래스의 R_drive 뒤에서 0 → 1 V 계단(t_r)을 내고 "
+           "C_load 로 끝나며, 피해 넷은 드라이버가 R_drive 로 레벨을 붙잡고 수신단이 C_load 입니다. 구간 앞뒤의 선로는 각 넷 주 폭의 Z0 를 갖는 무손실 T 선입니다. "
+           "각 덱은 두 시간 간격(step, 2·step)으로 각각 별도 프로세스에서 돌리고, 두 실행이 모두 DC 레벨로 수렴하고 피크가 서로 맞을 때만 그 피크를 씁니다"
+           "(ngspice CPL 이 오류 메시지 없이 틀린 값을 낼 수 있음을 측정했기 때문의 선택). 수신단의 피크 |v| 합이 예산 이하면 PASS, "
+           "간격이 하나인 구간의 덱 하나만으로 예산을 넘으면 FAIL, 그 밖에는 NOT_VERIFIED 입니다. 예산은 사용자가 정한 `xtalk_budget_rel` 이 우선이고, "
+           "없으면 grounding 된 데이터시트 레벨의 NM/3 = min(VOH−VIH, VIL−VOL)/3 ÷ 스윙(드라이버의 공급 전압 VCC, `v_cc`: 계단의 상한) 입니다(TI SCEA005 그림 1, Bogatin RoT #19). "
+           "공격 넷의 계단은 피해 넷의 스윙과 같다고 봅니다(같은 스윙 가정): 더 높은 전원의 공격 넷은 그만큼 더 큰 잡음을 줍니다.", ""]
+    latest = ir.validation.latest_by_check()
+    rs = [r for k, r in sorted(latest.items()) if k.startswith("spice.xtalk.")]
+    if not rs:
+        return out + ["`spice.xtalk` 결과 없음: 넘겨진 피해 넷이 없었거나 SPICE 단계 전입니다.", ""]
+    live = [r for r in rs if r.status is not ValidationStatus.NOT_APPLICABLE]
+    old = [r for r in rs if r.status is ValidationStatus.NOT_APPLICABLE]
+    for r in sorted(live, key=lambda r: (_STATUS_ORDER.get(r.status, 9), r.check_id)):
+        out.append(_result_line(r))
+        d = r.details if isinstance(r.details, dict) else {}
+        decks = [x for x in d.get("decks") or [] if isinstance(x, dict)]
+        if decks:
+            st = _st()
+            table = [[f"`{x.get('deck')}`", f"`{x.get('aggressor')}`", "예" if x.get("exact") else "아니오 (최소 간격)", x.get("victim_driver", "-"),
+                      x.get("aggressor_driver", "-"), _pct(x.get("peak_rel")), st._cell(x.get("problem") or "-")] for x in decks]
+            out += ["", st._table(["덱", "공격 넷", "정확한 구간", "피해 드라이버", "공격 드라이버", "피크 (%)", "문제 (기록)"], table), ""]
+    if old:
+        out.append(f"- 더 이상 넘겨지지 않아 대체된 결과 (NOT_APPLICABLE): {', '.join(f'`{r.check_id}`' for r in old)}")
+    out.append("")
+    return out
+
+
 def spice_lines(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     st = _st()
     out = ["### 반사·링잉 시뮬레이션 (`spice.si.<넷>`, ngspice)", "",
@@ -553,6 +649,8 @@ def limit_lines() -> list[str]:
         "- 드라이버 모델(t_r, R_s, C_L)은 보수적인 선택값이며 IBIS 모델이 아닙니다. 드라이버 부품의 데이터시트 t_rise / r_out / c_in 이 grounding 되면 그 값이 대신 쓰입니다.",
         "- `spice.si` 는 패드가 둘인 넷 하나를 무손실 선 하나로 봅니다(neck-down 을 합침). 가지가 있는 넷, 수동 부품이 달린 넷, 드라이버가 구동하지 않는 넷은 판정하지 않습니다(NOT_VERIFIED). "
         "종단 저항을 넣는 것 같은 설계 변경은 사람의 결정이며 파이프라인이 하지 않습니다.",
+        "- 누화(`si.crosstalk`)는 피해 넷의 양 끝이 Z0 로 종단된 경우의 닫힌 식이라 판정이 아닙니다. 판정은 패드가 둘인 넷끼리의 결합선 덱(`spice.xtalk`)만 하며, "
+        "덱 하나에는 피해·공격 넷 한 쌍만 있고, 손실·분산·솔더 마스크, 패드·비아에서 오는 결합, 옆의 전원·접지 구리(코플래너)는 모델에 없습니다.",
         "- 넷 클래스 폭은 IR 기하 검사(`si.width` / `si.impedance`)로만 확인합니다. 컴파일된 `.kicad_pro` 는 넷 클래스를 싣지 않으므로 **KiCad DRC 의 넷 클래스 폭 검사는 측정되지 않았습니다**.",
         "- 평면은 KiCad 가 채우는 존입니다. 채움 결과(다른 넷 둘레의 빈틈, 평면의 연속성)는 kicad-cli 가 있어야 확인되며, 이 보고서의 평면 그림은 존의 외곽선입니다.",
         "",
@@ -582,6 +680,7 @@ def si_circuit_section(ir: CircuitIR, figures: ReportFigures) -> list[str]:
     out += impedance_lines(ir, figures)
     out += budget_lines(ir)
     out += timing_lines(ir)
+    out += crosstalk_lines(ir)
     out += spice_lines(ir, figures)
     out += limit_lines()
     return out
@@ -736,6 +835,7 @@ __all__ = [
     "SLOT_SI_DELAY",
     "SLOT_SI_STEP",
     "SLOT_SI_Z0",
+    "crosstalk_lines",
     "si_circuit_section",
     "si_theory_section",
     "stackup_lines",

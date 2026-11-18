@@ -172,7 +172,7 @@ def test_template_version_moved_with_the_value_spelling():
 TEMPLATE_VALUES = {
     "divider": (DIVIDER, template_library, {"R1": "14k", "R2": "10k"}),
     "led": (LED, template_library, {"R1": "300"}),
-    "rc_lowpass": (RC, template_library, {"R1": "1.5915k", "C1": "100n"}),
+    "rc_lowpass": (RC, template_library, {"R1": "1.6k", "C1": "100n"}),
     "astable": (ASTABLE, template_library, {"R1": "1k", "R2": "1k", "R3": "10k", "R4": "10k", "C1": "64.817n", "C2": "64.817n"}),
     "atmega128_devboard": (ATMEGA, atmega_library, {
         "C1": "10u", "C2": "10u", "C3": "100n", "R1": "1.5k", "C4": "100n", "C5": "100n", "L1": "10u", "C6": "100n", "C7": "100n",
@@ -207,13 +207,13 @@ def test_every_template_writes_readable_values_and_keeps_the_exact_netlist(templ
 
 
 def test_bom_schematic_and_board_show_the_readable_value_and_the_netlist_the_exact_one(tmp_path: Path):
-    """The RC template through the whole offline pipeline: every derived view shows ``100n`` / ``1.5915k``, the netlist ``1e-7`` / the exact R."""
+    """The RC template through the whole offline pipeline: every derived view shows ``100n`` / ``1.6k`` (the E24 value placed), the netlist ``1e-7`` / ``1.6k``."""
     lib = template_library(tmp_path / "kicad")
     ir = _ir(tmp_path, "rc")
     _present(ir, tmp_path, lib, RC)
     state, _ = _confirm(ir, tmp_path, lib, None)
     assert state.outcome(Stage.PCB) is not None and ArtifactKind.PCB in ir.artifacts
-    want = {"R1": "1.5915k", "C1": "100n", "J1": "Conn_01x03"}
+    want = {"R1": "1.6k", "C1": "100n", "J1": "Conn_01x03"}
     # BOM (decoded by the single decoder: a positive number is never neutralised)
     with open(ir.artifacts[ArtifactKind.BOM].path, newline="", encoding="utf-8") as f:
         rows = {row["Reference"]: row for row in csv.DictReader(f)}
@@ -231,7 +231,7 @@ def test_bom_schematic_and_board_show_the_readable_value_and_the_netlist_the_exa
     assert {fp.ref: fp.value for fp in read_board_footprints(Path(ir.artifacts[ArtifactKind.PCB].path))} == want
     # netlist: the exact spellings, unchanged
     text = _netlist(ir, tmp_path, lib)  # the SPICE compiler itself (this offline run has no engine, so no netlist artifact)
-    assert "C1 OUT 0 1e-7\n" in text and "R1 IN OUT 1.5915494309189537k\n" in text and "1.5915k" not in text and "100n" not in text
+    assert "C1 OUT 0 1e-7\n" in text and "R1 IN OUT 1.6k\n" in text and "1.5915" not in text and "100n" not in text
     # the two compilers are deterministic on the readable values too
     again = CircuitIR.load(ir.save(tmp_path / "ir.json"))
     for compiler, name in ((BOMCompiler(), "bom"), (SchematicCompiler(), "sch")):
@@ -298,8 +298,17 @@ def test_a_v01_template_project_keeps_the_v01_wording_without_the_5_digit_claim(
     rc = _ir(tmp_path / "rc", "rc")
     _present(rc, tmp_path / "rc", lib, RC)
     _confirm(rc, tmp_path / "rc", lib)
-    assert f"저항값 1.5915 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in RcLowpassTemplate().part_notes(rc)["R1"].criteria
+    standard_line = "저항값 1.6 kΩ (E24 표준값(IEC 60063): 계산값 1.5915 kΩ 에 가장 가까운 값)"
+    assert standard_line in RcLowpassTemplate().part_notes(rc)["R1"].criteria  # today's build: R1 is a value that is sold
+    # a design built before R1 was a standard value carries the calculator's number as the part: it keeps the old sentence
+    old = rc.model_copy(deep=True)
+    old.parameters["r"] = old.parameters["r_ideal"]
+    old.component("R1").value = "1.5915k"
+    old.component("R1").electrical["resistance"] = old.parameters["r"]
+    assert f"저항값 1.5915 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in RcLowpassTemplate().part_notes(old)["R1"].criteria
+    old = _as_template_v01(old)
+    assert old.component("R1").value == "1.5915494309189537k"
+    assert "저항값 1.5915 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음)" in RcLowpassTemplate().part_notes(old)["R1"].criteria
     rc = _as_template_v01(rc)
-    assert rc.component("R1").value == "1.5915494309189537k"
-    assert "저항값 1.5915 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음)" in RcLowpassTemplate().part_notes(rc)["R1"].criteria
+    assert rc.component("R1").value == "1.6k" and standard_line in RcLowpassTemplate().part_notes(rc)["R1"].criteria
     assert VALUE_COLUMN_NOTE not in parts_report(rc, lib) and VALUE_SPELLING_NOTE not in parts_report(rc, lib)

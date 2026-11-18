@@ -110,6 +110,7 @@ from ai_eda.ir import (
     llm_generated,
 )
 from ai_eda.llm.client import LLMError
+from ai_eda.llm.crosscheck import not_crosschecked_note
 from ai_eda.llm.extraction import _strictify, _table, find_directive, is_confirmation, is_rejection  # shared helpers, reused on purpose
 from ai_eda.llm.prompts import DATASHEET_FACT_SYSTEM, PART_CANDIDATE_SYSTEM, part_candidate_messages
 from ai_eda.llm.router import TaskKind
@@ -547,6 +548,8 @@ class ComponentAgent(Agent):
             }
             cache[key] = entry
             called = True
+            if ctx.llm.crosscheck:
+                notes.append(f"{c.ref}: " + not_crosschecked_note("datasheet facts", str(entry.get("model"))))
         proposed = DatasheetFacts.model_validate(entry["facts"])
         model = str(entry.get("model"))
         if entry.get("rejected"):
@@ -712,6 +715,8 @@ class ComponentAgent(Agent):
                 return set()
             called = True
             cache[key] = entry
+            if llm.crosscheck:
+                notes.append(not_crosschecked_note("candidate parts", str(entry.get("model"))))
         parsed = PartCandidates.model_validate(entry["candidates"])
         if set(entry.get("refs") or []) != lacking_refs:
             parsed = PartCandidates(candidates=[c for c in parsed.candidates if c.ref.strip() in lacking_refs])

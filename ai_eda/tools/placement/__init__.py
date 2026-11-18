@@ -18,6 +18,12 @@ the outline:
   keep-outs that forbid footprints avoided; a part or can that does not fit
   is refused, never overlapped; the PCB agent uses it for every IR with
   ``ir.rf.blocks``.
+* :mod:`ai_eda.tools.placement.fixed` - the design's fixed parts
+  (``ir.pcb.fixed``) copied as given, each pack region's parts
+  (``ir.pcb.pack_regions``) packed in the region's list order around them by
+  the RF floorplan's shelf packer, the rest in the free board area; it refuses
+  rather than moves a fixed part or overlaps two parts; the PCB agent uses it
+  for every board with fixed parts or pack regions, before any other choice.
 
 Whether the resulting board is valid is decided exclusively by real
 ``kicad-cli`` DRC (:meth:`ai_eda.tools.kicad.cli.KicadCli.run_drc`), never

@@ -66,6 +66,7 @@ from ai_eda.agents import (
     SimulationAgent,
 )
 from ai_eda.agents.requirement import EXTRACTION_CHECK, blocks_pipeline, regulatory_scope_keys
+from ai_eda.agents.keys import SCHEMATIC_LAYOUT_KEY
 from ai_eda.compilers import (
     BOMCompiler,
     CPLCompiler,
@@ -104,6 +105,21 @@ def _stamp(results: list[ValidationResult], ir: CircuitIR) -> None:
 def _neutralised_summary(notes: list[str]) -> str:
     """``'N cell(s) neutralised (R1.Value, ...)'`` from compiler notes of the form ``'<where>: <why>; ...'`` (one line per stage)."""
     return f"{len(notes)} cell(s) neutralised ({', '.join(n.split(':', 1)[0] for n in notes)})"
+
+
+def _removed_previous(ir: CircuitIR, kind: ArtifactKind) -> str:
+    """Drop the artifact an earlier run registered under ``kind`` (stale evidence once this compile did not happen) and say so; ``""`` when there was none."""
+    old = ir.artifacts.pop(kind, None)
+    if old is None:
+        return ""
+    return f"; the previous {kind} artifact ({Path(old.path).name}) was removed from the IR's artifacts - it would be stale evidence, and later stages now find none"
+
+def _notes_summary(kind: ArtifactKind, notes: list[str]) -> str:
+    """The one-line form of a compiler's notes for the stage table: BOM / CPL notes are neutralised cells; any other
+    compiler's notes (the schematic's wiring report) are printed as written."""
+    if kind in (ArtifactKind.BOM, ArtifactKind.CPL):
+        return _neutralised_summary(notes)
+    return "; ".join(notes)
 
 
 def _field_annotation(model: Any, name: str) -> Any:
@@ -185,7 +201,7 @@ class Orchestrator:
         self.ctx.tools.setdefault(
             "compilers",
             {
-                ArtifactKind.SCHEMATIC: SchematicCompiler(),
+                ArtifactKind.SCHEMATIC: SchematicCompiler(answer_layout=ctx.answers.get(SCHEMATIC_LAYOUT_KEY)),
                 ArtifactKind.PCB: PCBCompiler(),
                 ArtifactKind.BOM: BOMCompiler(),
                 ArtifactKind.CPL: CPLCompiler(),
@@ -446,7 +462,10 @@ class Orchestrator:
 
         NothingToCompileError / NotImplementedError -> NOT_VERIFIED (the
         input does not exist yet), CompileError -> FAIL (the IR is
-        inconsistent); anything else propagates.
+        inconsistent); anything else propagates. A compile that did not
+        happen removes the artifact an earlier run registered under the kind,
+        and the message says so (:func:`_removed_previous`): a later stage's
+        "no ... artifact" is then explained where it was caused.
         """
         compiler = ctx.tools["compilers"][kind]
         # the verdict is recorded as a tool-backed ``compile.<kind>`` result, so a refusal (FAIL) reaches
@@ -454,20 +473,20 @@ class Orchestrator:
         stamp = dict(check_id=f"compile.{kind}", tool=getattr(compiler, "id", type(compiler).__name__), tool_version=getattr(compiler, "version", None), ir_hash=ir.content_hash())
         try:
             ir.artifacts[kind] = compiler.compile(ir, CompileContext(workdir=ctx.workdir, tools=ctx.tools))
+            stamp["tool_version"] = ir.artifacts[kind].generator_version
         except (NothingToCompileError, NotImplementedError) as e:
-            ir.artifacts.pop(kind, None)  # an older artifact of this kind would be stale evidence
-            ir.validation.add(ValidationResult(status=ValidationStatus.NOT_VERIFIED, message=str(e), **stamp))
-            return ValidationStatus.NOT_VERIFIED, str(e)
+            message = f"{e}{_removed_previous(ir, kind)}"  # an older artifact of this kind would be stale evidence
+            ir.validation.add(ValidationResult(status=ValidationStatus.NOT_VERIFIED, message=message, **stamp))
+            return ValidationStatus.NOT_VERIFIED, message
         except CompileError as e:
-            ir.artifacts.pop(kind, None)
-            message = f"{kind} compile refused: {e}"
+            message = f"{kind} compile refused: {e}{_removed_previous(ir, kind)}"
             ir.validation.add(ValidationResult(status=ValidationStatus.FAIL, message=message, details={"repair": "human"}, **stamp))
             return ValidationStatus.FAIL, message
         art = ir.artifacts[kind]
         # a cell the compiler neutralised (BOM free text written with a leading apostrophe) is reported, never hidden:
         # the full notes in the details, a count + the cells in the message
-        details = {"neutralised": list(art.notes)} if art.notes else {}
-        message = f"compiled {art.path}" + (f"; {_neutralised_summary(art.notes)}" if art.notes else "")
+        details = {("neutralised" if kind in (ArtifactKind.BOM, ArtifactKind.CPL) else "notes"): list(art.notes)} if art.notes else {}
+        message = f"compiled {art.path}" + (f"; {_notes_summary(kind, art.notes)}" if art.notes else "")
         ir.validation.add(ValidationResult(status=ValidationStatus.PASS, message=message, artifact_hash=art.content_hash, details=details, **stamp))
         return ValidationStatus.PASS, str(art.path)
 
@@ -628,7 +647,9 @@ class Orchestrator:
         design; a PASS without any stamp (an agent's result) is about this
         design only when this run produced it - one carried over from an
         earlier run in ``ir.validation`` vouches for nothing now. None of
-        them releases anything, however the aggregate reads.
+        them releases anything, however the aggregate reads. Regulatory
+        scope questions still open (``regulatory.applicability``'s
+        ``missing_keys``) are named as a reason of their own.
         """
         latest = ir.validation.latest_by_check()
         overall = ir.validation.overall()
@@ -649,5 +670,13 @@ class Orchestrator:
             reasons.append(f"PASS produced for another IR version ({', '.join(stale)})")
         if carried:
             reasons.append(f"PASS carried over from an earlier run without an IR version, not re-produced by this one ({', '.join(carried)})")
+        # the regulatory scope questions never stop the pipeline, so a run reaches RELEASE with candidates still undecided: name the
+        # answers that would decide them here, where the user reads why nothing was released (no "; " and no parentheses inside: readers split the reasons on them)
+        scope = latest.get("regulatory.applicability")
+        # only a result this run produced: an earlier run's list may name answers given since
+        open_keys = [str(k) for k in (scope.details.get("missing_keys") or [])] if scope is not None and scope.check_id in fresh else []
+        if open_keys:
+            undecided = len(scope.details.get("undecided") or {})
+            reasons.append(f"regulatory scope not decided - answer {', '.join(open_keys)} with --answer key=value, undecided candidate regulations: {undecided}")
         status = overall if overall != ValidationStatus.PASS else ValidationStatus.NOT_VERIFIED
         return StageOutcome(stage=Stage.RELEASE, status=status, message="not releasable: " + "; ".join(reasons))

@@ -116,7 +116,7 @@ def test_table_lists_every_input_choice_computed_value_part_net_and_simulation_l
         "jack_pinout: J1 Connector:Barrel_Jack_Switch pins carry no names in the KiCad library, so its polarity is a pin-number assumption: pin 1 = centre pin (+, VIN_RAW)",
         "cp_polarity: C1 / C2 Device:C_Polarized pins carry no names in the KiCad library, so their polarity is a pin-number assumption: pin 1 = +",
         # every calculator output, with its tool and the ids that filled its roles
-        "p_reg = 0.2 W [calc.regulator.p_dissipation from v_in, v_out_reg, i_load_budget]", "r_led = 1500 ohm [calc.led.R from v_out_reg, v_f_led, i_led]",
+        "p_reg = 0.2 W [calc.regulator.p_dissipation from v_in, v_out_reg, i_load_budget]", "r_led_ideal = 1500 ohm [calc.led.R from v_out_reg, v_f_led, i_led]", "r_led = 1500 ohm [calc.e_series.e24.nearest from r_led_ideal]",
         "i_led_design = 0.002 A [calc.led.I from v_out_reg, v_f_led, r_led]", "tau_reset = 0.001 s [calc.rc.tau from r_reset, c_reset]",
         f"v_reset_tau = {V_RESET_TAU:.12g} V [calc.rc.step_response from v_out_reg, tau_reset, tau_reset]", "tran_step = 1e-05 s [calc.rc.tran_step from tau_reset]",
         "tran_stop = 0.005 s [calc.rc.tran_stop from tau_reset]", "c_load = 1.5e-11 F [calc.crystal.load_capacitance from c_xtal, c_xtal, c_stray]",
@@ -156,7 +156,7 @@ def test_table_lists_every_input_choice_computed_value_part_net_and_simulation_l
 def test_confirm_applies_the_board_with_every_mcu_pin_in_exactly_one_net(tmp_path: Path):
     ir, lib, state, _ = _built(tmp_path)
     out = state.outcome(Stage.ARCHITECTURE)
-    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"135 proposal(s) applied, nothing verified; template atmega128_devboard v{TEMPLATE_VERSION} confirmed by the user: 135 proposal(s)")
+    assert out.status is S.NOT_VERIFIED and out.message.startswith(f"136 proposal(s) applied, nothing verified; template atmega128_devboard v{TEMPLATE_VERSION} confirmed by the user: 136 proposal(s)")
     assert [c.ref for c in ir.components] == REFS
     assert [n.name for n in ir.nets] == ["VIN_RAW", "VIN", "+5V", "GND", "LED_A", "AVCC", "AREF", "RESET", "PEN", "XTAL1", "XTAL2", *PORT_NETS]
     # every pin of every part is in exactly one net; U1's 64 pins, found by name, land where the ATmega128 pinout says
@@ -183,20 +183,20 @@ def test_confirm_applies_the_board_with_every_mcu_pin_in_exactly_one_net(tmp_pat
     # the parameters: inputs copied from the requirements, choices the user's, the rest calculator outputs
     p = ir.parameters
     assert list(p) == ["v_in", "f_clk", "v_out_reg", "i_load_budget", "p_reg_max", "c_in", "c_out", "c_dec", "l_avcc", "c_xtal", "c_stray", "r_reset", "c_reset", "c8_ic",
-                       "r_pen", "v_f_led", "i_led", "tol_rel", "v_avcc_tol_abs", "p_reg", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop",
+                       "r_pen", "v_f_led", "i_led", "tol_rel", "v_avcc_tol_abs", "p_reg", "r_led_ideal", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop",
                        "c_load", "f_avcc", "power_temp_rise", "w_power_min", "isp_sck_divider", "f_sck"]  # the last four: the board's SI declarations
     for key, rid, value in (("v_in", "req.input_voltage", 9.0), ("f_clk", "req.clock_frequency", 16e6)):
         assert p[key].value == value and p[key].provenance.kind is ProvenanceKind.USER_REQUIREMENT and p[key].provenance.derived_from == [rid]
     for key in list(p)[2:19]:
         assert p[key].provenance.kind is ProvenanceKind.USER_REQUIREMENT and p[key].provenance.tool is None, key
         assert p[key].provenance.note.startswith(f"{CHOICE_NOTE_PREFIX}; template atmega128_devboard v{TEMPLATE_VERSION}: {key} = "), key
-    tools = {k: (p[k].provenance.tool, p[k].provenance.tool_version) for k in list(p)[19:28]}
-    assert {k: (p[k].provenance.tool, p[k].provenance.kind) for k in list(p)[28:]} == {  # the board's SI declarations: two choices, two calculator outputs
+    tools = {k: (p[k].provenance.tool, p[k].provenance.tool_version) for k in list(p)[19:29]}
+    assert {k: (p[k].provenance.tool, p[k].provenance.kind) for k in list(p)[29:]} == {  # the board's SI declarations: two choices, two calculator outputs
         "power_temp_rise": (None, ProvenanceKind.USER_REQUIREMENT), "w_power_min": ("calc.ipc2221.width_for_current", ProvenanceKind.DERIVED),
         "isp_sck_divider": (None, ProvenanceKind.USER_REQUIREMENT), "f_sck": ("calc.clock.divided", ProvenanceKind.DERIVED),
     }
     assert tools == {
-        "p_reg": ("calc.regulator.p_dissipation", CALC_VERSION), "r_led": ("calc.led.R", CALC_VERSION), "i_led_design": ("calc.led.I", CALC_VERSION),
+        "p_reg": ("calc.regulator.p_dissipation", CALC_VERSION), "r_led_ideal": ("calc.led.R", CALC_VERSION), "r_led": ("calc.e_series.e24.nearest", CALC_VERSION), "i_led_design": ("calc.led.I", CALC_VERSION),
         "tau_reset": ("calc.rc.tau", CALC_VERSION), "v_reset_tau": ("calc.rc.step_response", CALC_VERSION), "tran_step": ("calc.rc.tran_step", CALC_VERSION),
         "tran_stop": ("calc.rc.tran_stop", CALC_VERSION), "c_load": ("calc.crystal.load_capacitance", CALC_VERSION), "f_avcc": ("calc.lc.cutoff", CALC_VERSION),
     }
@@ -259,9 +259,9 @@ def test_the_simulation_excludes_what_has_no_model_and_judges_three_analog_facts
 def test_recompute_inputs_check_validators_and_compiled_views_of_the_confirmed_board(tmp_path: Path):
     ir, lib, _, _ = _built(tmp_path)
     rec = recompute_parameters(ir)
-    assert rec.status is S.PASS and rec.message == "20 value(s) recomputed"  # + w_power_min, f_sck and their copies in ir.si
+    assert rec.status is S.PASS and rec.message == "21 value(s) recomputed"  # + w_power_min, f_sck and their copies in ir.si
     assert {k for k in rec.details["parameters"] if not k.startswith(("components", "simulation"))} == {
-        "p_reg", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop", "c_load", "f_avcc",
+        "p_reg", "r_led_ideal", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop", "c_load", "f_avcc",
         "w_power_min", "f_sck", "si.net_classes[POWER].min_width_mm", "si.timing_paths[ISP].f_clk_hz"}
     assert {k for k in rec.details["parameters"] if k.startswith("simulation")} == {
         "simulation.analyses[tran].params[step]", "simulation.analyses[tran].params[stop]", "simulation.expectations[i_led].nominal",
@@ -274,6 +274,15 @@ def test_recompute_inputs_check_validators_and_compiled_views_of_the_confirmed_b
     sch = SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path / "sch", tools={"kicad_library": lib}))
     text = Path(sch.path).read_text(encoding="utf-8")
     assert '(lib_id "MCU_Microchip_ATmega:ATmega128-16A")' in text and text.count('(global_label "PE0"') == 4
+    # B12: the fixture library has no power.kicad_sym, so no PWR_FLAG is placed and the note names the nets ERC will report
+    assert "PWR_FLAG" not in text and sch.notes[-1].startswith("power flags: none placed, power:PWR_FLAG is not in the installed KiCad libraries") and "AVCC, GND, VIN" in sch.notes[-1]
+    # B11 W3: the default gutters run out of wire tracks on this board (17 of its 64 nets were drawn), so the compiler widens
+    # the ones that ran out and draws the sheet again: at least half the nets are wires, and the bytes are the same every time
+    wiring = next(n for n in sch.notes if n.startswith("wiring: "))
+    assert wiring.endswith(" of 64 net(s) drawn as wires (labels kept on every pin)") and int(wiring.split()[1]) >= 32, wiring
+    assert any(n.startswith("gutters widened: ") and n.endswith(f"{wiring.split()[1]} now)") for n in sch.notes), sch.notes
+    again = SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path / "sch_again", tools={"kicad_library": lib}))
+    assert Path(again.path).read_text(encoding="utf-8") == text
     bom = BOMCompiler().compile(ir, CompileContext(workdir=tmp_path / "bom", tools={"kicad_library": lib}))
     bom_text = Path(bom.path).read_text(encoding="utf-8")
     assert all(ref in bom_text for ref in REFS) and "power output header (+5V / GND)" in bom_text  # J11's description does not start with a formula character

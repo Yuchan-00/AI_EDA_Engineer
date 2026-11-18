@@ -559,7 +559,11 @@ def test_a_stale_model_question_no_longer_blocks_the_review_of_a_full_run(tmp_pa
     review = state.outcome(Stage.INDEPENDENT_REVIEW)
     assert review.status is not S.USER_INPUT_REQUIRED and review.questions == []
     assert ir.validation.latest(ReviewArea.REQUIREMENTS_VS_IR).status is not S.USER_INPUT_REQUIRED
-
+    # B2: the scope questions never block, so the run reached RELEASE with candidates undecided - RELEASE names the answers that decide them
+    scope = ir.validation.latest("regulatory.applicability").details
+    open_keys, undecided = scope["missing_keys"], len(scope["undecided"])
+    release = state.outcome(Stage.RELEASE).message
+    assert open_keys and release.endswith(f"; regulatory scope not decided - answer {', '.join(open_keys)} with --answer key=value, undecided candidate regulations: {undecided}")
 
 def test_a_run_without_a_model_closes_the_recorded_questions_it_answers_and_nothing_else(tmp_path: Path) -> None:
     """A typed answer closes the recorded question under its key; a control key's question stays; an IR with nothing stale is not rewritten."""
@@ -646,9 +650,9 @@ def test_a_refusal_is_answered_by_leave_out_in_the_report_and_the_gui_other_ques
     state = _run(ir, None, tmp_path, lib, {"application": "bench", "jurisdiction": "KR", "input_voltage": "12 V", "output_voltage": "5 V",
                                            "efficiency": "90 %", "mains_powered": "no", "radio": "no"})
     [q] = [q for q in state.outcome(Stage.ARCHITECTURE).questions if q.key == "efficiency"]
-    assert q.answer_key == LEAVE_OUT_KEY and answer_command(Path("p/ir.json"), q) == "ai-eda run p/ir.json --answer leave_out=efficiency"
+    assert q.answer_key == LEAVE_OUT_KEY and answer_command(Path("p/ir.json"), q) == f"ai-eda run {Path('p/ir.json')} --answer leave_out=efficiency"
     plain = MissingInformation(key="operating_temperature", question="range?", required=False)
-    assert answer_command(Path("p/ir.json"), plain) == "ai-eda run p/ir.json --answer operating_temperature=<value>"
+    assert answer_command(Path("p/ir.json"), plain) == f"ai-eda run {Path('p/ir.json')} --answer operating_temperature=<value>"
     # the divider's load refusal (a stated load) and the kr447 family's refusals are marked too; the load *question* is not
     divider = DividerTemplate()
     assert divider._load_question("why", "req.output_current").answer_key == LEAVE_OUT_KEY and divider._load_question("why").answer_key is None
@@ -751,3 +755,32 @@ def test_the_gui_sends_every_ticked_leave_out_and_the_extra_line_as_one_answer(t
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"input_voltage": "12 V", "mains_powered": "no",
                                          "leave_out": "antenna_switch_present,battery_voltage_max,battery_cell_count"}
+
+def test_a_later_typed_application_replaces_the_earlier_one_and_no_note_names_a_refused_leave_out(tmp_path: Path) -> None:
+    """B13. Before: ``application=...`` typed a second time was dropped with "leave it out with --answer leave_out=application and
+    answer application again", and that leave-out is refused (application is never left out) - the only way on was editing the IR."""
+    lib = template_library(tmp_path / "kicad")
+    ir = _ir(tmp_path, raw="")
+    _run(ir, None, tmp_path, lib, {"application": "bench reference", "jurisdiction": "KR", "input_voltage": "12 V", "output_voltage": "5 V", **SCOPE})
+    # the same value again changes nothing, and the note names the remedy that works for this key
+    before = [r.model_dump(mode="json") for r in ir.requirements.requirements]
+    msg = _run(ir, None, tmp_path, lib, {"application": "bench reference"}).outcome(Stage.REQUIREMENT_ANALYSIS).message
+    assert [r.model_dump(mode="json") for r in ir.requirements.requirements] == before
+    assert "which is kept; to change it answer application with the new value" in msg and "leave_out=application" not in msg
+    # a different value replaces it: still one req.application, still the user's
+    msg = _run(ir, None, tmp_path, lib, {"application": "relay driver"}).outcome(Stage.REQUIREMENT_ANALYSIS).message
+    app = ir.requirements.get("application")
+    assert app.id == "req.application" and app.value.value == "relay driver" and app.value.provenance.kind is ProvenanceKind.USER_REQUIREMENT
+    assert [r.key for r in ir.requirements.requirements].count("application") == 1
+    assert "application: your answer 'relay driver' replaces your earlier answer 'bench reference' (req.application)" in msg and "not applied" not in msg
+    # jurisdiction is neither left out nor replaced: its note says so instead of offering the refused leave-out
+    msg = _run(ir, None, tmp_path, lib, {"jurisdiction": "EU"}).outcome(Stage.REQUIREMENT_ANALYSIS).message
+    assert ir.requirements.get("jurisdiction").value.value == "KR" and [j.code for j in ir.regulatory.jurisdictions] == ["KR"]
+    assert "--answer leave_out=jurisdiction is refused for this key" in msg and "leave it out with" not in msg
+    # the same on the extraction path, before the table is confirmed (typed requirements are rebuilt beside the extraction's)
+    svc, client = _service([{"structured": CANNED, "usage": USAGE}])
+    ir = _ir(tmp_path, name="llm")
+    _run(ir, svc, tmp_path, lib, {"application": "bench reference"})
+    msg = _run(ir, svc, tmp_path, lib, {"application": "relay driver"}).outcome(Stage.REQUIREMENT_ANALYSIS).message
+    assert ir.requirements.get("application").value.value == "relay driver" and [r.id for r in ir.requirements.requirements].count("req.application") == 1
+    assert "replaces your earlier answer 'bench reference'" in msg and "a second requirement with this id was dropped" not in msg and len(client.calls) == 1

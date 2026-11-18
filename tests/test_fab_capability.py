@@ -18,6 +18,8 @@ and is gated on the Windows measurement.
 
 from __future__ import annotations
 
+import time
+
 import copy
 import io
 import json
@@ -449,6 +451,7 @@ def test_identical_limits_are_not_reproposed_design_view(tmp_path: Path):
     archive, doc = _page(tmp_path)
     file = load_capability_file(_write_file(tmp_path, source=FILE_SOURCE))
     first = ground_capability(doc, file).constraints()
+    time.sleep(0.02)  # longer than one tick of the Windows system clock (~15.6 ms), so the two created_at stamps differ
     second = ground_capability(doc, file).constraints()
     assert first != second  # Provenance.created_at differs (model equality)
     assert design_data(first) == design_data(second)  # the design view does not
@@ -675,6 +678,7 @@ def test_check_capability_matrix(tmp_path: Path, monkeypatch):
     ir.validation.results.clear()
     drc = _synthetic_drc(ir, tmp_path)
     assert drc.details["design_rules"] == {"min_track_width": 0.127, "min_clearance": 0.127, "min_via_diameter": 0.5, "min_through_hole_diameter": 0.3}
+    monkeypatch.setattr(kicad_cli, "PROJECT_RULES_MEASURED_VERSIONS", frozenset())  # as on a version nobody measured
     rows = _rows(check_capability(ir))
     assert rows["clearance_between_items"]["message"].startswith("project-rule application by kicad-cli 10.0.6 not measured")  # the last gate, on every machine
     monkeypatch.setattr(kicad_cli, "PROJECT_RULES_MEASURED_VERSIONS", frozenset({"10.0.6"}))

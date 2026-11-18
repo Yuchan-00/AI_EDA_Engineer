@@ -10,8 +10,10 @@ value) after the documented normalisation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -52,6 +54,8 @@ from ai_eda.ir import (
     authoritative,
     llm_generated,
     user_requirement,
+    SimElement,
+    Traced,
 )
 from ai_eda.tools.calc import ngspice_reads, parse_spice_number
 from ai_eda.tools.kicad import KicadCli, KicadLibrary
@@ -259,6 +263,9 @@ def test_model_cards_are_verbatim_deduplicated_and_sorted():
         + "D1 VOUT K D1N4148\nD2 VOUT K D1N4148\nR1 VIN VOUT 10k\nR2 VOUT 0 10k\nXU1 VOUT 0 OUT IDEALOPAMP\nVVIN VIN 0 DC 12\n.end\n"
     )
     assert build_report(ir)["models"] == ["d1n4148", "idealopamp"]
+    rows = build_report(ir)["model_cards"]  # one row per card taken in, with the hash of the text the netlist carries
+    assert [(r["of"], r["model"], r["provenance"]) for r in rows] == [("D1", "D1N4148", "authoritative"), ("D2", "D1N4148", "authoritative"), ("U1", "IDEALOPAMP", "user_requirement")]
+    assert rows[2]["sha256"] == "sha256:" + hashlib.sha256(OPAMP_CARD.encode()).hexdigest() and rows[0]["source"]["title"] == DS.title
     assert netlist_elements(text)[4] == ("XU1", ["VOUT", "0", "OUT"], "IDEALOPAMP")
     # a card that does not define the referenced model, or a model with no card at all, is refused
     ir.component("D1").spice.model_card = authoritative(DIODE_CARD.replace("D1N4148", "OTHER"), DS)
@@ -735,3 +742,96 @@ def test_net_names_the_runner_would_reject_are_refused_by_the_compiler():
     ir.simulation.expectations[0].id = "v out"
     with pytest.raises(CompileError, match="expectation id 'v out' must be a plain identifier"):
         build(ir)
+
+
+# --------------------------------------------------------------------------- simulation-only elements (PLAN decision 16 b)
+
+
+def _bus_capacitance(**kw) -> SimElement:
+    args = dict(id="CBUS", device=SpiceDevice.C, net="VOUT", reference_net="GND", value=user_requirement(100e-12, "F"), reason="bus wiring capacitance, not a part", provenance=USER)
+    args.update(kw)
+    return SimElement(**args)
+
+
+def test_simulation_only_elements_sit_between_the_parts_and_the_stimuli_and_may_use_private_nodes():
+    ir = divider_ir()
+    ir.simulation.nodes = ["DRV"]
+    ir.simulation.elements = [
+        _bus_capacitance(),
+        SimElement(id="DOD", device=SpiceDevice.D, net="VOUT", reference_net="DRV", model_name="D1N4148", model_card=authoritative(DIODE_CARD, DS), reason="idealised open-drain driver", provenance=USER),
+    ]
+    ir.simulation.stimuli.append(Stimulus(id="DRV", source="voltage", net="DRV", reference_net="GND", kind=StimulusKind.DC, value=user_requirement(0.0, "V"), provenance=USER))
+    assert build(ir) == "divider\n" + DIODE_CARD + "\nR1 VIN VOUT 10k\nR2 VOUT 0 10k\nCBUS VOUT 0 100p\nDOD VOUT DRV D1N4148\nVDRV DRV 0 DC 0\nVVIN VIN 0 DC 12\n.end\n"
+    report = build_report(ir)
+    assert report["elements"] == ["R1", "R2"] and report["sim_elements"] == ["CBUS", "DOD"] and report["sim_nodes"] == ["DRV"] and report["component_count"] == 3
+    assert report["models"] == ["d1n4148"] and report["nets_without_pins"] == [] and report["nets_touching_only_excluded"] == []
+    assert ir.simulation.element("CBUS") is not None and ir.simulation.element("nope") is None
+    # a net only a connector and a simulation element touch has a node (like a stimulated net)
+    ir.components.append(connector("J2", 1))
+    ir.nets.append(net("AUX", ("J2", "1")))
+    ir.simulation.elements.append(_bus_capacitance(id="CAUX", net="AUX"))
+    assert build_report(ir)["nets_touching_only_excluded"] == []
+
+
+@pytest.mark.parametrize(("element", "message"), [
+    (_bus_capacitance(net="NOPE"), "unknown net or simulation node 'NOPE'"),
+    (_bus_capacitance(reference_net="VOUT"), "net and reference_net are both 'VOUT'"),
+    (_bus_capacitance(value=user_requirement(0.0, "F")), "value must be positive"),
+    (_bus_capacitance(value=None), "needs a value"),
+    (_bus_capacitance(value=Traced(value=1e-10, unit="F", provenance=Provenance(kind=ProvenanceKind.LLM_GENERATED))), "llm_generated provenance"),
+    (_bus_capacitance(provenance=Provenance(kind=ProvenanceKind.LLM_GENERATED)), "llm_generated provenance"),
+    (_bus_capacitance(id="R2", device=SpiceDevice.R), "collides with component R2"),
+    (_bus_capacitance(id="VIN", device=SpiceDevice.V), "a simulation-only element is R, C, L or D"),
+    (_bus_capacitance(id="QX", device=SpiceDevice.Q), "a simulation-only element is R, C, L or D"),
+    (_bus_capacitance(model_name="X"), "takes a value, not a model"),
+    (SimElement(id="DX", device=SpiceDevice.D, net="VOUT", reference_net="GND", model_name="D1N4148", reason="x", provenance=USER), "not defined by any model_card"),
+    (SimElement(id="DX", device=SpiceDevice.D, net="VOUT", reference_net="GND", model_name="D1N4148", model_card=Traced(value=DIODE_CARD, provenance=DERIVED), reason="x", provenance=USER), "a model card must have authoritative or user_requirement provenance"),
+    (SimElement(id="DX", device=SpiceDevice.D, net="VOUT", reference_net="GND", value=user_requirement(1.0), model_name="D1N4148", model_card=authoritative(DIODE_CARD, DS), reason="x", provenance=USER), "takes a model, not a value"),
+])
+def test_a_simulation_only_element_is_refused_like_a_part(element: SimElement, message: str):
+    ir = divider_ir()
+    ir.simulation.elements = [element]
+    with pytest.raises(CompileError, match=re.escape(message)):
+        build(ir)
+
+
+@pytest.mark.parametrize(("node", "message"), [("VOUT", "collides with a net"), ("vout", "collides with a net"), ("gnd", "collides with a net or the ground node"), ("bad node", "not a plain node name")])
+def test_a_simulation_node_may_not_shadow_a_net_or_the_ground(node: str, message: str):
+    ir = divider_ir()
+    ir.simulation.nodes = [node]
+    with pytest.raises(CompileError, match=message):
+        build(ir)
+
+
+def test_elements_and_nodes_stay_out_of_the_design_view_while_empty_and_are_hashed_once_set():
+    ir = divider_ir()
+    view = ir.design_dict()["simulation"]
+    assert "elements" not in view and "nodes" not in view
+    h = ir.content_hash()
+    ir.simulation.elements = [_bus_capacitance()]
+    assert ir.content_hash() != h and ir.design_dict()["simulation"]["elements"][0]["id"] == "CBUS"
+    loaded = CircuitIR.model_validate_json(ir.model_dump_json())
+    assert loaded.content_hash() == ir.content_hash() and build(loaded) == build(ir)
+
+
+def test_a_derived_element_value_is_walked_by_recompute_and_an_assumed_one_by_the_assumption_walk():
+    from ai_eda.tools.calc.recompute import derived_values
+    from ai_eda.validation.structural import simulation_assumptions
+
+    ir = divider_ir()
+    ir.simulation.elements = [_bus_capacitance(value=Traced(value=1e-10, unit="F", provenance=DERIVED)), _bus_capacitance(id="CASSUMED", value=assumption(2e-10, "a guess", unit="F"))]
+    assert "simulation.elements[CBUS].value" in dict(derived_values(ir))
+    assert any(item.startswith("simulation.elements[CASSUMED].value") for item in simulation_assumptions(ir))
+    assert "assumption" in build_report(ir)["accepted_provenance_kinds"]
+
+
+def test_the_theory_report_lists_simulation_only_elements_with_their_reason():
+    from ai_eda.report.stages import theory_report
+
+    ir = divider_ir()
+    ir.simulation.nodes = ["DRV"]
+    ir.simulation.elements = [_bus_capacitance()]
+    text = theory_report(ir)
+    assert "### 시뮬레이션 전용 요소" in text and "- `CBUS` (C) VOUT → GND: 100 pF — bus wiring capacitance, not a part" in text
+    assert "- 시뮬레이션 전용 노드: `DRV` (보드의 넷이 아님)" in text
+    assert "### 시뮬레이션 전용 요소" not in theory_report(divider_ir())

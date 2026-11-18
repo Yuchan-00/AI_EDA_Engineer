@@ -99,9 +99,13 @@ DEFAULT_FACT_KEYS: tuple[str, ...] = (
     # signal integrity (ir.si): the driver's edge and output resistance, the receiver's input capacitance, the interface timing
     "t_rise", "t_fall", "r_out", "c_in", "t_co", "t_su", "t_h",
 )
-#: the signal-integrity fact keys the ``si.*`` checks and ``spice.si`` read from a component's grounded facts (``electrical[key]``):
-#: without them offline, every check that needs one is NOT_VERIFIED naming the key
-SI_FACT_KEYS: tuple[str, ...] = ("t_rise", "t_fall", "r_out", "v_oh", "i_oh", "c_in", "t_co", "t_co_min", "t_su", "t_h")
+#: the signal-integrity fact keys the ``si.*`` checks, ``spice.si`` and ``spice.xtalk`` read from a component's grounded facts
+#: (``electrical[key]``): without them offline, every check that needs one is NOT_VERIFIED naming the key. ``v_oh`` / ``v_ol`` are a
+#: driver's output levels at the load current ``i_oh`` / ``i_ol`` of the same datasheet row and ``v_cc`` that row's supply voltage (VCC /
+#: VDD), ``v_ih`` / ``v_il`` a receiver's input thresholds (the crosstalk budget NM / 3 of :mod:`ai_eda.tools.spice.xtalk_check`, whose
+#: swing is ``v_cc``; the ``v_`` / ``i_`` prefixes type them V / A)
+SI_FACT_KEYS: tuple[str, ...] = ("t_rise", "t_fall", "r_out", "v_oh", "i_oh", "v_ol", "i_ol", "v_cc", "v_ih", "v_il", "c_in", "t_co", "t_co_min", "t_su",
+                                 "t_h")
 
 #: canonical unit (of :mod:`ai_eda.tools.calc.quantity`) a numeric fact key must carry: exact keys, then prefixes, then suffixes.
 #: ``theta_ja`` (junction-to-ambient thermal resistance, K/W - datasheets write °C/W, the same unit) and ``t_j_max``

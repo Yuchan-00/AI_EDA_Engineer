@@ -1,6 +1,6 @@
 """AM / SFFM stimuli and the level / window reductions through the compiler, the deck check and ngspice.
 
-Without ngspice: the compiler writes ``AM(VA VO MF FC TD)`` / ``SFFM(VO VA FC MDI FS)``
+Without ngspice: the compiler writes the IR's ``AM`` (VA VO MF FC TD) in ngspice 43+'s form ``AM(0 VA*VO VA MF FC TD)`` / ``SFFM(VO VA FC MDI FS)``
 only with every parameter, refuses a zero ``mf`` / ``fc`` (AM) or ``fc`` /
 ``fs`` (SFFM) - ngspice-42 silently substitutes a default of its own there
 (measured: ``AM(1 2 0 20k 0)`` peaks at 3.0 V, not 2.0 V; ``SFFM(0 1 1k 5 0)``
@@ -70,6 +70,7 @@ from ai_eda.ir import (
 from ai_eda.ir import ValidationStatus as S
 from ai_eda.ir.simulation import REDUCE_PARAMS, STIMULUS_PARAMS
 from ai_eda.tools.spice import NgspiceShared, SpiceAnalysis
+from ai_eda.tools.spice.stage import AM_MIN_ENGINE_MAJOR, engine_major
 from ai_eda.tools.spice.ngspice_shared import validate_deck
 from ai_eda.tools.spice.stage import run_spice_for
 
@@ -142,12 +143,14 @@ def _run(ir: CircuitIR, tmp_path: Path) -> dict:
 
 
 def test_am_and_sffm_lines_are_written_in_ngspice_order_and_pass_the_deck_check():
+    """The IR states AM as VA VO MF FC TD; the netlist carries ngspice 43+'s AM(VO VMO VMA FM FC TD) = AM(0 VA*VO VA MF FC TD) (A9)."""
     assert STIMULUS_PARAMS[StimulusKind.AM] == ("va", "vo", "mf", "fc", "td") and STIMULUS_PARAMS[StimulusKind.SFFM] == ("vo", "va", "fc", "mdi", "fs")
     am = build(source_ir(None, StimulusKind.AM, AM_100, tran(1e-7, 3e-3)))
-    assert am == "rfsrc\nR1 OUT 0 1k\nVVS OUT 0 AM(1 2 1k 100k 0)\n.end\n"
+    assert am == "rfsrc\nR1 OUT 0 1k\nVVS OUT 0 AM(0 2 1 1k 100k 0)\n.end\n"
+    assert "AM(0 1 500m 100k 900meg 0)" in build(source_ir(None, StimulusKind.AM, {"va": 0.5, "vo": 2.0, "mf": 100e3, "fc": 900e6, "td": 0.0}, tran(1e-10, 1e-5)))
     sffm = build(source_ir(None, StimulusKind.SFFM, {"vo": 0.0, "va": 1.0, "fc": 1e3, "mdi": 0.0, "fs": 10e3}, tran(1e-6, 5e-3)))
     assert "VVS OUT 0 SFFM(0 1 1k 0 10k)\n" in sffm
-    for text in (am, sffm, "t\nV1 A 0 AM(0.5 2 100k 900meg 0)\nV2 B 0 SFFM(0 1 1k 5 10k) AC 1\nR1 A B 1k\nR2 B 0 1k\n.end\n"):
+    for text in (am, sffm, "t\nV1 A 0 AM(0 1 0.5 100k 900meg 0)\nV2 B 0 SFFM(0 1 100k 5 1k) AC 1\nR1 A B 1k\nR2 B 0 1k\n.end\n"):
         assert validate_deck(text)[0] == []
         assert not any(tok in text.lower() for tok in (".save", ".meas", ".four", ".tran", ".control"))
 
@@ -165,7 +168,11 @@ def test_modulated_sources_refuse_what_ngspice_would_silently_replace():
     refused(StimulusKind.AM, {k: v for k, v in AM_100.items() if k != "td"}, r"am needs params \['va', 'vo', 'mf', 'fc', 'td'\], missing \['td'\]")
     refused(StimulusKind.SFFM, {"vo": 0.0, "va": 1.0, "fc": 1e3, "mdi": 5.0, "fs": 10e3, "phasec": 0.0}, r"unexpected params \['phasec'\]")
     # VO = 0 (DSB-SC) and MDI = 0 are honoured by ngspice (measured): they compile
-    assert "AM(1 0 1k 100k 0)" in build(source_ir(None, StimulusKind.AM, {**AM_100, "vo": 0.0}, tran(1e-7, 3e-3)))
+    assert "AM(0 0 1 1k 100k 0)" in build(source_ir(None, StimulusKind.AM, {**AM_100, "vo": 0.0}, tran(1e-7, 3e-3)))  # VMO = 0: carrier suppressed
+    # ngspice 43+ clamps MDI to FC / FS (measured: one warning, then a silently different waveform): refused, not written
+    with pytest.raises(CompileError, match=r"mdi must be within 0 \.\. fc / fs = 0\.1, got 5\.0"):
+        build(source_ir(None, StimulusKind.SFFM, {"vo": 0.0, "va": 1.0, "fc": 1e3, "mdi": 5.0, "fs": 10e3}, tran(1e-6, 5e-3)))
+    assert "SFFM(0 1 100k 5 1k)" in build(source_ir(None, StimulusKind.SFFM, {"vo": 0.0, "va": 1.0, "fc": 100e3, "mdi": 5.0, "fs": 1e3}, tran(1e-7, 3e-3)))
     ir = source_ir(None, StimulusKind.AM, AM_100, tran(1e-7, 3e-3))
     ir.simulation.stimuli[0].params["fc"] = llm_generated(100e3, "Hz")
     with pytest.raises(CompileError, match="llm_generated"):
@@ -285,9 +292,14 @@ def test_the_reviewer_traces_the_level_and_depth_reductions_to_their_requirement
 # --------------------------------------------------------------------------- real ngspice
 
 
+#: the AM source is written in ngspice 43+'s form; an older engine is refused by the stage (test below), so the engine tests skip there
+needs_ngspice43 = pytest.mark.skipif(not runner.available() or (engine_major(runner.version()) or 0) < AM_MIN_ENGINE_MAJOR, reason="AM sources need ngspice 43+")
+
+
 @needs_ngspice
+@needs_ngspice43
 def test_am_depth_of_ngspice_s_am_source(tmp_path: Path):
-    """``AM(1 2 1k 100k 0)`` has depth 1 / VO = 50 %: read 49.967 % over one modulation period; ratio 20 shows the documented bias."""
+    """IR ``AM`` va 1, vo 2 (netlist ``AM(0 2 1 1k 100k 0)``) has depth 1 / VO = 50 %: read 49.967 % over one modulation period; ratio 20 shows the documented bias."""
     ir = source_ir(tmp_path, StimulusKind.AM, AM_100, tran(1e-7, 3e-3), depth("depth", 100e3))
     res = _run(ir, tmp_path)
     d = res["spice.depth"]
@@ -314,6 +326,7 @@ def test_am_depth_of_ngspice_s_am_source(tmp_path: Path):
 
 
 @needs_ngspice
+@needs_ngspice43
 def test_a_biased_am_depth_never_passes_a_depth_outside_the_band(tmp_path: Path):
     """Regression: AM(1 1.9724 1k 20k 0) has the true depth 1 / 1.9724 = 50.70 %, outside 50 +/- 0.2; it read 49.93 % and PASSed."""
     ir = source_ir(tmp_path, StimulusKind.AM, {**AM_20, "vo": 1.9724}, tran(5e-7, 3e-3), depth("depth", 20e3))
@@ -427,3 +440,37 @@ def test_rc_lowpass_is_minus_3_db_at_its_corner(tmp_path: Path):
         assert r.status is S.PASS and r.details["measured"] == pytest.approx(10 * math.log10(0.5), abs=1e-6), r.message
         assert r.details["bracket"]["exact"] and r.details["db_at"]["at"] == 1000.0
     assert res["spice.refvec"].details["db_at"]["reference_magnitude"] == pytest.approx(1.0) and "re v(IN)" in res["spice.refvec"].message
+
+
+def test_the_stage_refuses_an_am_source_on_an_engine_older_than_43(tmp_path: Path):
+    """A9: ngspice-42 reads the 43+ spelling as a zero source, so the stage stops before running instead of judging silence."""
+    from ai_eda.errors import ToolUnavailableError
+    from ai_eda.tools.spice.stage import AM_MIN_ENGINE_MAJOR, engine_major, run_spice_for
+    from ai_eda.tools.spice.runner import SpiceResult, SpiceRunner
+
+    assert AM_MIN_ENGINE_MAJOR == 43 and engine_major("ngspice-42") == 42 and engine_major("ngspice-46") == 46 and engine_major("fake-1") is None
+
+    class Old(SpiceRunner):
+        engine = "old"
+
+        def available(self) -> bool:
+            return True
+
+        def version(self) -> str:
+            return "ngspice-42"
+
+        def run(self, netlist_path: Path, analysis: SpiceAnalysis, workdir: Path, command: str | None = None) -> SpiceResult:
+            raise AssertionError("an AM setup must not reach an ngspice-42 run")
+
+    ir = source_ir(tmp_path, StimulusKind.AM, AM_100, tran(1e-7, 3e-3), depth("depth", 100e3))
+    with pytest.raises(ToolUnavailableError, match="ngspice-42 cannot run this setup: its AM source"):
+        run_spice_for(ir, {"spice": Old()}, tmp_path)
+
+    class Unknown(Old):
+        engine = "ngspice-shared"
+
+        def version(self) -> str:
+            return "unknown"
+
+    with pytest.raises(ToolUnavailableError, match="could not be read: an AM source needs ngspice 43"):  # fails closed for an ngspice of unknown version
+        run_spice_for(ir, {"spice": Unknown()}, tmp_path)

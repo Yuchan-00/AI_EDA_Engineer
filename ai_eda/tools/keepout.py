@@ -41,6 +41,9 @@ import math
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from ai_eda.ir.arc import ARC_SAGITTA_MM
+from ai_eda.ir.pcb import track_points
+
 __all__ = [
     "ALL_COPPER",
     "KEEPOUT_ITEMS",
@@ -67,6 +70,7 @@ __all__ = [
     "rect_difference",
     "rect_pieces",
     "segment_area_distance",
+    "track_area_distance",
 ]
 
 Point = tuple[float, float]
@@ -214,6 +218,17 @@ def segment_area_distance(a: Point, b: Point, pts: Sequence[Point]) -> float:
         return 0.0
     n = len(pts)
     return min(_seg_seg(a, b, pts[i], pts[(i + 1) % n]) for i in range(n))
+
+
+def track_area_distance(t: Any, pts: Sequence[Point], max_sagitta: float = ARC_SAGITTA_MM) -> float:
+    """Distance from a track's centreline to the area (0 when it enters, crosses or touches it): :func:`segment_area_distance` of
+    a straight track's two ends (the same value), and for an arc (a track with ``mid``) the smallest over the chords of its chain.
+
+    An arc lies within ``max_sagitta`` of its chain (:mod:`ai_eda.ir.arc`), so its true distance is at most ``max_sagitta``
+    smaller than the value returned: a caller that needs "far enough" compares against its limit plus ``max_sagitta``.
+    """
+    chain = track_points(t, max_sagitta)
+    return min(segment_area_distance(a, b, pts) for a, b in zip(chain, chain[1:]))
 
 
 def boxes_overlap(a: Box, b: Box) -> bool:
@@ -418,4 +433,38 @@ def rect_difference(rect: Box, holes: Sequence[Box]) -> list[list[Point]]:
             out.append(loop)
         else:
             out.extend([[(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])] for b in _rectangles(cells, xs, ys)])
+    return out
+
+
+def rect_contours(rect: Box, holes: Sequence[Box]) -> list[tuple[list[Point], list[list[Point]]]]:
+    """Rectangle minus boxes, as connected outlines with interior contours; shared seams disappear.
+
+    Refuse pinch points: two contours touching at one vertex are not valid independent zone boundaries.
+    """
+    xs, ys, inside = _grid(rect, holes)
+    out = []
+    for part in _components(inside):
+        cells = set(part)
+        nxt: dict[tuple[int, int], tuple[int, int]] = {}
+        for i, j in part:
+            for (di, dj), a, b in (
+                ((0, -1), (i, j), (i + 1, j)), ((1, 0), (i + 1, j), (i + 1, j + 1)),
+                ((0, 1), (i + 1, j + 1), (i, j + 1)), ((-1, 0), (i, j + 1), (i, j)),
+            ):
+                if (i + di, j + dj) not in cells:
+                    if a in nxt:
+                        raise ValueError("plane keep-out clipping creates contours touching at a point")
+                    nxt[a] = b
+        loops = []
+        while nxt:
+            start = min(nxt, key=lambda v: (v[1], v[0]))
+            loop, v = [], start
+            while True:
+                loop.append((xs[v[0]], ys[v[1]]))
+                v = nxt.pop(v)
+                if v == start:
+                    break
+            loops.append([p for k, p in enumerate(loop) if abs(_orient(loop[k - 1], p, loop[(k + 1) % len(loop)])) > _AREA_TOL])
+        outer = next(poly for poly in loops if polygon_area(poly) > 0)
+        out.append((outer, [poly for poly in loops if polygon_area(poly) < 0]))
     return out

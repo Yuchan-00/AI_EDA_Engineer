@@ -55,7 +55,7 @@ the colours are app.css classes built from the same palette,
 :data:`NETCLASS_CSS`) with a legend of the classes, their net counts and the
 promoted nets from the project JSON (``previews.board_classes``, read from
 ``ir.si``). The 검증 tab's 검사 묶음 filter shows the signal-integrity rows
-(``si.*`` / ``spice.si.*``) alone - the same rows, copied.
+(``si.*`` / ``spice.si.*`` / ``spice.xtalk.*``) alone - the same rows, copied.
 """
 
 from __future__ import annotations
@@ -103,10 +103,13 @@ APP_HTML = r"""<!doctype html>
 <option value="12 V 입력을 5 V로 나누는 무부하 저항 분배기" data-template="divider" data-inputs="input_voltage=12 V|output_voltage=5 V">저항 분배기 (divider)</option>
 <option value="5 V 전원, 순방향 전압 2 V·순방향 전류 10 mA인 LED 표시등" data-template="led" data-inputs="input_voltage=5 V|led_forward_voltage=2 V|led_forward_current=10 mA">LED 표시등 (led)</option>
 <option value="차단 주파수 1 kHz인 1차 RC 저역통과 필터" data-template="rc_lowpass" data-inputs="cutoff_frequency=1 kHz">RC 저역통과 (rc_lowpass)</option>
+<option value="50 Ω 시스템에서 차단 주파수 100 kHz인 2차 LC 저역통과 필터" data-template="lc_lowpass" data-inputs="cutoff_frequency=100 kHz|system_impedance=50 ohm">LC 저역통과 (lc_lowpass)</option>
+<option value="5 V 제어 신호로 12 V 릴레이 코일(50 mA)을 켜는 NPN 로우사이드 스위치, ON 전압 강하 0.3 V 이하" data-template="bjt_lowside_switch" data-inputs="input_voltage=5 V|output_voltage=12 V|output_current=50 mA|max_voltage_drop=0.3 V">BJT 로우사이드 스위치 (bjt_lowside_switch)</option>
+<option value="3.3 V, 400 kHz I2C 버스(버스 용량 150 pF, 상승 시간 300 ns 이하)의 풀업 저항" data-template="i2c_pullup" data-inputs="input_voltage=3.3 V|clock_frequency=400 kHz|bus_capacitance=150 pF|bus_rise_time=300 ns">I2C 풀업 (i2c_pullup)</option>
 <option value="5 V 입력, 1 kHz 구형파 발진기" data-template="astable" data-inputs="input_voltage=5 V|oscillation_frequency=1 kHz">구형파 발진기 (astable)</option>
 <option value="ATmega128 개발 보드: DC 잭 9 V 입력, L7805 5 V 레귤레이터, 16 MHz 크리스탈, 모든 포트 1x8 헤더, ISP 2x3, UART0 1x4" data-template="atmega128_devboard" data-inputs="input_voltage=9 V|clock_frequency=16 MHz">ATmega128 개발 보드 (atmega128_devboard)</option>
 </select>
-<p id="new-example-hint" class="hint">고르면 다섯 가지 결정론적 회로 템플릿 중 하나의 요청문을 아래 요청문 칸에 채웁니다. LLM 없이 실행하면 요청문은 읽지 않습니다: 첫 실행의 질문(적용 분야, 시장)에 답한 뒤, 템플릿 입력을 개요의 '추가 답변'에 <code>키=값</code> 줄로 줍니다.</p>
+<p id="new-example-hint" class="hint">고르면 여덟 가지 결정론적 회로 템플릿 중 하나의 요청문을 아래 요청문 칸에 채웁니다. LLM 없이 실행하면 요청문은 읽지 않습니다: 첫 실행의 질문(적용 분야, 시장)에 답한 뒤, 템플릿 입력을 개요의 '추가 답변'에 <code>키=값</code> 줄로 줍니다.</p>
 <p id="new-example-inputs" class="hint" hidden></p>
 </div>
 <div class="field">
@@ -372,7 +375,7 @@ APP_HTML = r"""<!doctype html>
 <label for="val-group">검사 묶음</label>
 <select id="val-group">
 <option value="all">모든 검사</option>
-<option value="si">신호 무결성 (si.* / spice.si.*)</option>
+<option value="si">신호 무결성 (si.* / spice.si.* / spice.xtalk.*)</option>
 <option value="rf">RF (rf.* / spice.rf.* / block.interface.* / power.*)</option>
 </select>
 <span id="val-count" class="muted" role="status"></span>
@@ -2140,7 +2143,7 @@ function drawValidation() {
   const known = ['PASS', 'FAIL', 'NOT_VERIFIED'];
   const rfPrefixes = ['rf.', 'spice.rf.', 'block.interface.', 'power.rail_budget.', 'power.headroom.'];
   const rfIds = ['domain.rf.impedance', 'si.rf_length'];
-  const inGroup = (r) => (group === 'si' ? r.check_id.startsWith('si.') || r.check_id.startsWith('spice.si.')
+  const inGroup = (r) => (group === 'si' ? r.check_id.startsWith('si.') || r.check_id.startsWith('spice.si.') || r.check_id.startsWith('spice.xtalk.')
     : group === 'rf' ? rfPrefixes.some((p) => r.check_id.startsWith(p)) || rfIds.includes(r.check_id) : true);
   const rows = v.latest.filter((r) => inGroup(r) && (filter === 'all' || (filter === 'other' ? !known.includes(r.status) : r.status === filter)));
   $('val-count').textContent = rows.length + '개 표시 / 전체 ' + v.latest.length + '개';
@@ -2347,7 +2350,11 @@ document.addEventListener('DOMContentLoaded', () => {
 """
 
 def _netclass_css() -> str:
-    """The 넷 클래스 색 view's rules: one per :func:`~ai_eda.report.figures.net_class_styles` token, the figure's own palette (B.Cu lighter)."""
+    """The 넷 클래스 색 view's rules: one per :func:`~ai_eda.report.figures.net_class_styles` token, the figure's own palette (B.Cu lighter).
+
+    The board figure draws a straight track as ``<line class="track">`` and an arc track as ``<path class="track">``: every track rule
+    is written for both elements (the arc rules after all the others), so a net keeps one colour round its corners.
+    """
     colours = {f"nc-{i}": c for i, c in enumerate(CLASS_COLOURS)} | {"nc-default": NET_CLASS_DEFAULT, "nc-other": NET_CLASS_OTHER}
     lines = ["/* 넷 클래스 색: the board SVG's tracks carry data-nc; the colours are the report figure's (ai_eda.report.figures.net_class_styles) */"]
     for token, colour in colours.items():
@@ -2365,6 +2372,9 @@ def _netclass_css() -> str:
         ".nc-list { list-style: none; padding: 0; margin: 4px 0; display: flex; flex-wrap: wrap; gap: 4px 16px; }",
         ".nc-swatch { display: inline-block; width: 18px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }",
     ]
+    # an arc track is a <path class="track"> in the board SVG: the rules of a straight track's <line>, for it
+    lines += ["/* 넷 클래스 색: an arc track is a path element; the same colours as a straight track's line */",
+              *(rule.replace("line.track", "path.track") for rule in lines if "line.track" in rule)]
     return "\n".join(lines) + "\n"
 
 

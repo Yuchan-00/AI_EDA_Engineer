@@ -121,6 +121,7 @@ from ai_eda.ir import (
     Topology,
     Traced,
 )
+from ai_eda.tools.calc.e_series import standard_value
 from ai_eda.tools.calc.basic import (
     crystal_load_capacitance,
     lc_cutoff,
@@ -167,6 +168,7 @@ from ai_eda.design.templates import (
     _known,
     _lin_grid,
     _log_grid,
+    RESISTOR_SERIES,
     _missing_inputs,
     _mul,
     _net_line,
@@ -174,9 +176,11 @@ from ai_eda.design.templates import (
     _refused,
     _resistor_criteria,
     _resistor_substitutes,
+    _solved,
     _spelled,
     _sub,
     _value_text,
+    standard_of,
 )
 
 if TYPE_CHECKING:
@@ -230,6 +234,10 @@ class Atmega128DevboardTemplate(Template):
     triggers = ("clock_frequency",)
     needs = ("clock_frequency", "input_voltage")
     serves = ("clock_frequency", "input_voltage")
+
+    def triggered_by(self, ir: CircuitIR, inputs: dict[str, DesignInput]) -> bool:
+        # a clock stated with a bus capacitance and a rise time is an I2C pull-up request (ai_eda.design.catalog.i2c_pullup), not a board
+        return self.triggered(inputs) and "bus_capacitance" not in inputs and "bus_rise_time" not in inputs
 
     V_IN_MIN, V_IN_MAX = 7.0, 15.0
     F_MIN, F_MAX = 1e6, 16e6
@@ -357,7 +365,14 @@ class Atmega128DevboardTemplate(Template):
         params.update({c.key: traced for c, traced in numbered})
         try:
             params["p_reg"] = regulator_dissipation(params["v_in"], params["v_out_reg"], params["i_load_budget"], ("v_in", "v_out_reg", "i_load_budget"))
-            params["r_led"] = led_series_resistor(params["v_out_reg"], params["v_f_led"], params["i_led"], ("v_out_reg", "v_f_led", "i_led"))
+            # the solved LED resistor is not a part: R1 is the first E series value whose current is within the tolerance of the chosen one
+            params["r_led_ideal"] = led_series_resistor(params["v_out_reg"], params["v_f_led"], params["i_led"], ("v_out_reg", "v_f_led", "i_led"))
+            i_target = params["i_led"].value
+
+            def led_fits(r: Traced) -> bool:
+                return abs(led_current(params["v_out_reg"], params["v_f_led"], r).value - i_target) <= self.TOL_REL * abs(i_target)
+
+            params["r_led"] = standard_value(params["r_led_ideal"], "r_led_ideal", RESISTOR_SERIES, accept=led_fits)
             params["i_led_design"] = led_current(params["v_out_reg"], params["v_f_led"], params["r_led"], ("v_out_reg", "v_f_led", "r_led"))
             params["tau_reset"] = rc_time_constant(params["r_reset"], params["c_reset"], ("r_reset", "c_reset"))
             params["v_reset_tau"] = rc_step_response(params["v_out_reg"], params["tau_reset"], params["tau_reset"], ("v_out_reg", "tau_reset", "tau_reset"))
@@ -367,7 +382,7 @@ class Atmega128DevboardTemplate(Template):
             params["f_avcc"] = lc_cutoff(params["l_avcc"], params["c_dec"], ("l_avcc", "c_dec"))
         except (ValueError, ZeroDivisionError) as e:
             return _refused(plan, f"{e} ({req_v} = {v:.12g} V, {req_f} = {f:.12g} Hz)")
-        plan.computed = [(k, params[k]) for k in ("p_reg", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop", "c_load", "f_avcc")]
+        plan.computed = [(k, params[k]) for k in ("p_reg", "r_led_ideal", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop", "c_load", "f_avcc")]
 
         try:
             parts = self._parts(library, params, f, req_v, req_f)
@@ -672,7 +687,7 @@ class Atmega128DevboardTemplate(Template):
 
     _KEYS: tuple[str, ...] = (
         "v_in", "f_clk", "v_out_reg", "i_load_budget", "p_reg_max", "c_in", "c_out", "c_dec", "l_avcc", "c_xtal", "c_stray", "r_reset", "c_reset", "c8_ic",
-        "r_pen", "v_f_led", "i_led", "tol_rel", "v_avcc_tol_abs", "p_reg", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop",
+        "r_pen", "v_f_led", "i_led", "tol_rel", "v_avcc_tol_abs", "p_reg", "r_led_ideal", "r_led", "i_led_design", "tau_reset", "v_reset_tau", "tran_step", "tran_stop",
         "c_load", "f_avcc",
     )
 
@@ -1054,8 +1069,12 @@ class Atmega128DevboardTemplate(Template):
             ),
             "R1": PartNote(
                 role="R1: 전원 LED 직렬 저항",
-                why=f"R = (V_out − V_f)/I = {quantity(n['r_led'], 'ohm')} (`calc.led.R`, 계산값 그대로). 0805 SMD.",
-                criteria=_resistor_criteria(n["r_led"], _mul(drop_led, n["i_led_design"]), tol_text, chosen=_is_choice(ir, "r_led"), spelled=_spelled(ir, "R1")),
+                why=(
+                    f"R = (V_out − V_f)/I = {quantity(n['r_led'], 'ohm')} (`calc.led.R`, 계산값 그대로). 0805 SMD."
+                    if standard_of(ir, "r_led") is None else
+                    f"R = (V_out − V_f)/I = {quantity(_solved(ir, 'r_led'), 'ohm')} (`calc.led.R`) 를 풀고 실제로 파는 값 {quantity(n['r_led'], 'ohm')} 으로 놓음. 0805 SMD."
+                ),
+                criteria=_resistor_criteria(n["r_led"], _mul(drop_led, n["i_led_design"]), tol_text, chosen=_is_choice(ir, "r_led"), spelled=_spelled(ir, "R1"), standard=standard_of(ir, "r_led")),
                 substitutes=_resistor_substitutes(n["r_led"], "Resistor_SMD"),
             ),
             "R2": PartNote(

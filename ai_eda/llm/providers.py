@@ -16,9 +16,12 @@ Invariants enforced here:
   same ``via`` / prefixed ``model``. A bare (single-provider) client keeps
   returning native ids; only this client adds the prefix.
 * **Billing is the members' billing.** ``paid`` is true when any member is
-  paid; ``billing`` is ``"per_call"`` / ``"subscription"`` when every member
-  agrees and ``"mixed"`` otherwise (the service then requires a budget for
-  the per-call side and records the subscription use).
+  paid; ``billing`` is ``"per_call"`` / ``"subscription"`` / ``"local"`` when
+  every member agrees and ``"mixed"`` otherwise (the service then requires a
+  budget for the per-call side and records the subscription / local use).
+  ``codex`` is a subscription like ``claude``; ``openai_compat`` is
+  ``"local"`` on a loopback base URL and ``"per_call"`` elsewhere
+  (:func:`compat_billing`).
 * :func:`describe_providers` is the pure view the GUI's run panel uses to
   offer exactly the providers that would work (OpenRouter: key set; Claude
   Code CLI: found and logged in). It never calls a model.
@@ -38,19 +41,53 @@ from pydantic import BaseModel
 from ai_eda.errors import ToolUnavailableError
 from ai_eda.llm.client import LLMClient, LLMError, LLMMessage, LLMResponse, ToolSpec, Usage
 from ai_eda.llm.router import check_provider_name, split_model_spec
+from ai_eda.llm.usage import LOCAL
 
 #: mirrors ``ai_eda.llm.openrouter.ENV_KEY`` without importing that module (it pulls in httpx)
 OPENROUTER_ENV_KEY = "OPENROUTER_API_KEY"
 #: the two routes a run panel can offer; ``script`` is the test double and takes a file, not a switch
 REAL_PROVIDERS: tuple[str, ...] = ("openrouter", "claude")
-#: how each provider bills (a scripted member is "per_call" by the client contract's default; it is also ``paid=False``)
-PROVIDER_BILLING: Mapping[str, str] = {"openrouter": "per_call", "claude": "subscription", "script": "per_call"}
+#: how each provider bills (a scripted member is "per_call" by the client contract's default; it is also ``paid=False``).
+#: ``openai_compat`` is "per_call" here, its conservative default: the client decides by its base URL (:func:`compat_billing`)
+PROVIDER_BILLING: Mapping[str, str] = {
+    "openrouter": "per_call", "claude": "subscription", "script": "per_call", "codex": "subscription", "openai_compat": "per_call",
+}
+#: the billing of an OpenAI-compatible server on this machine (a loopback base URL): no per-call charge, no budget required
+LOCAL_BILLING = LOCAL
+#: the environment variable naming the OpenAI-compatible base URL when ``--llm-openai-base-url`` is not given
+OPENAI_COMPAT_ENV_BASE_URL = "AI_EDA_OPENAI_BASE_URL"
 #: class names of the bare clients, for :func:`provider_names_of` without importing httpx or the CLI module
 _CLIENT_CLASS_PROVIDERS: Mapping[str, str] = {
     "OpenRouterClient": "openrouter",
     "ClaudeCodeClient": "claude",
     "ScriptedLLMClient": "script",
+    "CodexCliClient": "codex",
+    "OpenAICompatClient": "openai_compat",
 }
+
+
+def is_loopback_host(host: str | None) -> bool:
+    """Whether ``host`` is this machine: ``localhost`` or a loopback address (``127.0.0.0/8``, ``::1``)."""
+    import ipaddress
+
+    name = (host or "").strip().strip("[]").lower()
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def compat_billing(base_url: str | None) -> str:
+    """How an ``openai_compat`` base URL bills: :data:`LOCAL_BILLING` on a loopback host, else ``"per_call"`` (also when unknown)."""
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit((base_url or "").strip()).hostname
+    except ValueError:
+        return "per_call"
+    return LOCAL_BILLING if is_loopback_host(host) else "per_call"
 
 ClientFactory = Callable[..., LLMClient]
 
@@ -206,6 +243,14 @@ def client_factory(provider: str) -> ClientFactory:
         from ai_eda.llm.fake import ScriptedLLMClient
 
         return ScriptedLLMClient
+    if name == "codex":
+        from ai_eda.llm.codex_cli import CodexCliClient
+
+        return CodexCliClient
+    if name == "openai_compat":
+        from ai_eda.llm.openai_compat import OpenAICompatClient
+
+        return OpenAICompatClient
     raise ValueError(f"no client for provider {provider!r}")  # unreachable: check_provider_name refused it
 
 
@@ -314,6 +359,15 @@ def subscription_detail(provider: str, client: LLMClient) -> str:
     return f"{provider} subscription via {cli_path_of(client) or provider} (no per-call cost; usage shown)"
 
 
+def local_detail(provider: str, client: LLMClient) -> str:
+    """The approval detail of a local member (a server on this machine): free, said explicitly, with the base URL it calls."""
+    where = getattr(client, "base_url", None) or provider
+    return (
+        f"{provider} local server {where}: free - no per-call charge on this route and no budget required "
+        "(a local server that forwards to a paid upstream is not seen here); usage shown"
+    )
+
+
 # ---------------------------------------------------------------- GUI hook
 
 
@@ -407,6 +461,8 @@ def describe_providers(
 
 
 __all__ = [
+    "LOCAL_BILLING",
+    "OPENAI_COMPAT_ENV_BASE_URL",
     "OPENROUTER_ENV_KEY",
     "PROVIDER_BILLING",
     "REAL_PROVIDERS",
@@ -417,7 +473,10 @@ __all__ = [
     "check_providers",
     "cli_path_of",
     "client_factory",
+    "compat_billing",
     "describe_providers",
+    "is_loopback_host",
+    "local_detail",
     "members_of",
     "provider_names_of",
     "subscription_detail",

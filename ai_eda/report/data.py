@@ -14,7 +14,9 @@ would read "recorded for the current IR"). The RELEASE
 verdict and its reasons come only from the recorded RELEASE outcome, and
 they carry the same run-freshness label as the stage table, so a recorded
 PASS is never shown as if it described a design that changed since; the
-aggregate of the latest results is labelled as not a verdict. Everything is
+aggregate of the latest results is labelled as not a verdict. ERC / DRC rows
+also carry the recorded KiCad scope (missing metadata is unavailable, never
+evidence that no checks were ignored). Everything is
 rendered from ``model_dump(mode="json")`` so timestamps read exactly as the
 files store them, and every field is a str / int / bool / list of those, so
 the renderer can never print an object repr.
@@ -31,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 from pathlib import Path
 
@@ -40,6 +43,7 @@ from ai_eda import __version__
 from ai_eda.ir.project import ArtifactRef, CircuitIR
 from ai_eda.ir.requirements import MissingInformation
 from ai_eda.ir.validation import Evidence, ValidationResult, ValidationStatus
+from ai_eda.report.actions import ActionGroup, group_actions
 from ai_eda.report.pipeline_log import (
     PIPELINE_FILE,
     PipelineRecord,
@@ -216,6 +220,7 @@ class ValidationRow(BaseModel):
     #: MODEL_OUTPUT for a result whose tool is a model id (requirements.extraction), else ""
     note: str
     timestamp: str
+    kicad_scope: str = ""
 
 
 class HistoryEntry(BaseModel):
@@ -323,6 +328,7 @@ class ReportData(BaseModel):
     release: ReleaseSection
     #: the stage reports found on disk (:mod:`ai_eda.report.stages`), in stage order; empty when none was written
     stage_reports: list[StageReportRow] = Field(default_factory=list)
+    remaining_work: list[ActionGroup] = Field(default_factory=list)
 
 
 # --- helpers -----------------------------------------------------------------
@@ -378,6 +384,31 @@ def artifact_disk_state(art: ArtifactRef, confine: Path | None = None) -> str:
     return ON_DISK if on_disk == art.content_hash else CHANGED_ON_DISK
 
 
+#: characters a Windows path may hold that PowerShell (``$``, backtick, ``"``) or cmd.exe (``%``) would interpret inside ``"..."``
+_WINDOWS_UNSAFE_IN_DOUBLE_QUOTES = set('$`%"&|<>^')
+
+
+def shell_path(path: Path | str) -> str:
+    """``path`` as the user's shell takes it, for a command a human copies from the report.
+
+    Bare when it is only word, dot, slash, colon and dash characters (plus backslash on Windows, where it is the
+    separator; on POSIX a backslash is an escape, so such a path is quoted) - every workdir the tool itself creates.
+    Otherwise: on POSIX ``shlex.quote``; on Windows ``"..."`` when the path only needs spaces protected (cmd.exe and
+    PowerShell both take that), and PowerShell's ``'...'`` (``'`` doubled) when it holds ``$``, a backtick, ``%``,
+    ``"`` or a shell operator - those expand inside double quotes in one shell or the other. cmd.exe does not take
+    single quotes: a path like that is a PowerShell command, and the report cannot write one line both shells read.
+    """
+    text = str(path)
+    bare = r"[\w./:\\-]+" if os.name == "nt" else r"[\w./:-]+"
+    if re.fullmatch(bare, text):
+        return text
+    if os.name != "nt":
+        return shlex.quote(text)
+    if _WINDOWS_UNSAFE_IN_DOUBLE_QUOTES.isdisjoint(text):
+        return '"' + text + '"'
+    return "'" + text.replace("'", "''") + "'"
+
+
 def answer_command(ir_path: Path, q: MissingInformation) -> str:
     """The ``ai-eda run ... --answer key=value`` line that answers ``q``; the value is a placeholder the human fills in.
 
@@ -387,12 +418,12 @@ def answer_command(ir_path: Path, q: MissingInformation) -> str:
     refused key - that is the dead end the refusal is about.
     """
     if q.answer_key:
-        return f"ai-eda run {shlex.quote(str(ir_path))} --answer {q.answer_key}={q.key}"
+        return f"ai-eda run {shell_path(ir_path)} --answer {q.answer_key}={q.key}"
     if q.source == "llm" or not q.options:
         value = "<value>"
     else:
         value = "<" + "|".join(q.options) + ">"
-    return f"ai-eda run {shlex.quote(str(ir_path))} --answer {q.key}={value}"
+    return f"ai-eda run {shell_path(ir_path)} --answer {q.key}={value}"
 
 
 class _Freshness:
@@ -410,6 +441,26 @@ class _Freshness:
         if r.ir_hash == self.design_hash:
             return FRESH
         return f"{STALE} (IR {r.ir_hash[:16]})"
+
+
+def kicad_scope_text(r: ValidationResult) -> str:
+    """The recorded ERC / DRC scope as plain text; missing metadata never means no ignored checks."""
+    if r.check_id not in ("kicad.erc", "kicad.drc"):
+        return ""
+    ignored = r.details.get("ignored_checks")
+    included = r.details.get("included_severities")
+    version = f"tool version: {r.tool_version or 'unavailable'}"
+    if not isinstance(ignored, list) or not isinstance(included, list) or not r.tool_version:
+        return f"Recorded scope: scope unavailable; {version}"
+    checks = []
+    for check in ignored:
+        if isinstance(check, dict):
+            name = str(check.get("key") or "(check key unavailable)")
+            checks.append(name + (f" — {check['description']}" if check.get("description") else ""))
+        else:
+            checks.append(str(check))
+    ignored_text = f"ignored checks ({len(checks)}): " + "; ".join(checks) if checks else "no checks ignored (recorded)"
+    return f"Recorded scope: included severities: {', '.join(str(s) for s in included) or '(none recorded)'}; {ignored_text}; {version}"
 
 
 def _validation_row(r: ValidationResult, index: int, fresh: _Freshness, kinds_by_hash: dict[str, str], confine: Path | None = None) -> ValidationRow:
@@ -433,6 +484,7 @@ def _validation_row(r: ValidationResult, index: int, fresh: _Freshness, kinds_by
         details_json=_json(d["details"]) if r.details else "",
         note=MODEL_OUTPUT if r.check_id == "requirements.extraction" else "",
         timestamp=d["timestamp"],
+        kicad_scope=kicad_scope_text(r),
     )
 
 
@@ -719,6 +771,7 @@ def build_report_data(ir: CircuitIR, ir_path: Path, workdir: Path, *, ir_sha: st
         requirements=_requirements(ir),
         questions=_questions(ir, record, ir_path),
         validation=validation,
+        remaining_work=group_actions(ir.validation.latest_by_check().values()),
         artifacts=_artifacts(ir, design_hash, confine_dir),
         review=_review(ir, fresh),
         repair=_repair(ir, fresh),

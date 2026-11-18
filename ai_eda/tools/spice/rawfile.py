@@ -78,6 +78,10 @@ class RawPlot(BaseModel):
     variables: list[tuple[str, str]]
     #: rawfile variable name -> samples; complex plots use the module's complex convention
     vectors: dict[str, list[float]] = Field(default_factory=dict)
+    #: every column of a variable name the file lists more than once, in file order, as read (``(re, im)`` pairs in a
+    #: complex plot): ngspice-46 writes a coupled line's four branch currents all as ``i(<name>)`` (measured 2026-11-13),
+    #: and ``vectors`` keeps only the last of them. Empty when every name is unique
+    repeated: dict[str, list[list]] = Field(default_factory=dict)
     #: name of the sweep variable (first variable) or None for an operating point
     scale: str | None
     n_points: int
@@ -232,6 +236,8 @@ def _parse_one(data: bytes, pos: int, path: Path) -> tuple[RawPlot, int]:
             vectors.update(complex_convention(name, col))
         else:
             vectors[name] = col
+    names = [name for name, _typ in variables]
+    repeated = {name: [col for (other, _typ), col in zip(variables, columns) if other == name] for name in dict.fromkeys(names) if names.count(name) > 1}
     plotname = header.get("Plotname", "")
     scale = None if (not variables or plotname == PLOTNAMES["op"]) else variables[0][0]
     plot = RawPlot(
@@ -242,6 +248,7 @@ def _parse_one(data: bytes, pos: int, path: Path) -> tuple[RawPlot, int]:
         flags=flags,
         variables=variables,
         vectors=vectors,
+        repeated=repeated,
         scale=scale,
         n_points=n_points,
         binary=binary,

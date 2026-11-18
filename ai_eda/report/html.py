@@ -265,6 +265,8 @@ def _result_rows(latest: list[ValidationRow]) -> str:
                        tag("div", r.note, class_="warn"))
         artifact = f"{r.artifact_kind} {r.artifact_hash}".strip()
         extra = [tag("span", r.message)]
+        if r.kicad_scope:
+            extra.append(tag("div", r.kicad_scope, class_="kicad-scope"))
         ev = _evidence_markup(r)
         if ev:
             extra.append(ev)
@@ -297,6 +299,17 @@ def _artifacts(data: ReportData) -> str:
         for a in data.artifacts
     ]
     return block("section", tag("h2", "Artifacts"), rows(["kind", "path", "files", "generator", "content hash", "from IR", "IR", "disk", "notes", "created"], body))
+
+
+def _remaining_work(data: ReportData) -> str:
+    parts = [tag("h2", "Remaining work"),
+             tag("p", "Action groups are reporting suggestions, not verdicts. Latest non-PASS results only; statuses and messages are copied unchanged, including NOT_APPLICABLE.", class_="note")]
+    if not data.remaining_work:
+        parts.append(tag("p", "No latest non-PASS results recorded.", class_="note"))
+    for group in data.remaining_work:
+        parts += [tag("h3", group.title), kv([("id", group.id), ("role", group.role), ("next action", group.next_action)]),
+                  rows(["check", "status", "message"], [[c.check_id, Markup(status_cell(c.status)), c.message] for c in group.checks])]
+    return block("section", *parts)
 
 
 def _stage_reports(data: ReportData) -> str:
@@ -365,6 +378,7 @@ def render_html(data: ReportData) -> str:
         _questions(data),
         _requirements(data),
         _validation(data),
+        _remaining_work(data),
         _artifacts(data),
         _stage_reports(data),
         _review(data),

@@ -57,6 +57,13 @@ Invariants this agent keeps:
   non-zero one is named as unservable. It also names confirmed design
   requirements that nothing serves, so the reviewer's ``requirements not
   traced`` FAIL is explained.
+* ``--design FILE.json`` (``ctx.tools["design_file"]``, a
+  :class:`~ai_eda.design.design_file.DesignFilePlan`) takes the place of the
+  template selection and goes through the same gate; on a design that is not
+  empty it proposes nothing and says ``ignored: --design needs an empty IR``.
+  A file's ``board`` section is proposed as a template's board layout is: into
+  a new board, or appended to the board the IR already has, never replacing
+  anything there (:meth:`~ai_eda.design.design_file.DesignFilePlan.for_board`).
 * Refusals are notes and non-required questions under the *real*
   requirement key, never a system-authored key, and a closed-world refusal
   names the exact answer that leaves the requirement out
@@ -101,6 +108,7 @@ from ai_eda.design import (
     read_inputs,
     template_keys_text,
 )
+from ai_eda.design.design_file import NEEDS_EMPTY_IR, DesignFilePlan
 from ai_eda.design.base import (
     AMBIGUOUS_KEYS,
     alias_duplicates,
@@ -128,9 +136,17 @@ class CircuitDesignAgent(Agent):
 
     def run(self, ir: CircuitIR, ctx: AgentContext) -> AgentResult:
         answer = ctx.answers.get(CONFIRM_DESIGN_KEY)
+        file_plan = ctx.tools.get("design_file")
         if ir.components or ir.nets or ir.topology is not None or ir.simulation is not None:
-            return self._design_present(ir, answer)
+            present = self._design_present(ir, answer)
+            if file_plan is not None:
+                present.notes.append(NEEDS_EMPTY_IR)
+            return present
         library = ctx.tools.get("kicad_library")
+        if file_plan is not None:
+            if isinstance(file_plan, DesignFilePlan):  # the file's board section onto a board the IR already has (itself on every other IR)
+                file_plan = file_plan.for_board(ir.pcb)
+            return self._present_or_apply(ir, ctx, file_plan, answer, answer is not None and is_confirmation(answer), [])
         if not isinstance(library, KicadLibrary):
             return self._result(notes=["no KiCad library in ctx.tools['kicad_library']: a template cannot resolve its symbols and footprints, nothing proposed"])
         inputs, unusable = read_inputs(ir)
@@ -143,6 +159,10 @@ class CircuitDesignAgent(Agent):
             if answer is not None:
                 notes.append(f"{CONFIRM_DESIGN_KEY} ignored: no template to confirm")
             return self._result(questions=questions, notes=notes)
+        return self._present_or_apply(ir, ctx, plan, answer, confirmed, notes)
+
+    def _present_or_apply(self, ir: CircuitIR, ctx: AgentContext, plan: Plan, answer: str | None, confirmed: bool, notes: list[str]) -> AgentResult:
+        """The confirmation gate every plan goes through, a template's or a design file's."""
         notes.extend(plan.notes)
         if not plan.buildable:
             if answer is not None:

@@ -114,7 +114,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import math
 from pathlib import Path
@@ -350,8 +350,10 @@ def test_6_fail_in_the_same_stage_does_not_hide_a_required_question(divider_ir: 
 
 
 def test_7_remove_matches_by_design_content(divider_ir: CircuitIR):
-    net_p = Provenance(kind=ProvenanceKind.DERIVED, tool="test")
-    rebuilt = Net(name="GND", kind=NetKind.GROUND, pins=[PinRef(component_ref="R2", pin_number="2")], provenance=net_p)  # a later created_at
+    # a later created_at, stated: a fixture built in the same clock tick (Windows' datetime.now ticks at ~1-16 ms) would otherwise compare equal
+    later = divider_ir.net("GND").provenance.created_at + timedelta(seconds=1)
+    net_p = Provenance(kind=ProvenanceKind.DERIVED, tool="test", created_at=later)
+    rebuilt = Net(name="GND", kind=NetKind.GROUND, pins=[PinRef(component_ref="R2", pin_number="2")], provenance=net_p)
     assert rebuilt != divider_ir.net("GND")  # model equality sees the wall clock ...
     Orchestrator.apply_proposals(divider_ir, [IRProposal(description="drop GND", target="nets", operation="remove", payload=rebuilt)])
     assert divider_ir.net("GND") is None  # ... the proposal does not
@@ -840,6 +842,21 @@ def test_32_a_bom_cell_refusal_is_a_fail_stage_not_an_exception(divider_ir: Circ
     assert state.outcome(Stage.RELEASE) is not None  # the pipeline ran to the end
 
 
+def test_32b_a_refused_compile_says_that_it_removed_the_previous_artifact(divider_ir: CircuitIR, tmp_path: Path):
+    """B4: the refusal drops the earlier run's artifact (stale evidence); before, only a later stage's "no ... artifact" hinted at it."""
+    Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS, tools=_no_library(tmp_path))).run(divider_ir)
+    assert ArtifactKind.BOM in divider_ir.artifacts
+    divider_ir.components[0].mpn = authoritative("=CMD()", DS)
+    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS, tools=_no_library(tmp_path))).run(divider_ir)
+    note = "; the previous bom artifact (bom.csv) was removed from the IR's artifacts"
+    out = state.outcome(Stage.MANUFACTURING_OUTPUTS)
+    assert out.status is S.FAIL and "bom compile refused" in out.message and note in out.message
+    assert note in divider_ir.validation.latest("compile.bom").message and ArtifactKind.BOM not in divider_ir.artifacts
+    # a refusal with nothing to remove says nothing about a previous artifact
+    state = Orchestrator(AgentContext(workdir=tmp_path, answers=ANSWERS, tools=_no_library(tmp_path))).run(divider_ir)
+    assert "bom compile refused" in state.outcome(Stage.MANUFACTURING_OUTPUTS).message and "previous bom artifact" not in state.outcome(Stage.MANUFACTURING_OUTPUTS).message
+
+
 # --------------------------------------------------------------------------- 33: opinions do not become review PASSes
 
 
@@ -974,6 +991,22 @@ def test_39_an_outcome_with_a_failed_action_is_not_pass():
     assert RepairOutcome(actions=[failed], unresolved=[], final_review=report).as_validation_result("sha256:h", "t").status is S.NOT_VERIFIED
     good = failed.model_copy(update={"succeeded": True, "error": None})
     assert RepairOutcome(actions=[good], unresolved=[], final_review=report).as_validation_result("sha256:h", "t").status is S.PASS
+
+
+def test_39b_a_review_that_only_waits_for_the_user_is_not_reported_as_a_plain_no_failures(divider_ir: CircuitIR, tmp_path: Path):
+    """B10: with USER_INPUT_REQUIRED areas and no FAIL the loop has nothing to repair; "stopped: no failures" alone read as a clean review."""
+    h = divider_ir.content_hash()
+    waiting = ValidationResult(check_id=ReviewArea.REQUIREMENTS_VS_IR, status=S.USER_INPUT_REQUIRED, message="1 required question is open")
+    outcome = RepairLoop(tools={}, strategies=[_Rerun()], reviewer=_Scripted(h, [waiting])).run(divider_ir, tmp_path)
+    assert outcome.actions == [] and outcome.unresolved == [] and outcome.iterations == 0
+    assert outcome.stopped_reason == (
+        f"no failures; 1 review area(s) wait for the user's answer ({ReviewArea.REQUIREMENTS_VS_IR}) - blocked on the user; no repair resolves that")
+    log = outcome.as_validation_result(h, "t")
+    assert log.status is S.NOT_APPLICABLE and "wait for the user's answer" in log.message and log.details["stopped_reason"] == outcome.stopped_reason
+    # a clean review keeps the plain reason, and a FAIL beside the waiting area is reported as the failure it is
+    assert RepairLoop(tools={}, strategies=[_Rerun()], reviewer=_Scripted(h, [])).run(divider_ir, tmp_path).stopped_reason == "no failures"
+    human = ValidationResult(check_id=ReviewArea.ERC, status=S.FAIL, message="kicad.erc: 1 error(s)", details={"repair": "human"})
+    assert RepairLoop(tools={}, strategies=[_Rerun()], reviewer=_Scripted(h, [waiting, human])).run(divider_ir, tmp_path).stopped_reason == "no repairable failures remain"
 
 
 # --------------------------------------------------------------------------- 40: one REF, one URL

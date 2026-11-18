@@ -215,8 +215,9 @@ def class_rule(ir: CircuitIR, cls: NetClass, p: RoutingParams) -> ClassRule:
     if cls.pairs:
         _pair_rule(ir, cls, p, out)
     stackup = ir.pcb.stackup if ir.pcb is not None else None
-    if stackup is not None and (out.max_length_mm is not None or out.match_group is not None):
-        out.via_length_mm = round(stackup.span_mm("F.Cu", "B.Cu"), 6)
+    span = stackup.through_via_span_mm() if stackup is not None else None  # None also on a one-copper-layer stack: no via, nothing to count
+    if span is not None and (out.max_length_mm is not None or out.match_group is not None):
+        out.via_length_mm = round(span, 6)
     return out
 
 
@@ -297,7 +298,8 @@ def net_rules(ir: CircuitIR, params: RoutingParams | None = None) -> SIRules:
         if cls.name in routed_by.values():  # what a class without nets cannot get is no news
             out.notes.extend(f"net class {cls.name}: {m}" for m in cr.missing)
     stackup = ir.pcb.stackup
-    via_length = round(stackup.span_mm("F.Cu", "B.Cu"), 6) if stackup is not None else None
+    span = stackup.through_via_span_mm() if stackup is not None else None
+    via_length = round(span, 6) if span is not None else None
     paired: dict[str, str] = {}
     for cls in si.net_classes:
         cr = out.classes[cls.name]

@@ -85,10 +85,12 @@ from ai_eda.report.stages import (
 )
 from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.model3d import BODY_CAPTION
+from ai_eda.tools.routing.corners import CORNER_ENTRY_PREFIX
 from ai_eda.tools.spice import NgspiceShared
 from ai_eda.workflow import STAGE_ORDER, Orchestrator, PipelineState, Stage
 from tests.fixtures_kicad import divider_with_connector_ir
 from tests.test_circuit_templates import ASTABLE, BASE, DIVIDER, LED, RC, _confirm, _ir, _present, _run, template_library
+from tests.test_report import SAVED_KICAD_IGNORED, SCOPE_CASES, _actions_project, _assert_scope_text, _scope_project, _visible_text
 
 needs_dll = pytest.mark.skipif(not NgspiceShared().available(), reason="ngspice shared library not found")
 
@@ -170,7 +172,7 @@ def test_astable_theory_report_states_the_formulas_with_the_design_numbers(astab
     # the model card comes from the IR's SPICE binding, the tran window from the calculator parameters
     assert "`.model QNPN NPN (TR=200n)`" in text and "step  = 1/(200·f) = 5 µs" in text and "stop  = 20/f      = 20 ms" in text
     # the parameter table: key, value, origin, calculator id or the confirmed-choice label, the formula note
-    assert "| `c` | 64.817 nF | 계산기 출력 | `calc.astable.c_for_frequency` v0.11 ← f_osc, r_b, v_in, v_be | C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE))) |" in text
+    assert "| `c` | 64.817 nF | 계산기 출력 | `calc.astable.c_for_frequency` v0.12 ← f_osc, r_b, v_in, v_be | C = 1 / (2 f R_b ln((2 V_cc - V_BE) / (V_cc - V_BE))) |" in text
     assert f"| `r_b` | 10 kΩ | 사용자 확인 선택값 | template astable v{TEMPLATE_VERSION} |" in text
     assert "| `v_in` | 5 V | 사용자 요구사항 | req.input_voltage |" in text
     # constraints, simulation setup, the judging rule and the frequency measurement rule (Reduce.FREQUENCY is used)
@@ -189,7 +191,8 @@ def test_divider_theory_report(divider, tmp_path: Path):
     assert "= 10 kΩ·(12 V − 5 V)/5 V = 14 kΩ" in text and "R_th = R1‖R2" in text and "5.8333 kΩ" in text
     assert "|측정값 − 5 V| ≤ 1 % × 5 V = 50 mV" in text
     assert "주파수 측정식" not in text  # no Reduce.FREQUENCY expectation in a divider
-    assert "| `r1` | 14 kΩ | 계산기 출력 | `calc.divider.r1_for_v_out` v0.11 ← v_in, v_out_target, r2 | R1 = R2 * (V_in - V_out) / V_out |" in text
+    assert "| `r1_ideal` | 14 kΩ | 계산기 출력 | `calc.divider.r1_for_v_out` v0.12 ← v_in, v_out_target, r2 | R1 = R2 * (V_in - V_out) / V_out |" in text
+    assert "| `r1` | 14 kΩ | 계산기 출력 | `calc.e_series.e96.nearest` v0.12 ← r1_ideal | the E96 value (IEC 60063) nearest to the solved value |" in text
     _assert_clean(text, tmp_path)
 
 
@@ -273,9 +276,9 @@ def test_divider_parts_report(divider, tmp_path: Path):
     for ref in ("R1", "R2", "J1"):
         assert f"## {ref} — " in text and f"### 존재 확인 (`component.existence.{ref}`)" in text
     assert "- 역할: R1: 상단 분압 저항 (VIN–VOUT), 출력 비율을 정함" in text
-    assert f"- 저항값 14 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in text
+    assert "- 저항값 14 kΩ (E96 표준값(IEC 60063): 계산값 14 kΩ 에 가장 가까운 값)" in text
     assert "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 3.5 mW = 7 mW" in text
-    assert "- 전기 특성: resistance = 14 kΩ [계산기 출력 (calc.divider.r1_for_v_out v0.11)]" in text
+    assert "- 전기 특성: resistance = 14 kΩ [계산기 출력 (calc.e_series.e96.nearest v0.12)]" in text
     assert "- req.output_voltage (output_voltage: 5 V)" in text
     _assert_clean(text, tmp_path)
 
@@ -300,7 +303,7 @@ def test_non_template_design_gets_honest_fallbacks(tmp_path: Path):
     assert template_of(ir) is None and template_for(ir) is None
     theory, parts = theory_report(ir, lib), parts_report(ir, lib)
     assert f"- 설계 출처: {NO_TEMPLATE}" in theory and f"{NO_TEMPLATE}: 이 설계는 템플릿이 만들지 않았으므로" in theory
-    assert "| `v_out` | 6 V | 계산기 출력 | `calc.divider.v_out` v0.11 ← v_in, r1, r2 | V_out = V_in * R2 / (R1 + R2) |" in theory
+    assert "| `v_out` | 6 V | 계산기 출력 | `calc.divider.v_out` v0.12 ← v_in, r1, r2 | V_out = V_in * R2 / (R1 + R2) |" in theory
     assert "제약 조건 기록 없음." in theory and "- `dc_vin`: dc (source = VIN, start = 0 V, stop = 12 V, step = 1 V)" in theory
     assert f"{NO_TEMPLATE}: 템플릿의 이론 곡선이 없습니다." in theory and "![fig]" not in theory and NO_WAVEFORM in theory
     assert parts.count(f"{NO_TEMPLATE_INFO}: 역할·선정 이유·대체 기준은 템플릿이 만든 설계에만 있습니다.") == 3
@@ -426,15 +429,38 @@ def test_circuit_report_lists_nets_placements_routing_and_the_reference_values(a
     assert copper_resistance_ohm(longest["length_mm"], 0.4) == pytest.approx(r_cu)
     assert f"- 가장 긴 넷 `{longest['net']}` ({longest['length_mm']:.3f} mm, 폭 0.4 mm) 의 구리 저항:" in text and quantity(r_cu, "ohm", 4) in text
     assert "공급 5 V 는 이 구간에 들고, 라우터 간격 0.25 mm ≥ 0.1 mm 입니다." in text
-    # the IR-geometry verdicts and the stage messages, copied
-    assert "- `pcb.routing.connectivity`: **PASS** (`pcb.routing` v0.1) — " in text and "(IR geometry check, not DRC)" in text
-    assert "- `pcb.routing.clearance`: **NOT_VERIFIED** (`pcb.routing` v0.1) — no clearance limit in ir.pcb.manufacturing" in text
+    # the IR-geometry verdicts and the stage messages, copied - the PCB agent rounds corners by default, so the board holds arc tracks
+    # and the layout checks carry their arc version (0.3)
+    assert any(t.mid is not None for t in ir.pcb.tracks)
+    assert "- `pcb.routing.connectivity`: **PASS** (`pcb.routing` v0.3) — " in text and "(IR geometry check, not DRC)" in text
+    assert "- `pcb.routing.clearance`: **NOT_VERIFIED** (`pcb.routing` v0.3) — no clearance limit in ir.pcb.manufacturing" in text
     assert "- `placement`: **NOT_VERIFIED** — " in text and "routing.maze 0.2:" in text
     assert "- `pcb`: **PASS** — astable.kicad_pcb" in text and "- `drc`: **NOT_VERIFIED** — kicad-cli not available" in text
     assert "PASS" not in text.split("## 배선")[0]  # statuses appear only where results are quoted
     _assert_clean(text, tmp_path)
     before = ir.content_hash()
     assert circuit_report(ir, lib, state) == text and ir.content_hash() == before
+
+
+def test_the_keep_out_section_says_the_arcs_and_chamfers_keep_the_exact_clearance_not_the_grid_margin(astable_release):
+    """The PCB agent rounds corners by default (routing.corners 0.2: tangent arcs, a 45-degree chamfer where no arc fits), and an arc
+    or a chamfer is audited at the clearance c, not at the grid copper's c + g/2: the section says so, with the counts, wherever the
+    copper carries ``corner:`` entries - and not on grid copper."""
+    ir, lib, state = astable_release
+    corners = {(t.net, t.layer, e) for t in ir.pcb.tracks for e in t.provenance.derived_from if e.startswith(CORNER_ENTRY_PREFIX)}
+    arcs = {c for c in corners if c[2].startswith(f"{CORNER_ENTRY_PREFIX}routing.corners 0.2:arc:")}
+    mitred = {c for c in corners if c[2].startswith(f"{CORNER_ENTRY_PREFIX}routing.corners 0.2:miter45:")}
+    assert arcs and not any(c[2].startswith(f"{CORNER_ENTRY_PREFIX}routing.corners 0.1:") for c in corners)  # the synthetic astable's corners are rounded
+    text = circuit_report(ir, lib, state)
+    section = text.split("### 라우터의 keep-out 규칙")[1].split("###")[0]
+    assert f"`routing.corners` 0.2 의 둥근 모서리(원호 트랙)가 {len(arcs)} 곳 (반지름 " in section
+    assert f"원호를 넣지 못해 45도 모따기로 바꾼 모서리가 {len(mitred)} 곳 있습니다" in section and "위 반경은 격자 위의 구리에만 해당합니다" in section
+    assert "다른 넷의 트랙·비아·패드 상자와 구리 사이 간격 c = 0.25 mm" in section and "패드·구멍과는 c + g/2 = 0.375 mm" in section
+    assert "전기적 요구가 아닌 기하 관례" in section and "45도 모따기가" not in section  # never the 0.1 sentence for a 0.2 board
+    grid = ir.model_copy(deep=True)
+    grid.pcb.tracks = [t.model_copy(update={"provenance": t.provenance.model_copy(update={
+        "derived_from": [e for e in t.provenance.derived_from if not e.startswith(CORNER_ENTRY_PREFIX)]})}) for t in grid.pcb.tracks]
+    assert "45도 모따기" not in circuit_report(grid, lib, state) and "둥근 모서리" not in circuit_report(grid, lib, state)
 
 
 def test_a_non_positive_track_width_is_named_not_a_crash(astable_release):
@@ -530,6 +556,41 @@ def test_final_report_without_a_record(astable):
     assert "| `f_osc` |" in text and NO_MEASUREMENT in text
 
 
+def test_final_action_groups_copy_latest_results_and_leave_project_unchanged(tmp_path: Path):
+    from ai_eda.report.actions import group_actions
+    from ai_eda.report.pipeline_log import sha256_of_file
+
+    ir, state, ir_path, board = _actions_project(tmp_path)
+    before = (ir.model_dump_json(), ir.content_hash(), ir.validation.overall(), state.model_dump_json(),
+              ir_path.read_bytes(), (tmp_path / PIPELINE_FILE).read_bytes(), board.read_bytes(), sha256_of_file(board))
+    doc = build_stage_document(Stage.RELEASE, ir, None, state)
+    section = doc.markdown.split("## 남은 일 (행동별)\n", 1)[1].split("## 결론", 1)[0]
+    for group in group_actions(ir.validation.results):
+        assert f"- 그룹: `{group.id}`" in section
+        assert "- 역할: " in section and "- 다음 행동: " in section
+        for check in group.checks:
+            assert section.count(f"| {stages_module._cell(check.check_id)} |") == 1
+            assert f"| {stages_module._cell(check.check_id)} | {check.status} | {stages_module._cell(check.message)} |" in section
+    assert "superseded failure" not in section and "historical missing input" not in section and "| finished |" not in section
+    assert "부품 자료 없음" in section and "구현되지 않은 백엔드" in section and "미분류" in section
+    assert "<script>" not in doc.html and "<input>" not in doc.html
+    assert '&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;' in doc.html
+    assert "- 기록된 상태: **NOT_VERIFIED**" in doc.markdown and "- 기록된 메시지: stored release outcome" in doc.markdown
+    repeated = build_stage_document(Stage.RELEASE, ir, None, state)
+    assert (doc.markdown, doc.html) == (repeated.markdown, repeated.html)
+    _assert_clean(doc.markdown, tmp_path)
+    _assert_clean(doc.html, tmp_path)
+    assert before == (ir.model_dump_json(), ir.content_hash(), ir.validation.overall(), state.model_dump_json(),
+                      ir_path.read_bytes(), (tmp_path / PIPELINE_FILE).read_bytes(), board.read_bytes(), sha256_of_file(board))
+
+
+def test_final_action_groups_without_results(tmp_path: Path):
+    from tests.test_report import _plain_ir
+
+    text = final_report(_plain_ir(tmp_path), None)
+    assert "## 남은 일 (행동별)" in text and "최신 non-PASS 결과가 없습니다." in text
+
+
 @needs_dll
 def test_final_report_compares_theory_with_the_measured_values(tmp_path: Path):
     ir, _lib, state = _release(tmp_path, "osc", ASTABLE, spice=True)
@@ -551,6 +612,72 @@ def test_final_report_compares_theory_with_the_measured_values(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- writers, the CLI and report.html
+
+
+@pytest.mark.parametrize("case", SCOPE_CASES)
+def test_stage_reports_show_kicad_scope_without_changing_verdicts(tmp_path: Path, case: str):
+    ir, state, ir_path = _scope_project(tmp_path, case)
+    before = ir.model_dump_json(), state.model_dump_json(), ir_path.read_bytes()
+    doc = build_stage_document(Stage.RELEASE, ir, None, state)
+    _assert_scope_text(doc.markdown, case)
+    _assert_scope_text(_visible_text(doc.html), case)
+    matrix = _matrix(doc.markdown)
+    for check, r in ir.validation.latest_by_check().items():
+        assert matrix[check] == str(r.status)
+        line = next(line for line in doc.markdown.splitlines() if line.startswith(f"| `{check}` |"))
+        assert r.message in line and "scope" in line
+        if case == "stale":
+            assert "이전 IR 버전" in line
+        if case == "excluded":
+            assert matrix[check] == "FAIL" and "still counted" in line
+    assert "- 기록된 상태: **NOT_VERIFIED**" in doc.markdown
+    assert "- 기록된 메시지: fixture release outcome" in doc.markdown
+    # The circuit report and the final report's stage summary also qualify the recorded DRC outcome.
+    circuit = build_stage_document(Stage.PCB, ir, None, state)
+    for text in (circuit.markdown, _visible_text(circuit.html), doc.markdown, _visible_text(doc.html)):
+        assert "scope unavailable" in text if case.startswith("missing") else "Recorded scope:" in text
+    for text in (doc.markdown, circuit.markdown):
+        drc = next(line for line in text.splitlines() if line.startswith(("| `drc` |", "- `drc`:")))
+        assert "scope" in drc and "검사별 최신 기록" in drc
+        if case == "stale":
+            assert "이전 IR 버전" in drc
+    if case == "escape":
+        for html in (doc.html, circuit.html):
+            assert "<script>" not in html and "<img src=" not in html
+            assert '&lt;script&gt;alert(&quot;key&quot;)&lt;/script&gt;' in html
+            assert '&lt;script&gt;alert(&quot;severity&quot;)&lt;/script&gt;' in html
+            assert '&lt;script&gt;alert(&quot;version&quot;)&lt;/script&gt;' in html
+            assert '&lt;img src=x onerror=&quot;bad&quot;&gt;' in html
+            assert "description" in _visible_text(html) and "| next line" in _visible_text(html)
+    assert doc.html == build_stage_document(Stage.RELEASE, ir, None, state).html
+    assert before == (ir.model_dump_json(), state.model_dump_json(), ir_path.read_bytes())
+
+
+def test_scoped_reports_preserve_serialization_and_compiled_board(astable_release, tmp_path: Path):
+    from ai_eda.compilers.base import CompileContext
+    from ai_eda.compilers.pcb import PCBCompiler
+    from ai_eda.report.pipeline_log import sha256_of_file
+    from ai_eda.tools.kicad.sexpr import dumps
+
+    ir, lib, state = astable_release
+    for check, ignored in SAVED_KICAD_IGNORED.items():
+        ir.validation.add(ValidationResult(
+            check_id=check, status=S.PASS, message="0 error(s), 0 warning(s)", tool="kicad-cli", tool_version="10.0.6",
+            ir_hash=ir.content_hash(), details={"ignored_checks": ignored, "included_severities": ["error", "warning", "exclusion"]},
+        ))
+    ir_path = ir.save(Path(ir.project.workdir) / "ir.json")
+    before = ir.model_dump_json(), ir.content_hash(), state.model_dump_json(), ir_path.read_bytes()
+    board = Path(ir.artifacts[ArtifactKind.PCB].path)
+    board_before = board.read_bytes(), sha256_of_file(board), ir.artifacts[ArtifactKind.PCB].content_hash
+    ctx = CompileContext(workdir=Path(ir.project.workdir), tools={"kicad_library": lib})
+    compiled_before = dumps(PCBCompiler().build(ir, ctx))
+    render_report_file(ir_path)
+    results = write_all_stage_reports(ir, lib, state, tmp_path / "out", pdf=False)
+    final = next(r for r in results if r.stage == Stage.RELEASE)
+    _assert_scope_text(_visible_text(final.html.read_text(encoding="utf-8")), "saved")
+    assert before == (ir.model_dump_json(), ir.content_hash(), state.model_dump_json(), ir_path.read_bytes())
+    assert board_before == (board.read_bytes(), sha256_of_file(board), ir.artifacts[ArtifactKind.PCB].content_hash)
+    assert compiled_before == dumps(PCBCompiler().build(ir, ctx))
 
 
 def test_write_stage_reports_are_views_not_artifacts(astable_release, tmp_path: Path):
@@ -828,7 +955,7 @@ def test_resistor_criteria_label_follows_the_parameter_provenance(astable, divid
     assert "계산값 그대로: E 계열 반올림은 하지 않았음" not in text  # no astable resistor is a calculator output
     ir, lib = divider
     text = parts_report(ir, lib)
-    assert f"- 저항값 14 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in text and "- 저항값 10 kΩ (템플릿 선택값, 사용자 확인)" in text
+    assert "- 저항값 14 kΩ (E96 표준값(IEC 60063): 계산값 14 kΩ 에 가장 가까운 값)" in text and "- 저항값 10 kΩ (템플릿 선택값, 사용자 확인)" in text
     assert "저항값 10 kΩ (계산값 그대로" not in text
 
 
@@ -839,12 +966,13 @@ def test_led_theory_and_parts_reports(tmp_path: Path):
     text = theory_report(ir, lib)
     assert "R = (V_in − V_f)/I_f" in text and "= (5 V − 2 V)/10 mA = 300 Ω   (`calc.led.R`)" in text and "= 3 V/300 Ω = 10 mA   (`calc.led.I`)" in text
     assert "| 저항 소비전력 | P(R) = (V_in − V_f)·I = (V_in − V_f)²/R | 30 mW |" in text and "| LED 소비전력 | P(LED) = V_f·I | 20 mW |" in text
-    assert "V_f 가 0.1 V 커지면 전류는 약 3.33 % 줄어듭니다" in text and "|측정값 − 10 mA| ≤ 1 % × 10 mA = 100 µA" in text
-    assert "| `r_led` | 300 Ω | 계산기 출력 | `calc.led.R` v0.11 ← v_in, v_f, i_f | R = (V_supply - V_f) / I_f |" in text
+    assert "V_f 가 0.1 V 커지면 전류는 약 3.33 % 줄어듭니다" in text and "|측정값 − 10 mA| ≤ 2 % × 10 mA = 200 µA" in text
+    assert "| `r_led_ideal` | 300 Ω | 계산기 출력 | `calc.led.R` v0.12 ← v_in, v_f, i_f | R = (V_supply - V_f) / I_f |" in text
+    assert "    부품값 = 300 Ω   (E24 표준값(IEC 60063): 계산값 300 Ω 에 가장 가까운 값; `calc.e_series.e24.nearest`)" in text
     parts = parts_report(ir, lib)
     notes = template_for(ir).part_notes(ir)
     assert set(notes) == {c.ref for c in ir.components} == {"R1", "D1", "J1"}
-    assert f"- 저항값 300 Ω (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in parts and "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 30 mW = 60 mW" in parts
+    assert "- 저항값 300 Ω (E24 표준값(IEC 60063): 계산값 300 Ω 에 가장 가까운 값)" in parts and "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 30 mW = 60 mW" in parts
     assert "- 데이터시트의 V_f(@ I_f = 10 mA) 가 요구값 2 V 과 같을 것 (다르면 R1 을 다시 계산)" in parts and "- 최대 순방향 전류 I_f(max) ≥ 10 mA 에 여유" in parts
     for note in notes.values():
         assert note.criteria and note.substitutes and all(sub.endswith(UNVERIFIED_SUBSTITUTE) for sub in note.substitutes)
@@ -854,11 +982,14 @@ def test_led_theory_and_parts_reports(tmp_path: Path):
 
 
 def test_rc_lowpass_theory_and_parts_reports(tmp_path: Path):
-    """The rc_lowpass hooks render with the design's numbers (1 kHz, 100 nF -> 1.5915 kΩ, τ = 159.15 µs) and state judge()'s bracket rule."""
+    """The rc_lowpass hooks render with the design's numbers (1 kHz, 100 nF -> solved 1.5915 kΩ, placed 1.6 kΩ (E24), τ = 160 µs) and state judge()'s bracket rule."""
     ir, lib = _build(tmp_path, "rc_lowpass", RC)
     assert template_of(ir) == ("rc_lowpass", TEMPLATE_VERSION)
     text = theory_report(ir, lib)
-    assert "R = 1/(2π·f_c·C) = 1/(2π·1 kHz·100 nF) = 1.5915 kΩ" in text and "τ = R·C = 159.15 µs   (`calc.rc.tau`)" in text and "검산: f_c = 1/(2π·R·C) = 1000 Hz" in text
+    assert "R(계산) = 1/(2π·f_c·C) = 1/(2π·1 kHz·100 nF) = 1.5915 kΩ" in text
+    assert "R(부품) = 1.6 kΩ   (E24 표준값(IEC 60063): 계산값 1.5915 kΩ 에 가장 가까운 값; `calc.e_series.e24.nearest`)" in text
+    assert "τ = R·C = 160 µs   (`calc.rc.tau`)" in text and "검산: f_c = 1/(2π·R·C) = 994.72 Hz" in text
+    assert "그 부품값에서 |H(f_c)| = 0.70523 (`calc.rc.lowpass_magnitude`), 목표 1/√2 = 0.70711 와의 차이가 허용치의 절반 안에 드는 가장 성긴 계열(E24 → E96 순)을 골랐고" in text
     assert "| f_c = 1 kHz | 1/√2 = 0.70711 (−3.01 dB) | −45° |" in text and "| 10·f_c = 10 kHz | 0.0995 (−20.04 dB) | −84.3° |" in text
     assert "스위프는 `dec` 100 점/decade, f_start = f_c/100 = 10 Hz 부터 f_stop = 100·f_c = 100 kHz 까지" in text
     assert "|측정값 − 0.70711| ≤ 2 % × 0.70711 = 0.014142" in text
@@ -868,7 +999,7 @@ def test_rc_lowpass_theory_and_parts_reports(tmp_path: Path):
     parts = parts_report(ir, lib)
     notes = template_for(ir).part_notes(ir)
     assert set(notes) == {c.ref for c in ir.components} == {"R1", "C1", "J1"}
-    assert f"- 저항값 1.5915 kΩ (계산값 그대로: E 계열 반올림은 하지 않았음; {VALUE_SPELLING_NOTE})" in parts and "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 628.32 µW = 1.2566 mW" in parts
+    assert "- 저항값 1.6 kΩ (E24 표준값(IEC 60063): 계산값 1.5915 kΩ 에 가장 가까운 값)" in parts and "- 정격 전력 ≥ 2 × 계산 소비전력 = 2 × 625 µW = 1.25 mW" in parts
     assert "- 정전용량 100 nF, 공차 5 % 이하 (Δf_c/f_c ≈ −ΔC/C: 커패시터 오차가 그대로 차단 주파수 오차가 됨)" in parts
     for note in notes.values():
         assert note.criteria and note.substitutes and all(sub.endswith(UNVERIFIED_SUBSTITUTE) for sub in note.substitutes)

@@ -14,7 +14,9 @@ board around ``U1``: decoupling and crystal capacitors, a reset pull-up and
 button, two 8-pin port headers, a UART-like 1x04 header, a power-in pair with
 a series diode, a power LED and a mounting hole. None of this is a design
 claim; the tests check the placer's promises (and :mod:`tests.test_routing` /
-:mod:`tests.test_pcb_agent` reuse the fixture for the routing rules).
+:mod:`tests.test_pcb_agent` reuse the fixture for the routing rules). One test swaps
+``U1`` for ``QFP64F``, the same 64 pads at 0.5 mm pitch (0.3 x 1.5 mm, rows 5.7 mm
+from the centre), to check the fan-out room of a fine-pitch core (step 5).
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from ai_eda.tools.placement.core_ring import (
     MARGIN_MM,
     OUTLINE_QUANTUM_MM,
     PLACER_ID,
+    PLACER_FANOUT_VERSION,
     PLACER_VERSION,
     SPACING_MM,
     body_axis,
@@ -497,3 +500,34 @@ def test_a_core_alone_gets_its_extent_plus_the_margin_rounded_up(tmp_path: Path,
     solo.nets = []
     ring = core_ring_placement(solo, lib)
     assert ring.bands == {} and ring.walk == {} and ring.outline == BoardOutline(width_mm=22.0, height_mm=22.0)  # 17.4 + 2 * 2.0 = 21.4 -> 22
+
+
+def test_a_fine_pitch_core_keeps_the_routers_fan_out_room_free_of_every_other_part(tmp_path: Path):
+    """Step 5: a core below 0.65 mm pitch keeps every other part's extent the router's fan-out margin (2.2 mm at the fine rules) from its
+    pads' copper box, and every placement says so; the 0.8 mm core of every other test keeps 0.2 (asserted there)."""
+    from ai_eda.tools.routing.maze import RoutingParams, fanout_margin
+
+    root = tmp_path / "kicad"
+    mcu_library(root)
+    rows = [(-5.7, -3.75 + 0.5 * k, 1.5, 0.3) for k in range(16)] + [(-3.75 + 0.5 * k, 5.7, 0.3, 1.5) for k in range(16)]
+    rows += [(5.7, 3.75 - 0.5 * k, 1.5, 0.3) for k in range(16)] + [(3.75 - 0.5 * k, -5.7, 0.3, 1.5) for k in range(16)]
+    (root / "footprints" / f"{LIB}.pretty" / "QFP64F.kicad_mod").write_text(
+        _fp("QFP64F", [_smd(str(n), *rows[n - 1]) for n in range(1, 65)], (-6.7, -6.7, 6.7, 6.7)), encoding="utf-8")
+    fine = KicadLibrary(roots=[root])
+    ir = mcu_ir(tmp_path, fine)
+    ir.components = [c.model_copy(update={"footprint": fine.resolve_footprint(LibraryRef(library=LIB, name="QFP64F"))}) if c.ref == "U1" else c
+                     for c in ir.components]
+    m = fanout_margin(RoutingParams.for_board(ir, fine))
+    assert m == 2.2
+    ring = core_ring_placement(ir, fine)
+    assert ring.fanout is not None and ring.fanout[0] == m and ring.fanout[1].startswith("fanout:U1=0.5;below_mm=0.65;margin_mm=2.2;")
+    core = next(p for p in ring.placements if p.component_ref == "U1")
+    pads = pads_bbox(core, fine.load_footprint(LibraryRef(library=LIB, name="QFP64F")))
+    for p in ring.placements:
+        assert p.provenance.tool_version == PLACER_FANOUT_VERSION == "0.3" and p.provenance.derived_from[-1] == ring.fanout[1]
+        if p.component_ref == "U1":
+            continue
+        box = ring.extents[p.component_ref]
+        gap = max(pads.x1 - box.x2, box.x1 - pads.x2, pads.y1 - box.y2, box.y1 - pads.y2)
+        assert gap >= m - 1e-6, (p.component_ref, gap)
+

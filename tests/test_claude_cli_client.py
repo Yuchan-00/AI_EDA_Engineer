@@ -458,6 +458,7 @@ def test_missing_binary_at_call_time_is_a_transport_error_not_sent(fake: FakeCla
     gone.write_bytes(fake.script.read_bytes())
     gone.chmod(0o755)
     c = ClaudeCodeClient(cli=str(gone))
+    c._subscription_ok = True  # this test is about the missing binary, not the login check (the copied fake reads no config)
     gone.unlink()
     with pytest.raises(LLMError) as ei:
         c.complete(MODEL, _msgs())
@@ -546,6 +547,27 @@ def test_probes_never_call_the_model(fake: FakeClaudeCli, client: ClaudeCodeClie
     assert fake.prompt_calls() == [] and fake.remaining == 0
 
 
+def _assert_gone(pid: int) -> None:
+    """The child is neither running nor a zombie. POSIX: ``os.kill(pid, 0)`` raises; Windows has no signal 0 (WinError 87
+    whatever the state), so the process is opened and asked for an exit code (STILL_ACTIVE = 259 means running)."""
+    if os.name != "nt":
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return  # no such process
+    try:
+        code = wintypes.DWORD()
+        assert k32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259, f"pid {pid} still running"
+    finally:
+        k32.CloseHandle(handle)
+
+
 def _writer_threads() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name == claude_cli.STDIN_WRITER_NAME and t.is_alive()]
 
@@ -581,9 +603,10 @@ def test_the_model_call_writes_bytes_to_stdin_and_the_probes_get_devnull(fake: F
     client.complete(MODEL, _msgs("한글 prompt\nline two"))
     client.version()
     client.login_state()
-    assert [argv[1] for argv, _ in ran] == ["--version", "auth"]  # the model call does not go through run(input=...)
-    assert [argv[1] for argv, _, _ in started] == ["-p", "--version", "auth"]  # run() starts the probes through Popen
-    _, model_call, pipe = started[0]
+    # the first model call confirms the subscription login (no API charges) through one `auth status` probe before it starts
+    assert [argv[1] for argv, _ in ran] == ["auth", "--version", "auth"]  # the model call does not go through run(input=...)
+    assert [argv[1] for argv, _, _ in started] == ["auth", "-p", "--version", "auth"]  # run() starts the probes through Popen
+    _, model_call, pipe = started[1]
     assert model_call["stdin"] is subprocess.PIPE and model_call["stdout"] is subprocess.PIPE and model_call["stderr"] is subprocess.PIPE
     assert not {"text", "encoding", "errors", "universal_newlines", "input"} & set(model_call)
     assert pipe is not None and pipe.closed  # written and closed (the child saw EOF)
@@ -707,8 +730,7 @@ def test_the_timeout_bounds_the_stdin_write_under_cpython312s_windows_communicat
     assert time.monotonic() - t0 < 3.0
     assert ei.value.kind == "transport" and ei.value.sent is True and "timeout after 0.5s" in ei.value.message
     (call,) = fake.prompt_calls()
-    with pytest.raises(ProcessLookupError):
-        os.kill(call["pid"], 0)
+    _assert_gone(call["pid"])
     assert _writer_threads() == [] and not os.path.exists(call["cwd"])
     # and a prompt the child does read still arrives whole under the same ordering
     fake.queue(success("OK"))
@@ -730,6 +752,7 @@ def test_an_interrupt_during_the_call_kills_and_reaps_the_child(fake: FakeClaude
             raise KeyboardInterrupt
         return real(self, input, timeout)
 
+    client._require_subscription(MODEL)  # the login probe runs before the patched communicate and the clock
     monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
     fake.queue(reply(envelope("never"), sleep=5))
     t0 = time.monotonic()
@@ -738,8 +761,7 @@ def test_an_interrupt_during_the_call_kills_and_reaps_the_child(fake: FakeClaude
     assert time.monotonic() - t0 < 4.0 and seen[0] == client.timeout and len(seen) == 2  # interrupted, then reaped
     (call,) = fake.prompt_calls()
     assert fake.stdin_bytes(call) == b"read me" and not os.path.exists(call["cwd"])
-    with pytest.raises(ProcessLookupError):
-        os.kill(call["pid"], 0)
+    _assert_gone(call["pid"])
     assert _writer_threads() == []
 
 
@@ -942,7 +964,8 @@ def test_an_argument_the_os_cannot_encode_is_an_llm_error_not_a_value_error(fake
     prompt itself is no argument) is a typed error, nothing started."""
     monkeypatch.setattr(claude_cli, "sanitise_arg", lambda text: text)
     fake.queue(success("never"))
-    for text in ("x\x00y", "x\ud800y"):
+    # Windows hands a lone surrogate to CreateProcessW as UTF-16 unchanged (the child starts), so only the NUL is a refused argument there
+    for text in (("x\x00y",) if os.name == "nt" else ("x\x00y", "x\ud800y")):
         with pytest.raises(LLMError) as ei:
             client.complete(MODEL, _msgs("hi", system=text))
         assert ei.value.kind == "transport" and ei.value.sent is False and not ei.value.maybe_billed
@@ -1146,3 +1169,28 @@ def test_a_prompt_too_long_for_the_cli_falls_back_to_a_configured_per_call_candi
     assert resp.via == "openrouter" and fake.calls() == []
     assert [(a.outcome, a.via, a.usage) for a in svc.last_attempts][0] == ("transport", "claude", None)  # nothing sent, nothing recorded
     assert [r.via for r in svc.usage.records] == ["openrouter"]
+
+
+@pytest.mark.parametrize("auth", [
+    {"loggedIn": True, "authMethod": "api_key", "apiProvider": "firstParty"},
+    {"loggedIn": True, "authMethod": "oauth_token", "apiProvider": "bedrock"},
+    {"loggedIn": False, "authMethod": "none", "apiProvider": "firstParty"},
+])
+def test_a_login_other_than_the_subscription_is_refused_before_anything_is_sent(fake: FakeClaudeCli, client: ClaudeCodeClient, auth: dict):
+    """The owner's rule of 2026-11-13 (no API charges): an API-key, Bedrock or absent login is refused before the call starts."""
+    fake.set_auth(auth)
+    fake.queue(success("must not be read"))
+    with pytest.raises(LLMError) as ei:
+        client.complete(MODEL, _msgs())
+    e = ei.value
+    assert e.code == "not_subscription" and e.sent is False and not e.maybe_billed and fake.prompt_calls() == []
+
+
+def test_billing_variables_never_reach_the_cli(monkeypatch: pytest.MonkeyPatch):
+    from ai_eda.llm.claude_cli import BILLING_ENV_VARS, subscription_env
+    for name in BILLING_ENV_VARS:
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setenv("KEEP_ME", "y")
+    env = subscription_env()
+    assert not set(BILLING_ENV_VARS) & set(env) and env["KEEP_ME"] == "y"
+

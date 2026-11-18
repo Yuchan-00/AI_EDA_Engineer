@@ -12,9 +12,19 @@ upper bound sqrt(er)/c0, so a budget it meets is met, one it breaks is
 NOT_VERIFIED (the real delay is smaller). The fab's measured impedance is the
 only real one (``details["kind"]``, every message ends with the note).
 
+A track with a ``mid`` point is a circular arc (:mod:`ai_eda.ir.arc`) and is
+judged as one, never as the straight line between its ends: its arc length
+in every length, delay and impedance row (:mod:`ai_eda.tools.si.measure`),
+a neck-down test sampled on the arc itself, never a segment of an escape
+stub, never part of a straight run, of a coupled piece or of a parallel run -
+the coupled-line formulas are about straight parallel conductors, so curved
+copper beside another net is named, not computed.
+
 The validator applies only to a design that states SI constraints
 (``ir.si`` is set): an IR without them gets no result, so older designs keep
-their verdicts. Results (tool :data:`~ai_eda.tools.si.measure.SI_TOOL`):
+their verdicts. Results (tool :data:`~ai_eda.tools.si.measure.SI_TOOL`; version
+:func:`~ai_eda.tools.si.measure.si_version`: 0.3 on a board with an arc
+track, 0.2 on one with a blind / buried / micro via, 0.1 on every other):
 
 * ``si.critical_length`` - every routed net's line delay against its
   class's driver edge (:func:`ai_eda.tools.si.promote.critical_rows`: the
@@ -78,7 +88,22 @@ their verdicts. Results (tool :data:`~ai_eda.tools.si.measure.SI_TOOL`):
   length - its tracks outside the coupled overlap: breakouts, mitred
   corners, compensation bumps (:mod:`ai_eda.tools.routing.coupling`, the
   definition the router enforces) - against ``pair_uncoupled_max_mm``, the
-  P / N delay difference against ``pair_max_skew_s``.
+  P / N delay difference against ``pair_max_skew_s``. An arc track is never
+  a coupled piece: its whole arc length is uncoupled copper of its net (the
+  row says how much of it is curved), and a pair with an arc and no straight
+  coupled section is NOT_VERIFIED - what its curved copper does is not
+  judged.
+* ``si.crosstalk`` - its own tool and version (:data:`XT_TOOL` :data:`XT_VERSION`,
+  :data:`XT_ARC_VERSION` on a board with an arc track - :func:`xt_version` -,
+  never re-stamped): one row per IR net with the other nets' copper beside
+  it within s <= 10 h and the matched-termination closed forms of each
+  parallel run (:func:`crosstalk_result`, :mod:`ai_eda.tools.calc.xtalk`).
+  They rank and explain: the check never says PASS or FAIL, because every
+  opened form assumes Z0 at both victim ends and an ai_eda net is driven
+  through R_drive into C_load; what no formula covers is named per row. A
+  victim whose every neighbour is computed and whose coupled-line decks can
+  be built is a NOT_APPLICABLE row "judged by spice.xtalk.<victim>"
+  (:mod:`ai_eda.tools.spice.xtalk_check`), otherwise NOT_VERIFIED naming why.
 * ``si.timing.<path>`` - setup and hold margins of a timing path with the
   routed flight times: T = 1 / f_clk, t_lc = capture_fraction * T,
   setup = t_lc + t_flight(clock) - t_co_max - t_flight(data) - t_su_min,
@@ -95,13 +120,16 @@ their verdicts. Results (tool :data:`~ai_eda.tools.si.measure.SI_TOOL`):
 from __future__ import annotations
 
 import math
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
-from ai_eda.ir import CircuitIR, NetClass, SIConstraints, TimingPath, Track, Traced, ValidationResult, ValidationStatus, worst_status
+from ai_eda.ir import CircuitIR, NetClass, NetKind, SIConstraints, TimingPath, Track, Traced, ValidationResult, ValidationStatus, track_length, worst_status
+from ai_eda.ir.arc import arc_point_at
 from ai_eda.ir.si import FACT_REF_RE, TIMING_TERMS
-from ai_eda.tools.calc.tline import NO_STACKUP, TLineRangeError, edge_coupled_microstrip, line_geometry
+from ai_eda.tools.calc.tline import COUPLED_G_RANGE, NO_STACKUP, TLineRangeError, edge_coupled_microstrip, line_geometry, propagation_delay
+from ai_eda.tools.calc.xtalk import fext_rel, kb_eq8, l_sat_mm, next_rel
 from ai_eda.tools.kicad.library import KicadLibrary
-from ai_eda.tools.routing.coupling import COUPLED_GAP_FACTOR, coupled_pieces, uncoupled_lengths
+from ai_eda.tools.routing.coupling import COUPLED_GAP_FACTOR, NeighbourIndex, coupled_pieces, uncoupled_lengths
 from ai_eda.tools.routing.maze import ROUTER_ESCAPE_VERSION, escape_entry
 from ai_eda.tools.si.measure import (
     NOT_DRC,
@@ -113,14 +141,19 @@ from ai_eda.tools.si.measure import (
     measure_nets,
     no_plane_reason,
     plane_keepout,
+    si_version,
     undefined_impedance_reason,
 )
+from ai_eda.tools.si.driver import driver_value
 from ai_eda.tools.si.paths import NetPads, PadBox, net_pads
 from ai_eda.tools.si.promote import critical_rows
 from ai_eda.tools.si.rf import RF_IMPEDANCE_CHECK, RF_LENGTH_CHECK, format_hz, rf_length_rows, rf_nets
 from ai_eda.tools.si.rules import controlled_width, round_up
 from ai_eda.validation.base import ValidationContext, Validator
 from ai_eda.validation.registry import default_registry
+
+if TYPE_CHECKING:  # imported where used: the SPICE deck module imports this one
+    from ai_eda.tools.spice.xtalk_check import VictimPlan, XtPiece
 
 S = ValidationStatus
 KIND = "ir_geometry+calculators"
@@ -291,7 +324,12 @@ def _box_distance(x: float, y: float, box: PadBox) -> float:
 
 
 def _escape_segment(track: Track) -> str | None:
-    """The words for a track that is one segment of an escape stub the router recorded (module docstring), else ``None``."""
+    """The words for a track that is one segment of an escape stub the router recorded (module docstring), else ``None``.
+
+    An arc is never one: a stub is recorded as straight segments, and an arc between two of its points is other copper.
+    """
+    if getattr(track, "mid", None) is not None:
+        return None
     esc = escape_entry(track)
     if esc is None:
         return None
@@ -307,7 +345,8 @@ def _escape_segment(track: Track) -> str | None:
 
 def _neckdown(track: Track, pads: dict[str, list[PadBox]] | None) -> tuple[bool, str]:
     """Whether ``track`` is a neck-down the router recorded - a rule's neck-down or an escape stub (module docstring) -, and the words for
-    the row."""
+    the row. An arc is sampled on its own centreline (points of the arc, their count from its arc length), never on the chord
+    between its ends."""
     escape = _escape_segment(track)
     if escape is not None:
         return True, escape
@@ -321,9 +360,13 @@ def _neckdown(track: Track, pads: dict[str, list[PadBox]] | None) -> tuple[bool,
         return True, f"neck-down recorded by the router (within {radius:g} mm + one {grid:g} mm grid step of a pad; its position not checked: no KiCad library)"
     boxes = [b for bs in pads.values() for b in bs]
     (ax, ay), (bx, by) = track.start, track.end
-    steps = max(1, int(math.ceil(math.hypot(bx - ax, by - ay) / max(grid, 0.05))))
+    mid = getattr(track, "mid", None)
+    steps = max(1, int(math.ceil(track_length(track) / max(grid, 0.05))))
     for k in range(steps + 1):
-        x, y = ax + (bx - ax) * k / steps, ay + (by - ay) * k / steps
+        if mid is None:
+            x, y = ax + (bx - ax) * k / steps, ay + (by - ay) * k / steps
+        else:
+            x, y = arc_point_at(track.start, mid, track.end, k / steps)
         if not any(_box_distance(x, y, b) <= reach + 1e-6 for b in boxes):
             return False, f"its rule names a neck-down, but the track leaves {radius:g} mm + one {grid:g} mm grid step of the net's pads"
     return True, f"neck-down recorded by the router within {radius:g} mm + one {grid:g} mm grid step of the net's pads"
@@ -367,7 +410,7 @@ def impedance_result(ir: CircuitIR, si: SIConstraints, cls: NetClass, measures: 
                     neck, words = _neckdown(t, None if pads is None else pads.pads.get(net, {}))
                 ko = plane_keepout(ir, t) if seg.keepout_mm > 0.0 else None
                 g = groups.setdefault((seg.layer, seg.width_mm, neck, ko), [0.0, words])
-                g[0] = float(g[0]) + math.hypot(t.end[0] - t.start[0], t.end[1] - t.start[1])
+                g[0] = float(g[0]) + track_length(t)
                 if not g[1]:
                     g[1] = words
         for (layer, w, neck, ko), (length, words) in groups.items():
@@ -593,7 +636,14 @@ def diff_results(ir: CircuitIR, si: SIConstraints, measures: dict[str, NetMeasur
                 ok = lo - _TOL <= z <= hi + _TOL
                 rows.append({**x, "z_diff_ohm": round(z, 4), "status": (S.PASS if ok else S.FAIL).value,
                              "reason": f"Z_diff {z:.2f} ohm {'within' if ok else 'outside'} {target:g} ohm +/- {tol:.0%}"})
-            if not pieces:
+            # an arc is never a coupled piece (ai_eda.tools.routing.coupling): its length is uncoupled copper, and the rows say so
+            curved = {net: sum(track_length(t) for t in tracks if t.net == net and getattr(t, "mid", None) is not None) for net in (pr.p, pr.n)}
+            if not pieces and any(curved.values()):
+                rows.append({"status": S.NOT_VERIFIED.value, "reason": (
+                    "no straight coupled section, and the pair holds arc track(s) (" + ", ".join(f"{net} {mm:.3f} mm" for net, mm in curved.items() if mm)
+                    + "): curved copper is never a coupled piece (the coupled-line formulas cover straight parallel segments), so whether the two "
+                    "nets run side by side there is not judged")})
+            elif not pieces:
                 rows.append({"status": S.FAIL.value, "reason": "no coupled section: the two nets never run side by side"})
             if cls.pair_uncoupled_max_mm is not None:
                 budget = float(cls.pair_uncoupled_max_mm.value)
@@ -601,6 +651,9 @@ def diff_results(ir: CircuitIR, si: SIConstraints, measures: dict[str, NetMeasur
                     ok = unc <= budget + 1e-6
                     rows.append({"net": net, "uncoupled_mm": round(unc, 6), "budget_mm": budget, "status": (S.PASS if ok else S.FAIL).value,
                                  "reason": f"{net} uncoupled {unc:.3f} mm {'<=' if ok else '>'} {budget:g} mm"})
+                    if curved[net]:
+                        rows[-1]["curved_mm"] = round(curved[net], 6)
+                        rows[-1]["reason"] += f" ({curved[net]:.3f} mm of it in arc track(s): curved copper is never counted as coupled)"
             if cls.pair_max_skew_s is not None:
                 budget_s = float(cls.pair_max_skew_s.value)
                 dp, dn = mp.delay_s, mn.delay_s
@@ -617,6 +670,434 @@ def diff_results(ir: CircuitIR, si: SIConstraints, measures: dict[str, NetMeasur
                 details["repair"] = "human"
             out.append(_result(check, status, f"pair {pr.name}: " + "; ".join(r["reason"] for r in rows), **details))
     return out
+
+
+# --------------------------------------------------------------------------- crosstalk (matched-termination closed forms: rank and explain)
+
+XT_CHECK = "si.crosstalk"
+#: tool id / version of the crosstalk rows (their own: the typed-via re-stamp of SI_TOOL never touches them; 0.2: a row whose decks
+#: spice.xtalk can build hands off to it)
+XT_TOOL = "si.crosstalk"
+XT_VERSION = "0.2"
+#: the version the crosstalk rows of a board with an arc track carry (:func:`xt_version`): an arc takes part in the neighbour search
+#: through its exact box and its chords, and a curved neighbour is named, never computed - a mechanism that acts only on those boards
+#: stamps its own; every other board stays XT_VERSION
+XT_ARC_VERSION = "0.3"
+#: net kinds that are victims and aggressors: a supply / ground net states no driven edge
+XT_KINDS = frozenset({NetKind.SIGNAL, NetKind.ANALOG, NetKind.HIGH_SPEED, NetKind.RF})
+#: the window: an edge gap of at most this many dielectric heights - the gap calc.tline.edge_coupled_microstrip refuses beyond
+XT_G_MAX = COUPLED_G_RANGE[1]
+XT_ESTIMATE = "matched-termination estimate, not a verdict"
+XT_NON_PARALLEL = "non-parallel neighbour not computed"
+#: a neighbour within the window where the victim's track or the neighbour's is an arc (``Track.mid``)
+XT_CURVED = "curved neighbour not computed (an arc track, the victim's or the neighbour's: the coupled-line formulas cover straight parallel copper only)"
+XT_NO_ASYMMETRIC = "no opened asymmetric coupled-line formula"
+XT_NO_BROADSIDE = "no opened broadside formula"
+XT_NOT_JUDGED = [
+    "pads and vias as aggressors (only tracks are)",
+    "power and ground copper beside a victim (no driven edge; a coplanar return is not modelled either)",
+    "conductor and dielectric loss, dispersion, the solder mask (calc.tline is quasi-static and lossless)",
+    "reflections at the victim's real ends (the forms assume Z0 at both)",
+]
+_XT_FORMULAS = {
+    "modes": "Z_even, Z_odd, e_eff_even, e_eff_odd: calc.tline.edge_coupled_microstrip (Kirschning & Jansen 1984, static) at the victim width, gap s, h, t, er",
+    "kb": "Kb = (Z_even - Z_odd) / (Z_even + Z_odd + 2 Z_even Z_odd / Z_term), Z_term = sqrt(Z_even Z_odd) (Simonovich, SIJ 2022, Eq. 8 and Eq. 2)",
+    "l_sat": "L_sat = t_r / (2 t_pd_even), t_pd_even = sqrt(e_eff_even) / c0 (Simonovich Eq. 4; the slower mode is a choice: the shorter L_sat)",
+    "next": "NEXT_rel = Kb min(1, L / L_sat) (Simonovich Eq. 6)",
+    "fext": "FEXT_rel = -min(L |sqrt(e_eff_even) - sqrt(e_eff_odd)| / (2 c0 t_r), 1/2) (Polar AP8164 velocity form with LaMeres slides 21/31's 1/2; "
+            "the 1/2 cap from Macnica 127093 Fig. 4)",
+    "sum": "matched_estimate_rel = sum over the computed pieces of |NEXT_rel| + |FEXT_rel| per unit launched aggressor step (superposition, LaMeres slide 2): "
+           "a ranking number",
+    "t_r": "the aggressor class's edge (tools.si.driver.driver_value t_rise_s) used as the 0-100 % linear ramp, as spice.si's PULSE uses it",
+}
+
+
+def xt_version(ir: CircuitIR) -> str:
+    """The version ``ir``'s ``si.crosstalk`` rows are stamped with: :data:`XT_ARC_VERSION` when its board holds an arc track
+    (``Track.mid``), else :data:`XT_VERSION` - a board without one is searched and stamped exactly as before."""
+    pcb = ir.pcb
+    return XT_ARC_VERSION if pcb is not None and any(getattr(t, "mid", None) is not None for t in pcb.tracks) else XT_VERSION
+
+
+def _xt_result(version: str, status: S, message: str, **details: Any) -> ValidationResult:
+    return ValidationResult(check_id=XT_CHECK, status=status, message=f"{message} ({NOT_DRC})", tool=XT_TOOL, tool_version=version,
+                            details={"kind": KIND, **details})
+
+
+def _g6(x: float) -> float:
+    return float(f"{x:.6g}")
+
+
+@dataclass(frozen=True)
+class _Run:
+    """A straight run of one net's copper: collinear tracks of one width on one layer that touch or overlap, merged (``tracks`` their
+    indices) - or one arc track by itself, with its ``mid`` point (``None`` for a straight run): shaped like a track, so the neighbour
+    search and the keep-out test read it as the arc it is."""
+
+    net: str
+    layer: str
+    start: tuple[float, float]
+    end: tuple[float, float]
+    width_mm: float
+    tracks: tuple[int, ...]
+    mid: tuple[float, float] | None = None
+
+
+def _straight_runs(tracks: list[Track], indices: list[int]) -> list[_Run]:
+    """The tracks ``indices`` (of ``tracks``) merged into straight runs, in order of first appearance (a router may split a straight run).
+
+    Two tracks join when they share the net, layer and width, are parallel
+    (the :func:`~ai_eda.tools.routing.coupling.coupled_pieces` test), lie on
+    one line (within 1e-6 mm) and their extents touch or overlap (within
+    1e-6 mm). Zero-length tracks are dropped. An arc track is never part of
+    a straight run: it is a run of its own (:attr:`_Run.mid`), whatever the
+    line through its two ends, so it ends the straight runs beside it.
+    """
+    groups: dict[tuple[str, str, float], list[list]] = {}
+    order: list[list] = []
+    for i in indices:
+        t = tracks[i]
+        if getattr(t, "mid", None) is not None:
+            order.append([None, None, None, None, None, tuple(t.start), tuple(t.end), [i]])  # listed, in no group: nothing merges with it
+            continue
+        (x0, y0), (x1, y1) = t.start, t.end
+        dx, dy = x1 - x0, y1 - y0
+        length = math.hypot(dx, dy)
+        if length <= _TOL:
+            continue
+        if dx < 0 or (dx == 0 and dy < 0):
+            x0, y0, x1, y1, dx, dy = x1, y1, x0, y0, -dx, -dy
+        ux, uy = dx / length, dy / length
+        # direction, line offset, extent along the line and its end points, sources
+        seg = [ux, uy, ux * y0 - uy * x0, ux * x0 + uy * y0, ux * x1 + uy * y1, (x0, y0), (x1, y1), [i]]
+        runs = groups.setdefault((t.net, t.layer, float(t.width_mm)), [])
+        merged = True
+        while merged:
+            merged = False
+            for r in runs:
+                if abs(r[0] * seg[1] - r[1] * seg[0]) <= 1e-6 and abs(r[2] - seg[2]) <= 1e-6 and seg[3] <= r[4] + 1e-6 and r[3] <= seg[4] + 1e-6:
+                    runs.remove(r)
+                    order.remove(r)
+                    lo, hi = (r if r[3] <= seg[3] else seg), (r if r[4] >= seg[4] else seg)
+                    seg = [r[0], r[1], r[2], lo[3], hi[4], lo[5], hi[6], sorted(r[7] + seg[7])]
+                    merged = True
+                    break
+        runs.append(seg)
+        order.append(seg)
+    out: list[_Run] = []
+    for seg in sorted(order, key=lambda s: s[7][0]):
+        t = tracks[seg[7][0]]
+        start, end = (tuple(t.start), tuple(t.end)) if len(seg[7]) == 1 else (seg[5], seg[6])
+        out.append(_Run(net=t.net, layer=t.layer, start=start, end=end, width_mm=float(t.width_mm), tracks=tuple(seg[7]), mid=getattr(t, "mid", None)))
+    return out
+
+
+def _xt_layers(stackup) -> tuple[dict[str, float], dict[str, dict], dict[str, dict[str, float]], dict[str, str]]:
+    """``(window h per layer, how each h was taken, broadside neighbours, unsearched layers -> why)`` of a stack (:func:`crosstalk_result`)."""
+    window: dict[str, float] = {}
+    info: dict[str, dict] = {}
+    unsearched: dict[str, str] = {}
+    names = stackup.copper_names()
+    for i, name in enumerate(names):
+        geom, why = line_geometry(stackup, name)
+        if geom is not None:
+            window[name] = float(geom.h.value)
+            info[name] = {"h_mm": window[name], "h_id": geom.h_id, "how": f"the microstrip dielectric over {geom.reference_layer} (calc.tline.line_geometry)"}
+            continue
+        if stackup.copper[i].plane_net is not None:
+            unsearched[name] = str(why)
+            continue
+        near = [k for k in (i - 1, i) if 0 <= k < len(stackup.dielectrics)]
+        if not near:
+            unsearched[name] = str(why)
+            continue
+        k = min(near, key=lambda k: (float(stackup.dielectrics[k].thickness_mm.value), k))
+        window[name] = float(stackup.dielectrics[k].thickness_mm.value)
+        info[name] = {"h_mm": window[name], "h_id": f"pcb.stackup.dielectrics[{k}].thickness_mm",
+                      "how": f"no microstrip geometry ({why}): the window uses the thinner dielectric next to the layer - a choice, so its neighbours are named, "
+                             "not computed"}
+    adjacent: dict[str, dict[str, float]] = {}
+    for i in range(len(names) - 1):
+        if stackup.copper[i].plane_net is None and stackup.copper[i + 1].plane_net is None:
+            d = float(stackup.dielectrics[i].thickness_mm.value)
+            adjacent.setdefault(names[i], {})[names[i + 1]] = d
+            adjacent.setdefault(names[i + 1], {})[names[i]] = d
+    return window, info, adjacent, unsearched
+
+
+@dataclass
+class CrosstalkScan:
+    """:func:`crosstalk_scan`'s result, the victims' computed pieces (with their end points on both tracks) and the deck plan of each
+    victim that hands off to ``spice.xtalk``."""
+
+    result: ValidationResult
+    pieces: dict[str, list[XtPiece]]
+    plans: dict[str, VictimPlan]
+
+
+def crosstalk_result(ir: CircuitIR, si: SIConstraints, measures: dict[str, NetMeasure] | None = None, pads: NetPads | None = None) -> ValidationResult:
+    """``si.crosstalk`` (:func:`crosstalk_scan`)."""
+    return crosstalk_scan(ir, si, measures, pads).result
+
+
+def crosstalk_scan(ir: CircuitIR, si: SIConstraints, measures: dict[str, NetMeasure] | None = None, pads: NetPads | None = None) -> CrosstalkScan:
+    """``si.crosstalk``: one row per IR net - the other nets' copper beside it and the matched-termination closed forms of each parallel run.
+
+    Victims and aggressors are the IR nets of :data:`XT_KINDS` (a supply or
+    ground net states no edge: a NOT_APPLICABLE row, never an aggressor).
+    Each net's touching collinear tracks of one width are first merged into
+    straight runs (:func:`_straight_runs`: a router may split a straight run,
+    and the split is no neighbour - a choice of this check; an arc track is a
+    run of its own). The neighbour
+    search (:class:`ai_eda.tools.routing.coupling.NeighbourIndex`)
+    looks on every searched layer for another net's copper within an edge
+    gap of :data:`XT_G_MAX` h, h the layer's microstrip dielectric
+    (:func:`~ai_eda.tools.calc.tline.line_geometry`; a layer without that
+    geometry uses the thinner dielectric next to it - a choice, its
+    neighbours are only named). Each exactly parallel run of equal width over
+    a plane is computed with :mod:`ai_eda.tools.calc.xtalk` (``details["formulas"]``):
+    Kb, L_sat, NEXT_rel and FEXT_rel per piece, their absolute sum per victim
+    ``matched_estimate_rel`` - a ranking number. What no opened formula
+    covers is named, never estimated: copper on a layer with no microstrip
+    geometry (the ``line_geometry`` text), a plane a keep-out clears
+    (``plane_keepout``), unequal widths (:data:`XT_NO_ASYMMETRIC`), a gap the
+    coupled-line formula refuses (its ``TLineRangeError``), a broadside
+    overlap on an adjacent signal layer with no plane between
+    (:data:`XT_NO_BROADSIDE`), a non-parallel neighbour (:data:`XT_NON_PARALLEL`),
+    a curved one (:data:`XT_CURVED`: the victim's track or the neighbour's is
+    an arc - found through the arc's exact box and its chords, named with the
+    smallest gap the copper can have, one piece per pair of tracks, never fed
+    to a closed form),
+    another net's zone, touching copper, a missing aggressor edge (the
+    ``driver_value`` text). Row status, first match wins: NOT_APPLICABLE for a
+    supply / ground net, a net without a routed track, no other net's copper
+    within the window (``beyond_window`` counts the other nets on its layers);
+    NOT_VERIFIED "no stackup"; NOT_VERIFIED naming every item not computed;
+    otherwise - every neighbour computed, but every opened closed form
+    assumes Z0 at both victim ends and an ai_eda net is driven through
+    ``r_drive_ohm`` into ``c_load_f`` - NOT_APPLICABLE "judged by
+    spice.xtalk.<victim>" when :func:`ai_eda.tools.spice.xtalk_check.plan_victim`
+    can build its coupled-line decks (``judged_by`` names that check, as
+    ``si.critical_length`` hands a long net to ``spice.si``), else
+    NOT_VERIFIED "the matched-termination closed forms do not bound a victim
+    driven through R ohm into C F; no coupled-line deck: <why>" (more than two
+    pads, an unmodelled part, no extracted path - inner-layer copper, a typed
+    via, no KiCad library -, a piece off the path). The check never says PASS
+    or FAIL. The result is the worst row (no row: NOT_APPLICABLE).
+    ``measures`` gives the nets' pad-to-pad paths (measured without a KiCad
+    library when ``None``: then no path, no hand-off); ``pads`` is not read.
+    Deterministic: IR net order, then track order.
+    """
+    from ai_eda.tools.spice.xtalk_check import XtPiece, plan_victim
+
+    if measures is None:
+        measures = measure_nets(ir)
+    pcb = ir.pcb
+    version = xt_version(ir)
+    tracks = list(pcb.tracks) if pcb is not None else []
+    stackup = pcb.stackup if pcb is not None else None
+    kinds = {n.name: n.kind for n in ir.nets}
+    by_net: dict[str, list[int]] = {}
+    for i, t in enumerate(tracks):
+        by_net.setdefault(t.net, []).append(i)
+    aggr = [i for i, t in enumerate(tracks) if kinds.get(t.net) in XT_KINDS]
+    base: dict[str, Any] = {"window": f"edge gap s <= {XT_G_MAX:g} h (the gap calc.tline.edge_coupled_microstrip refuses beyond: COUPLED_G_RANGE)",
+                            "estimate": XT_ESTIMATE, "formulas": dict(_XT_FORMULAS), "not_judged": list(XT_NOT_JUDGED),
+                            "swing": "every relative number is per unit launched aggressor step; the aggressor swing is taken equal to the victim swing"}
+    window: dict[str, float] = {}
+    adjacent: dict[str, dict[str, float]] = {}
+    unsearched: dict[str, str] = {}
+    if stackup is not None:
+        window, info, adjacent, unsearched = _xt_layers(stackup)
+        base["layers"] = info
+        base["broadside_pairs"] = sorted({tuple(sorted((a, b))) for a, row in adjacent.items() for b in row})
+    zones = [z for z in (pcb.zones if pcb is not None else []) if kinds.get(z.net) in XT_KINDS and z.layer not in unsearched]
+    runs = _straight_runs(tracks, aggr)
+    runs_of: dict[str, list[int]] = {}
+    for k, run in enumerate(runs):
+        runs_of.setdefault(run.net, []).append(k)
+    index = NeighbourIndex(runs, window, g_max=XT_G_MAX, adjacent=adjacent, zones=zones)
+    nets_on: dict[str, set[str]] = {}
+    for i in aggr:
+        nets_on.setdefault(tracks[i].layer, set()).add(tracks[i].net)
+    edges: dict[str, tuple[Any, str]] = {}
+    coupled: dict[tuple[str, float, float], Any] = {}
+    keepouts: dict[int, str | None] = {}
+
+    def edge(net: str) -> tuple[Any, str]:
+        if net not in edges:
+            cls = si.class_of(net)
+            if cls is None:
+                edges[net] = (None, f"{net} is in no net class (no default class), so its edge is not stated")
+            else:
+                edges[net] = driver_value(ir, cls, "t_rise_s", net)
+        return edges[net]
+
+    def keepout(k: int) -> str | None:
+        if k not in keepouts:
+            keepouts[k] = plane_keepout(ir, runs[k])
+        return keepouts[k]
+
+    rows: list[dict] = []
+    pieces_of: dict[str, list[XtPiece]] = {}
+    plans: dict[str, VictimPlan] = {}
+    for n in ir.nets:
+        cls = si.class_of(n.name)
+        row: dict[str, Any] = {"net": n.name, "class": None if cls is None else cls.name, "judged_by": None, "matched_estimate_rel": None,
+                               "not_computed": [], "beyond_window": 0, "aggressors": []}
+        rows.append(row)
+        mine = by_net.get(n.name, [])
+        if n.kind not in XT_KINDS:
+            row.update(status=S.NOT_APPLICABLE.value, reason=f"a {n.kind.value} net carries no driven edge: neither victim nor aggressor")
+            continue
+        if not mine:
+            row.update(status=S.NOT_APPLICABLE.value, reason="no routed track")
+            continue
+        if stackup is None:
+            row.update(status=S.NOT_VERIFIED.value, reason=f"{NO_STACKUP}: the window (s <= {XT_G_MAX:g} h) and the coupled-line values need the dielectric")
+            continue
+        mine_runs = runs_of.get(n.name, [])
+        victim = [runs[k] for k in mine_runs]
+        items: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+        def name(kind: str, layer: str, reason: str, net: str, gap: float | None = None, length: float | None = None) -> None:
+            it = items.setdefault((kind, layer, reason), {"kind": kind, "layer": layer, "reason": reason, "nets": [], "pieces": 0})
+            if net not in it["nets"]:
+                it["nets"].append(net)
+            it["pieces"] += 1
+            if gap is not None:
+                it["min_gap_mm"] = round(min(gap, it.get("min_gap_mm", gap)), 6)
+            if length is not None:
+                it["length_mm"] = round(it.get("length_mm", 0.0) + length, 6)
+
+        for layer in dict.fromkeys(tracks[i].layer for i in mine):
+            if layer not in window and layer in unsearched:
+                name("victim_copper", layer, f"the victim's own copper on {layer} is not searched: {unsearched[layer]}", n.name)
+            elif layer not in window:
+                name("victim_copper", layer, f"the victim's own copper on {layer} is not searched: layer {layer!r} is not in the stackup", n.name)
+        near: set[str] = set()
+        total = 0.0
+        computed = 0
+        for rec in index.runs(victim):
+            a_net, kind, layer = rec["net"], rec["kind"], rec["layer"]
+            near.add(a_net)
+            if kind == "non_parallel" and rec.get("curved"):
+                name(kind, layer, XT_CURVED, a_net, rec["gap_mm"])
+                continue
+            if kind == "non_parallel":
+                name(kind, layer, XT_NON_PARALLEL + (" (parallel, no projected overlap)" if rec["parallel"] else ""), a_net, rec["gap_mm"])
+                continue
+            if kind == "contact":
+                name(kind, layer, "copper of another net touches or crosses the victim (edge gap <= 0): a short for DRC to judge, not a coupled line", a_net)
+                continue
+            if kind == "zone":
+                name(kind, layer, "another net's zone on a signal layer inside the window: not computed", a_net, rec["gap_mm"])
+                continue
+            if kind == "broadside":
+                name(kind, layer, f"{XT_NO_BROADSIDE} ({rec['victim_layer']} over {layer} with no plane between, dielectric {rec['h_mm']:g} mm)", a_net,
+                     rec["lateral_gap_mm"], rec["length_mm"])
+                continue
+            vt, at = victim[rec["victim_index"]], runs[rec["aggressor_index"]]
+            length, gap = float(rec["length_mm"]), float(rec["gap_mm"])
+            stop: list[str] = []
+            geom, why = line_geometry(stackup, layer)
+            if geom is None:
+                stop.append(str(why))
+            for k in (mine_runs[rec["victim_index"]], rec["aggressor_index"]):
+                ko = keepout(k)
+                if ko is not None:
+                    stop.append(ko)
+            wv, wa = float(vt.width_mm), float(at.width_mm)
+            if abs(wv - wa) > 1e-6:
+                stop.append(f"{XT_NO_ASYMMETRIC} (victim {wv:g} mm, aggressor {wa:g} mm; Kirschning-Jansen covers equal widths only)")
+            r = None
+            if not stop and geom is not None:
+                key = (layer, wv, gap)
+                if key not in coupled:
+                    try:
+                        coupled[key] = edge_coupled_microstrip(wv, gap, float(geom.h.value), float(geom.t.value), float(geom.er.value))
+                    except (TLineRangeError, ValueError) as e:
+                        coupled[key] = f"calc.tline.edge_coupled_microstrip refuses: {e}"
+                r = coupled[key]
+                if isinstance(r, str):
+                    stop.append(r)
+                    r = None
+            t_r, missing = edge(a_net)
+            if t_r is None:  # one item per missing value; the item lists the aggressor nets
+                stop.append(f"an aggressor's edge is missing: {missing}")
+            for reason in stop:
+                name("parallel", layer, reason, a_net, gap, length)
+            if r is None:
+                continue
+            assert geom is not None
+            kb = kb_eq8(r.z_even, r.z_odd, math.sqrt(r.z_even * r.z_odd))
+            entry: dict[str, Any] = {"net": a_net, "layer": layer, "length_mm": round(length, 6), "width_mm": wv, "gap_mm": round(gap, 6),
+                                     "s_over_h": round(gap / float(geom.h.value), 6), "z_even_ohm": round(r.z_even, 4), "z_odd_ohm": round(r.z_odd, 4),
+                                     "e_eff_even": round(r.e_eff_even, 6), "e_eff_odd": round(r.e_eff_odd, 6), "kb": _g6(kb),
+                                     "l_sat_mm": None, "next_rel": None, "fext_rel": None, "t_r_s": None, "t_r_source": missing, "ids": list(geom.ids)}
+            if t_r is not None:
+                ls = l_sat_mm(t_r.value, propagation_delay(r.e_eff_even))
+                nx, fx = next_rel(kb, length, ls), fext_rel(length, r.e_eff_even, r.e_eff_odd, t_r.value)
+                entry.update(l_sat_mm=round(ls, 6), next_rel=_g6(nx), fext_rel=_g6(fx), t_r_s=t_r.value, t_r_source=t_r.source)
+                total += abs(nx) + abs(fx)
+                computed += 1
+                vs, as_ = rec["victim_span"], rec["aggressor_span"]
+                pieces_of.setdefault(n.name, []).append(XtPiece(
+                    aggressor=a_net, layer=layer, width_mm=wv, gap_mm=gap, length_mm=length, victim_span=(tuple(vs[0]), tuple(vs[1])),
+                    aggressor_span=(tuple(as_[0]), tuple(as_[1])), z_even=r.z_even, z_odd=r.z_odd, e_eff_even=r.e_eff_even, e_eff_odd=r.e_eff_odd))
+            row["aggressors"].append(entry)
+        row["not_computed"] = list(items.values())
+        row["beyond_window"] = len(set().union(*(nets_on.get(t.layer, set()) for t in victim)) - near - {n.name})
+        if computed:
+            row["matched_estimate_rel"] = _g6(total)
+        if not near and not items:
+            row.update(status=S.NOT_APPLICABLE.value, reason=f"no other net's copper within s <= {XT_G_MAX:g} h of its tracks"
+                       + (f" ({row['beyond_window']} other net(s) on its layers lie beyond the window)" if row["beyond_window"] else ""))
+        elif items:
+            row.update(status=S.NOT_VERIFIED.value, reason="; ".join(dict.fromkeys(it["reason"] for it in items.values())))
+        else:
+            rv, why_r = driver_value(ir, cls, "r_drive_ohm", n.name) if cls is not None else (None, f"{n.name} is in no net class")
+            cv, why_c = driver_value(ir, cls, "c_load_f", n.name) if cls is not None else (None, f"{n.name} is in no net class")
+            if rv is not None and cv is not None:
+                ends = f"do not bound a victim driven through {rv.value:g} ohm into {cv.value:g} F"
+            else:
+                ends = "assume Z0 at both victim ends, and its termination is not stated (" + "; ".join(w for w in (why_r, why_c) if w) + ")"
+            plan = plan_victim(ir, n.name, pieces_of.get(n.name, []), measures)
+            if isinstance(plan, str):
+                row.update(status=S.NOT_VERIFIED.value, reason=f"the matched-termination closed forms {ends}; no coupled-line deck: {plan}")
+            else:
+                plans[n.name] = plan
+                row.update(status=S.NOT_APPLICABLE.value, judged_by=f"spice.xtalk.{n.name}",
+                           reason=f"judged by spice.xtalk.{n.name} ({plan.decks} coupled-line deck(s)), not by this rule: the matched-termination closed forms {ends}")
+    status = _worst(rows)
+    details = {**base, "rows": rows}
+    nv = [r for r in rows if r["status"] == S.NOT_VERIFIED.value]
+    handed = [r["net"] for r in rows if r["judged_by"] is not None]
+    if status == S.NOT_APPLICABLE:
+        if handed:
+            return CrosstalkScan(_xt_result(version, status, f"every victim with a neighbour is judged by spice.xtalk: {', '.join(handed)}", **details), pieces_of, plans)
+        judged = sum(1 for r in rows if r["reason"].startswith("no other net's copper"))
+        return CrosstalkScan(_xt_result(version, status, f"no victim has another net's copper within s <= {XT_G_MAX:g} h ({judged} routed signal net(s) searched)",
+                                        **details), pieces_of, plans)
+    estimates = [r for r in rows if r["matched_estimate_rel"] is not None]
+    parts = [f"{len(nv)} victim(s) NOT_VERIFIED - the closed forms rank and explain, they never PASS or FAIL a net"]
+    if stackup is None:
+        parts.append(f"{NO_STACKUP}: no window and no coupled-line value")
+    complete = [r["net"] for r in nv if not r["not_computed"] and r["aggressors"]]
+    if complete:
+        parts.append(f"{len(complete)} with every neighbour computed but driven through R_drive into C_load, not Z0, and no coupled-line deck (named per row)")
+    partial = [r["net"] for r in nv if r["not_computed"]]
+    if partial:
+        parts.append(f"{len(partial)} with neighbours not computed (named per row)")
+    if handed:
+        parts.append(f"{len(handed)} judged by spice.xtalk: {', '.join(handed)}")
+    if estimates:
+        top = max(estimates, key=lambda r: (r["matched_estimate_rel"], r["net"]))
+        parts.append(f"largest {XT_ESTIMATE}: {top['matched_estimate_rel']:.3%} of the aggressor step on {top['net']}")
+    others = [r for r in rows if r["status"] == S.NOT_APPLICABLE.value and r["judged_by"] is None]
+    if others:
+        parts.append(f"{len(others)} net(s) not applicable")
+    return CrosstalkScan(_xt_result(version, status, "; ".join(parts), **details), pieces_of, plans)
 
 
 # --------------------------------------------------------------------------- timing paths
@@ -727,7 +1208,11 @@ def si_results(ir: CircuitIR, library: KicadLibrary | None = None) -> list[Valid
         out.append(delay_result(ir, si, cls, measures))
     out.extend(skew_results(ir, si, measures))
     out.extend(diff_results(ir, si, measures))
+    out.append(crosstalk_result(ir, si, measures, pads))
     out.extend(timing_results(ir, si, measures))
+    version = si_version(ir)
+    if version != SI_VERSION:  # a board with an arc track or a blind / buried / micro via is measured as such: its results say so (every other board: as before)
+        out = [r.model_copy(update={"tool_version": version}) if r.tool == SI_TOOL else r for r in out]
     return out
 
 
@@ -751,7 +1236,14 @@ __all__ = [
     "CRITICAL_CHECK",
     "SHORT_TEXT",
     "SIValidator",
+    "XT_ARC_VERSION",
+    "XT_CHECK",
+    "XT_TOOL",
+    "XT_VERSION",
+    "CrosstalkScan",
     "critical_result",
+    "crosstalk_result",
+    "crosstalk_scan",
     "delay_result",
     "diff_results",
     "impedance_result",
@@ -761,4 +1253,5 @@ __all__ = [
     "skew_results",
     "timing_results",
     "width_result",
+    "xt_version",
 ]

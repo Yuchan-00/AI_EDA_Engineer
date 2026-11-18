@@ -41,8 +41,44 @@ from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR
 
 #: KiCad's default ``Default`` netclass clearance (mm); a stricter fab clearance is written into the netclass as well
 KICAD_DEFAULT_NETCLASS_CLEARANCE_MM = 0.2
+#: KiCad's own board minimums (mm), which kicad-cli DRC applies where the project file states none: the minimum track width (a
+#: ``min_track_width`` rule replaces it) and the copper-to-edge clearance (no IR limit maps onto it: :data:`MANUFACTURING_RULE_KEYS
+#: <ai_eda.compilers.pcb.MANUFACTURING_RULE_KEYS>`). Measured 2026-11-13: kicad-cli 10.0.6 ``pcb drc`` on the STM32F407 example's
+#: routed 6-layer board beside this compiler's project file with empty rules reported its tracks against "board setup constraint"
+#: copper-to-edge 0.5000 mm and minimum width 0.2000 mm (``copper_edge_clearance`` / ``track_width`` violations at 0.475 / 0.15 mm)
+KICAD_DEFAULT_MIN_TRACK_WIDTH_MM = 0.2
+KICAD_DEFAULT_COPPER_EDGE_CLEARANCE_MM = 0.5
+#: KiCad's own via minimums (mm) beside a project file that states none: the via diameter and the hole of a through or blind via
+#: (a ``min_via_diameter`` / ``min_through_hole_diameter`` rule replaces it; a micro via has minimums of its own) and the gap
+#: between two drilled holes (nothing writes ``min_hole_to_hole``). Measured 2026-11-13: kicad-cli 10.0.6 ``pcb drc`` on a 4-layer
+#: probe board beside a project file with empty rules reported a 0.45 / 0.2 mm through via and a 0.45 / 0.2 mm blind via against
+#: minimum diameter 0.5000 mm (``via_diameter``) and minimum hole 0.3000 mm (``drill_out_of_range``), left a 0.45 / 0.2 mm micro
+#: via alone, and reported two same-net 0.6 / 0.3 mm through vias 0.5 mm apart against minimum 0.2500 mm (``hole_to_hole``, actual
+#: 0.2000 mm; 0.55 mm apart passed); with written track and clearance rules alone the three still applied
+KICAD_DEFAULT_MIN_VIA_DIAMETER_MM = 0.5
+KICAD_DEFAULT_MIN_THROUGH_HOLE_MM = 0.3
+KICAD_DEFAULT_MIN_HOLE_TO_HOLE_MM = 0.25
 #: the ``.kicad_pro`` ``meta.version`` KiCad 8-10 write
 PROJECT_FILE_META_VERSION = 3
+
+
+def checked_rules(ir: CircuitIR) -> dict[str, float]:
+    """The minimums kicad-cli DRC checks the compiled board against beside this compiler's project file (mm): ``min_track_width``
+    (the written rule, else :data:`KICAD_DEFAULT_MIN_TRACK_WIDTH_MM`), ``min_clearance`` (the ``Default`` netclass clearance -
+    :data:`KICAD_DEFAULT_NETCLASS_CLEARANCE_MM`, or the stricter fab clearance :class:`ProjectFileCompiler` writes into it - never
+    below the written rule), ``min_copper_edge_clearance`` (:data:`KICAD_DEFAULT_COPPER_EDGE_CLEARANCE_MM`: nothing is written),
+    ``min_via_diameter`` / ``min_through_hole_diameter`` (the written rule, else :data:`KICAD_DEFAULT_MIN_VIA_DIAMETER_MM` /
+    :data:`KICAD_DEFAULT_MIN_THROUGH_HOLE_MM`) and ``min_hole_to_hole`` (:data:`KICAD_DEFAULT_MIN_HOLE_TO_HOLE_MM`: nothing is
+    written). Pure: the same IR gives the same numbers."""
+    rules = design_rules(ir)
+    return {
+        "min_track_width": rules.get("min_track_width", KICAD_DEFAULT_MIN_TRACK_WIDTH_MM),
+        "min_clearance": max(KICAD_DEFAULT_NETCLASS_CLEARANCE_MM, rules.get("min_clearance", 0.0)),
+        "min_copper_edge_clearance": KICAD_DEFAULT_COPPER_EDGE_CLEARANCE_MM,
+        "min_via_diameter": rules.get("min_via_diameter", KICAD_DEFAULT_MIN_VIA_DIAMETER_MM),
+        "min_through_hole_diameter": rules.get("min_through_hole_diameter", KICAD_DEFAULT_MIN_THROUGH_HOLE_MM),
+        "min_hole_to_hole": KICAD_DEFAULT_MIN_HOLE_TO_HOLE_MM,
+    }
 
 
 def project_filename(ir: CircuitIR) -> str:
@@ -74,4 +110,8 @@ class ProjectFileCompiler(Compiler):
         return self._write(ir, Path(ctx.workdir) / project_filename(ir), text)
 
 
-__all__ = ["KICAD_DEFAULT_NETCLASS_CLEARANCE_MM", "PROJECT_FILE_META_VERSION", "ProjectFileCompiler", "project_filename"]
+__all__ = [
+    "KICAD_DEFAULT_COPPER_EDGE_CLEARANCE_MM", "KICAD_DEFAULT_MIN_HOLE_TO_HOLE_MM", "KICAD_DEFAULT_MIN_THROUGH_HOLE_MM", "KICAD_DEFAULT_MIN_TRACK_WIDTH_MM",
+    "KICAD_DEFAULT_MIN_VIA_DIAMETER_MM", "KICAD_DEFAULT_NETCLASS_CLEARANCE_MM", "PROJECT_FILE_META_VERSION",
+    "ProjectFileCompiler", "checked_rules", "project_filename",
+]

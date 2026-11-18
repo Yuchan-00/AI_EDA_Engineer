@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from ai_eda.agents import AgentContext, PCBAgent
-from ai_eda.agents.pcb import PLACEMENT_KEY, ROUTING_KEY, UNROUTED_NOTE
+from ai_eda.agents.pcb import CORNERS_KEY, PLACEMENT_KEY, ROUTING_KEY, UNROUTED_NOTE
 from ai_eda.agents.requirement import CONTROL_KEYS
 from ai_eda.cli import run_exit_code
 from ai_eda.compilers import CompileContext, PCBCompiler, SchematicCompiler
@@ -55,6 +55,7 @@ from ai_eda.tools.kicad.library import BBox, FootprintDef, KicadLibrary, Library
 from ai_eda.tools.placement import COLUMNS, MARGIN_MM, PLACER_ID, PLACER_VERSION, SPACING_MM, footprint_extent, grid_pitch, grid_placement
 from ai_eda.tools.placement.grid import _disjoint
 from ai_eda.tools.routing import ROUTER_ID, ROUTER_VERSION
+from ai_eda.tools.routing.corners import CORNER_ENTRY_PREFIX, DEFAULT_CORNER_STYLE, ORTHOGONAL
 from ai_eda.validation import ValidationContext, default_registry
 from ai_eda.validation.layout import CLEARANCE_CHECK, CONNECTIVITY_CHECK
 from ai_eda.workflow import Orchestrator, Stage
@@ -103,6 +104,11 @@ def lib(tmp_path: Path) -> KicadLibrary:
 def _ctx(tmp_path: Path, lib: KicadLibrary | None, **answers: str) -> AgentContext:
     tools = {"kicad_library": lib} if lib is not None else {}
     return AgentContext(workdir=tmp_path, tools=tools, answers={**ANSWERS, **answers})
+
+
+def _router_entries(prov) -> list[str]:
+    """A track's ``derived_from`` without the corner-style entries routing.corners appends after the router's own."""
+    return [e for e in prov.derived_from if not e.startswith(CORNER_ENTRY_PREFIX)]
 
 
 def _run_agent(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary | None, **answers: str):
@@ -348,7 +354,8 @@ def test_agent_proposes_only_when_nothing_is_placed(tmp_path: Path, lib: KicadLi
 
 
 def test_agent_places_and_routes_in_one_proposal(tmp_path: Path, lib: KicadLibrary):
-    """Placement + copper in the one ``pcb`` payload: routing.maze provenance on every track, the validator's connectivity PASSes on it."""
+    """Placement + copper in the one ``pcb`` payload: routing.maze provenance on every track (routing.corners' entries, when the corner-style
+    rule rounded, mitred or straightened a track, after the router's own), the validator's connectivity PASSes on it."""
     ir = parts_ir(tmp_path, lib)
     res = _run_agent(ir, tmp_path, lib)
     [proposal] = res.proposals
@@ -357,7 +364,9 @@ def test_agent_places_and_routes_in_one_proposal(tmp_path: Path, lib: KicadLibra
     for item in [*payload.tracks, *payload.vias]:
         prov = item.provenance
         assert prov.kind is ProvenanceKind.DERIVED and prov.tool == ROUTER_ID == "routing.maze" and prov.tool_version == ROUTER_VERSION and not prov.needs_verification
-        assert prov.derived_from[0] == f"net:{item.net}" and prov.derived_from[-1].startswith("params:grid=0.25,width=0.4,clearance=0.25,via=0.8/0.4,edge=0.3")
+        routed = _router_entries(prov)
+        assert prov.derived_from[:len(routed)] == routed and all(e.startswith(CORNER_ENTRY_PREFIX) for e in prov.derived_from[len(routed):])
+        assert routed[0] == f"net:{item.net}" and routed[-1].startswith("params:grid=0.25,width=0.4,clearance=0.25,via=0.8/0.4,edge=0.3")
     assert all(t.layer in ("F.Cu", "B.Cu") and t.width_mm == 0.4 for t in payload.tracks)
     # the notes and the description name the router, its version, the counts, the copper length and the vias; never "clean"
     assert res.notes[0].startswith("placement.grid 0.1: 5 component(s)")
@@ -379,7 +388,10 @@ def test_agent_places_and_routes_in_one_proposal(tmp_path: Path, lib: KicadLibra
     ir.artifacts[ArtifactKind.PCB] = art
     areas = {r.check_id: r for r in IndependentReviewer(tools={"kicad_library": lib}).review(ir, tmp_path).results}
     assert areas[ReviewArea.IR_VS_PCB].status is S.PASS, areas[ReviewArea.IR_VS_PCB].message
-    assert sexpr.find_all(sexpr.parse_file(Path(art.path)), "segment") and len(sexpr.find_all(sexpr.parse_file(Path(art.path)), "segment")) == len(ir.pcb.tracks)
+    # one board item per track: a straight track is a (segment ...), an arc track (the default corner style rounds corners) an (arc ...)
+    board = sexpr.parse_file(Path(art.path))
+    segments, arcs = sexpr.find_all(board, "segment"), sexpr.find_all(board, "arc")
+    assert segments and len(segments) == sum(1 for t in ir.pcb.tracks if t.mid is None) and len(arcs) == sum(1 for t in ir.pcb.tracks if t.mid is not None)
 
 
 def test_existing_placements_without_copper_are_routed_and_never_moved(tmp_path: Path, lib: KicadLibrary):
@@ -614,7 +626,15 @@ def test_inconsistent_ir_is_still_placed_and_blocked_at_ir_build(tmp_path: Path,
     assert ir.pcb is not None and [p.component_ref for p in ir.pcb.placements] == ["R1", "R2"]  # the placer walks components only
     assert state.outcome(Stage.IR_BUILD).status is S.FAIL and state.blocked and state.current is Stage.IR_BUILD
     assert [q.key for q in state.open_questions] == ["ir.assumptions"]
+    # B9: the stage table shows FAIL and the run asks a question - the CLI says these are two things, only for such a stage
+    from ai_eda.cli import blocked_fail_note
+    from ai_eda.workflow.orchestrator import PipelineState, StageOutcome
 
+    assert blocked_fail_note(state) == ("  note: ir_build is FAIL and, separately, blocked by the question(s) above: an answer lets the run continue, "
+                                        "it does not clear the failure (see the ir_build line in the table)")
+    asked = PipelineState(outcomes=[StageOutcome(stage=Stage.MISSING_INFORMATION, status=S.USER_INPUT_REQUIRED)], blocked=True)
+    failed = PipelineState(outcomes=[StageOutcome(stage=Stage.RELEASE, status=S.FAIL)])
+    assert blocked_fail_note(asked) is None and blocked_fail_note(failed) is None and blocked_fail_note(PipelineState()) is None
 
 def test_bom_fail_survives_a_gerber_tool_unavailable(tmp_path: Path, lib: KicadLibrary):
     """A missing kicad-cli makes the gerber export NOT_VERIFIED; it must not discard the BOM refusal recorded before it."""
@@ -738,7 +758,8 @@ def test_agent_places_a_many_pad_board_on_the_core_ring_and_routes_it_at_the_fin
     # provenance: core_ring on every placement, the fine rules and the pitch that chose them on every track and via
     assert {p.provenance.tool for p in payload.placements} == {"placement.core_ring"} and payload.tracks
     for item in [*payload.tracks, *payload.vias]:
-        assert item.provenance.derived_from[-1] == fine.derived_from_entry() and item.provenance.derived_from[-1].endswith(",rules=fine,pad_pitch=0.8,pitch_footprint=Test_MCU:QFP64")
+        routed = _router_entries(item.provenance)
+        assert routed[-1] == fine.derived_from_entry() and routed[-1].endswith(",rules=fine,pad_pitch=0.8,pitch_footprint=Test_MCU:QFP64")
     assert all(t.width_mm == 0.25 for t in payload.tracks) and all((v.diameter_mm, v.drill_mm) == (0.6, 0.3) for v in payload.vias)
     # the IR copper connects every net (IR geometry, not DRC)
     Orchestrator.apply_proposals(ir, res.proposals)
@@ -769,7 +790,10 @@ def test_the_core_ring_starts_at_32_pads_and_every_other_board_keeps_the_grid(tm
 
 def test_existing_boards_keep_the_grid_and_the_default_rules_exactly(tmp_path: Path):
     """The grid-placed synthetic astable and the hand-placed divider: no fine-rule note, the default params entry verbatim, and the agent's
-    copper identical to ``route_board`` with no params at all (the router's own default) - the selection changes nothing below 1.0 mm pitch."""
+    copper identical to ``route_board`` with no params at all (the router's own default) - the selection changes nothing below 1.0 mm pitch.
+    The agent keeps the router's grid corners here (``pcb.corners=orthogonal``): the comparison is the rule selection's, not the corner
+    style's (routing.corners rounds the default board's corners into arcs: ``tests/test_routing_arcs.py``; ``pcb.corners=miter45`` mitres
+    them: ``tests/test_routing_corners.py``)."""
     from ai_eda.ir import Component, LibraryRef
     from ai_eda.tools.routing import RoutingParams, route_board
 
@@ -787,7 +811,7 @@ def test_existing_boards_keep_the_grid_and_the_default_rules_exactly(tmp_path: P
     ir.nets = [Net(name=n, pins=[PinRef(component_ref=r, pin_number=k) for r, k in pins], provenance=NET_P) for n, pins in nets.items()]
     div = divider_with_connector_ir(tmp_path, lib)
     for board, placer in ((ir, "placement.grid 0.1: 9 component(s)"), (div, "not placed: ir.pcb already has 3 placement(s)")):
-        res = _run_agent(board, tmp_path, lib)
+        res = _run_agent(board, tmp_path, lib, **{CORNERS_KEY: ORTHOGONAL})
         [proposal] = res.proposals
         assert res.notes[0].startswith(placer) and not any("fine rules" in n for n in res.notes), res.notes
         payload = proposal.payload
@@ -854,7 +878,7 @@ def test_a_partial_route_is_reported_as_not_applied_and_never_proposed(tmp_path:
     assert m is not None, dropped[0]
     routed, total, tracks, vias, length, iterations, unrouted = int(m[1]), int(m[2]), int(m[3]), int(m[4]), float(m[5]), int(m[6]), int(m[7])
     assert routed > 0 and tracks > 0 and unrouted == len(reasons) and routed + unrouted == total
-    again = route_board(ir.model_copy(update={"pcb": proposal.payload}), mlib, params)
+    again = route_board(ir.model_copy(update={"pcb": proposal.payload}), mlib, params, corner_style=DEFAULT_CORNER_STYLE)  # the agent's corner style
     assert (routed, tracks, vias, length, iterations) == (again.stats["routed_nets"], len(again.tracks), len(again.vias), again.stats["total_length_mm"], again.stats["iterations"])
     # a board where nothing routes gets no such note (nothing was connected)
     ir.pcb = PCBDesign(manufacturing=ManufacturingConstraints(min_clearance_mm=assumption(3.0, note="absurd, to fence every pad")))
@@ -885,7 +909,9 @@ def test_the_partial_answer_applies_whole_routed_nets_and_names_the_rest(tmp_pat
     assert design_data(silk_only.payload.model_copy(update={"silkscreen": []})) == design_data(ir.pcb) and silk_only.description.startswith("silkscreen.place 0.1: ")
     assert res.notes[0] == "not placed: ir.pcb already has 7 placement(s); the agent never replaces a layout"
     assert res.notes[1].startswith(f"not applied: {ROUTER_ID} {ROUTER_VERSION} connected 1 of 2 net(s) (") and res.notes[1].endswith(f"(--answer {ROUTING_KEY}={PARTIAL_ANSWER} applies the routed nets, each whole)")
-    assert _board_notes(res.notes)[2:] == [reason]
+    # the layer escalation (multilayer plan P6) does not climb: A was ripped up in negotiation, but the board has no ground net for its planes
+    no_ground = "layer escalation: not attempted - 0 net(s) of kind ground (none); the plane layers need exactly one"
+    assert _board_notes(res.notes)[2:] == [reason, no_ground]
     res = agent.run(ir, _ctx(tmp_path, flib, **{ROUTING_KEY: " Partial "}))
     assert ir.content_hash() == before and res.questions == [] and not res.blocked_on_user
     [proposal] = res.proposals
@@ -896,7 +922,7 @@ def test_the_partial_answer_applies_whole_routed_nets_and_names_the_rest(tmp_pat
         "partial: pcb.routing=partial applies the 1 of 2 net(s) the router connected, each whole; 1 net(s) have no copper and need manual routing "
         "in KiCad: A (pcb.routing.connectivity judges the IR copper, DRC the board)"
     )
-    assert _board_notes(res.notes)[2:] == [left, reason] and proposal.description.startswith(f"{res.notes[1]}; {left}; silkscreen.place 0.1: ")
+    assert _board_notes(res.notes)[2:] == [left, reason, no_ground] and proposal.description.startswith(f"{res.notes[1]}; {left}; silkscreen.place 0.1: ")
     assert proposal.rationale.startswith("the nets listed as routed maze-routed") and "DRC decides validity" in proposal.rationale
     Orchestrator.apply_proposals(ir, res.proposals)
     ir.pcb.manufacturing = ManufacturingConstraints(min_clearance_mm=assumption(0.25, note="the router's own clearance as the limit"))

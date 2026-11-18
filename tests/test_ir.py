@@ -1,8 +1,10 @@
 from ai_eda.ir import (
     CircuitIR,
+    PCBDesign,
     ProjectMeta,
     ProvenanceKind,
     SourceRef,
+    Track,
     ValidationResult,
     ValidationStatus,
     assumption,
@@ -37,6 +39,23 @@ def test_json_roundtrip(divider_ir: CircuitIR, tmp_path):
     loaded = CircuitIR.load(p)
     assert loaded.content_hash() == divider_ir.content_hash()
     assert loaded.component("R1").mpn.provenance.kind == ProvenanceKind.AUTHORITATIVE
+
+
+def test_an_arc_track_is_saved_loaded_and_hashed(divider_ir: CircuitIR, tmp_path):
+    """A track with ``mid`` (a circular arc) is design data: it survives save / load and is in the content hash, so the same board with
+    the straight chord in the arc's place hashes differently - evidence about the one is never taken for the other."""
+    arc = Track(net="GND", layer="F.Cu", start=(13.5, 5.75), mid=(12.62132, 7.87132), end=(10.5, 8.75), width_mm=0.4)
+    chord = Track(net="GND", layer="F.Cu", start=(13.5, 5.75), end=(10.5, 8.75), width_mm=0.4, provenance=arc.provenance)
+    divider_ir.pcb = PCBDesign(tracks=[arc])
+    h = divider_ir.content_hash()
+    p = divider_ir.save(tmp_path / "ir.json")
+    loaded = CircuitIR.load(p)
+    assert loaded.pcb is not None and loaded.pcb.tracks[0].is_arc and loaded.pcb.tracks[0].mid == (12.62132, 7.87132)
+    assert loaded.content_hash() == h == divider_ir.content_hash()
+    assert '"mid"' in p.read_text(encoding="utf-8")
+    divider_ir.pcb = PCBDesign(tracks=[chord])
+    assert divider_ir.content_hash() != h
+    assert '"mid"' not in divider_ir.save(tmp_path / "chord.json").read_text(encoding="utf-8")  # a straight track has no such key
 
 
 def test_net_lookup(divider_ir: CircuitIR):

@@ -76,6 +76,64 @@ these facts:
     Without ``td`` ngspice-42 simulates the line with a delay of its own and
     no error, so :func:`validate_deck` refuses a ``T`` line that does not
     carry exactly ``z0=`` and ``td=``.
+12. The coupled multiconductor line (CPL, ``P<name> in1 in2 0 out1 out2 0
+    <model>`` with ``.model <model> CPL length= R= L= G= C=``, ngspice-46
+    manual sect. 6.4.2), measured 2026-11-13 on KiCad 10.0.6's
+    ``ngspice.dll`` (ngspice-46, build Apr 14 2026 05:15:29); ngspice-42 is
+    not installed here and was not run. Two lines on the 4-layer generic F.Cu
+    (h 0.2 mm, t 35 um, er 4.5, 50-ohm width, Maxwell matrices from
+    :func:`ai_eda.tools.calc.xtalk.maxwell_from_modes`):
+
+    a. It parses and runs. The plot adds four branch currents
+       ``p1#branch1_0`` ``p1#branch1_1`` ``p1#branch2_0`` ``p1#branch2_1``,
+       which the rawfile writes all as ``i(p1)``, in that (sorted) order; the
+       cross-check compares them by position (:meth:`_Engine._rawfile_mismatch`).
+    b. No coupling at all (L12 = C12 = 0, and 1e-9 of the self terms) is
+       refused: "Error in CPL p1: Forbidden combination of model
+       parameters!" and a ControlledExit. 1e-6 of the self terms runs, and
+       with R = 1 ohm/m each line matches a lossless ``T`` line of its own Z0
+       and delay within 0.4 % of the peak (25 / 40 ohm drivers, 5 pF / 100
+       ohm loads, 20 mm).
+    c. R at the engine's 1e-4 ohm/m floor (what a "lossless" CPL gets)
+       simulates wrongly with no error: all four ends at sqrt(Ze Zo) =
+       49.48 ohm, s/h 1.5, 20 mm, a 2 V step: the aggressor's input settles
+       at 2.008 V where the divider gives 1.000 V, NEXT reads 2.26 % where
+       the closed form gives 1.15 %, at every step from 1 to 20 ps; at
+       100 mm the run aborts ("Timestep too small"). With R = 1 ohm/m on the
+       diagonal (the manual example's ``R=1 0 1``) the same decks settle
+       within 0.1 % of 1.000 V and give NEXT / V_A within 3.9 % of the
+       closed form below saturation and 0.5 % of Kb at 100 and 300 mm (s/h
+       0.5 to 10, 1 to 300 mm, 1 ps step), so the compiler writes R = 1 ohm/m
+       (:data:`ai_eda.compilers.spice.CPL_R_OHM_PER_M`).
+    d. Even at R = 1 ohm/m the engine can be wrong with no error when the
+       ends are not matched: 25 ohm driver, 5 pF loads, s/h 0.5, 10 mm, a
+       2 ns edge at a 1.27 ps step: the lines settle at 0.987 and 0.974 V of
+       1 V and the victim's far-end peak is -5.1 mV where an L-K-C ladder of
+       the same matrices (200 segments) gives +8.2 mV; at a 5 to 20 ps step
+       the same deck agrees with the ladder (+8.14 mV, settled within
+       5e-5 V). Over 40 such decks (s/h 0.5 to 10, 2 to 100 mm, 0.5 and 2 ns
+       edges; the ladder at 20 segments per mm, its own step converged to
+       about 1 %): at the step min(t_r, td) / 50, 10 of 38 differ from the
+       ladder by more than 10 % in the |NEXT| or |FEXT| peak or settle more
+       than 1 mV off; at steps of 0.02, 0.05, 0.1, 0.2 and 0.4 times the
+       faster mode's delay 10, 7, 13, 19 and 26 of 40 do (the coarse steps
+       also under-sample the edge). No message marks a wrong run and no step
+       rule that avoids it has been found, so a verdict that rests on a CPL
+       deck needs a check of its own.
+    e. The tau check: a 1 mm line (mode delays 5.9 / 6.3 ps) at a 1 ps step
+       runs clean; at a 10 ps or 100 ps step ngspice prints "your time step
+       was too large for CPL tau." and "tmax is now set to 5.321922e-12." on
+       stderr (a failed run here).
+    f. A later CPL deck can crash the host process (access violation): a CPL
+       deck, a ``T``-line deck, a CPL deck crashed at the second CPL; with a
+       1200-element RC deck in between, after 9 runs; two CPL decks in a row
+       at R = 1e-3 ohm/m (the first simulated wrongly), at the second;
+       ``ngSpice_Reset`` + ``Init`` after each CPL deck did not prevent it;
+       20 and 40 CPL decks in a row at R = 1 ohm/m did not crash, and the
+       runs that did not crash wrote the same rawfile values as a first run
+       of the same deck. So this runner loads at most
+       one CPL deck per process and refuses the next one as unverifiable
+       (:func:`cpl_refusal`): run each CPL deck in a process of its own.
 """
 
 from __future__ import annotations
@@ -298,6 +356,9 @@ def check_path_for_command(path: Path) -> None:
 #: characters ngspice keeps intact in a node name (measured); ``( ) { } = , ; ' "`` and non-ASCII are mangled or fatal
 NODE_RE = re.compile(r"[A-Za-z0-9_./+\-:#@\[\]]+")
 GROUND_NODES = frozenset({"0", "gnd"})
+#: a device operating-point quantity the runner may be asked to keep beside the node vectors (``@q1[ic]``):
+#: an element name and a parameter name, nothing an ngspice command could read as anything else
+PROBE_RE = re.compile(r"@[a-z][a-z0-9_]*\[[a-z][a-z0-9_]*\]")
 #: cards refused because they execute commands, pull in files, change the title or hide vectors
 _FORBIDDEN_CARDS: dict[str, str] = {
     ".control": "a .control block executes arbitrary ngspice commands (including shell) when the file is sourced",
@@ -317,10 +378,12 @@ _ANALYSIS_CARDS = (".op", ".dc", ".ac", ".tran", ".tf", ".noise", ".pz", ".sens"
 #: certain - the behavioural forms ``E1 out 0 value={...}`` have no controlling node pair)
 _ELEMENT_NODES: dict[str, int] = {
     "R": 2, "C": 2, "L": 2, "V": 2, "I": 2, "D": 2, "B": 2, "E": 2, "F": 2, "G": 2, "H": 2, "W": 2,
-    "Q": 3, "J": 3, "Z": 3, "M": 4, "S": 4, "T": 4,
+    "Q": 3, "J": 3, "Z": 3, "M": 4, "S": 4, "T": 4, "P": 6,
 }
 _NEEDS_VALUE = frozenset("RCL")
-_NEEDS_MODEL = frozenset("DQJZM")
+#: letters whose line must name a model after its nodes (a voltage-controlled switch ``S`` without one fails to load on
+#: ngspice-46 with "Unable to find definition of model" - measured 2026-11-18 - refused here before the engine sees it)
+_NEEDS_MODEL = frozenset("DQJZMPS")
 #: the params a lossless transmission line (``T``) must carry - and the only ones accepted on it. Measured on ngspice-42
 #: (2026-09-27): ``t1 a 0 b 0 z0=50`` (no ``td``) is simulated with a delay ngspice picks itself and no error line (a
 #: silent wrong result); without ``z0`` the analysis aborts with "transmission line z0 must be given"
@@ -338,6 +401,30 @@ def _tline_problem(toks: list[str]) -> str | None:
     if sorted(seen) != sorted(TLINE_PARAMS):
         return (f"{toks[0]!r}: a lossless line needs exactly z0= and td= (got {seen or 'no params'}); "
                 "ngspice simulates a line without td with a delay of its own choosing and no error")
+    return None
+
+
+#: instance tokens ngspice's CPL parser takes as the line's length (inp2p.c at ngspice-46, as the crosstalk research step
+#: read it: it counts nodes up to ``len`` / ``length`` and drops a length it cannot evaluate without a word)
+CPL_LENGTH_KEYS: tuple[str, ...] = ("len", "length")
+
+
+def _cpl_problem(toks: list[str]) -> str | None:
+    """Why a ``P`` element line is not the ``P<name> in1 in2 0 out1 out2 0 <model>`` form the runner accepts, else ``None``.
+
+    Two coupled lines only (six nodes), a model name, both reference nodes
+    ground and no instance length: the length belongs on the ``.model`` line.
+    """
+    if any(t.lower().partition("=")[0] in CPL_LENGTH_KEYS for t in toks[1:]):
+        return (f"{toks[0]!r}: a coupled line takes its length on its .model line, not on the instance "
+                "(ngspice drops an instance len it cannot evaluate without a word)")
+    if len(toks) != 8:
+        return f"{toks[0]!r}: a coupled line takes exactly 6 nodes (in1 in2 gnd1 out1 out2 gnd2: two lines) and a model name, got {len(toks) - 1} tokens"
+    if "=" in toks[7]:
+        return f"{toks[0]!r}: a coupled line needs a model name after its six nodes, got {toks[7]!r}"
+    off = [t for t in (toks[3], toks[6]) if t.lower() not in GROUND_NODES]
+    if off:
+        return f"{toks[0]!r}: a coupled line's reference nodes (its 3rd and 6th nodes) must be ground (0), got {off}"
     return None
 
 
@@ -363,16 +450,19 @@ def _element_nodes(letter: str, toks: list[str]) -> list[str] | None:
     return None
 
 
-def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
+def validate_deck(text: str) -> tuple[list[str], dict[str, str | int]]:
     """Refuse decks that crash, poison or silently mis-simulate in ngspice.dll; returns ``(problems, info)``.
 
-    ``info["title"]`` is the first line. Checked: non-empty title; ``.end`` as
+    ``info["title"]`` is the first line; ``info["coupled_lines"]`` the number
+    of coupled-line (P) element lines. Checked: non-empty title; ``.end`` as
     the last non-empty line; no quote/backtick, control or non-ASCII
     characters; no analysis cards (the runner issues the analysis as a
     command, so a card would be inert and misleading), no ``.control`` /
     ``.include`` / ``.lib`` / ``.title`` / ``.save``; element lines with a
-    name, their nodes and a value (R C L) or model (D Q J Z M); a lossless
-    line (T) with exactly ``z0=`` and ``td=`` (:data:`TLINE_PARAMS`); node names in
+    name, their nodes and a value (R C L) or model (D Q J Z M P S); a lossless
+    line (T) with exactly ``z0=`` and ``td=`` (:data:`TLINE_PARAMS`); a coupled
+    line (P) with exactly six nodes, both reference nodes ground, a model
+    name and no instance ``len`` / ``length`` (:func:`_cpl_problem`); node names in
     ``A-Z a-z 0-9 _ . / + - : # @ [ ]`` (:data:`NODE_RE`); no duplicate element names; at least one
     non-ground node; no two node names that collide after lowercasing.
     """
@@ -388,6 +478,7 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
     nodes: dict[str, set[str]] = {}
     depth = 0
     in_control = False
+    coupled = 0
     for i, ln in enumerate(lines, 1):
         if any(ch in "'\"`" for ch in ln):
             problems.append(f"line {i}: quote/backtick characters are forbidden (an unbalanced ' poisons ngspice.dll for the rest of the process)")
@@ -430,15 +521,19 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
             needed = 1 + n_nodes + (1 if letter in _NEEDS_VALUE or letter in _NEEDS_MODEL else 0)
             if len(toks) < needed:
                 what = "a value" if letter in _NEEDS_VALUE else "a model" if letter in _NEEDS_MODEL else ""
-                problems.append(
-                    f"line {i}: {s!r} needs {n_nodes} nodes{' and ' + what if what else ''} "
-                    "(ngspice ignores such a line with only a warning and simulates the rest)"
-                )
+                why = ("ngspice-46 refuses to load the deck: 'Unable to find definition of model'" if letter == "S"
+                       else "ngspice ignores such a line with only a warning and simulates the rest")
+                problems.append(f"line {i}: {s!r} needs {n_nodes} nodes{' and ' + what if what else ''} ({why})")
                 continue
         if letter == "T":
             tline = _tline_problem(toks)
             if tline is not None:
                 problems.append(f"line {i}: {tline}")
+        if letter == "P":
+            coupled += 1
+            cpl = _cpl_problem(toks)
+            if cpl is not None:
+                problems.append(f"line {i}: {cpl}")
         element_nodes = _element_nodes(letter, toks)
         if element_nodes is None:
             continue
@@ -452,7 +547,21 @@ def validate_deck(text: str) -> tuple[list[str], dict[str, str]]:
     for k, variants in nodes.items():
         if len(variants) > 1:
             problems.append(f"node names {sorted(variants)} collide after ngspice lowercases them")
-    return problems, {"title": title}
+    return problems, {"title": title, "coupled_lines": coupled}
+
+
+def cpl_refusal(first_cpl_deck: str | None) -> str | None:
+    """Why this process may not load another deck with a coupled line (P), else ``None`` (module docstring item 12).
+
+    ``first_cpl_deck`` is the CPL deck the process already loaded, if any:
+    on ngspice-46 a later CPL deck can crash the host process, so each CPL
+    deck runs in a process of its own and the runner refuses the second one
+    (the result is ``unverifiable``: NOT_VERIFIED downstream, never a verdict).
+    """
+    if first_cpl_deck is None:
+        return None
+    return (f"not run: this process already loaded a coupled-line (CPL) deck ({first_cpl_deck}); on ngspice-46 a later CPL deck "
+            "can crash the host process (measured 2026-11-13, ngspice_shared item 12), so each CPL deck runs in a process of its own")
 
 
 # ------------------------------------------------------------------------------------------ the engine
@@ -576,6 +685,8 @@ class _Engine:
         self.init_log: list[str] = []
         self.settings: list[str] = []
         self.self_test: dict = {}
+        #: the first deck with a coupled line (P) this process loaded: the one CPL deck it may run (module docstring item 12)
+        self.cpl_deck: str | None = None
         self._dll_dir = os.add_dll_directory(str(dll.parent)) if hasattr(os, "add_dll_directory") else None
         # loaded and started in an empty folder: the dynamic loader resolves an empty or relative LD_LIBRARY_PATH entry,
         # and ngSpice_Init a .spiceinit, against the working directory (:func:`_empty_working_directory`)
@@ -907,6 +1018,7 @@ class _Engine:
         *,
         timeout_s: float,
         raw_format: Literal["ascii", "binary"],
+        probes: tuple[str, ...] = (),
     ) -> SpiceResult:
         t_start = time.perf_counter()
         transcript: list[str] = []
@@ -933,6 +1045,11 @@ class _Engine:
             errors.extend(f"netlist rejected before reaching ngspice: {p}" for p in problems)
             return finish()
         title = info["title"]
+        if info["coupled_lines"]:
+            refusal = cpl_refusal(self.cpl_deck)
+            if refusal is not None:
+                errors.append(refusal)
+                return finish(unverifiable=refusal)
         lines = [ln.rstrip("\r") for ln in text.split("\n")]
         while lines and not lines[-1].strip():
             lines.pop()
@@ -943,6 +1060,8 @@ class _Engine:
         try:
             self.unload_all()
             self.cap.clear()
+            if info["coupled_lines"]:
+                self.cpl_deck = str(netlist_path)  # from here on this process loads no other CPL deck
             rc = self._circ(lines)
             out, err, exits, _ = drain()
             circuit_seen = any(s.strip().lower() == f"circuit: {title.lower()}" for s in out)
@@ -959,6 +1078,16 @@ class _Engine:
             self._cmd("listing")
             listing = self.cap.stdout()
             drain()
+            if probes:
+                # the interactive command, never a .save card: "all" keeps every vector the plot has without it
+                # (measured, ngspice-46), and loading the next circuit forgets the list
+                rc = self._cmd("save all " + " ".join(probes))
+                _, err, exits, _ = drain()
+                if rc != 0 or err or exits:
+                    errors.extend(err)
+                    errors.append(f"ngspice refused the device probes {list(probes)}")
+                    self._after_failure(exits)
+                    return finish(listing=listing)
             pre_plots = self.all_plots()
             timed_out = self._run_with_watchdog(f"bg_{command}", timeout_s)
             out, err, exits, init_data = drain()
@@ -1059,7 +1188,14 @@ class _Engine:
 
     @staticmethod
     def _rawfile_mismatch(raw: Path, vecs: dict[str, _Vector], n_points: int, plot_type: str | None) -> str:
-        """Compare the rawfile ngspice wrote with the API vectors; '' when consistent (binary exact, ASCII 1e-12 relative)."""
+        """Compare the rawfile ngspice wrote with the API vectors; '' when consistent (binary exact, ASCII 1e-12 relative).
+
+        Plot vectors that the file names alike (a coupled line's four branch
+        currents ``p1#branch1_0`` ... ``p1#branch2_1`` are all ``i(p1)``) are
+        compared by position: the file lists them in the sorted order of their
+        plot names (measured on ngspice-46, module docstring item 12), against
+        :attr:`~ai_eda.tools.spice.rawfile.RawPlot.repeated`.
+        """
         try:
             rp = rawfile.parse(raw)
         except ValueError as e:
@@ -1076,8 +1212,13 @@ class _Engine:
                 return a == b
             return abs(a - b) <= 1e-12 * max(1.0, abs(a), abs(b))
 
+        alike: dict[str, list[str]] = {}
+        for name, v in vecs.items():
+            alike.setdefault(rawfile.raw_variable_name(name, v.v_type), []).append(name)
         for name, v in vecs.items():
             raw_name = rawfile.raw_variable_name(name, v.v_type)
+            if len(alike[raw_name]) > 1:
+                continue  # compared by position below
             expected = rawfile.complex_convention(raw_name, v.data) if v.complex else {raw_name: list(v.data)}
             for key, api_values in expected.items():
                 file_values = rp.vectors.get(key)
@@ -1088,6 +1229,19 @@ class _Engine:
                 for k, (a, b) in enumerate(zip(file_values, api_values)):
                     if not same(a, b):
                         return f"variable {key!r} sample {k}: file {a!r} vs plot {b!r}"
+        for raw_name, names in alike.items():
+            if len(names) < 2:
+                continue
+            columns = rp.repeated.get(raw_name, [])
+            if len(columns) != len(names):
+                return f"{len(names)} plot vectors {sorted(names)} are written as {raw_name!r}, the file lists that name {len(columns)} times"
+            for place, (name, column) in enumerate(zip(sorted(names), columns)):
+                api = vecs[name].data
+                if len(column) != len(api):
+                    return f"variable {raw_name!r} #{place} has {len(column)} samples in the file, {len(api)} in plot vector {name!r}"
+                for k, (a, b) in enumerate(zip(column, api)):
+                    if not (same(a[0], b[0]) and same(a[1], b[1]) if vecs[name].complex else same(a, b)):
+                        return f"variable {raw_name!r} #{place} (plot vector {name!r}) sample {k}: file {a!r} vs plot {b!r}"
         return ""
 
 
@@ -1127,6 +1281,7 @@ class NgspiceShared(SpiceRunner):
     """
 
     engine = ENGINE_ID
+    device_probes = True
     _instances: dict[str, NgspiceShared] = {}
 
     def __new__(cls, dll: str | Path | None = None, codemodel_dir: str | Path | None = None) -> NgspiceShared:
@@ -1225,8 +1380,13 @@ class NgspiceShared(SpiceRunner):
         *,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         raw_format: Literal["ascii", "binary"] = "ascii",
+        probes: tuple[str, ...] = (),
     ) -> SpiceResult:
         """Run one analysis of the netlist file at ``netlist_path``.
+
+        ``probes`` are device operating-point quantities (``@q1[ic]``,
+        :data:`PROBE_RE`; ``ValueError`` otherwise) kept as extra vectors of
+        the plot beside every node vector.
 
         The file's bytes are read once, hashed (``netlist_hash``), validated
         and handed to ``ngSpice_Circ`` - the path itself never reaches an
@@ -1251,21 +1411,27 @@ class NgspiceShared(SpiceRunner):
         cmd = normalise_command(command, analysis)
         if raw_format not in ("ascii", "binary"):
             raise ValueError(f"raw_format must be 'ascii' or 'binary', got {raw_format!r}")
+        bad = [p for p in probes if not PROBE_RE.fullmatch(p)]
+        if bad:
+            raise ValueError(f"not device probes (expected e.g. '@q1[ic]'): {bad}")
         eng = self._engine()
         with eng.lock:
             if eng.dead:
                 raise ToolUnavailableError(f"ngspice.dll is unusable in this process ({eng.dead_reason}); restart the process")
-            return eng.run(netlist_path, analysis, cmd, Path(workdir).resolve(), timeout_s=timeout_s, raw_format=raw_format)
+            return eng.run(netlist_path, analysis, cmd, Path(workdir).resolve(), timeout_s=timeout_s, raw_format=raw_format, probes=tuple(probes))
 
 
 __all__ = [
     "CODEMODELS",
+    "CPL_LENGTH_KEYS",
     "DEFAULT_TIMEOUT_S",
     "ENGINE_ID",
     "NODE_RE",
+    "PROBE_RE",
     "TLINE_PARAMS",
     "NgspiceShared",
     "check_path_for_command",
+    "cpl_refusal",
     "find_codemodel_dir",
     "find_ngspice_dll",
     "validate_deck",

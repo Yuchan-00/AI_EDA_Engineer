@@ -393,7 +393,7 @@ def test_the_page_is_the_korean_app_and_needs_nothing_its_csp_forbids(shared):
     # the new-project form: the name rule and the five template requests, each naming its template's inputs (the answers without --llm)
     assert 'pattern="[A-Za-z0-9][A-Za-z0-9_\\-]{0,63}"' in APP_HTML
     examples = page_examples()
-    assert len(examples) == 5 and "5 V 입력, 1 kHz 구형파 발진기" in [e["value"] for e in examples]
+    assert len(examples) == 8 and "5 V 입력, 1 kHz 구형파 발진기" in [e["value"] for e in examples]  # one per template of TEMPLATES
     needs = {t.id: set(t.needs) for t in TEMPLATES}
     assert sorted(e["data-template"] for e in examples) == sorted(needs)
     for e in examples:
@@ -702,7 +702,7 @@ def test_schematic_preview_draws_every_component_stub_and_label(shared):
     symbols = [g for g in root.iter(f"{SVG_NS}g") if g.get("class") == "symbol"]
     assert sorted(g.get("data-ref") for g in symbols) == sorted(c.ref for c in ir.components), "one symbol group per component"
     net_pins = sum(len(n.pins) for n in ir.nets)
-    assert len(classed(root, "line", "wire")) == net_pins, "one wire stub per net pin"
+    assert len(classed(root, "line", "wire")) >= net_pins, "one wire stub per net pin, plus the routed net wires (B11)"
     labels = [g for g in root.iter(f"{SVG_NS}g") if g.get("class") == "global-label"]
     assert len(labels) == net_pins and sorted({g.get("data-net") for g in labels}) == sorted(n.name for n in ir.nets)
     assert get(running.port, "/preview/divider/schematic.svg")[2] == body, "deterministic"
@@ -720,8 +720,11 @@ def test_board_preview_carries_the_layer_classes(shared):
     for layer in ("F.Cu", "B.Cu"):
         group = next(g for g in root.iter(f"{SVG_NS}g") if g.get("class") == f"layer-{layer.replace('.', '_')}")
         assert group.get("data-layer") == layer
-        assert [t.get("data-layer") for t in classed(group, "line", "track")] == [layer] * sum(1 for t in ir.pcb.tracks if t.layer == layer)
-    assert len(classed(root, "line", "track")) == len(ir.pcb.tracks) and len(classed(root, "g", "via")) == len(ir.pcb.vias)
+        # a straight track is a <line class="track">, an arc track (the PCB agent rounds corners by default) a <path class="track">
+        assert [t.get("data-layer") for t in classed(group, "line", "track")] == [layer] * sum(1 for t in ir.pcb.tracks if t.layer == layer and t.mid is None)
+        assert [t.get("data-layer") for t in classed(group, "path", "track")] == [layer] * sum(1 for t in ir.pcb.tracks if t.layer == layer and t.mid is not None)
+    assert any(t.mid is not None for t in ir.pcb.tracks)
+    assert len(classed(root, "line", "track")) + len(classed(root, "path", "track")) == len(ir.pcb.tracks) and len(classed(root, "g", "via")) == len(ir.pcb.vias)
     # designed silk carries the references: the labels group is empty, and the page disables its 라벨 toggle when it is
     labels = next(g for g in root.iter(f"{SVG_NS}g") if g.get("class") == "labels")
     assert ir.pcb.silkscreen and len(labels) == 0

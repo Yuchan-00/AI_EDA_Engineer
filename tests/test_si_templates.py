@@ -35,7 +35,9 @@ from ai_eda.workflow import Stage
 from tests.fixtures_atmega import atmega_library
 from tests.test_circuit_templates import ASTABLE, DIVIDER, LED, RC, _confirm, _ir, _present, template_library
 
-TEMPLATE_INPUTS = {"divider": DIVIDER, "led": LED, "rc_lowpass": RC, "astable": ASTABLE}
+TEMPLATE_INPUTS = {"divider": DIVIDER, "led": LED, "rc_lowpass": RC, "astable": ASTABLE, "lc_lowpass": {"cutoff_frequency": "100 kHz", "system_impedance": "50 ohm"},
+                   "bjt_lowside_switch": {"input_voltage": "5 V", "output_voltage": "12 V", "output_current": "50 mA", "max_voltage_drop": "0.3 V"},
+                   "i2c_pullup": {"input_voltage": "3.3 V", "clock_frequency": "400 kHz", "bus_capacitance": "150 pF", "bus_rise_time": "300 ns"}}
 
 
 def test_the_template_version_names_the_board_decisions():

@@ -1,0 +1,688 @@
+{
+  "table_hash": "sha256:55828bf44237dcc6947e4576c338028d4b78dd0529e4280628bd833e351270a1",
+  "changes_sha256": "22846ec04ed721dbca58e54542e27cda7b91676f4b2d5d95468f2a9a17f862a7",
+  "ir_hash": "sha256:8348de01d7bceb7384a0a691d7bd265391ed94536dfbbbf7ea81a344a9686126",
+  "ir": {
+    "schema_version": "0.1",
+    "project": {
+      "id": "tpl",
+      "name": "tpl",
+      "description": ""
+    },
+    "requirements": {
+      "raw_input": "",
+      "corrections": [],
+      "requirements": [],
+      "missing": [],
+      "conflicts": []
+    },
+    "topology": {
+      "name": "rc low-pass",
+      "domains": [
+        "analog"
+      ],
+      "blocks": [],
+      "rationale": "",
+      "provenance": {
+        "kind": "user_requirement",
+        "source": null,
+        "derived_from": [],
+        "inputs": {},
+        "tool": null,
+        "tool_version": null,
+        "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+      }
+    },
+    "components": [
+      {
+        "ref": "R1",
+        "value": "1k",
+        "description": "",
+        "manufacturer": null,
+        "mpn": null,
+        "datasheet": null,
+        "package": null,
+        "pins": [
+          {
+            "number": "1",
+            "name": "~",
+            "electrical_type": "passive",
+            "provenance": {
+              "kind": "authoritative",
+              "source": {
+                "title": "KiCad symbol Device:R",
+                "url": null,
+                "authority": "KiCad library",
+                "section": null,
+                "content_hash": "sha256:23f33a2ea6d8f682076d03c98b3c37640e165392158e22d04d94db33785db689"
+              },
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null
+            }
+          },
+          {
+            "number": "2",
+            "name": "~",
+            "electrical_type": "passive",
+            "provenance": {
+              "kind": "authoritative",
+              "source": {
+                "title": "KiCad symbol Device:R",
+                "url": null,
+                "authority": "KiCad library",
+                "section": null,
+                "content_hash": "sha256:23f33a2ea6d8f682076d03c98b3c37640e165392158e22d04d94db33785db689"
+              },
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null
+            }
+          }
+        ],
+        "electrical": {
+          "resistance": {
+            "value": 1000.0,
+            "unit": "ohm",
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+            }
+          }
+        },
+        "symbol": {
+          "library": "Device",
+          "name": "R",
+          "verified": true
+        },
+        "footprint": {
+          "library": "Resistor_SMD",
+          "name": "R_0603_1608Metric",
+          "verified": true
+        },
+        "sourcing": [],
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+        },
+        "serves_requirements": [
+          "req.step_response"
+        ],
+        "spice": {
+          "device": "R",
+          "exclude": false,
+          "exclude_reason": "",
+          "value": {
+            "value": 1000.0,
+            "unit": "ohm",
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+            }
+          },
+          "model_name": null,
+          "model_card": null,
+          "pin_order": [
+            "1",
+            "2"
+          ],
+          "ignored_pins": {},
+          "params": {},
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+          }
+        }
+      },
+      {
+        "ref": "C1",
+        "value": "1u",
+        "description": "",
+        "manufacturer": null,
+        "mpn": null,
+        "datasheet": null,
+        "package": null,
+        "pins": [
+          {
+            "number": "1",
+            "name": "~",
+            "electrical_type": "passive",
+            "provenance": {
+              "kind": "authoritative",
+              "source": {
+                "title": "KiCad symbol Device:C",
+                "url": null,
+                "authority": "KiCad library",
+                "section": null,
+                "content_hash": "sha256:23f33a2ea6d8f682076d03c98b3c37640e165392158e22d04d94db33785db689"
+              },
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null
+            }
+          },
+          {
+            "number": "2",
+            "name": "~",
+            "electrical_type": "passive",
+            "provenance": {
+              "kind": "authoritative",
+              "source": {
+                "title": "KiCad symbol Device:C",
+                "url": null,
+                "authority": "KiCad library",
+                "section": null,
+                "content_hash": "sha256:23f33a2ea6d8f682076d03c98b3c37640e165392158e22d04d94db33785db689"
+              },
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null
+            }
+          }
+        ],
+        "electrical": {
+          "capacitance": {
+            "value": 1e-06,
+            "unit": "F",
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+            }
+          }
+        },
+        "symbol": {
+          "library": "Device",
+          "name": "C",
+          "verified": true
+        },
+        "footprint": {
+          "library": "Capacitor_SMD",
+          "name": "C_0603_1608Metric",
+          "verified": true
+        },
+        "sourcing": [],
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+        },
+        "serves_requirements": [
+          "req.step_response"
+        ],
+        "spice": {
+          "device": "C",
+          "exclude": false,
+          "exclude_reason": "",
+          "value": {
+            "value": 1e-06,
+            "unit": "F",
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+            }
+          },
+          "model_name": null,
+          "model_card": null,
+          "pin_order": [
+            "1",
+            "2"
+          ],
+          "ignored_pins": {},
+          "params": {},
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+          }
+        }
+      },
+      {
+        "ref": "J1",
+        "value": "Conn_01x02",
+        "description": "",
+        "manufacturer": null,
+        "mpn": null,
+        "datasheet": null,
+        "package": null,
+        "pins": [
+          {
+            "number": "1",
+            "name": "Pin_1",
+            "electrical_type": "passive",
+            "provenance": {
+              "kind": "authoritative",
+              "source": {
+                "title": "KiCad symbol Connector_Generic:Conn_01x02",
+                "url": null,
+                "authority": "KiCad library",
+                "section": null,
+                "content_hash": "sha256:b69004fcc74c98115b8100a62cd228b731c712a744b832d56fedcb055fa393a9"
+              },
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null
+            }
+          },
+          {
+            "number": "2",
+            "name": "Pin_2",
+            "electrical_type": "passive",
+            "provenance": {
+              "kind": "authoritative",
+              "source": {
+                "title": "KiCad symbol Connector_Generic:Conn_01x02",
+                "url": null,
+                "authority": "KiCad library",
+                "section": null,
+                "content_hash": "sha256:b69004fcc74c98115b8100a62cd228b731c712a744b832d56fedcb055fa393a9"
+              },
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": null
+            }
+          }
+        ],
+        "electrical": {},
+        "symbol": {
+          "library": "Connector_Generic",
+          "name": "Conn_01x02",
+          "verified": true
+        },
+        "footprint": {
+          "library": "Connector_PinHeader_2.54mm",
+          "name": "PinHeader_1x02_P2.54mm_Vertical",
+          "verified": true
+        },
+        "sourcing": [],
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+        },
+        "serves_requirements": [],
+        "spice": {
+          "device": null,
+          "exclude": true,
+          "exclude_reason": "connector",
+          "value": null,
+          "model_name": null,
+          "model_card": null,
+          "pin_order": [
+            "1",
+            "2"
+          ],
+          "ignored_pins": {},
+          "params": {},
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+          }
+        }
+      }
+    ],
+    "nets": [
+      {
+        "name": "IN",
+        "kind": "signal",
+        "pins": [
+          {
+            "component_ref": "J1",
+            "pin_number": "1"
+          },
+          {
+            "component_ref": "R1",
+            "pin_number": "1"
+          }
+        ],
+        "net_class": "Default",
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+        },
+        "serves_requirements": []
+      },
+      {
+        "name": "OUT",
+        "kind": "signal",
+        "pins": [
+          {
+            "component_ref": "R1",
+            "pin_number": "2"
+          },
+          {
+            "component_ref": "C1",
+            "pin_number": "1"
+          }
+        ],
+        "net_class": "Default",
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+        },
+        "serves_requirements": []
+      },
+      {
+        "name": "GND",
+        "kind": "ground",
+        "pins": [
+          {
+            "component_ref": "J1",
+            "pin_number": "2"
+          },
+          {
+            "component_ref": "C1",
+            "pin_number": "2"
+          }
+        ],
+        "net_class": "Default",
+        "provenance": {
+          "kind": "user_requirement",
+          "source": null,
+          "derived_from": [],
+          "inputs": {},
+          "tool": null,
+          "tool_version": null,
+          "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+        },
+        "serves_requirements": []
+      }
+    ],
+    "constraints": [],
+    "parameters": {},
+    "pcb": null,
+    "simulation": {
+      "stimuli": [
+        {
+          "id": "VIN",
+          "source": "voltage",
+          "net": "IN",
+          "reference_net": "GND",
+          "kind": "pulse",
+          "value": null,
+          "params": {
+            "v1": {
+              "value": 0.0,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            },
+            "v2": {
+              "value": 5.0,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            },
+            "td": {
+              "value": 0.0,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            },
+            "tr": {
+              "value": 1e-09,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            },
+            "tf": {
+              "value": 1e-09,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            },
+            "pw": {
+              "value": 1.0,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            },
+            "per": {
+              "value": 2.0,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            }
+          },
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+          },
+          "serves_requirements": []
+        }
+      ],
+      "analyses": [
+        {
+          "id": "tran",
+          "kind": "tran",
+          "params": {
+            "step": {
+              "value": 1e-06,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            },
+            "stop": {
+              "value": 0.005,
+              "unit": null,
+              "provenance": {
+                "kind": "user_requirement",
+                "source": null,
+                "derived_from": [],
+                "inputs": {},
+                "tool": null,
+                "tool_version": null,
+                "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+              }
+            }
+          },
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+          }
+        }
+      ],
+      "expectations": [
+        {
+          "id": "v_out_tau",
+          "analysis_id": "tran",
+          "vector": "v(OUT)",
+          "reduce": "at",
+          "at": {
+            "value": 0.001,
+            "unit": null,
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+            }
+          },
+          "nominal": {
+            "value": 3.1606027941,
+            "unit": "V",
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+            }
+          },
+          "tol_abs": null,
+          "tol_rel": {
+            "value": 0.02,
+            "unit": null,
+            "provenance": {
+              "kind": "user_requirement",
+              "source": null,
+              "derived_from": [],
+              "inputs": {},
+              "tool": null,
+              "tool_version": null,
+              "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+            }
+          },
+          "requirement_id": null,
+          "provenance": {
+            "kind": "user_requirement",
+            "source": null,
+            "derived_from": [],
+            "inputs": {},
+            "tool": null,
+            "tool_version": null,
+            "note": "design file sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1"
+          }
+        }
+      ],
+      "temperature_c": null
+    },
+    "regulatory": {
+      "jurisdictions": [],
+      "intended_use": null,
+      "requirements": [],
+      "scope_answers": {},
+      "proposed_candidates": []
+    }
+  },
+  "table": "Design file 'RC low-pass' (sha256:e3099f0f80304568f3c4aa7421d8414567a8ecc7c9ca8e88e0a6ee4f3c13a9f1) can be built as written. Nothing is applied until you answer confirm_design=yes (confirm_design=no leaves the design empty). Confirming makes every value below your own (user_requirement); no value in it is checked yet.\nTopology: rc low-pass (analog)\nParts instantiated from the KiCad library on disk:\n  R1 Device:R / Resistor_SMD:R_0603_1608Metric, value 1k (pins 1, 2 from {library:Device}); SPICE R 1000.0 ohm; serves req.step_response\n  C1 Device:C / Capacitor_SMD:C_0603_1608Metric, value 1u (pins 1, 2 from {library:Device}); SPICE C 1e-06 F; serves req.step_response\n  J1 Connector_Generic:Conn_01x02 / Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical, value Conn_01x02 (pins 1, 2 from {library:Connector_Generic}); excluded from SPICE: connector\nNets:\n  IN (signal): J1.1, R1.1\n  OUT (signal): R1.2, C1.1\n  GND (ground): J1.2, C1.2\nSimulation:\n  stimulus VIN: voltage pulse on IN against GND (v1=0.0, v2=5.0, td=0.0, tr=1e-09, tf=1e-09, pw=1.0, per=2.0)\n  analysis tran: tran (step=1e-06, stop=0.005)\n  expectation v_out_tau: at of v(OUT) in tran at 0.001 = 3.1606027941 V (tol_rel 0.02)"
+}

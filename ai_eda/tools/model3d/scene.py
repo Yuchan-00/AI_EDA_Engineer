@@ -30,7 +30,12 @@ top at the thickness ``T``):
   before. An inner zone without a stackup has no depth and is not drawn
   (said in the notes);
 * copper: tracks on F.Cu / B.Cu (inner layers are hidden in the board and not
-  drawn), via rings on the outer layers they reach, pads from the library
+  drawn) - a straight track as one round-ended bar, an arc track
+  (``Track.mid``) as one such bar per chord of its chain
+  (:func:`~ai_eda.ir.track_points`: every point of the arc within 1 um of the
+  chain and the reverse; the chain itself at the track's width, because this
+  is a picture, and the notes count the arcs and their chords) -, via rings
+  on the outer layers they reach, pads from the library
   footprint on every outer copper layer they are on (above the mask when the
   pad opens the mask, under it otherwise), centred on the copper (the pad's
   ``(at)`` plus its drill offset; the drill stays at ``(at)``); circle / oval /
@@ -43,7 +48,9 @@ top at the thickness ``T``):
   read, an unknown shape) as its ``(size)`` box, said in the notes to be
   possibly smaller than the copper;
 * drills (pads and vias) as dark 8-sided cylinders through the board; oval
-  drills are drawn round;
+  drills are drawn round; a blind / buried / micro via (``Via.kind``) is
+  drawn the same full-depth way, its rings only on the outer layers its
+  ``layers`` name, and the notes say its span is not drawn;
 * silkscreen **strokes** of the footprints' own library graphics
   (``F.SilkS`` / ``B.SilkS`` lines, arcs, circles, rectangles, polygons,
   curves, mirrored with the footprint). **Texts are omitted in 3D** - the
@@ -72,7 +79,7 @@ from pathlib import Path
 from types import EllipsisType
 
 from ai_eda.errors import CompileError
-from ai_eda.ir import BoardSide, CircuitIR, Placement
+from ai_eda.ir import ARC_SAGITTA_MM, BoardSide, CircuitIR, Placement, track_points
 from ai_eda.tools.kicad import sexpr
 from ai_eda.tools.kicad.geometry import custom_pad_parts, mirrored_layer, pad_angle, pad_center, pad_copper_center, pad_layers, rotate, to_board
 from ai_eda.tools.kicad.library import FootprintDef, KicadLibrary, Pad
@@ -578,21 +585,37 @@ class _Builder:
     def copper(self) -> None:
         pcb = self.ir.pcb
         assert pcb is not None
-        inner = 0
+        inner = arcs = chords = 0
         for t in pcb.tracks:
             if t.layer not in ("F.Cu", "B.Cu"):
                 inner += 1
                 continue
             if not (t.width_mm > 0 and math.isfinite(t.width_mm)):
                 raise SceneError(f"track of {t.net!r} has a non-positive width {t.width_mm!r}")
-            self.decal("track", "copper", _capsule(t.start, t.end, t.width_mm / 2.0), t.layer == "F.Cu", COPPER_MM, t.net)
+            if t.mid is None:
+                self.decal("track", "copper", _capsule(t.start, t.end, t.width_mm / 2.0), t.layer == "F.Cu", COPPER_MM, t.net)
+                continue
+            try:  # an arc: its chain of chords, one bar each (never the one bar of its chord)
+                chain = track_points(t)
+            except ValueError as exc:  # three points that are no arc (the Track model refuses them; assigned afterwards)
+                raise SceneError(f"track of {t.net!r} on {t.layer}: {exc}") from exc
+            for a, b in zip(chain, chain[1:]):
+                self.decal("track", "copper", _capsule(a, b, t.width_mm / 2.0), t.layer == "F.Cu", COPPER_MM, t.net)
+            arcs += 1
+            chords += len(chain) - 1
+        typed = 0
         for v in pcb.vias:
             for layer in ("F.Cu", "B.Cu"):
                 if layer in v.layers:
                     self.decal("via", "copper", _circle(v.x_mm, v.y_mm, v.diameter_mm / 2.0, _VIA_SIDES), layer == "F.Cu", COPPER_MM, v.net)
             self.drill(v.x_mm, v.y_mm, v.drill_mm, v.net)
+            typed += getattr(v, "kind", None) is not None
         if inner:
             self.scene.notes.append(f"안쪽 층 트랙 {inner}개는 보드 속에 있어 그리지 않음")
+        if arcs:  # a picture of the chain: the track count of the scene counts its chords
+            self.scene.notes.append(f"원호 트랙 {arcs}개는 현 {chords}개를 이은 사슬로 그림 (사슬과 원호의 차이 {ARC_SAGITTA_MM:g} mm 이내)")
+        if typed:  # a picture, not the span: the drill is drawn through the whole board like a through via's
+            self.scene.notes.append(f"블라인드/매립/마이크로 비아 {typed}개는 보드 전체 깊이의 구멍으로 그림 (층 범위는 그리지 않음)")
         outer = [z for z in pcb.zones if not INNER_LAYER_RE.match(z.layer)]
         if outer:
             self.scene.notes.append(f"구리 영역(zone) {len(outer)}개는 채움 계산이 KiCad 의 몫이라 그리지 않음")
@@ -756,7 +779,7 @@ def build_scene(ir: CircuitIR, library: KicadLibrary, *, model_dir: Path | None 
     (pass ``None`` for no 3D library: every body is a flat outline); ``step_cache`` lets a caller reuse parsed STEP files between builds.
 
     Refuses (:class:`SceneError`) what the PCB compiler refuses: no outline, a component without a footprint on disk or a placement,
-    a non-finite coordinate, a non-positive track width. Builds nothing into the IR.
+    a non-finite coordinate, a non-positive track width, an arc track whose three points are no arc. Builds nothing into the IR.
     """
     directory = find_3dmodel_dir(library) if model_dir is ... else model_dir
     builder = _Builder(ir, library, directory, step_cache if step_cache is not None else {})

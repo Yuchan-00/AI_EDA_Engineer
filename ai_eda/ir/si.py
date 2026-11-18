@@ -47,6 +47,14 @@ saved before the field existed keeps its hash.
   and ``domain.rf.impedance`` read them. Both fields, added after IRs were
   saved, are left out of the design view while ``None`` (every older IR
   keeps its hash).
+* Crosstalk: ``NetClass.xtalk_budget_rel`` - the crosstalk a victim of the
+  class may take, as a fraction of its swing in (0, 1] (no unit), for
+  ``spice.xtalk.<victim>`` (:mod:`ai_eda.tools.spice.xtalk_check`). Only a
+  budget the user stated is accepted (``user_requirement`` provenance; any
+  other is refused here): it takes precedence over the budget
+  ``spice.xtalk`` computes from grounded datasheet levels (NM / 3) and is
+  the only budget for analog / rf victims and for pins with thresholds of
+  their own. Left out of the design view while ``None``.
 """
 
 from __future__ import annotations
@@ -56,7 +64,7 @@ import re
 
 from pydantic import BaseModel, Field, model_validator
 
-from ai_eda.ir.provenance import Provenance, Traced, drop_empty_in_design_view
+from ai_eda.ir.provenance import Provenance, ProvenanceKind, Traced, drop_empty_in_design_view
 
 #: the id prefix of every traced SI number (``si.net_classes[Z50].target_z0_ohm``), resolved by :meth:`SIConstraints.lookup`
 SI_PREFIX = "si"
@@ -69,10 +77,11 @@ CLASS_UNITS: dict[str, str | None] = {
     "target_z0_ohm": "ohm", "z0_tol_rel": None, "target_zdiff_ohm": "ohm", "zdiff_tol_rel": None, "pair_uncoupled_max_mm": "mm",
     "pair_max_skew_s": "s", "max_length_mm": "mm", "max_delay_s": "s", "max_skew_s": "s", "min_width_mm": "mm", "power_current_a": "A",
     "power_temp_rise_c": "degC", "t_rise_s": "s", "r_drive_ohm": "ohm", "c_load_f": "F", "ringing_tol_rel": None, "rf_frequency_hz": "Hz",
+    "xtalk_budget_rel": None,
 }
 #: fields of a class that must be > 0 when given (the rest: >= 0)
 _POSITIVE = frozenset({"target_z0_ohm", "target_zdiff_ohm", "max_length_mm", "max_delay_s", "min_width_mm", "power_current_a", "power_temp_rise_c",
-                       "t_rise_s", "c_load_f", "z0_tol_rel", "zdiff_tol_rel", "ringing_tol_rel", "rf_frequency_hz"})
+                       "t_rise_s", "c_load_f", "z0_tol_rel", "zdiff_tol_rel", "ringing_tol_rel", "rf_frequency_hz", "xtalk_budget_rel"})
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*$")
 
 
@@ -166,9 +175,12 @@ class NetClass(BaseModel):
     #: the highest RF frequency the class's nets carry (Hz, > 0): marks them as RF nets for ``si.rf_length`` and
     #: ``domain.rf.impedance``; left out of the design view while ``None``
     rf_frequency_hz: Traced[float] | None = None
+    #: the crosstalk budget of the class's victims as a fraction of the swing, (0, 1], no unit - only the user's stated value
+    #: (``user_requirement``; module docstring); left out of the design view while ``None``
+    xtalk_budget_rel: Traced[float] | None = None
     provenance: Provenance
 
-    _design = drop_empty_in_design_view("rf_frequency_hz")
+    _design = drop_empty_in_design_view("rf_frequency_hz", "xtalk_budget_rel")
 
     @model_validator(mode="after")
     def _consistent(self) -> NetClass:
@@ -176,6 +188,13 @@ class NetClass(BaseModel):
             raise ValueError(f"net class name {self.name!r} must start with a letter and use letters, digits, _ + - only")
         for field, unit in CLASS_UNITS.items():
             _check_number(getattr(self, field), f"net class {self.name}: {field}", unit, field in _POSITIVE)
+        budget = self.xtalk_budget_rel
+        if budget is not None:
+            if budget.value > 1.0:
+                raise ValueError(f"net class {self.name}: xtalk_budget_rel must be in (0, 1] (a fraction of the swing), got {budget.value!r}")
+            if budget.provenance.kind is not ProvenanceKind.USER_REQUIREMENT:
+                raise ValueError(f"net class {self.name}: xtalk_budget_rel is accepted only as a budget the user stated (user_requirement provenance), "
+                                 f"got {budget.provenance.kind.value}; without one spice.xtalk computes NM / 3 from grounded datasheet levels")
         if len(set(self.nets)) != len(self.nets):
             raise ValueError(f"net class {self.name}: a net is listed twice in {self.nets}")
         if (self.match_group is None) != (self.max_skew_s is None):

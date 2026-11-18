@@ -38,10 +38,18 @@ PROPOSE_REGS_KEY = "propose_regulations"
 #: route - each whole - when it could not route them all, naming the rest for manual routing (the default is the
 #: placement alone: all or nothing)
 PLACEMENT_KEY = "pcb.placement"
+PLACEMENT_POLICY_KEY = "pcb.placement_policy"
 ROUTING_KEY = "pcb.routing"
 #: PCB agent: ``--answer pcb.silkscreen=skip`` proposes the board without designed silkscreen (the compiled board keeps
 #: the library's reference positions)
 SILKSCREEN_KEY = "pcb.silkscreen"
+#: PCB agent: by default (``arc``) the router's sidesteps are straightened and its right-angle corners rounded into tangent arcs,
+#: mitred where no arc fits (routing.corners 0.2, the project owner's corner-style rule of 2026-11-13); ``--answer
+#: pcb.corners=miter45`` mitres them into 45-degree corners (routing.corners 0.1) and ``--answer pcb.corners=orthogonal`` keeps the
+#: router's right-angle grid corners
+CORNERS_KEY = "pcb.corners"
+#: Opt in to compiler 0.9's rail/column layout for small circuits.
+SCHEMATIC_LAYOUT_KEY = "schematic.layout"
 
 #: requirement agent: ``--answer leave_out=k1,k2`` leaves the requirements under those keys out of the design (moved into
 #: ``ir.requirements.left_out``, the user's recorded decision; a closed-world refusal names this answer). Defined with the
@@ -57,7 +65,7 @@ CONTROL_KEYS: frozenset[str] = frozenset({
     CONFIRM_KEY, ACCEPT_KEY, REJECT_KEY,
     CONFIRM_PARTS_KEY, CONFIRM_FACTS_KEY, FACTS_FILE_KEY, EXTRACT_FACTS_KEY,
     ACCEPT_REGS_KEY, REJECT_REGS_KEY, PROPOSE_REGS_KEY,
-    PLACEMENT_KEY, ROUTING_KEY, SILKSCREEN_KEY, CONFIRM_DESIGN_KEY, LEAVE_OUT_KEY,
+    PLACEMENT_KEY, PLACEMENT_POLICY_KEY, ROUTING_KEY, SILKSCREEN_KEY, CORNERS_KEY, SCHEMATIC_LAYOUT_KEY, CONFIRM_DESIGN_KEY, LEAVE_OUT_KEY,
 })
 
 __all__ = [
@@ -68,14 +76,17 @@ __all__ = [
     "CONFIRM_KEY",
     "CONFIRM_PARTS_KEY",
     "CONTROL_KEYS",
+    "CORNERS_KEY",
     "EXTRACT_FACTS_KEY",
     "FACTS_FILE_KEY",
     "LEAVE_OUT_KEY",
     "PLACEMENT_KEY",
+    "PLACEMENT_POLICY_KEY",
     "PROPOSE_REGS_KEY",
     "REJECT_KEY",
     "REJECT_REGS_KEY",
     "REQUIREMENT_DECISION_KEYS",
     "ROUTING_KEY",
     "SILKSCREEN_KEY",
+    "SCHEMATIC_LAYOUT_KEY",
 ]

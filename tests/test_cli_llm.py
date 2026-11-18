@@ -135,8 +135,20 @@ def test_doctor_never_prints_the_key_and_fetches_nothing_offline(monkeypatch):
     assert "claude cli : NOT FOUND (" in out
 
 
-# --------------------------------------------------------------------------- the provider flags
+def test_doctor_without_the_llm_extra_names_the_missing_package_instead_of_crashing(monkeypatch):
+    """A1: after a plain ``pip install -e .`` there is no httpx, and ``ai-eda doctor`` died with ModuleNotFoundError before printing anything."""
+    import sys
 
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-never-printed")
+    monkeypatch.setitem(sys.modules, "httpx", None)  # `import httpx` now raises ModuleNotFoundError, as in an install without the extra
+    monkeypatch.delitem(sys.modules, "ai_eda.llm.openrouter", raising=False)  # not yet imported, as in a fresh process
+    code, out, _ = _cli("doctor", "--online")
+    assert code == 0 and "LLM key   : httpx not installed (pip install 'ai-eda-engineer[llm]'): --llm openrouter is unavailable" in out
+    assert "LLM account: not fetched (httpx not installed" in out and "sk-or-v1-never-printed" not in out
+    assert out.startswith("ai-eda ") and "claude cli :" in out and "missing   :" in out  # the rest of the report is still there
+
+
+# --------------------------------------------------------------------------- the provider flags
 
 @pytest.fixture
 def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeClaudeCli:
