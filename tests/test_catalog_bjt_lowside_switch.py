@@ -132,8 +132,15 @@ def test_the_schematic_compiles_with_wires_and_erc_is_clean(tmp_path: Path):
     ir = _ir(tmp_path)
     _present(ir, tmp_path, SWITCH)
     _confirm(ir, tmp_path, Stage.CALCULATION)
-    ref = SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path, tools={"kicad_library": _lib}))
+    # the "wiring:" note is the legacy table's: checked with layout="legacy" since textbook 1.0 became the default, which
+    # is checked too (drawn with no whole-sheet fallback, ERC clean)
+    ref = SchematicCompiler("legacy").compile(ir, CompileContext(workdir=tmp_path, tools={"kicad_library": _lib}))
     assert ref.notes and ref.notes[0].startswith("wiring: "), ref.notes
     result = kicad.run_erc(Path(ref.path), tmp_path / "erc.json")
+    assert result.status is S.PASS and result.details["errors"] == [], result.details["errors"]
+    assert not [w for w in result.details["warnings"] if w.get("type") in ("lib_symbol_mismatch", "unconnected_wire_endpoint", "endpoint_off_grid", "isolated_pin_label", "global_label_dangling")]
+    ref = SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path / "textbook", tools={"kicad_library": _lib}))
+    assert ref.generator_version == "1.0" and "fallbacks: none" in ref.notes[0], ref.notes
+    result = kicad.run_erc(Path(ref.path), tmp_path / "textbook" / "erc.json")
     assert result.status is S.PASS and result.details["errors"] == [], result.details["errors"]
     assert not [w for w in result.details["warnings"] if w.get("type") in ("lib_symbol_mismatch", "unconnected_wire_endpoint", "endpoint_off_grid", "isolated_pin_label", "global_label_dangling")]

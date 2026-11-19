@@ -261,7 +261,7 @@ def test_astable_parts_report_lists_every_part_with_notes_library_facts_and_exis
     assert "- 제조사: 기록 없음" in text and "- MPN: 기록 없음" in text and "- SPICE: Q, 모델 `QNPN`, 노드 순서 3, 2, 1" in text
     assert "- 전기 특성: resistance = 1 kΩ [사용자 요구사항]" in text and "- SPICE: 넷리스트에서 제외 (connector, no electrical model)" in text
     # the existence result with its sub-checks, library files named by basename only
-    assert "### 존재 확인 (`component.existence.Q1`)" in text and "- 최신 결과: **NOT_VERIFIED** (`parts.existence` v0.2)" in text
+    assert "### 존재 확인 (`component.existence.Q1`)" in text and "- 최신 결과: **NOT_VERIFIED** (`parts.existence` v0.3)" in text
     assert "  - symbol: PASS: symbol Transistor_BJT:2N3904 found in Transistor_BJT.kicad_sym" in text
     assert "  - footprint: PASS: footprint Package_TO_SOT_THT:TO-92_Inline found in TO-92_Inline.kicad_mod" in text
     assert "  - datasheet_pointer: NOT_VERIFIED: no datasheet pointer" in text and "  - catalog: NOT_APPLICABLE: no catalog loaded" in text

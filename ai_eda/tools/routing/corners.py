@@ -184,15 +184,65 @@ counted with the reason.
   corner is one of these) and never across one: a via centre, a pad centre or another track's end of the net that lies on the
   centreline of the tracks a move changes must still lie on it afterwards; the point where the slid copper turns must be fit for
   a plain corner itself; and at both ends of its run of plain corners the copper leaves the kept point in the direction it had.
+* *A run end that takes the sidestep* (the 9 V piano board of 2026-11-18 left 20 of its 25 sidesteps, most of them next to such an
+  end). Two kinds of copper at the end of a run may take the sidestep slid to that end, the neighbour between them used up:
+  a *junction on a straight line of the net* - the net's other straight tracks of the sidestep's width (no escape stub) along the
+  slid sidestep's line cover it whole: it merges into them, nothing new is laid there, and the run joins them where the slid
+  sidestep began (a point in no pad and no via of the net), so the junction moves along that line by the sidestep's length; and a
+  *through-hole pad* of the net whose box holds the end - a plated hole is soldered through its barrel, so where a track meets its
+  ring does not matter to the joint: where the slid sidestep lies within the pad's inscribed circle it goes (the run now ends in
+  the pad there), else it stays and meets the pad from its new side. Only there may the copper meet the run's end from a new
+  direction; the points that copper holds (a junction's ends on that line, the pad's centre and the track ends in its box) stay on
+  it, and the tracks that make it up (the line's tracks, the tracks that end in the pad) are joined to the run through it, whatever
+  of the run's copper touches them. Every other rule holds: the audit of the new copper, no new contact, no lost contact with any
+  other copper, no longer net. A surface-mount pad and a via stay points the pass keeps (where a track enters an SMD land is a
+  soldering matter; a via is the router's).
+* *A junction the run may pass through* (since 2026-11-19; the 9 V piano board's rev 3 still had its MIX run stepping 0.25 mm off
+  its line at a junction, and its VREF bus bumping 0.25 mm down between two resistor columns' junctions - kinks after the
+  rounding). A junction - three track ends of the net or more, no pad, no via, on no other track's interior - is a point the pass
+  keeps, but where a straight track of the net (of the run's width, no escape stub, not at the neck-down width) *arrives* there
+  along a line, copper that leaves the junction along that same line only continues it: the junction stays a T with an unbroken
+  line. So (a) a *junction step* - a track along an axis, shorter than :data:`SIDESTEP_WIDTHS` widths, between such a junction and
+  a plain corner, where a track of the junction arrives along the line the step's neighbour leaves the corner on - is slid along
+  that neighbour like a sidestep, with the arriving track at the front of its run: the track is carried through the junction to
+  the slid step's new corner, the junction itself does not move (the other tracks there still end on the track's centreline,
+  where they ended before); a junction step without such a track is a plain branch and no candidate. (b) Any move may meet the
+  far end of its run, or turn where the slid copper turns, at such a junction from a new direction where a straight track of the
+  net leaves it along the line the copper arrives on (the copper runs straight on through the junction). Every other rule of a
+  move holds - the audit below, no new or lost contact, no longer net; a via or a pad is never such a junction (moving a via to
+  straighten a run that changes layers there is not done: it stays as routed). The row of a junction step names the junction
+  (``junction``).
+* *A lane change at a junction* (since 2026-11-19; the 9 V piano board's rev 3 still had eight 0.25-0.75 mm lane steps where a run
+  passed a junction or a through-hole pad: GND at Q2.1, C3.2, C24.2 and C2.2, VBAT at a T, OSC4 / OSC8 at R24.1 / R28.1, VS at
+  R50.1). Three more kinds of copper make a step at a junction a candidate, every rule of a junction step above still holding:
+  (a) *through-hole pads* - the junction, and the step's corner, may lie in the box of a through-hole pad of the net (not at its
+  centre; never in a via): a plated hole is soldered through its barrel, as for a run end that takes the sidestep, so the run is
+  carried straight through the pad; a surface-mount pad stays a point the pass keeps. (b) *A T on a track's interior* - a straight
+  track that alone ends on the interior of another straight track of its width (the host), within :data:`SIDESTEP_WIDTHS` widths
+  of a host's end that is a corner whose other track runs on the far side of the host's line the way the first runs on its side (a
+  Z: one lane stepped across the host): the part of the host between the T and that corner is the step - slid like a junction step,
+  the host cut back to the T. (c) *The step stays, the junction's lane moves* - where the step goes on along a branch's line (a
+  junction of exactly three straight track ends: the step, a track that continues the step's line beyond the junction, and the
+  junction's lane; or the host beyond the T), the junction's lane may instead be slid onto the corner's lane: the step slides
+  along that lane to its far end, the lane's own track is laid there, and the step stays where it was, as the branch's copper (the
+  corner becomes the T). Of the legal moves of one step the one that leaves fewer corners, then less copper is made; a move at a
+  junction must take two corners at least (where the run's far end keeps the slid step - it meets a pad from its side - the step
+  would only have moved). A run end that takes the sidestep on a straight line of the net also keeps the other tracks that end on
+  that line joined to the run through it.
 * *The audit of a move*, in this order, the first problem kept as the reason. The new copper is what the changed tracks cover and
   did not cover before - straight pieces, so there are no chords and no bound. (1) Other nets: every new piece passes the exact
   audit of a chamfer, with the track's width and clearance. (2) Every new piece stays outside the track keep-outs that do not allow
   the net and keeps the edge clearance from the outline, as a chamfer does. (3) The net's own copper: no via centre, pad centre or
   track end of the net comes to lie on the centreline of the changed tracks, and every pad box, via disc and other track of the
   net on the layer touches the copper of the changed tracks afterwards exactly when it did before (copper touches at a centreline
-  distance of at most the half-widths) - no contact made, none lost. (4) Length: a move never lengthens the net - a Z joined to a
-  track that continues the sidestep keeps the length, every other case shortens it - so a length budget still holds, and none is
-  checked again.
+  distance of at most the half-widths) - no contact made, none lost. (4) Length: a move never lengthens the net's copper as the
+  router laid it (straight tracks, before the corners are rounded) - a Z joined to a track that continues the sidestep keeps the
+  length, every other case shortens it. A move that keeps the step (a lane change at a junction, (c)) adds the step's copper to the
+  slide's, so it is measured: one that would lengthen the net (a Z) is refused with the reason ``length``. The rounding afterwards
+  only shortens, so the finished copper is never longer than the router's and a length budget the router met still holds. It is not
+  the copper the rounding alone would have left: a move takes corners away, and with them what their arcs or chamfers would have cut
+  off, so a straightened net can end up a little longer than the same net rounded without the step (the 9 V piano board's rev 2 and
+  rev 3: at most 1.01 mm on one net's layer - a straight lane is what the owner asked for; the stated choice).
 * *Order*: sweep after sweep over the sidesteps as they stand, shortest first, then in track order. A move changes the audit's
   copper at once, so every later move and the rounding see it. Every move removes at least two corners, so the sweeps end by
   themselves; a sweep that moves nothing ends the step, and :data:`SIDESTEP_SWEEPS` bounds them (a sidestep that only this bound
@@ -205,7 +255,7 @@ counted with the reason.
   sentence in its note. ``stats["corners"]`` gains ``straighten`` (this rule in words), ``sidesteps`` (how many the step dealt
   with: each one it slid - a track slid twice, further each time, counts twice - and each one still in the copper at its end),
   ``straightened`` (the moves made), ``sidesteps_left`` with ``sidestep_reasons`` (``kept_point``, ``clearance``, ``keepout``,
-  ``edge``, ``own_copper``, ``sweep_cap``) and ``sidestep_rows``, one row per sidestep (where it lay, its length, slid - where to,
+  ``edge``, ``own_copper``, ``length``, ``sweep_cap``) and ``sidestep_rows``, one row per sidestep (where it lay, its length, slid - where to,
   the corners and the copper it removed - or left, and why): ``sidesteps == straightened + sidesteps_left`` (a second sidestep that
   disappears with a move, as the far side of a bump does, has no row of its own). The lengths are measured again as for the corners.
 
@@ -1070,9 +1120,10 @@ class _OwnCopper:
                 self.ends.setdefault(s.b, []).append((s, 1))
         self.known = {} if moved is None else {pt: words for pt, words in self.known.items() if not _on(pt, moved)}
 
-    def pinned(self, pt: Point, but: list[_Seg]) -> str | None:
-        """What of the net pins a point, whatever tracks end there - a via it is at or inside, a pad centre, a pad box, another live
-        track it lies on (none of ``but``) - in words, or ``None``: the tests by which the pass skips a corner."""
+    def pad_or_via(self, pt: Point, ring: bool = False) -> str | None:
+        """The via of the net a point is at or inside, or the pad whose centre or box it lies in, in words - or ``None``. With
+        ``ring`` (since 2026-11-19, module docstring: the straightening, a lane change at a junction) the box of a through-hole pad
+        does not count - only its centre does."""
         for q, r in self.discs:
             if math.hypot(pt[0] - q[0], pt[1] - q[1]) <= r + _TOL:
                 return f"at or inside the via of its net at ({q[0]:g}, {q[1]:g})"
@@ -1080,12 +1131,85 @@ class _OwnCopper:
             if _near(pt, centre):
                 return f"the centre of pad {g.ref}.{g.number} of its net"
         for g in self.geoms:
-            if _in_box(pt, g.box):
+            if _in_box(pt, g.box) and not (ring and _through_hole(g)):
                 return f"inside the box of pad {g.ref}.{g.number} of its net"
+        return None
+
+    def pinned(self, pt: Point, but: list[_Seg], ring: bool = False) -> str | None:
+        """What of the net pins a point, whatever tracks end there - a via it is at or inside, a pad centre, a pad box, another live
+        track it lies on (none of ``but``) - in words, or ``None``: the tests by which the pass skips a corner. ``ring``: as for
+        :meth:`pad_or_via`."""
+        words = self.pad_or_via(pt, ring)
+        if words is not None:
+            return words
         for s in self.tracks:
             if s.alive and all(s is not t for t in but) and _pt_seg(pt[0], pt[1], s.a, s.b) <= _TOL:
                 return f"on its own net's {_name(s)} (a junction)"
         return None
+
+    def corner(self, pt: Point) -> bool:
+        """routing.corners 0.2, since 2026-11-19 (module docstring: the straightening, a lane change at a junction): whether a point is
+        a plain corner, or would be one but for lying in the box of a through-hole pad of the net (not at its centre)."""
+        if self.kept(pt) is None:
+            return True
+        at = self.ends.get(pt, [])
+        if len(at) != 2 or at[0][0] is at[1][0] or self.pinned(pt, [s for s, _e in at], ring=True) is not None:
+            return False
+        (s1, _e1), (s2, _e2) = at
+        w1, w2 = float(s1.track.width_mm), float(s2.track.width_mm)
+        return (not s1.escape and not s2.escape and abs(w1 - w2) <= _TOL and not (self.neck is not None and abs(w1 - self.neck) <= _TOL)
+                and {_axis(s1.a, s1.b), _axis(s2.a, s2.b)} == {0, 1})
+
+    def walk(self, seg: _Seg, start: Point) -> tuple[list[_Seg], list[Point]] | None:
+        """routing.corners 0.2, since 2026-11-19: the tracks from ``seg`` (which leaves ``start``) on through plain corners to the
+        next point the pass keeps, and their points (``start`` first) - or ``None`` where they close on themselves."""
+        cur, pt = seg, _far(seg, 0 if seg.a == start else 1)
+        tracks, pts = [seg], [start, pt]
+        while self.kept(pt) is None:
+            (s1, e1), (s2, e2) = self.ends[pt]
+            cur, at = (s2, e2) if s1 is cur else (s1, e1)
+            if cur is seg:
+                return None
+            pt = _far(cur, at)
+            tracks.append(cur)
+            pts.append(pt)
+        return tracks, pts
+
+    def straight(self, t: _Seg, w: float) -> bool:
+        """A live straight track along an axis of width ``w``, no escape stub, not at the net's neck-down width."""
+        return (t.alive and t.mid is None and not t.escape and _axis(t.a, t.b) is not None and abs(float(t.track.width_mm) - w) <= _TOL
+                and not (self.neck is not None and abs(w - self.neck) <= _TOL))
+
+    def tees(self) -> list[tuple[_Seg, _Seg, Point, _Seg, Point, _Seg]]:
+        """routing.corners 0.2, since 2026-11-19 (module docstring: the straightening, a lane change at a junction): every lane change
+        at a T on a track's interior - a straight track ``n`` that alone ends at ``P`` on the interior of a straight track ``host``
+        of its width (at right angles), where ``host`` ends within :data:`SIDESTEP_WIDTHS` widths of ``P`` at a corner ``C``
+        (:meth:`corner`) whose other track ``nc`` runs on the far side of the host's line, the way ``n`` runs on its side (a Z: the
+        two are one lane, stepped across the host). ``P`` lies in no via and no pad box but a through-hole pad's. Each as ``(m, n,
+        P, host, C, nc)``, ``m`` the part of the host from ``P`` to ``C`` (a track of the pass's own making, which no copper holds)."""
+        out = []
+        for n in self.tracks:
+            if not self.straight(n, float(n.track.width_mm)):
+                continue
+            w = float(n.track.width_mm)
+            for p in (n.a, n.b):
+                if len(self.ends.get(p, [])) != 1:
+                    continue
+                hosts = [h for h in self.tracks if h is not n and self.straight(h, w) and _axis(h.a, h.b) != _axis(n.a, n.b)
+                         and p != h.a and p != h.b and _pt_seg(p[0], p[1], h.a, h.b) <= _TOL]
+                if len(hosts) != 1 or self.pinned(p, [n, hosts[0]], ring=True) is not None:
+                    continue
+                host = hosts[0]
+                away = _heading(p, _far(n, 0 if n.a == p else 1))
+                for c in (host.a, host.b):
+                    length = abs(c[0] - p[0]) + abs(c[1] - p[1])
+                    if length >= SIDESTEP_WIDTHS * w - _TOL or c not in self.ends or not self.corner(c):
+                        continue
+                    nc, ec = next((t, e) for t, e in self.ends[c] if t is not host)
+                    if _heading(_far(nc, ec), c) != away:
+                        continue  # not a Z: the two tracks leave the host on the same side
+                    out.append((_Seg(host.order, host.track, p, c, False), n, p, host, c, nc))
+        return out
 
     def kept(self, pt: Point) -> str | None:
         """What the pass keeps at a point where track ends meet, in words - or ``None`` at a plain corner (module docstring: the
@@ -1120,6 +1244,68 @@ class _OwnCopper:
             return False
         length = abs(s.b[0] - s.a[0]) + abs(s.b[1] - s.a[1])
         return length < SIDESTEP_WIDTHS * float(s.track.width_mm) - _TOL and self.kept(s.a) is None and self.kept(s.b) is None
+
+    def through(self, pt: Point, heading: tuple[int, int], w: float, but: list[_Seg], ring: bool = False) -> _Seg | None:
+        """routing.corners 0.2, since 2026-11-19 (module docstring: the straightening, a junction the run may pass through): the straight track of the
+        net that ends at the junction ``pt`` arriving in the direction ``heading`` (so copper leaving ``pt`` that way continues its
+        line), of width ``w``, no escape stub, not at the net's neck-down width and none of ``but`` - or ``None``. ``pt`` must be a
+        junction of three track ends or more and nothing else: no pad, no via, on no other track's interior (with ``ring``, as for
+        :meth:`pad_or_via`, it may lie in the box of a through-hole pad of the net)."""
+        at = self.ends.get(pt, [])
+        if len(at) < 3 or self.pinned(pt, [t for t, _e in at], ring) is not None:
+            return None
+        for t, e in at:
+            if any(t is b for b in but) or t.mid is not None or t.escape or abs(float(t.track.width_mm) - w) > _TOL:
+                continue
+            if self.neck is not None and abs(float(t.track.width_mm) - self.neck) <= _TOL:
+                continue
+            if _axis(t.a, t.b) is not None and _heading(_far(t, e), pt) == heading:
+                return t
+        return None
+
+    def leaves(self, pt: Point, heading: tuple[int, int], w: float, but: list[_Seg]) -> bool:
+        """routing.corners 0.2, since 2026-11-19: whether a live straight track of the net (width ``w``, no escape stub, none of ``but``) ends at ``pt``
+        and leaves it in the direction ``heading`` - so copper arriving at ``pt`` that way passes straight on into it."""
+        for t in self.tracks:
+            if not t.alive or any(t is b for b in but) or t.mid is not None or t.escape or abs(float(t.track.width_mm) - w) > _TOL:
+                continue
+            for end, far in ((t.a, t.b), (t.b, t.a)):
+                if end == pt and _axis(end, far) is not None and _heading(end, far) == heading:
+                    return True
+        return False
+
+    def junction_step(self, s: _Seg) -> Point | None:
+        """routing.corners 0.2, since 2026-11-19 (module docstring: the straightening, a junction the run may pass through): the junction a short step
+        ends at - a track along an axis, shorter than :data:`SIDESTEP_WIDTHS` widths, between a junction of the net (three track ends or
+        more, no pad, no via) and a plain corner - or ``None``. Whether a track of the junction continues the line of the step's
+        neighbour is checked here: a track of the junction must arrive along the line the neighbour leaves the corner on
+        (:meth:`through`), or the step is a plain branch of the junction and no candidate."""
+        if not s.alive or _axis(s.a, s.b) is None or s.escape:
+            return None
+        length = abs(s.b[0] - s.a[0]) + abs(s.b[1] - s.a[1])
+        if length >= SIDESTEP_WIDTHS * float(s.track.width_mm) - _TOL:
+            return None
+        if self.neck is not None and abs(float(s.track.width_mm) - self.neck) <= _TOL:
+            return None
+        for j, other in ((s.a, s.b), (s.b, s.a)):
+            # since 2026-11-19 (a lane change at a junction): the junction and the corner may lie in the box of a through-hole pad
+            if self.corner(other) and len(self.ends.get(j, [])) >= 3 and self.pinned(j, [t for t, _e in self.ends[j]], ring=True) is None:
+                n2, e2 = next((t, e) for t, e in self.ends[other] if t is not s)
+                if self.through(j, _heading(other, _far(n2, e2)), float(s.track.width_mm), [s, n2], ring=True) is not None:
+                    return j
+        return None
+
+    def branch(self, s: _Seg, j: Point) -> _Seg | None:
+        """routing.corners 0.2, since 2026-11-19 (module docstring: the straightening, a lane change at a junction): the track ``b`` of the
+        junction ``j`` of the step ``s`` that continues the step's line beyond the junction, where the junction holds exactly three
+        track ends - the step, ``b`` and one more - all straight and of the step's width - or ``None``."""
+        at = self.ends.get(j, [])
+        w = float(s.track.width_mm)
+        if len(at) != 3 or any(not self.straight(t, w) for t, _e in at):
+            return None
+        other = s.b if s.a == j else s.a
+        line = [t for t, e in at if t is not s and _heading(j, _far(t, e)) == _heading(other, j)]
+        return line[0] if len(line) == 1 else None
 
     def run(self, m: _Seg) -> tuple[list[_Seg], list[Point], int] | None:
         """The run of tracks through plain corners that holds the sidestep ``m``, from one point the pass keeps to the next: its
@@ -1159,6 +1345,62 @@ class _Slide:
     rank: tuple[int, float, int]
 
 
+@dataclass(frozen=True, eq=False)
+class _EndTake:
+    """routing.corners 0.2 (module docstring: the straightening, a run end that takes the sidestep): the copper a run ends in that may
+    take the sidestep slid to that end. ``cover`` - the net's straight tracks of the sidestep's width on whose centreline the slid
+    sidestep lies whole (the run ended on them: a junction), or ``pad`` - the through-hole pad of the net the run ended in; ``absorb``
+    when the slid sidestep lies wholly in that copper (on the tracks' centreline, or within the pad's inscribed circle) and goes."""
+
+    absorb: bool
+    cover: tuple[_Seg, ...] = ()
+    pad: _PadGeom | None = None
+
+    def holds(self, q: Point) -> bool:
+        """Whether a point of the net stays on the copper the run ends in: on the centreline of a covering track, or in the pad's box."""
+        if self.pad is not None:
+            return _in_box(q, self.pad.box)
+        return _on(q, [(t.a, t.b) for t in self.cover])
+
+    def joins(self, t: _Seg) -> bool:
+        """Whether a track of the net is part of the copper the run ends in (one of the covering tracks, or a track that ends in the
+        pad) - or, since 2026-11-19, ends on a covering track's centreline (a junction's other track there): it stays joined to the
+        run through that copper, whatever of the run's copper it touches."""
+        if self.pad is not None:
+            return _in_box(t.a, self.pad.box) or _in_box(t.b, self.pad.box)
+        line = [(c.a, c.b) for c in self.cover]
+        return any(t is c for c in self.cover) or _on(t.a, line) or _on(t.b, line)
+
+
+def _through_hole(g: _PadGeom) -> bool:
+    """A footprint pad (not a plane via or an escape) with a convex copper on more than one copper layer: a plated through hole."""
+    return g.kind == "pad" and g.reach is None and len(g.layers) > 1
+
+
+def _end_take(own: _OwnCopper, run: list[_Seg], m: _Seg, p1n: Point, p3: Point) -> _EndTake | None:
+    """routing.corners 0.2 (module docstring: the straightening, a run end that takes the sidestep): what of the copper at the run's
+    end ``p3`` takes the sidestep ``m`` slid to it (from ``p1n`` to ``p3``) - or ``None``, where the end stays a point the pass keeps.
+
+    * *A junction on a straight line of the net*: the net's other straight tracks (none of the run, none an escape stub, of ``m``'s
+      width) along the slid sidestep's line cover it whole. It merges into them - nothing new is laid there - and the run joins them
+      at ``p1n``, which may be neither in a pad nor in a via of the net: the junction moves along the line by the sidestep's length.
+    * *A through-hole pad* of the net whose box holds ``p3``: a plated hole is soldered through its barrel, so where a track meets
+      its annular ring does not matter to the joint. Where ``p1n`` lies within the pad's inscribed circle the slid sidestep lies in
+      the pad's copper and goes (the run ends in the pad at ``p1n``); else it stays and meets the pad from its new side."""
+    w = float(m.track.width_mm)
+    along = _axis(p1n, p3)
+    if along is not None:
+        line = [t for t in own.tracks
+                if t.alive and t.mid is None and not t.escape and all(t is not s for s in run) and abs(float(t.track.width_mm) - w) <= _TOL
+                and _axis(t.a, t.b) == along and t.a[1 - along] == p3[1 - along]]
+        if line and not _minus((p1n, p3), [(t.a, t.b) for t in line]) and own.pad_or_via(p1n) is None:
+            return _EndTake(True, tuple(t for t in line if _seg_seg(p1n, p3, t.a, t.b) <= _TOL))
+    for g in own.geoms:
+        if _through_hole(g) and _in_box(p3, g.box):
+            return _EndTake(math.hypot(p1n[0] - g.cx, p1n[1] - g.cy) <= g.inscribed_r - _TOL, pad=g)
+    return None
+
+
 def _fold(pieces: list[list]) -> None:
     """Join what a slide left on one line, until nothing is: a piece without length goes (the entries of its tracks pass to the piece
     before it, or to the one after), and two pieces on one line that share an end become one - from the start of the first to the
@@ -1180,18 +1422,26 @@ def _fold(pieces: list[list]) -> None:
 
 
 def _slide(own: _OwnCopper, world: _Copper, board: _Board, tracks: list[_Seg], pts: list[Point], k: int, cl: float,
-           what: str) -> _Slide | tuple[str, str]:
+           what: str, stay: bool = False, host: _Seg | None = None) -> _Slide | tuple[str, str]:
     """routing.corners 0.2 (module docstring: the straightening - the move, kept points, the audit of a move): slide the sidestep
     ``tracks[k]`` of a run along the next track, ``tracks[k + 1]``, to that track's far end. A :class:`_Slide` where the move is
-    legal (nothing is changed here), else ``(reason, words)`` of the first rule it breaks."""
+    legal (nothing is changed here), else ``(reason, words)`` of the first rule it breaks.
+
+    Since 2026-11-19 (module docstring: the straightening, a lane change at a junction): with ``stay`` the step stays where it lies
+    (a branch of the net goes on along its line) and the neighbour's own track is what is slid; with ``host`` the step is the part of
+    that track between a T on it and its end, and without ``stay`` the host is cut back to the T. A move of either kind is also
+    refused where it would lengthen the net (``length``)."""
     m = tracks[k]
     w = float(m.track.width_mm)
     half = w / 2.0
     p0, p1, p2, p3 = pts[k - 1], pts[k], pts[k + 1], pts[k + 2]
-    if k + 2 == len(tracks):  # the far end of the neighbour is the end of the run
-        return "kept_point", f"the pass keeps that point: {own.kept(p3)}"
     ax = _axis(p2, p3)  # the axis the neighbour runs along; the sidestep runs along the other one
     p1n = (p3[0], p1[1]) if ax == 0 else (p1[0], p3[1])  # P1 + (P3 - P2), on the stored coordinates
+    end: _EndTake | None = None
+    if k + 2 == len(tracks):  # the far end of the neighbour is the end of the run: only a run end that takes the slid sidestep
+        end = _end_take(own, tracks, m, p1n, p3)
+        if end is None:
+            return "kept_point", f"the pass keeps that point: {own.kept(p3)}"
     side = p0[ax] - p1[ax]
     if side * (p3[ax] - p2[ax]) > 0.0 and (p3[ax] - p0[ax]) * side > 0.0:  # a U whose other neighbour is the shorter one
         return "kept_point", (f"the sidestep would pass ({p0[0]:g}, {p0[1]:g}), the end of its shorter neighbour (a U slides only as far as "
@@ -1199,34 +1449,60 @@ def _slide(own: _OwnCopper, world: _Copper, board: _Board, tracks: list[_Seg], p
     pieces = [[pts[i], pts[i + 1], [t], []] for i, t in enumerate(tracks)]
     pieces[k - 1][1] = p1n
     pieces[k][0], pieces[k][1] = p1n, p3
-    pieces[k][3].append(tracks[k + 1])  # the neighbour is used up: its entries pass to the slid track
+    if stay or host is not None:  # the step stays, or is part of the host: the neighbour's own track is laid where the step goes
+        pieces[k][2] = [tracks[k + 1]]
+    else:
+        pieces[k][3].append(tracks[k + 1])  # the neighbour is used up: its entries pass to the slid track
     del pieces[k + 1]
+    if end is not None and end.absorb:  # the slid sidestep lies in the copper the run ends in: it goes, its entries pass on
+        _a, _b, joined, passed = pieces.pop(k)
+        pieces[k - 1][3].extend([*joined, *passed])
     _fold(pieces)
-    for point, toward, piece in ((pts[0], pts[1], pieces[:1]), (pts[-1], pts[-2], pieces[-1:])):
-        # the two ends of the run are points the pass keeps: the copper still leaves each in the direction it had
+    for i, (point, toward, piece) in enumerate(((pts[0], pts[1], pieces[:1]), (pts[-1], pts[-2], pieces[-1:]))):
+        # the two ends of the run are points the pass keeps: the copper still leaves each in the direction it had - but for the end
+        # that takes the slid sidestep (module docstring: the straightening, a run end that takes the sidestep)
+        if end is not None and i == 1:
+            continue
         leaves = [(a, b) if a == point else (b, a) for a, b, _joined, _passed in piece]
+        if leaves and leaves[0][0] == point and _heading(*leaves[0]) != _heading(point, toward):
+            # routing.corners 0.2, since 2026-11-19: a junction the copper may now pass straight through - a straight track of the net there continues
+            # the line the copper arrives on (module docstring: the straightening, a junction the run may pass through): the copper leaves the
+            # run end in the direction ``out``, so the track must arrive at the end travelling ``out`` - from the far side of the junction
+            out = _heading(*leaves[0])
+            if own.through(point, out, w, tracks) is not None:
+                continue
         if not leaves or leaves[0][0] != point or _heading(*leaves[0]) != _heading(point, toward):
             return "kept_point", (f"the copper would meet ({point[0]:g}, {point[1]:g}) from a new direction, and the pass keeps that point: "
                                   f"{own.kept(point)}")
     lay = {id(t): (pts[i], pts[i + 1]) for i, t in enumerate(tracks)}
     changed = [piece for piece in pieces if piece[3] or len(piece[2]) != 1 or (piece[0], piece[1]) != lay[id(piece[2][0])]]
+    if host is not None and not stay:  # the host is cut back from the step's far end to the T
+        lay[id(host)] = (host.a, host.b)
+        changed.append([pts[k] if host.a == pts[k + 1] else host.a, pts[k] if host.b == pts[k + 1] else host.b, [host], []])
     involved = [t for _a, _b, joined, passed in changed for t in (*joined, *passed)]
-    old = [lay[id(t)] for t in involved]
-    new = [(a, b) for a, b, _joined, _passed in changed]
+    kept_step = [(pts[k], pts[k + 1])] if stay else []  # the step that stays is copper before and after the move
+    old = [*(lay[id(t)] for t in involved), *kept_step]
+    new = [*((a, b) for a, b, _joined, _passed in changed), *kept_step]
     others = [t for t in own.tracks if t.alive and all(t is not s for s in involved)]
     pins = [*((q, "a via") for q, _r in own.discs),
             *((centre, f"the centre of pad {g.ref}.{g.number}") for g, centre in zip(own.geoms, own.centres)),
             *((q, f"an end of {_name(t)}") for t in others for q in (t.a, t.b))]
     onto: tuple[Point, str] | None = None
     for q, name in pins:
+        if end is not None and end.holds(q):
+            continue  # it stays on the copper the run ends in (module docstring: the straightening, a run end that takes the sidestep)
         before, after = _on(q, old), _on(q, new)
         if before and not after:
             return "kept_point", f"{name} of its net at ({q[0]:g}, {q[1]:g}) lies on copper the move would take away"
         if after and not before and onto is None:
             onto = (q, name)
-    if any(piece[0] == p1n for piece in pieces[1:]):  # the slid copper still turns there: the point must be fit for a plain corner
+    turn = next((i for i, piece in enumerate(pieces) if i and piece[0] == p1n), None)
+    if turn is not None:  # the slid copper still turns there: the point must be fit for a plain corner
         pinned = own.pinned(p1n, involved)
-        if pinned is not None:
+        # routing.corners 0.2, since 2026-11-19: or a junction the copper arriving there passes straight through - a straight track of the net leaves it
+        # along the arriving copper's line (module docstring: the straightening, a junction the run may pass through)
+        arriving = _heading(pieces[turn - 1][0], p1n)
+        if pinned is not None and not (own.pad_or_via(p1n) is None and own.leaves(p1n, arriving, w, involved)):
             return "kept_point", f"the slid copper would turn at ({p1n[0]:g}, {p1n[1]:g}), {pinned}"
     # the audit of a move, in the module docstring's order: other nets, keep-outs and the edge, the net's own copper
     fresh = [part for seg in new for part in _minus(seg, old)]
@@ -1247,7 +1523,7 @@ def _slide(own: _OwnCopper, world: _Copper, board: _Board, tracks: list[_Seg], p
     touched += [(f"the via of its own net at ({q[0]:g}, {q[1]:g})", [_pt_seg(q[0], q[1], a, b) <= r + half + _TOL for a, b in both])
                 for q, r in own.discs]
     touched += [(f"its own net's {_name(t)}", [_seg_seg(a, b, t.a, t.b) <= half + float(t.track.width_mm) / 2.0 + _TOL for a, b in both])
-                for t in others]
+                for t in others if end is None or not end.joins(t)]
     for name, hits in touched:
         before, after = any(hits[:len(old)]), any(hits[len(old):])
         if after and not before:
@@ -1255,6 +1531,10 @@ def _slide(own: _OwnCopper, world: _Copper, board: _Board, tracks: list[_Seg], p
         if before and not after:
             return "own_copper", f"{what} would leave {name}, which the copper it replaces reached (a contact lost)"
     length = sum(abs(b[0] - a[0]) + abs(b[1] - a[1]) for a, b, _joined, _passed in pieces)
+    length += sum(abs(b[0] - a[0]) + abs(b[1] - a[1]) for a, b in kept_step)
+    before = sum(abs(b[0] - a[0]) + abs(b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+    if length > before + _TOL:  # since 2026-11-19: only a move that keeps the step can lengthen the run; none is made
+        return "length", f"{what} would lengthen its net by {_q(length - before):g} mm (the step stays as the branch's copper)"
     return _Slide(pieces, changed, involved, lay, p3, (len(pieces), _q(length), tracks[k + 1].order))
 
 
@@ -1289,34 +1569,85 @@ def _straighten(groups: dict[tuple[str, str], list[_Seg]], world: _Copper, board
         last = sweep == SIDESTEP_SWEEPS  # the bound is reached: one more look, which moves nothing and says what it kept from moving
         left = []
         moved = False
-        found = [(own, s) for own in owns for s in own.tracks if own.sidestep(s)]
-        for own, m in sorted(found, key=lambda f: (step(f[1]), f[1].order)):  # shortest first, then in track order
-            if not own.sidestep(m):
-                continue  # a move of this sweep took it, lengthened it or changed its corners
+        found = [(own, s, None) for own in owns for s in own.tracks if own.sidestep(s) or own.junction_step(s) is not None]
+        found += [(own, tee[0], tee) for own in owns for tee in own.tees()]  # since 2026-11-19: lane changes at a T on a track
+        for own, m, tee in sorted(found, key=lambda f: (step(f[1]), f[1].order)):  # shortest first, then in track order
+            if tee is not None:
+                # routing.corners 0.2, since 2026-11-19 (module docstring: the straightening, a lane change at a junction): the T as
+                # the copper now stands - a move of this sweep may have changed it
+                tee = next((now for now in own.tees() if now[1] is tee[1] and now[2] == tee[2] and now[3] is tee[3] and now[4] == tee[4]), None)
+                if tee is None:
+                    continue
+                m, junction = tee[0], tee[2]
+            else:
+                junction = None if own.sidestep(m) else own.junction_step(m)
+                if junction is None and not own.sidestep(m):
+                    continue  # a move of this sweep took it, lengthened it or changed its corners
             at = (_q((m.a[0] + m.b[0]) / 2.0), _q((m.a[1] + m.b[1]) / 2.0))
             row: dict[str, Any] = {"net": own.net, "layer": own.layer, "at": [at[0], at[1]], "step_mm": step(m)}
-            run = own.run(m)
-            if run is None:
-                left.append({**row, "outcome": "left", "reason": "kept_point",
-                             "why": "its copper closes on itself through plain corners: the pass keeps no point of it to slide the sidestep to"})
-                continue
-            tracks, pts, k = run
             what = f"the straightened copper of the sidestep at ({at[0]:g}, {at[1]:g})"
             cl = track_clear(m.track)
-            # the move along the neighbour at the sidestep's second end, and the mirrored one (the run read the other way round)
-            tries = [(pts[k + 2], _slide(own, world, board, tracks, pts, k, cl, what)),
-                     (pts[k - 1], _slide(own, world, board, tracks[::-1], pts[::-1], len(tracks) - 1 - k, cl, what))]
-            legal = [slide for _to, slide in tries if isinstance(slide, _Slide)]
+            w = float(m.track.width_mm)
+            tries: list[tuple[Point, _Slide | tuple[str, str], list[_Seg], list[Point]]] = []
+            if junction is not None:
+                # routing.corners 0.2, since 2026-11-19 (module docstring: the straightening, a junction the run may pass through, and a lane
+                # change at a junction): the step leaves a junction; the run is read from it across the step's corner, and a track of the
+                # junction that arrives along the neighbour's line joins it in front, so the slide along the neighbour carries that track
+                # through the junction; where the step goes on along a branch's line, the junction's track may instead be slid onto the
+                # corner's lane, the step staying as the branch's copper
+                row["junction"] = [junction[0], junction[1]]
+                corner_pt = m.b if m.a == junction else m.a
+                nc = next((t for t, _e in own.ends.get(corner_pt, []) if t is not m and t is not (tee[3] if tee else None)), None)
+                side = None if nc is None else own.walk(nc, corner_pt)
+                if side is None:
+                    left.append({**row, "outcome": "left", "reason": "kept_point",
+                                 "why": f"the step at the junction ({junction[0]:g}, {junction[1]:g}) has no neighbour to slide along"})
+                    continue
+                c_tracks, c_pts = side
+                if tee is not None:
+                    t, host, b = tee[1], tee[3], tee[3]
+                else:
+                    t = own.through(junction, _heading(c_pts[0], c_pts[1]), w, [m, *c_tracks], ring=True)
+                    host, b = None, own.branch(m, junction)
+                if t is None:
+                    left.append({**row, "outcome": "left", "reason": "kept_point",
+                                 "why": (f"no straight track of its net arrives at the junction ({junction[0]:g}, {junction[1]:g}) along the line "
+                                         "of the step's neighbour: the run cannot pass straight through it")})
+                    continue
+                far = t.a if t.b == junction else t.b
+                jt, jp = [t, m, *c_tracks], [far, junction, *c_pts]
+                tries.append((c_pts[1], _slide(own, world, board, jt, jp, 1, cl, what, host=host), jt, jp))
+                n_side = own.walk(t, junction) if b is not None and b is not t else None
+                if n_side is not None:
+                    bt, bp = [*c_tracks[::-1], m, *n_side[0]], [*c_pts[::-1], *n_side[1]]
+                    tries.append((n_side[1][1], _slide(own, world, board, bt, bp, len(c_tracks), cl, what, stay=True), bt, bp))
+            else:
+                run = own.run(m)
+                if run is None:
+                    left.append({**row, "outcome": "left", "reason": "kept_point",
+                                 "why": "its copper closes on itself through plain corners: the pass keeps no point of it to slide the sidestep to"})
+                    continue
+                tracks, pts, k = run
+                # the move along the neighbour at the sidestep's second end, and the mirrored one (the run read the other way round)
+                tries = [(pts[k + 2], _slide(own, world, board, tracks, pts, k, cl, what), tracks, pts),
+                         (pts[k - 1], _slide(own, world, board, tracks[::-1], pts[::-1], len(tracks) - 1 - k, cl, what), tracks[::-1], pts[::-1])]
+            if junction is not None:
+                # since 2026-11-19: a move at a junction must put a lane on one line - two corners fewer at least; where the run's end
+                # keeps the slid step (it meets a pad from its side) only one goes, and the step has just moved: no move
+                tries = [(to, ("kept_point", f"the pass keeps ({to[0]:g}, {to[1]:g}): the slid step would stay there as a step "
+                                             "(one corner fewer, not two)")
+                          if isinstance(slide, _Slide) and len(tr) - slide.rank[0] < 2 else slide, tr, pt) for to, slide, tr, pt in tries]
+            legal = [(slide, tr, pt) for _to, slide, tr, pt in tries if isinstance(slide, _Slide)]
             if not legal:
-                reason = next((slide[0] for _to, slide in tries if slide[0] != "kept_point"), "kept_point")
+                reason = next((slide[0] for _to, slide, _tr, _pt in tries if slide[0] != "kept_point"), "kept_point")
                 left.append({**row, "outcome": "left", "reason": reason,
-                             "why": "; ".join(f"toward ({to[0]:g}, {to[1]:g}): {slide[1]}" for to, slide in tries)})
+                             "why": "; ".join(f"toward ({to[0]:g}, {to[1]:g}): {slide[1]}" for to, slide, _tr, _pt in tries)})
                 continue
             if last:
                 left.append({**row, "outcome": "left", "reason": "sweep_cap",
                              "why": f"it could still be slid, but the step stops after {SIDESTEP_SWEEPS} sweeps"})
                 continue
-            best = min(legal, key=lambda slide: slide.rank)
+            best, tracks, pts = min(legal, key=lambda found: found[0].rank)
             copper = sum(abs(b[0] - a[0]) + abs(b[1] - a[1]) for a, b in zip(pts, pts[1:]))
             entry = f"{CORNER_ENTRY_PREFIX}{CORNERS_ID} {CORNERS_ARC_VERSION}:{STRAIGHTEN}:at={at[0]!r},{at[1]!r}:step={step(m)!r}"
             _make(own, world, best, entry, track_clear)
@@ -1365,9 +1696,20 @@ def _straighten_words() -> str:
             "of the largest radius need) between two right-angle corners the pass would not skip, neither of them on a track at its net's "
             "neck-down width - is slid along one of its two neighbours to that neighbour's far corner and joined with the track that leaves "
             "it there (one track where that one continues it, their difference where it runs back over it); never into or across a point the "
-            "pass keeps (a pad, a via, a junction, a track end); the copper a move adds passes the exact audit of a chamfer (every clearance, "
+            "pass keeps (a pad, a via, a junction, a track end) - but the run's end may take the slid sidestep where it is a junction on a "
+            "straight line of the net that covers the slid sidestep whole (the junction moves along that line), or a through-hole pad (the "
+            "slid sidestep goes where it lies within the pad's inscribed circle, else it meets the pad from its new side); a short step "
+            "between a junction and a plain corner is slid the same way where a track of the junction arrives along the line of the step's "
+            "neighbour (that track is carried through the junction), and a move may meet or turn at a junction from a new direction where "
+            "a straight track of the net leaves it along that line (the copper passes straight through); a junction and a step's corner "
+            "may lie in a through-hole pad's box, a T on a track's interior near the track's corner is a junction step too, and where the "
+            "step goes on along a branch's line the junction's lane may be slid onto the corner's lane instead, the step staying as the "
+            "branch's copper (a move at a junction takes two corners at least); the copper a move "
+            "adds passes the exact audit of a chamfer (every clearance, "
             "track keep-out and the board edge), and the move may neither make nor lose a contact within its net; a move never lengthens the "
-            "net; of two legal moves the one that leaves fewer corners, then less copper; shortest sidestep first, sweep after sweep until "
+            "net's copper as the router laid it (before the rounding; the finished copper is never longer than the router's, though a move "
+            "takes away corners whose rounding would have shortened it); of two legal moves the one that leaves fewer corners, then less "
+            "copper; shortest sidestep first, sweep after sweep until "
             f"none moves (at most {SIDESTEP_SWEEPS} sweeps); a sidestep that cannot be slid legally stays as routed, with the reason")
 
 

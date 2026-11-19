@@ -328,15 +328,32 @@ def test_a_junction_on_the_side_a_u_shortens_stays_on_the_copper_or_stops_the_mo
     the net that ends on that side
 
     * at (4, 12), on the part that stays: its end lies on the side's centreline before and after - the U is slid away;
-    * at (4, 8), on the part the move takes away: the branch would be left hanging - the U stays;
-    * at (4, 9), exactly where the slid track would turn: a corner on a junction is no plain corner - the U stays."""
+    * at (4, 8), on the part the move takes away: the branch would be left hanging - the U move is refused (since 2026-11-19 the
+      branch's T is a lane change, which takes the U's copper instead);
+    * at (4, 9), exactly where the slid track would turn, but along the line the slid copper takes there (since 2026-11-19): the
+      copper passes straight through that junction - a T, the line y = 9 unbroken - and the U is slid away;
+    * at (4, 9) running off at 45 degrees, along no line the copper takes: a corner on a junction is no plain corner - the U stays."""
     seen = _watch(monkeypatch)
     detour = ((4.0, 16.0), (4.0, 6.0), (5.0, 6.0), (5.0, 9.0), (12.0, 9.0))
     r = _run(tmp_path, lib, detour, *_poly("A", (4.0, 12.0), (2.0, 12.0)))
-    assert _path(seen) == [((4.0, 16.0), (4.0, 9.0)), ((4.0, 9.0), (12.0, 9.0)), ((4.0, 12.0), (2.0, 12.0))] and _counts(r) == (1, 1, 0, {})
-    for y, words in ((8.0, "an end of track (4, 8)-(2, 8) of its net at (4, 8) lies on copper the move would take away"),
-                     (9.0, "the slid copper would turn at (4, 9), on its own net's track (4, 9)-(2, 9) (a junction)")):
-        r = _run(tmp_path / f"{y}", lib, detour, *_poly("A", (4.0, y), (2.0, y)))
+    assert _path(seen) == [((4.0, 16.0), (4.0, 9.0)), ((4.0, 9.0), (12.0, 9.0)), ((4.0, 12.0), (2.0, 12.0))] and _counts(r) == (2, 1, 1, {"kept_point": 1})
+    # since 2026-11-19 the slid U leaves a lane change at a T (the branch west at y 12, the run east at y 9, 3 mm apart along the side
+    # between them): a step at a T, which stays - both lanes end on points the pass keeps
+    assert _steps(r)[1]["junction"] == [4.0, 12.0] and _steps(r)[1]["reason"] == "kept_point"
+    r = _run(tmp_path / "through", lib, detour, *_poly("A", (4.0, 9.0), (2.0, 9.0)))
+    # since 2026-11-19 the branch's T on the U's long side is a lane change (west at y 9 there, east at y 9 beyond the U): the same
+    # copper, the branch carried through the T to the far side of the U and joined with the run there - one track along y = 9
+    assert _path(seen) == [((4.0, 16.0), (4.0, 9.0)), ((2.0, 9.0), (12.0, 9.0))] and _counts(r) == (1, 1, 0, {})
+    assert _steps(r)[0]["junction"] == [4.0, 9.0] and _steps(r)[0]["corners_removed"] == 4
+    # the branch at (4, 8): the U itself cannot be slid (the branch's end lies on copper the move would take away), but since
+    # 2026-11-19 the branch's T, 2 mm above the U's corner, is a lane change: the branch is carried through the T to the U's far
+    # side and the U's copper goes - the run comes down to the T and leaves along the branch's line, 4 mm shorter, and a 1 mm step
+    # down to the run east is left between two points the pass keeps
+    r = _run(tmp_path / "8.0", lib, detour, *_poly("A", (4.0, 8.0), (2.0, 8.0)))
+    assert _path(seen) == [((4.0, 16.0), (4.0, 8.0)), ((5.0, 8.0), (5.0, 9.0)), ((5.0, 9.0), (12.0, 9.0)), ((5.0, 8.0), (2.0, 8.0))], _path(seen)
+    assert [(row["outcome"], row.get("junction"), row.get("shorter_mm")) for row in _steps(r)] == [("straightened", [4.0, 8.0], 4.0), ("left", None, None)]
+    for y, branch, words in ((9.0, ((4.0, 9.0), (2.0, 11.0)), "the slid copper would turn at (4, 9), on its own net's track (4, 9)-(2, 11) (a junction)"),):
+        r = _run(tmp_path / f"{y}", lib, detour, *_poly("A", *branch))
         assert _path(seen)[:4] == list(zip(detour, detour[1:])) and r.stats["corners"]["straightened"] == 0, y
         row = _steps(r)[0]
         assert (row["at"], row["reason"]) == ([4.5, 6.0], "kept_point"), (y, row)
@@ -359,6 +376,72 @@ def test_a_track_of_eight_widths_is_no_sidestep(tmp_path: Path, lib: KicadLibrar
     words = r.stats["corners"]["straighten"]
     assert "a track shorter than 8 track widths (the room two arcs of the largest radius need) between two right-angle corners" in words
     assert "neither of them on a track at its net's neck-down width" in words and "a move never lengthens the net" in words
+    # the length rule says what it measures: the router's straight copper, not the rounded one (a move takes away corners whose
+    # rounding would have shortened the net - the 9 V piano board's rev 3 SPK and GND F.Cu came out 0.27 / 0.22 mm longer that way)
+    assert "the net's copper as the router laid it (before the rounding; the finished copper is never longer than the router's" in words
+
+
+#: routing.corners 0.2, since 2026-11-19: net A of the junction boards - R1 east, R2 at the end of a branch north of the junction, R5 south-west
+JUNCTION_NETS = {"A": [("R1", "1"), ("R2", "1"), ("R5", "1")], "B": [("R3", "1"), ("R4", "1")]}
+
+
+def test_a_step_at_a_junction_is_slid_so_the_run_passes_straight_through_it(tmp_path: Path, lib: KicadLibrary, monkeypatch: pytest.MonkeyPatch):
+    """The 9 V piano board's MIX run came from the east to a junction at (40.5, 42), stepped 0.25 mm down there and ran on west 0.25 mm
+    off its own line (a kink after the rounding): the step leaves a junction, so it was no sidestep. routing.corners 0.2, since 2026-11-19: a short step
+    between a junction and a plain corner, where a track of the junction arrives along the line the step's neighbour runs on, is slid
+    along that neighbour like a sidestep - the arriving track is carried through the junction, which stays where it was (a T with an
+    unbroken line); the row names the junction. Without a track arriving along that line the step is a plain branch: no candidate."""
+    seen = _watch(monkeypatch)
+    east, branch, step = _poly("A", (16.0, 6.0), (10.0, 6.0)), _poly("A", (10.0, 6.0), (10.0, 2.0)), _poly("A", (10.0, 6.0), (10.0, 6.25), (3.0, 6.25), (3.0, 14.0))
+    parts = [("R1", "SMD1", 16.0, 6.0), ("R2", "SMD1", 10.0, 2.0), ("R5", "SMD1", 3.0, 14.0), ("R3", "SMD1", 1.2, 1.2), ("R4", "SMD1", 1.2, 18.8)]
+    r = _pass(tmp_path, lib, [*east, *branch, *step], parts=parts, nets=JUNCTION_NETS)
+    assert _path(seen) == [((16.0, 6.0), (3.0, 6.0)), ((10.0, 6.0), (10.0, 2.0)), ((3.0, 6.0), (3.0, 14.0))], _path(seen)
+    row = _steps(r)[0]
+    assert _counts(r) == (1, 1, 0, {}) and row["junction"] == [10.0, 6.0] and row["outcome"] == "straightened" and row["corners_removed"] == 2
+    assert row["shorter_mm"] == 0.0  # a Z joined to the track that continues it keeps the length
+    # R1 reached at 45 degrees instead: no track arrives at (10, 6) heading west, so the step is a branch of the junction and stays
+    parts[0] = ("R1", "SMD1", 14.0, 2.0)
+    r = _pass(tmp_path / "branch", lib, [*_poly("A", (14.0, 2.0), (10.0, 6.0)), *branch, *step], parts=parts, nets=JUNCTION_NETS)
+    assert _counts(r) == (0, 0, 0, {}) and _path(seen)[:3] == [((14.0, 2.0), (10.0, 6.0)), ((10.0, 6.0), (10.0, 2.0)), ((10.0, 6.0), (10.0, 6.25))]
+
+
+def test_a_bump_between_two_junctions_becomes_their_straight_line(tmp_path: Path, lib: KicadLibrary, monkeypatch: pytest.MonkeyPatch):
+    """The piano board's VREF bus ran at y 111.5 from one resistor column's junction, stepped 0.25 mm down, ran 15 mm at y 111.75 and
+    stepped back up onto the next column's junction (the stub up to that resistor's pad ends on the line there). The bump is slid onto
+    the line: the copper arrives at the second junction along the line the track beyond it leaves on, so it passes straight through
+    that junction too, and the bus is one line through both junctions, 0.5 mm shorter."""
+    seen = _watch(monkeypatch)
+    nets = {"A": [("R1", "1"), ("R2", "1"), ("R5", "1"), ("R6", "1")], "B": [("R3", "1"), ("R4", "1")]}
+    parts = [("R1", "SMD1", 2.0, 6.0), ("R2", "SMD1", 18.0, 6.0), ("R5", "SMD1", 6.0, 2.0), ("R6", "SMD1", 14.0, 2.0),
+             ("R3", "SMD1", 1.2, 1.2), ("R4", "SMD1", 1.2, 18.8)]
+    tracks = [*_poly("A", (2.0, 6.0), (6.0, 6.0)), *_poly("A", (6.0, 6.0), (6.0, 2.0)), *_poly("A", (6.0, 6.0), (6.0, 6.25), (14.0, 6.25), (14.0, 2.0)),
+              *_poly("A", (14.0, 6.0), (18.0, 6.0))]
+    r = _pass(tmp_path, lib, tracks, parts=parts, nets=nets)
+    assert _path(seen) == [((2.0, 6.0), (14.0, 6.0)), ((6.0, 6.0), (6.0, 2.0)), ((14.0, 6.0), (14.0, 2.0)), ((14.0, 6.0), (18.0, 6.0))], _path(seen)
+    assert _counts(r) == (1, 1, 0, {}) and _steps(r)[0]["junction"] == [6.0, 6.0] and _steps(r)[0]["shorter_mm"] == 0.5
+
+
+def test_a_u_may_end_its_run_at_a_junction_where_a_track_continues_its_new_line(tmp_path: Path, lib: KicadLibrary, monkeypatch: pytest.MonkeyPatch):
+    """routing.corners 0.2, since 2026-11-19 (module docstring: the straightening, a junction the run may pass through, (b)): a move may
+    meet the end of its run at a junction from a new direction when a straight track of the net continues the slid copper's line on the
+    far side of the junction. The junction (4, 10): R1's track arrives from the north heading south, a branch runs west to R5, and
+    the run leaves east as an equal-armed U - 4 mm east, 0.5 mm down, 4 mm back west - and goes on south to R2. Slid, the U's copper
+    leaves the junction heading south, the line R1's track arrives on: the net becomes one straight line from R1 to R2 through the
+    junction, which stays a T. Where no track arrives at the junction along that line (R1 reached from the west and R5 at 45
+    degrees), the junction keeps the direction the copper meets it in and the U stays."""
+    seen = _watch(monkeypatch)
+    u = _poly("A", (4.0, 10.0), (8.0, 10.0), (8.0, 10.5), (4.0, 10.5), (4.0, 16.0))
+    parts = [("R1", "SMD1", 4.0, 4.0), ("R2", "SMD1", 4.0, 16.0), ("R5", "SMD1", 1.0, 10.0), ("R3", "SMD1", 18.8, 1.2), ("R4", "SMD1", 18.8, 18.8)]
+    r = _pass(tmp_path, lib, [*_poly("A", (4.0, 4.0), (4.0, 10.0)), *_poly("A", (4.0, 10.0), (1.0, 10.0)), *u], parts=parts, nets=JUNCTION_NETS)
+    assert _path(seen) == [((4.0, 4.0), (4.0, 10.0)), ((4.0, 10.0), (1.0, 10.0)), ((4.0, 10.0), (4.0, 16.0))], _path(seen)
+    assert _counts(r) == (1, 1, 0, {}) and _steps(r)[0]["outcome"] == "straightened"
+    # no straight track continues the new line beyond the junction: the U stays as routed
+    parts[0], parts[2] = ("R1", "SMD1", 1.0, 10.0), ("R5", "SMD1", 1.0, 7.0)
+    r = _pass(tmp_path / "no_line", lib, [*_poly("A", (1.0, 10.0), (4.0, 10.0)), *_poly("A", (1.0, 7.0), (4.0, 10.0)), *u], parts=parts,
+              nets=JUNCTION_NETS)
+    assert _counts(r) == (1, 0, 1, {"kept_point": 1}) and _path(seen)[2:] == [((4.0, 10.0), (8.0, 10.0)), ((8.0, 10.0), (8.0, 10.5)),
+                                                                               ((8.0, 10.5), (4.0, 10.5)), ((4.0, 10.5), (4.0, 16.0))]
+    assert "the copper would meet (4, 10) from a new direction" in _steps(r)[0]["why"]
 
 
 # --------------------------------------------------------------------------- what stops a move
@@ -570,8 +653,11 @@ def test_a_ring_of_plain_corners_has_no_point_to_slide_to(tmp_path: Path, lib: K
     assert {row["why"] for row in _steps(r)} == {"its copper closes on itself through plain corners: the pass keeps no point of it to slide the sidestep to"}
     hung = [*_poly("A", (8.0, 12.0), (8.0, 10.0)), *_poly("A", (8.0, 10.0), (10.0, 10.0), (10.0, 8.0), (8.0, 8.0), (8.0, 10.0))]
     r = _pass(tmp_path / "hung", lib, hung, parts=_parts((8.0, 12.0), (16.0, 4.0)), nets=STEP_NETS)
-    assert _counts(r) == (2, 0, 2, {"kept_point": 2}) and [row["at"] for row in _steps(r)] == [[10.0, 9.0], [9.0, 8.0]]
-    assert _steps(r)[0]["why"] == ("toward (8, 8): the copper would meet (8, 10) from a new direction, and the pass keeps that point: a junction of 3 track "
+    # routing.corners 0.2, since 2026-11-19: the top side also leaves the junction (8, 10), where the stem arrives along the line the right side runs
+    # on - a step that could pass through the junction; sliding it would fold the ring onto itself just the same
+    assert _counts(r) == (3, 0, 3, {"kept_point": 3}) and [row["at"] for row in _steps(r)] == [[9.0, 10.0], [10.0, 9.0], [9.0, 8.0]]
+    assert _steps(r)[0]["junction"] == [8.0, 10.0] and "the copper would meet (8, 10) from a new direction" in _steps(r)[0]["why"]
+    assert _steps(r)[1]["why"] == ("toward (8, 8): the copper would meet (8, 10) from a new direction, and the pass keeps that point: a junction of 3 track "
                                    "ends of its net; toward (8, 10): the pass keeps that point: a junction of 3 track ends of its net")
 
 
@@ -829,7 +915,7 @@ def test_the_stage_report_counts_a_straightened_sidestep_as_what_it_is(tmp_path:
         "이 보드의 구리에서 `routing.corners` 0.2 는 모서리를 둥글리기 전에 라우터가 남긴 옆걸음(sidestep: 두 직각 모서리 사이의 짧은 트랙) 2 곳을 곧게 폈습니다 "
         "(길이 0.2–0.6 mm; 트랙 provenance 의 `corner:` 항목 중 `straighten`; 프로젝트 소유자의 모서리 규칙 — 전기적 요구가 아닌 기하 관례). "
         "옆걸음은 의도한 패턴이나 길이 맞춤이 아니라 격자 탐색이 남긴 것입니다. 그 짧은 트랙을 이웃 트랙을 따라 다음 모서리까지 밀어 거기서 나가는 트랙과 하나로 합쳤고, "
-        "패드·비아·접합점은 그대로이며 넷의 길이는 늘지 않습니다. 새로 놓인 구리는 격자 여유 g/2 없이 정확한 기하로 검사했습니다: 다른 넷의 트랙·비아·패드 상자와 구리 사이 "
+        "패드·비아는 그대로이고 접합점은 제 직선 위에서만 움직이며, 넷의 길이는 라우터가 놓은 직선 구리보다 늘지 않습니다(없앤 모서리의 둥글리기 몫만큼은 줄지 않으므로, 펴지 않고 둥글린 구리보다는 조금 길 수 있습니다). 새로 놓인 구리는 격자 여유 g/2 없이 정확한 기하로 검사했습니다: 다른 넷의 트랙·비아·패드 상자와 구리 사이 "
         "간격 c = 0.25 mm (두 넷 중 넷 규칙의 간격이 더 크면 그 값; 넷이 없는 패드·구멍과는 c + g/2 = 0.375 mm), 중심선에서 트랙 keep-out 까지 w/2, 가장자리까지 e + w/2. "
         "그래서 그 구리는 위 반경보다 가까울 수 있으며, 그 판정도 kicad-cli DRC 가 합니다. 곧게 펴지 못한 옆걸음은 트랙에 항목을 남기지 않아 여기서 세지 않습니다 "
         "(라우터의 배선 메모가 그 수를 적었다면 아래 단계 기록에 있습니다)."
@@ -880,3 +966,142 @@ def test_the_pcb_agent_says_how_many_sidesteps_were_straightened(tmp_path: Path,
 def test_the_architecture_document_names_the_straightening():
     doc = (Path(__file__).resolve().parents[1] / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
     assert "둥글리기 전에 라우터가 남긴 옆걸음" in doc and "`straighten` 항목" in doc and "`sidesteps`·`straightened`·`sidesteps_left`·`sidestep_reasons`" in doc
+
+
+# --------------------------------------------------------------------------- a run end that takes the sidestep
+
+
+def test_a_junction_on_a_straight_line_takes_the_sidestep_and_moves_along_that_line(tmp_path: Path, lib: KicadLibrary,
+                                                                                     monkeypatch: pytest.MonkeyPatch):
+    """The 9 V piano board's GND sidestep at (67, 40): a run from a pad steps 0.2 mm aside and ends on a straight track of its net
+    that runs along the sidestep's line (a T). Sliding the sidestep onto that track lays nothing new there - the track already
+    covers it -, so the junction moves 0.2 mm along the track and the run is one straight track. Where the line's copper does not
+    cover the slid sidestep whole (the track ends short of it), the junction stays a point the pass keeps, as before."""
+    seen = _watch(monkeypatch)
+    nets = {"A": [("R1", "1"), ("R2", "1"), ("R5", "1")], "B": STEP_NETS["B"]}
+    line = _poly("A", (2.0, 6.0), (14.0, 6.0))
+    r = _pass(tmp_path, lib, [*_poly("A", (4.0, 16.0), (4.0, 13.0), (4.2, 13.0), (4.2, 6.0)), *line],
+              parts=_parts((4.0, 16.0), (14.0, 6.0), ("R5", "SMD1", 2.0, 6.0)), nets=nets)
+    assert _path(seen) == [((4.0, 16.0), (4.0, 6.0)), ((2.0, 6.0), (14.0, 6.0))]
+    assert _counts(r) == (1, 1, 0, {})
+    row, = _steps(r)
+    assert (row["outcome"], row["at"], row["slid_to"], row["corners_removed"], row["shorter_mm"]) == ("straightened", [4.1, 13.0], [4.2, 6.0], 2, 0.2)
+    assert any(_entry((4.1, 13.0), 0.2) in t.provenance.derived_from for t in r.tracks)
+    short = _poly("A", (4.1, 6.0), (14.0, 6.0))  # the line ends at x = 4.1: the slid sidestep (4 .. 4.2) would leave its copper
+    r = _pass(tmp_path / "short", lib, [*_poly("A", (4.0, 16.0), (4.0, 13.0), (4.2, 13.0), (4.2, 6.0)), *short],
+              parts=_parts((4.0, 16.0), (14.0, 6.0)), nets=STEP_NETS)
+    assert _counts(r) == (1, 0, 1, {"kept_point": 1}) and ((4.0, 13.0), (4.2, 13.0)) in _shape(r)
+
+
+def test_a_through_hole_pad_takes_the_sidestep_into_its_ring_or_is_met_from_the_side(tmp_path: Path, lib: KicadLibrary,
+                                                                                    monkeypatch: pytest.MonkeyPatch):
+    """The 9 V piano board's VREF sidestep at (41.5, 51.4): a run leaves a through-hole pad, steps aside and runs on; its other way
+    is blocked (a via of the net on the copper the move would take away). A plated hole is soldered through its barrel, so where
+    the track meets its ring does not matter: a 0.3 mm step slides into the pad - it lies within the pad's inscribed circle (0.8 mm)
+    and goes, the run now leaves the pad 0.3 mm off its centre, straight; a 1.0 mm step is longer than that, so the slid sidestep
+    stays and meets the pad from its side (one corner fewer). A surface-mount pad in the same place stays a point the pass keeps."""
+    seen = _watch(monkeypatch)
+    via = Via(net="A", x_mm=4.3, y_mm=9.0, drill_mm=0.4, diameter_mm=0.8, provenance=HAND)
+    pts = ((4.0, 16.0), (4.0, 13.0), (4.3, 13.0), (4.3, 6.0), (14.0, 6.0))
+    tht = [("R1", "PAD1", 4.0, 16.0), ("R2", "SMD1", 14.0, 6.0), ("R3", "SMD1", 1.2, 1.2), ("R4", "SMD1", 1.2, 18.8)]
+    r = _pass(tmp_path, lib, _poly("A", *pts), vias=(via,), parts=tht, nets=STEP_NETS)
+    assert _path(seen) == [((4.3, 16.0), (4.3, 6.0)), ((4.3, 6.0), (14.0, 6.0))] and _counts(r) == (1, 1, 0, {})
+    assert _steps(r)[0]["slid_to"] == [4.0, 16.0]
+    side = ((4.0, 16.0), (4.0, 13.0), (5.0, 13.0), (5.0, 6.0), (14.0, 6.0))
+    r = _pass(tmp_path / "side", lib, _poly("A", *side), vias=(via.model_copy(update={"x_mm": 5.0}),), parts=tht, nets=STEP_NETS)
+    assert _path(seen) == [((4.0, 16.0), (5.0, 16.0)), ((5.0, 16.0), (5.0, 6.0)), ((5.0, 6.0), (14.0, 6.0))] and _counts(r) == (1, 1, 0, {})
+    smd = [("R1", "SMD1", 4.0, 16.0), *tht[1:]]
+    r = _pass(tmp_path / "smd", lib, _poly("A", *pts), vias=(via,), parts=smd, nets=STEP_NETS)
+    assert _counts(r) == (1, 0, 1, {"kept_point": 1}) and _path(seen) == list(zip(pts, pts[1:]))
+
+
+# --------------------------------------------------------------------------- a lane change at a junction (since 2026-11-19)
+
+
+def test_a_lane_change_at_a_t_on_a_track_is_slid_so_the_lane_runs_straight_through(tmp_path: Path, lib: KicadLibrary,
+                                                                                   monkeypatch: pytest.MonkeyPatch):
+    """The 9 V piano board's VS run (rev 3, at R50.1): the run came from the east at y 26.75 and ended on the stub down to the pad,
+    0.25 mm before that stub's corner; the run went on west from the corner at y 27 - a lane change at a T on a track's interior, no
+    junction of track ends, so no candidate. Now the part of the stub between the T and its corner is a step: the arriving track is
+    carried through the T along the corner's neighbour (the stub is cut back to the T), and the lane is one line."""
+    seen = _watch(monkeypatch)
+    parts = [("R1", "SMD1", 16.0, 6.0), ("R2", "SMD1", 10.0, 2.0), ("R5", "SMD1", 3.0, 14.0), ("R3", "SMD1", 1.2, 1.2), ("R4", "SMD1", 1.2, 18.8)]
+    tracks = [*_poly("A", (16.0, 6.0), (10.0, 6.0)), *_poly("A", (10.0, 6.25), (10.0, 2.0)), *_poly("A", (10.0, 6.25), (3.0, 6.25), (3.0, 14.0))]
+    r = _pass(tmp_path, lib, tracks, parts=parts, nets=JUNCTION_NETS)
+    assert _path(seen) == [((16.0, 6.0), (3.0, 6.0)), ((10.0, 6.0), (10.0, 2.0)), ((3.0, 6.0), (3.0, 14.0))], _path(seen)
+    row, = _steps(r)
+    assert _counts(r) == (1, 1, 0, {}) and (row["at"], row["step_mm"], row["junction"], row["corners_removed"], row["shorter_mm"]) == (
+        [10.0, 6.125], 0.25, [10.0, 6.0], 2, 0.0), row  # a Z: the step slid to the west corner continues the track there
+
+
+def test_a_lane_change_at_a_t_may_move_the_arriving_lane_onto_the_corners_line(tmp_path: Path, lib: KicadLibrary,
+                                                                              monkeypatch: pytest.MonkeyPatch):
+    """The piano board's OSC4 / OSC8 runs (rev 3, at R24.1 / R28.1): the lane from the north at x 46.25 ended on the stub to the pad
+    0.25 mm east of the stub's corner, where the lane on south left at x 46.0; the southern lane cannot move (its far end is a pad).
+    The northern lane is slid onto the corner's line instead - the step between the T and the corner stays, as the stub it is, and
+    the corner becomes the T: the lane is one line, 0.25 mm shorter."""
+    seen = _watch(monkeypatch)
+    parts = [("R1", "SMD1", 1.0, 3.0), ("R2", "SMD1", 7.0, 10.0), ("R5", "SMD1", 4.0, 16.0), ("R3", "SMD1", 18.8, 1.2), ("R4", "SMD1", 18.8, 18.8)]
+    tracks = [*_poly("A", (1.0, 3.0), (4.25, 3.0), (4.25, 10.0)), *_poly("A", (4.0, 10.0), (7.0, 10.0)), *_poly("A", (4.0, 10.0), (4.0, 16.0))]
+    r = _pass(tmp_path, lib, tracks, parts=parts, nets=JUNCTION_NETS)
+    assert _path(seen) == [((1.0, 3.0), (4.0, 3.0)), ((4.0, 10.0), (7.0, 10.0)), ((4.0, 3.0), (4.0, 16.0))], _path(seen)
+    row, = _steps(r)
+    assert _counts(r) == (1, 1, 0, {}) and (row["junction"], row["slid_to"], row["shorter_mm"]) == ([4.25, 10.0], [4.25, 3.0], 0.25), row
+
+
+def test_a_junction_and_a_corner_in_a_through_hole_pad_let_the_run_pass_straight_through(tmp_path: Path, lib: KicadLibrary,
+                                                                                         monkeypatch: pytest.MonkeyPatch):
+    """The piano board's GND feed past Q2.1 (rev 3): the run came up at x 10.0 into the pad's box, met the stub to the pad's centre
+    there and went on north 0.25 mm aside, at x 9.75 - the junction and the corner both inside the pad's box, so both points the pass
+    kept. A plated hole is soldered through its barrel (as for a run end in such a pad): the junction may lie in its box and so may
+    the step's corner; the run is carried straight through and the step goes. A surface-mount pad there stays a point the pass keeps."""
+    seen = _watch(monkeypatch)
+    parts = [("R1", "SMD1", 10.1, 16.0), ("R2", "PAD1", 10.0, 10.05), ("R5", "SMD1", 16.0, 4.0), ("R3", "SMD1", 1.2, 1.2), ("R4", "SMD1", 1.2, 18.8)]
+    tracks = [*_poly("A", (10.1, 16.0), (10.1, 10.0)), *_poly("A", (10.1, 10.0), (10.0, 10.05)),
+              *_poly("A", (10.1, 10.0), (9.85, 10.0), (9.85, 4.0), (16.0, 4.0))]
+    r = _pass(tmp_path, lib, tracks, parts=parts, nets=JUNCTION_NETS)
+    assert _path(seen) == [((10.1, 16.0), (10.1, 4.0)), ((10.1, 10.0), (10.0, 10.05)), ((10.1, 4.0), (16.0, 4.0))], _path(seen)
+    assert _counts(r) == (1, 1, 0, {}) and _steps(r)[0]["junction"] == [10.1, 10.0]
+    smd = [*parts[:1], ("R2", "SMD1", 10.0, 10.05), *parts[2:]]
+    r = _pass(tmp_path / "smd", lib, tracks, parts=smd, nets=JUNCTION_NETS)
+    assert _counts(r) == (0, 0, 0, {}) and _path(seen)[2:4] == [((10.1, 10.0), (9.85, 10.0)), ((9.85, 10.0), (9.85, 4.0))]
+
+
+def test_a_lane_change_at_a_junction_may_slide_the_junctions_lane_where_the_step_goes_on_as_a_branch(tmp_path: Path, lib: KicadLibrary,
+                                                                                                     monkeypatch: pytest.MonkeyPatch):
+    """The piano board's VBAT run (rev 3, the T at (57.25, 28.75)): the lane from the west at y 28.75 met a branch going north, stepped
+    0.75 mm south along that branch's line and ran on east at y 29.5 to a via. The step could not slide east (the via is a point the
+    pass keeps); now the junction's lane may be slid onto the corner's line instead, the step staying as the branch's copper - here
+    0.5 mm shorter, the bend at the west end taking the difference. Where the west end continues the lane's direction (a Z) the move
+    would lengthen the net by the step: the step stays, with the reason ``length`` (the pass never lengthens a net)."""
+    seen = _watch(monkeypatch)
+    parts = [("R1", "SMD1", 2.0, 14.0), ("R2", "SMD1", 10.0, 2.0), ("R5", "SMD1", 16.0, 6.5), ("R3", "SMD1", 18.8, 1.2), ("R4", "SMD1", 18.8, 18.8)]
+    tracks = [*_poly("A", (2.0, 14.0), (2.0, 6.0), (10.0, 6.0)), *_poly("A", (10.0, 6.0), (10.0, 2.0)), *_poly("A", (10.0, 6.0), (10.0, 6.5), (16.0, 6.5))]
+    r = _pass(tmp_path, lib, tracks, parts=parts, nets=JUNCTION_NETS)
+    assert _path(seen) == [((2.0, 14.0), (2.0, 6.5)), ((10.0, 6.0), (10.0, 2.0)), ((10.0, 6.0), (10.0, 6.5)), ((2.0, 6.5), (16.0, 6.5))], _path(seen)
+    row, = _steps(r)
+    assert _counts(r) == (1, 1, 0, {}) and (row["junction"], row["slid_to"], row["shorter_mm"]) == ([10.0, 6.0], [2.0, 6.0], 0.5), row
+    parts[0] = ("R1", "SMD1", 2.0, 2.0)
+    z = [*_poly("A", (2.0, 2.0), (2.0, 6.0), (10.0, 6.0)), *tracks[2:]]
+    r = _pass(tmp_path / "z", lib, z, parts=parts, nets=JUNCTION_NETS)
+    assert _counts(r) == (1, 0, 1, {"length": 1}) and _path(seen) == [(t.start, t.end) for t in z]
+    assert "would lengthen its net by 0.5 mm (the step stays as the branch's copper)" in _steps(r)[0]["why"]
+
+
+def test_two_lane_changes_at_a_through_hole_pad_and_a_t_beyond_it_become_one_line(tmp_path: Path, lib: KicadLibrary,
+                                                                                    monkeypatch: pytest.MonkeyPatch):
+    """The piano board's GND run past C24.2 (rev 3): from the north at x 10 into the pad's box, 0.5 mm east to the stub to the pad's
+    centre, on south at x 10.5 to a T on a line from the west, then south again at x 10.5 below it. First the southern lane is slid onto
+    the corner's line (the step stays as the stub's copper); its end merges into the line from the west, and the junction's other
+    track there, the lane on south, keeps its contact through that line. That leaves a lane change at the T on the line, slid as a
+    step at a T: the run is one line from the north to the bend at the bottom."""
+    seen = _watch(monkeypatch)
+    nets = {"A": [("R1", "1"), ("R2", "1"), ("R5", "1"), ("R6", "1")], "B": [("R3", "1"), ("R4", "1")]}
+    parts = [("R1", "SMD1", 10.0, 1.5), ("R2", "PAD1", 10.55, 6.0), ("R5", "SMD1", 4.0, 9.0), ("R6", "SMD1", 16.0, 14.0),
+             ("R3", "SMD1", 18.8, 1.2), ("R4", "SMD1", 1.2, 18.8)]
+    tracks = [*_poly("A", (10.0, 1.5), (10.0, 6.0), (10.5, 6.0)), *_poly("A", (10.5, 6.0), (10.55, 6.0)), *_poly("A", (10.5, 6.0), (10.5, 9.0)),
+              *_poly("A", (4.0, 9.0), (10.5, 9.0)), *_poly("A", (10.5, 9.0), (10.5, 14.0), (16.0, 14.0))]
+    r = _pass(tmp_path, lib, tracks, parts=parts, nets=nets)
+    assert _path(seen) == [((10.0, 1.5), (10.0, 14.0)), ((10.0, 6.0), (10.5, 6.0)), ((10.5, 6.0), (10.55, 6.0)), ((4.0, 9.0), (10.0, 9.0)),
+                           ((10.0, 14.0), (16.0, 14.0))], _path(seen)
+    assert _counts(r) == (2, 2, 0, {}) and [row["junction"] for row in _steps(r)] == [[10.5, 6.0], [10.0, 9.0]]

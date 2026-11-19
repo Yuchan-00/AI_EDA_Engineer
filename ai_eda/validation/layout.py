@@ -238,6 +238,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from ai_eda.compilers.schematic import datasheet_field
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import BoardSide, CircuitIR, PCBDesign, Track, ValidationResult, ValidationStatus, Via
@@ -1360,7 +1361,7 @@ class _SilkBoard:
                     self.unknown_copper.append(f"pad {pad.label} of {fp.lib_id} has shape {pad.pad_shape!r}, whose copper is not read (a trapezoid's rect_delta, or a custom pad's unread primitive)")
                 else:
                     self.pads.append(pad)
-            values = {"Value": comp.value, "Datasheet": (comp.datasheet.url or "") if comp.datasheet is not None else ""}
+            values = {"Value": comp.value, "Datasheet": datasheet_field(comp)}  # the text the footprint carries (pcb.py)
             silk = footprint_silk(comp.ref, fp, placement, values)
             for item in silk.items:
                 if item.shape is None:

@@ -43,7 +43,9 @@ from ai_eda.ir import (
     SilkKind,
     SilkText,
     SourceRef,
+    Track,
     ValidationStatus as S,
+    Via,
     assumption,
     authoritative,
 )
@@ -55,7 +57,7 @@ from ai_eda.tools.kicad.library import KicadLibrary
 from ai_eda.tools.manufacturing.capability import NOT_COMPARED as CAPABILITY_NOT_COMPARED
 from ai_eda.tools.manufacturing.capability_file import CAPABILITY_KEYS, MM_KEYS, ground_capability, load_capability_file
 from ai_eda.tools.silkscreen import PLACER_ID, PLACER_VERSION, SilkParams, place_silkscreen, shape_distance, text_box, text_extent
-from ai_eda.tools.silkscreen.geometry import footprint_silk, ir_text_box, pad_copper, side_of_layer
+from ai_eda.tools.silkscreen.geometry import Shape, footprint_silk, ir_text_box, pad_copper, side_of_layer
 from ai_eda.validation import ValidationContext, default_registry
 from ai_eda.validation.layout import (
     SILK_CLEARANCE_CHECK,
@@ -936,3 +938,247 @@ def test_silk_drc_canary_no_silk_over_copper_or_silk_overlap(tmp_path: Path):
     res = _kicad.run_drc(Path(art.path), tmp_path / "drc.json")
     found = {str(v.get("type")) for k in ("errors", "warnings") for v in res.details.get(k, []) if isinstance(v, dict)}
     assert not found & {"silk_over_copper", "silk_overlap", "silk_edge_clearance", "text_height", "text_thickness"}, found
+
+
+# --------------------------------------------------------------------------- the routed copper, kept texts, turned references, polarity
+
+
+def test_a_via_is_kept_out_of_every_placed_text(tmp_path: Path, lib: KicadLibrary):
+    """A tented via is still a drilled hole: no silk prints over it, and a hole inside a designator breaks its glyphs (the 9 V piano
+    board had via INM6 inside 'C16'). A via of any net where R1's first candidate would go (above, centred at (10, 8.525)) sends
+    the reference to the next free spot, its box a gap clear of the via's disc; the provenance note says vias are kept out."""
+    ir = basic_ir(tmp_path, lib)
+    ir.pcb.vias = [Via(net="GND", x_mm=10.0, y_mm=8.525, drill_mm=0.4, diameter_mm=0.8, provenance=P)]
+    r1 = _texts(place_silkscreen(ir, lib), SilkKind.REFERENCE)["R1"]
+    assert (r1.x_mm, r1.y_mm) != (10.0, 8.525)
+    assert shape_distance(ir_text_box(r1), Shape(((10.0, 8.525),), 0.4)) >= 0.1
+    assert "every via's disc + gap is a keep-out too" in r1.provenance.note
+
+
+def test_a_placed_text_keeps_a_characters_width_from_a_kept_design_text(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board's pin label 'GND' sat 0.35 mm after the design text 'SPK' - the letter spacing inside 'SPK' - and the two
+    read as 'SPKGND'. A kept text is a keep-out grown by one character of it (1.2 mm text: 1.08 mm): J1's centre-line labels, whose
+    spots on the side facing the board centre end 0.35 mm from a kept 'SPK', go to J1's other side instead (the side where more of
+    them fit), every label at least a character's width from the kept text; the same text 1.2 mm away leaves them where they were."""
+    ir = basic_ir(tmp_path, lib)
+    # VIN's spot: right-justified at x = 30.1 (J1's courtyard 30.2 - gap), 0.8 mm, 3 characters: 2.31 mm wide -> from x = 27.79
+    def kept(right: float) -> SilkText:
+        return SilkText(text="SPK", x_mm=right, y_mm=5.0, layer="F.SilkS", size_mm=1.2, thickness_mm=0.18, justify="right", kind=SilkKind.USER,
+                        provenance=Provenance(kind=ProvenanceKind.USER_REQUIREMENT, note="kept text of the test"))
+    near = place_silkscreen(ir, lib, keep=[kept(27.79 - 0.35)])
+    labels = _texts(near, SilkKind.PIN_LABEL)
+    assert labels["VIN"].x_mm > 32.0 and labels["VIN"].justify == "left"  # right of J1 now
+    assert all(shape_distance(ir_text_box(t), ir_text_box(kept(27.79 - 0.35))) >= 1.08 for t in labels.values())
+    far = place_silkscreen(ir, lib, keep=[kept(27.79 - 1.2)])
+    assert (_texts(far, SilkKind.PIN_LABEL)["VIN"].x_mm, _texts(far, SilkKind.PIN_LABEL)["VIN"].justify) == (30.1, "right")
+
+
+def test_a_reference_takes_a_horizontal_spot_before_it_is_turned_and_the_note_names_a_turn(tmp_path: Path, lib: KicadLibrary):
+    """R1 between two parts above and below (no room for a text between the courtyards) and one on its left with room only for a
+    turned text: it used to be turned at its left (left at 90 degrees came before right at 0); now every horizontal spot - each
+    side, slid along it, the corners - comes first, and the free one on its right wins. Hemmed in on the right too, it is turned,
+    and the notes say why."""
+    parts = [("R1", 10.0, 10.0), ("R2", 10.0, 12.0), ("R3", 10.0, 8.0), ("R4", 5.8, 10.0)]
+    r1 = _texts(place_silkscreen(silk_ir(tmp_path, lib, parts, {}, (30.0, 20.0)), lib), SilkKind.REFERENCE)["R1"]
+    assert (r1.rotation_deg, "candidate:4:right@0" in r1.provenance.derived_from) == (0.0, True), r1.provenance.derived_from
+    res = place_silkscreen(silk_ir(tmp_path, lib, [*parts, ("R5", 14.2, 10.0)], {}, (30.0, 20.0), name="hemmed"), lib)
+    r1 = _texts(res, SilkKind.REFERENCE)["R1"]
+    assert r1.rotation_deg == 90.0 and "turned by 90 degrees: no horizontal position is free" in r1.provenance.note
+    assert any(n.startswith("silkscreen: reference(s) turned by 90 degrees (no horizontal position free): R1 (") for n in res.notes)
+
+
+def test_a_reference_prefers_a_spot_clear_of_the_tracks(tmp_path: Path, lib: KicadLibrary):
+    """A track under R1's first candidate (above): the reference takes the next spot clear of every track on its side's copper
+    (below); a track on the other side's copper does not count, and where every spot is over a track the first one is taken and
+    the note says so."""
+    ir = basic_ir(tmp_path, lib)
+    track = Track(net="X", layer="F.Cu", start=(5.0, 8.5), end=(15.0, 8.5), width_mm=0.25, provenance=P)
+    ir.pcb.tracks = [track]
+    r1 = _texts(place_silkscreen(ir, lib), SilkKind.REFERENCE)["R1"]
+    assert "candidate:1:below@0" in r1.provenance.derived_from and r1.y_mm == round(10.0 + 0.7 + 0.1 + 0.675, 6)
+    ir.pcb.tracks = [track.model_copy(update={"layer": "B.Cu"})]
+    r1 = _texts(place_silkscreen(ir, lib), SilkKind.REFERENCE)["R1"]
+    assert (r1.x_mm, r1.y_mm) == (10.0, 8.525)
+    ir.pcb.tracks = [Track(net="X", layer="F.Cu", start=(0.5, y), end=(39.5, y), width_mm=0.25, provenance=P) for y in (8.5, 11.5)]
+    ir.pcb.tracks += [Track(net="X", layer="F.Cu", start=(x, 0.5), end=(x, 19.5), width_mm=0.25, provenance=P) for x in (7.0, 13.0)]
+    r1 = _texts(place_silkscreen(ir, lib), SilkKind.REFERENCE)["R1"]
+    assert (r1.x_mm, r1.y_mm) == (10.0, 8.525) and "over a track of X" in r1.provenance.note
+
+
+def test_a_diode_gets_a_k_at_its_cathode_pad_and_a_polarized_part_a_plus_from_its_symbols_pin_names(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board's LED D1 had only KiCad's 'flat' on its outline, which the TLLR4400 body lacks (Vishay doc. 83029 p.7). A
+    two-pin part whose symbol names its pins A / K gets a 'K' beside the pad of its K pin - here pad 2, so the mark goes right of it,
+    away from pad 1 -; one whose pins are + / - a '+' beside the + pad; a part with other pin names (an op-amp's '+' inputs among
+    others) gets none, and neither does a footprint whose own silk already has the mark."""
+    def named(ir: CircuitIR, ref: str, names: dict[str, str]) -> None:
+        c = next(c for c in ir.components if c.ref == ref)
+        c.pins = [Pin(number=n, name=names[n], electrical_type=PinElectricalType.PASSIVE, provenance=P) for n in ("1", "2")]
+
+    ir = silk_ir(tmp_path, lib, [("R1", 10.0, 10.0), ("R2", 20.0, 10.0), ("R3", 30.0, 10.0), ("O1", 10.0, 16.0)], {}, (40.0, 20.0))
+    named(ir, "R1", {"1": "A", "2": "K"})
+    named(ir, "R2", {"1": "+", "2": "-"})
+    named(ir, "R3", {"1": "+", "2": "OUT"})
+    named(ir, "O1", {"1": "+", "2": "-"})  # its footprint's own silk has a "+" text
+    res = place_silkscreen(ir, lib)
+    marks = [(t.component_ref, t.text, t.x_mm > {"R1": 10.0, "R2": 20.0}[t.component_ref]) for t in res.texts if t.kind == SilkKind.PIN_LABEL]
+    assert marks == [("R1", "K", True), ("R2", "+", False)]
+    k = next(t for t in res.texts if t.text == "K")
+    assert "pad:R1.2" in k.provenance.derived_from and "pin_name:K" in k.provenance.derived_from and k.y_mm == 10.0
+    assert res.marks_placed == ["R1.2 K", "R2.1 +"]
+    assert "silkscreen: polarity mark(s) placed beside the pad the symbol's pin names: R1.2 K; R2.1 +" in res.notes
+
+
+
+def _gap_to_others(t: SilkText, ir: CircuitIR, lib: KicadLibrary) -> tuple[float, float]:
+    """``(gap to the reference's own courtyard, smallest gap to any other courtyard)`` of a placed reference."""
+    from ai_eda.tools.kicad.geometry import courtyard_bbox
+
+    box = ir_text_box(t)
+    gaps: dict[str, float] = {}
+    for c in ir.components:
+        cy = courtyard_bbox(ir.pcb.placement(c.ref), lib.load_footprint(c.footprint))
+        gaps[c.ref] = shape_distance(box, Shape(((cy.x1, cy.y1), (cy.x2, cy.y1), (cy.x2, cy.y2), (cy.x1, cy.y2))))
+    own = gaps.pop(t.component_ref)
+    return own, min(gaps.values())
+
+
+def test_a_reference_takes_a_spot_that_reads_as_its_own_parts_before_a_horizontal_one_in_a_gap(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board's RV5 sat off the corner of RV5, as near RV6 as its own trimmer, and the 0.8 mm R2x labels between two
+    resistor columns as near the next column's pads as their own: a reader matches a designator with the nearest part. R1 (turned
+    upright) in a row of parts 2.2 mm apart, with parts 0.55 mm above and below it: the horizontal 1.0 mm spot on its left fits the
+    gap but ends 0.15 mm from R3 - as near R3 as R1 -, so R1 is turned in that gap, 0.1 mm from its own body and 0.75 mm from R3; the
+    note says why it is turned. Without the neighbour on the left, the horizontal spot there reads as R1's and wins."""
+    parts = [("R1", 10.0, 10.0, 90.0), ("R2", 13.6, 10.0, 90.0), ("R3", 6.4, 10.0, 90.0), ("R4", 10.0, 7.0, 90.0), ("R5", 10.0, 13.0, 90.0)]
+    ir = silk_ir(tmp_path, lib, parts, {}, (20.0, 20.0))
+    res = place_silkscreen(ir, lib)
+    r1 = _texts(res, SilkKind.REFERENCE)["R1"]
+    assert (r1.rotation_deg, r1.size_mm, "candidate:3:left@90" in r1.provenance.derived_from) == (90.0, 1.0, True), r1.provenance.derived_from
+    own, other = _gap_to_others(r1, ir, lib)
+    assert round(own, 6) == 0.1 and other >= own + 0.5, (own, other)
+    assert ("turned by 90 degrees: every free horizontal position reads as another part's (the first, left at 1 mm, is as near the "
+            "courtyard of R3 as its own body)") in r1.provenance.note
+    assert not res.references_ambiguous
+    assert any(n.startswith("silkscreen: reference(s) turned by 90 degrees (every free horizontal position reads as another part's): R1 (")
+               for n in res.notes)
+    ir = silk_ir(tmp_path, lib, [p for p in parts if p[0] != "R3"], {}, (20.0, 20.0), name="open")
+    r1 = _texts(place_silkscreen(ir, lib), SilkKind.REFERENCE)["R1"]
+    assert (r1.rotation_deg, "candidate:2:left@0" in r1.provenance.derived_from) == (0.0, True), r1.provenance.derived_from
+
+
+def test_a_reference_that_cannot_read_as_its_own_parts_is_named_in_the_notes(tmp_path: Path, lib: KicadLibrary):
+    """Hemmed in on every side (parts 0.6 mm above and below, 1.8 mm left and right): no free spot is 0.5 mm nearer R1 than every
+    other courtyard. R1 still gets the first free spot outside every other courtyard (turned on its left), and the notes name the
+    part it sits as near as its own."""
+    parts = [("R1", 10.0, 10.0), ("R2", 10.0, 12.0), ("R3", 10.0, 8.0), ("R4", 5.8, 10.0), ("R5", 14.2, 10.0)]
+    res = place_silkscreen(silk_ir(tmp_path, lib, parts, {}, (30.0, 20.0)), lib)
+    r1 = _texts(res, SilkKind.REFERENCE)["R1"]
+    assert r1.rotation_deg == 90.0 and "(no free spot reads as its own part's)" in r1.provenance.note
+    assert [a.split(":")[0] for a in res.references_ambiguous] == ["R1"]
+    assert any(n.startswith("silkscreen: reference(s) as near another part as their own (no free spot reads as their own part's): R1: as near")
+               for n in res.notes)
+
+
+def test_a_polarity_mark_prefers_a_spot_clear_of_the_tracks(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board's 'K' beside D1's cathode pad touched a GND track. A track under the first spot (right of the K pad, away
+    from the other pad) sends the mark to the next spot clear of the tracks; a track on the other copper side does not count."""
+    ir = silk_ir(tmp_path, lib, [("R1", 10.0, 10.0)], {}, (20.0, 20.0))
+    c = ir.components[0]
+    c.pins = [Pin(number=n, name={"1": "A", "2": "K"}[n], electrical_type=PinElectricalType.PASSIVE, provenance=P) for n in ("1", "2")]
+    track = Track(net="GND", layer="F.Cu", start=(11.885, 5.0), end=(11.885, 15.0), width_mm=0.25, provenance=P)
+    ir.pcb.tracks = [track.model_copy(update={"layer": "B.Cu"})]
+    k = next(t for t in place_silkscreen(ir, lib).texts if t.text == "K")
+    assert (k.x_mm, k.y_mm) == (11.885, 10.0) and "side:right" in k.provenance.derived_from
+    ir.pcb.tracks = [track]
+    k = next(t for t in place_silkscreen(ir, lib).texts if t.text == "K")
+    assert "side:right" not in k.provenance.derived_from
+    assert shape_distance(ir_text_box(k), Shape((track.start, track.end), 0.125)) > 0.0
+
+
+def test_a_reference_leaves_its_polarity_marks_first_spot_to_the_mark(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board with test points: a track ran above D1, so D1's reference took the first spot clear of the tracks - left,
+    beside the cathode pad -, which is where the 'K' goes first, and the 'K' was left out ("no free spot beside the pad"). Tracks
+    above and below R1 (pins named K / A, the K pad on the left): the reference now tries the mark's side last, as a connector's
+    reference does its pin labels' side, and the 'K' keeps its spot left of the K pad."""
+    ir = silk_ir(tmp_path, lib, [("R1", 10.0, 10.0)], {}, (20.0, 20.0))
+    c = ir.components[0]
+    c.pins = [Pin(number=n, name={"1": "K", "2": "A"}[n], electrical_type=PinElectricalType.PASSIVE, provenance=P) for n in ("1", "2")]
+    ir.pcb.tracks = [Track(net="X", layer="F.Cu", start=(0.5, y), end=(19.5, y), width_mm=0.25, provenance=P) for y in (8.5, 11.5)]
+    res = place_silkscreen(ir, lib)
+    k = next(t for t in res.texts if t.text == "K")
+    r1 = _texts(res, SilkKind.REFERENCE)["R1"]
+    assert "side:left" in k.provenance.derived_from and k.x_mm < 10.0, k.provenance.derived_from
+    assert not any(":left@" in d for d in r1.provenance.derived_from if d.startswith("candidate:")), r1.provenance.derived_from
+    assert res.marks_placed == ["R1.1 K"] and shape_distance(ir_text_box(k), ir_text_box(r1)) > 0.0
+
+
+# --------------------------------------------------------------------------- repeated cells, the standard size, the edge, clusters
+
+
+def _region(rid: str, rect: list[float], refs: list[str]):
+    from ai_eda.ir import PackRegion
+
+    return PackRegion(id=rid, rect=assumption(rect, "fixture region", "mm"), refs=refs, provenance=P)
+
+
+def test_the_repeats_of_a_cell_take_one_reference_spot_and_the_notes_say_what_kept_the_first(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board's eight voice columns are one cell repeated at a 15 mm pitch, yet each part's reference went where it fitted
+    best alone: RV2/3/6/7/8 above, RV1/RV4 right, RV5 left, C11/C16 right and the other C1x left - a drawing that does not look
+    deliberate. Two pack regions with the same parts in the same arrangement (R1 + R2, R3 + R4 four mm to the right of each other)
+    are a repeated cell: R1 and R3 take one spot - the first free in both -, and so do R2 and R4. A via of another net where R3's
+    first spot (above) would go sends both R1 and R3 below, and the notes name the cell and the via; without the regions each part
+    is placed on its own (R1 above, R3 below)."""
+    parts = [("R1", 5.0, 10.0), ("R2", 9.0, 10.0), ("R3", 15.0, 10.0), ("R4", 19.0, 10.0)]
+    ir = silk_ir(tmp_path, lib, parts, {}, (30.0, 20.0))
+    ir.pcb.vias = [Via(net="X", x_mm=15.0, y_mm=8.525, drill_mm=0.4, diameter_mm=0.8, provenance=P)]
+    alone = _texts(place_silkscreen(ir, lib), SilkKind.REFERENCE)
+    assert alone["R1"].y_mm < 10.0 < alone["R3"].y_mm  # each on its own: R1 above, R3 below
+    ir.pcb.pack_regions = [_region("a", [3.0, 8.0, 9.0, 4.0], ["R1", "R2"]), _region("b", [13.0, 8.0, 9.0, 4.0], ["R3", "R4"])]
+    res = place_silkscreen(ir, lib)
+    refs = _texts(res, SilkKind.REFERENCE)
+    offsets = {ref: (round(t.x_mm - x, 6), round(t.y_mm - y, 6), t.rotation_deg, t.size_mm) for ref, x, y in parts for t in (refs[ref],)}
+    assert offsets["R1"] == offsets["R3"] and offsets["R2"] == offsets["R4"], offsets
+    assert offsets["R1"][1] > 0.0 and offsets["R1"][3] == 1.0  # below, at the standard size
+    assert "repeated_cell:R1,R3" in refs["R3"].provenance.derived_from and "the same spot as every repeat of its cell" in refs["R3"].provenance.note
+    line = next(n for n in res.notes if n.startswith("silkscreen: repeated cells"))
+    assert "R1x (R1, R3, pack regions a, b): below at 1 mm in every repeat" not in line  # the stem is the refs' common prefix
+    assert "Rx (R1, R3, pack regions a, b): below at 1 mm in every repeat" in line, line
+    assert "above at 1 mm, which 1 of 2 repeats would take alone, is not free at R3 (within 0.1 mm of the via of X at (15, 8.525))" in line, line
+
+
+def test_a_reference_keeps_the_standard_size_turned_before_it_shrinks(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board had eight references at 0.8 mm (R12-R14, R17, R18, R23, R27, R38) where a 1 mm one fitted: the smaller
+    size came before a turned text. 0.8 mm is the last resort now: R1, with a part 0.9 mm below, 1.9 mm above (a 1 mm text fits there
+    but sits as near that part as its own: 0.45 mm) and 2.25 mm left and right (no horizontal 1 mm text fits), used to take 0.8 mm
+    above; it takes 1 mm turned in the gap on its left, which reads as its own, and the note says why it is turned."""
+    parts = [("R1", 10.0, 10.0), ("R2", 10.0, 12.3), ("R3", 10.0, 6.7), ("R4", 5.45, 10.0), ("R5", 14.55, 10.0)]
+    res = place_silkscreen(silk_ir(tmp_path, lib, parts, {}, (30.0, 20.0)), lib)
+    r1 = _texts(res, SilkKind.REFERENCE)["R1"]
+    assert (r1.size_mm, r1.rotation_deg, "candidate:3:left@90" in r1.provenance.derived_from) == (1.0, 90.0, True), r1.provenance.derived_from
+    assert "turned by 90 degrees" in r1.provenance.note and not res.references_reduced and not res.references_ambiguous
+
+
+def test_a_reference_keeps_a_millimetre_from_the_board_edge_where_it_can(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board's R18 / R38 sat 0.55 mm and R31 0.60 mm from the board edge - inside the 0.3 mm the silk rule holds, so
+    they were taken. A reference prefers 1 mm (``PREFERRED_EDGE_MM``): R1 near the top edge, whose spot above would end 0.5 mm from
+    it, goes below; where nothing keeps 1 mm the nearest spot is still taken and the notes say how near."""
+    from ai_eda.tools.silkscreen.place import PREFERRED_EDGE_MM
+
+    assert PREFERRED_EDGE_MM == 1.0 and SilkParams().silk_to_edge_mm == 0.3  # the hard rule is unchanged
+    r1 = _texts(place_silkscreen(silk_ir(tmp_path, lib, [("R1", 10.0, 2.65)], {}, (20.0, 20.0)), lib), SilkKind.REFERENCE)["R1"]
+    assert r1.y_mm > 2.65 and ir_text_box(r1).bbox()[1] >= 1.0, r1
+    res = place_silkscreen(silk_ir(tmp_path, lib, [("R1", 3.0, 2.5)], {}, (6.0, 5.0), name="tiny"), lib)
+    r1 = _texts(res, SilkKind.REFERENCE)["R1"]
+    assert r1.layer == "F.SilkS" and res.references_near_edge and res.references_near_edge[0].startswith("R1: ")
+    assert any(n.startswith("silkscreen: reference(s) nearer the board edge than 1 mm (no free spot farther in): R1: ") for n in res.notes)
+
+
+def test_two_references_of_different_parts_keep_a_millimetre_apart(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board's 'C11' and 'C12' sat 0.93 mm apart between the two bodies with 'R11' 0.6 mm above them: three designators
+    read as one cluster. A reference prefers a spot 1 mm (``CLUSTER_GAP_MM``) from every other part's reference: R2, whose first spot
+    (above) ends 0.85 mm from R1's, takes the next spot 1 mm clear of it."""
+    from ai_eda.tools.silkscreen.place import CLUSTER_GAP_MM
+
+    res = place_silkscreen(silk_ir(tmp_path, lib, [("R1", 10.0, 10.0), ("R2", 12.8, 10.0)], {}, (30.0, 20.0)), lib)
+    refs = _texts(res, SilkKind.REFERENCE)
+    assert CLUSTER_GAP_MM == 1.0 and refs["R1"].y_mm < 10.0  # R1 above its part
+    assert shape_distance(ir_text_box(refs["R1"]), ir_text_box(refs["R2"])) >= 1.0 and not res.references_clustered

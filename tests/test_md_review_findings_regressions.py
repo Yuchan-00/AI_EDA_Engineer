@@ -255,7 +255,7 @@ def test_1_cpl_designator_is_gated_and_plain_cells_still_print(tmp_path: Path):
     ir = _ir(tmp_path, part)
     art = BOMCompiler().compile(ir, CompileContext(workdir=tmp_path, tools={}))
     row = Path(art.path).read_text(encoding="utf-8").splitlines()[1]
-    assert row.startswith("R1,10k,resistor,NOT_VERIFIED,MPN-10k,0603,Resistor_SMD:R_0603_1608Metric,JLCPCB,C25804,")
+    assert row.startswith("R1,10k,resistor,,MPN-10k,0603,Resistor_SMD:R_0603_1608Metric,JLCPCB,C25804,")
     ir.pcb = PCBDesign(placements=[Placement(component_ref="-R1", x_mm=0.0, y_mm=0.0, provenance=AUTH)])
     with pytest.raises(CompileError, match="Designator.*refusing to write a cell"):
         CPLCompiler().compile(ir, CompileContext(workdir=tmp_path, tools={}))

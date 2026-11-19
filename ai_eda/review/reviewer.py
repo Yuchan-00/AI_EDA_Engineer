@@ -10,7 +10,10 @@ How evidence is read (see ``docs/ARCHITECTURE.md`` section 4):
   unchanged on disk, the board artifact must be fresh and unchanged, and the
   rows are compared with the footprints read from the compiled
   ``.kicad_pcb`` (reference, value, footprint id for the BOM; reference,
-  position, rotation, side for the CPL). The BOM ``Value`` cell is decoded
+  position, rotation, side for the CPL - the position in the frame the
+  CPL's ``compiler.cpl`` version wrote: the Gerbers' frame, Y up, from 0.3
+  on; KiCad's page frame, Y down, for 0.1 / 0.2, which is failed to be
+  recompiled; the message names the frame). The BOM ``Value`` cell is decoded
   with :func:`ai_eda.tools.manufacturing.csv_cells.bom_cell_text` (one
   leading apostrophe removed) before it is compared with the board's
   value, so a neutralised ``-12V`` still matches and a board whose value
@@ -118,7 +121,9 @@ from ai_eda.ir.simulation import REDUCE_UNITS
 from ai_eda.review.areas import ReviewArea
 from ai_eda.tools.calc.quantity import QUANTITY_VERSION, parse_answer, unit_key
 from ai_eda.tools.calc.recompute import CHECK_ID as CALC_CHECK_ID, recompute_parameters, resolve_input
+from ai_eda.compilers.bom import bom_refs, cpl_refs
 from ai_eda.tools.kicad.board import BoardFootprint, read_board_footprints
+from ai_eda.tools.kicad.library import EXCLUDE_FROM_BOM, EXCLUDE_FROM_POS_FILES, KicadLibrary
 from ai_eda.tools.kicad.geometry import normalize_angle
 from ai_eda.tools.manufacturing.capability import CHECK_ID as CAPABILITY_CHECK_ID, check_capability
 from ai_eda.tools.manufacturing.capability_file import relocate_limits
@@ -133,6 +138,16 @@ Check = Callable[[CircuitIR, Path], ValidationResult]
 
 #: position tolerance when comparing CPL rows (4 decimals) with board coordinates (6 decimals)
 POSITION_TOL_MM = 1e-4
+#: CPL generator versions whose ``Mid X`` / ``Mid Y`` are the footprint anchor, not the part's centre (``compiler.cpl`` 0.1); the
+#: reviewer compares such a CPL with the board's anchors and sends it back to be recompiled (an assembler places by the centre)
+CPL_ANCHOR_VERSIONS: frozenset[str] = frozenset({"0.1"})
+#: CPL generator versions that wrote ``Mid X`` / ``Mid Y`` in KiCad's page frame (Y down: ``compiler.cpl`` 0.1 and 0.2), the opposite
+#: sign of the Gerbers' Y; the reviewer measures such a CPL in that frame, says so, and sends it back to be recompiled - every later
+#: version writes the Gerbers' frame (``ai_eda.compilers.bom.CPL_FRAME``: Y up)
+CPL_PAGE_FRAME_VERSIONS: frozenset[str] = frozenset({"0.1", "0.2"})
+#: how the reviewer names the two frames it reads a CPL in
+CPL_PAGE_FRAME = "KiCad's page frame (mm from the page origin, Y down)"
+CPL_GERBER_FRAME = "the Gerbers' frame (mm from KiCad's page origin, Y up)"
 
 #: the ten fields of :class:`~ai_eda.ir.RegulatoryProvenance` every regulatory requirement must carry (``verification_status`` must be PASS)
 REGULATORY_PROVENANCE_FIELDS: tuple[str, ...] = (
@@ -532,9 +547,25 @@ class IndependentReviewer:
             return problem
         return pcb, read_board_footprints(Path(pcb.path))
 
+    def _library(self) -> KicadLibrary:
+        library = self.tools.get("kicad_library")
+        return library if isinstance(library, KicadLibrary) else KicadLibrary()
+
+    @staticmethod
+    def _left_out(ir: CircuitIR, ref: str, fp: BoardFootprint, expected: set[str], token: str, output: str) -> str | None:
+        """Why a board footprint without a row in ``output`` is a mismatch, or ``None`` when it is a part of ``ir`` whose library
+        footprint keeps it out (not ``expected``) and the board's footprint carries the same ``token``."""
+        if ref in expected or ir.component(ref) is None:
+            return f"{ref}: on the board, not in {output}"
+        if token not in fp.attributes:
+            return f"{ref}: left out of the {output} by its library footprint's ({token}), but the board's footprint does not carry it"
+        return None
+
     def check_pcb_vs_bom(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
-        """BOM rows vs the footprints of the compiled board: reference, value and footprint id must agree."""
-        got = self._csv_artifact(ir, ArtifactKind.BOM, "Reference", {c.ref for c in ir.components}, "only_in_bom", "only_in_ir", "references")
+        """BOM rows vs the footprints of the compiled board: reference, value and footprint id must agree. A part whose footprint
+        is excluded from the BOM (``compiler.bom`` 0.4) is expected to have no row, and its board footprint to say so too."""
+        expected = bom_refs(ir, self._library())
+        got = self._csv_artifact(ir, ArtifactKind.BOM, "Reference", expected, "only_in_bom", "only_in_ir", "references")
         if isinstance(got, ValidationResult):
             return got
         bom, rows = got
@@ -560,7 +591,9 @@ class IndependentReviewer:
             if row["Footprint"] != fp.lib_id:
                 mismatches.append(f"{fp.ref}: footprint BOM {row['Footprint']!r} vs board {fp.lib_id!r}")
         for ref in sorted(set(on_board) - {row["Reference"] for row in rows}):
-            mismatches.append(f"{ref}: on the board, not in BOM")
+            why = self._left_out(ir, ref, on_board[ref], expected, EXCLUDE_FROM_BOM, "BOM")
+            if why is not None:
+                mismatches.append(why)
         evidence = [self._evidence("bom csv", bom), self._evidence("kicad_pcb", pcb)]
         if mismatches:
             return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="BOM and board disagree", details={"mismatches": mismatches, "repair": "human"}, evidence=evidence)
@@ -570,7 +603,8 @@ class IndependentReviewer:
         """CPL rows vs the footprints of the compiled board: designator, position, rotation and side must agree."""
         if ir.pcb is None:
             return ValidationResult(check_id="", status=ValidationStatus.NOT_VERIFIED, message="no PCB design in the IR")
-        got = self._csv_artifact(ir, ArtifactKind.CPL, "Designator", {p.component_ref for p in ir.pcb.placements}, "only_in_cpl", "only_in_pcb", "designators")
+        expected = cpl_refs(ir, self._library())  # a part excluded from position files has no row (compiler.cpl 0.4)
+        got = self._csv_artifact(ir, ArtifactKind.CPL, "Designator", expected, "only_in_cpl", "only_in_pcb", "designators")
         if isinstance(got, ValidationResult):
             return got
         cpl, rows = got
@@ -581,6 +615,13 @@ class IndependentReviewer:
             return board
         pcb, footprints = board
         on_board = {fp.ref: fp for fp in footprints}
+        # what Mid X / Mid Y mean depends on the version that wrote them: the footprint anchor (0.1), else the centre of the pads' box;
+        # in KiCad's page frame (Y down: 0.1, 0.2), else in the Gerbers' frame (Y up)
+        ours = cpl.generator == "compiler.cpl"
+        anchored = ours and cpl.generator_version in CPL_ANCHOR_VERSIONS
+        page_frame = ours and cpl.generator_version in CPL_PAGE_FRAME_VERSIONS
+        frame = CPL_PAGE_FRAME if page_frame else CPL_GERBER_FRAME
+        y_sign = 1.0 if page_frame else -1.0
         mismatches: list[str] = []
         for row in rows:
             fp = on_board.get(row["Designator"])
@@ -593,18 +634,35 @@ class IndependentReviewer:
             except ValueError as exc:
                 mismatches.append(f"{fp.ref}: unreadable CPL row {row!r} ({exc})")
                 continue
-            if not (math.isclose(x, fp.x, abs_tol=POSITION_TOL_MM) and math.isclose(y, fp.y, abs_tol=POSITION_TOL_MM)):
-                mismatches.append(f"{fp.ref}: position CPL ({x}, {y}) vs board ({fp.x}, {fp.y})")
+            cx, cy = (fp.x, fp.y) if anchored else fp.centre  # compiler.cpl 0.2 on writes the centre of the pads' box on the board
+            cy = y_sign * cy  # the board's Y (down) in the CPL's frame
+            if not (math.isclose(x, cx, abs_tol=POSITION_TOL_MM) and math.isclose(y, cy, abs_tol=POSITION_TOL_MM)):
+                what = "the footprint anchor" if anchored else "the centre of its pads' box"
+                mismatches.append(f"{fp.ref}: position CPL ({x}, {y}) vs board ({round(cx, 4) + 0.0}, {round(cy, 4) + 0.0}) - {what}, in {frame}")
             if not math.isclose(normalize_angle(rot), normalize_angle(fp.rotation), abs_tol=1e-6):
                 mismatches.append(f"{fp.ref}: rotation CPL {rot} vs board {fp.rotation}")
             if row["Layer"] != fp.side:
                 mismatches.append(f"{fp.ref}: side CPL {row['Layer']!r} vs board {fp.side!r}")
         for ref in sorted(set(on_board) - {row["Designator"] for row in rows}):
-            mismatches.append(f"{ref}: on the board, not in CPL")
+            why = self._left_out(ir, ref, on_board[ref], expected, EXCLUDE_FROM_POS_FILES, "CPL")
+            if why is not None:
+                mismatches.append(why)
         evidence = [self._evidence("cpl csv", cpl), self._evidence("kicad_pcb", pcb)]
         if mismatches:
-            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message="CPL and board disagree", details={"mismatches": mismatches, "repair": "human"}, evidence=evidence)
-        return ValidationResult(check_id="", status=ValidationStatus.PASS, message=f"{len(rows)} CPL rows match the board's footprints (position, rotation, side)", evidence=evidence)
+            return ValidationResult(check_id="", status=ValidationStatus.FAIL, message=f"CPL and board disagree (CPL read in {frame})",
+                                    details={"mismatches": mismatches, "repair": "human", "frame": frame}, evidence=evidence)
+        if anchored or page_frame:
+            why = ("Mid X / Mid Y are the footprint anchors, not the parts' centres an assembler places by"
+                   if anchored else "Mid X / Mid Y are the parts' centres")
+            return ValidationResult(
+                check_id="", status=ValidationStatus.FAIL,
+                message=(f"CPL written by compiler.cpl {cpl.generator_version}: its {len(rows)} rows match the board in {frame}, but {why}, and "
+                         "its Mid Y has the opposite sign of the Gerbers' Y; recompile the CPL"),
+                details={"artifact": ArtifactKind.CPL, "repair": "regenerate", "frame": frame}, evidence=evidence,
+            )
+        return ValidationResult(check_id="", status=ValidationStatus.PASS,
+                                message=f"{len(rows)} CPL rows match the board's footprints (position, rotation, side; positions read in {frame})",
+                                details={"frame": frame}, evidence=evidence)
 
     def check_spice_vs_requirements(self, ir: CircuitIR, workdir: Path) -> ValidationResult:
         """Every expectation of the simulation setup must have passed in a run of the *current* netlist (see the module docstring)."""

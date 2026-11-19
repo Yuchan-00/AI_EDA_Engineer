@@ -36,7 +36,7 @@ import pytest
 
 from ai_eda.agents import CircuitDesignAgent
 from ai_eda.agents.circuit import CONFIRM_DESIGN_KEY
-from ai_eda.agents.keys import PLACEMENT_KEY, ROUTING_KEY
+from ai_eda.agents.keys import PLACEMENT_KEY, ROUTING_KEY, SCHEMATIC_LAYOUT_KEY
 from ai_eda.compilers import BOMCompiler, CompileContext, SchematicCompiler
 from ai_eda.compilers.schematic_layout import pin_position
 from ai_eda.compilers.spice import analysis_command
@@ -49,7 +49,8 @@ from ai_eda.gui.preview import board_svg, project_schematic_svg
 from ai_eda.report.figures import _text_width
 from ai_eda.report.stages import build_stage_document
 from ai_eda.tools.calc import CALC_VERSION, part_value_agrees, recompute_parameters
-from ai_eda.tools.kicad import sexpr
+from ai_eda.tools.layout_metrics import schematic_gates
+from ai_eda.tools.kicad import KicadLibrary, sexpr
 from ai_eda.tools.kicad.geometry import footprint_bbox, pads_bbox
 from ai_eda.tools.placement.core_ring import MARGIN_MM
 from ai_eda.tools.routing import RoutingParams
@@ -57,6 +58,7 @@ from ai_eda.workflow import Stage
 from tests.fixtures_atmega import ATMEGA128_PINS, atmega_library
 from tests.test_report_figures import labels_on_foreign_copper
 from tests.test_circuit_templates import BASE, _confirm, _ctx, _ir, _netlist, _present, _run, _validate, needs_dll
+from tests.textbook_corpus import corpus_ir
 
 ATMEGA = {"input_voltage": "9 V", "clock_frequency": "16 MHz"}
 TEMPLATE = Atmega128DevboardTemplate()
@@ -270,8 +272,9 @@ def test_recompute_inputs_check_validators_and_compiled_views_of_the_confirmed_b
     assert inputs.status is S.PASS and set(inputs.details["parameters"]) == {"v_in", "f_clk"}
     validators = _validate(ir, tmp_path, lib)
     assert validators["ir.assumptions"] is S.PASS and validators["ir.llm_requirements"] is S.PASS and validators["ir.connectivity"] is S.PASS
-    # the 64-pin symbol lays out on the schematic (the fixture's distinct power-pin positions) and the BOM carries every part
-    sch = SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path / "sch", tools={"kicad_library": lib}))
+    # the 64-pin symbol lays out on the schematic (the fixture's distinct power-pin positions) and the BOM carries every part;
+    # the legacy table on purpose (layout="legacy" since textbook 1.0 became the default): its labels, flag note and gutters
+    sch = SchematicCompiler("legacy").compile(ir, CompileContext(workdir=tmp_path / "sch", tools={"kicad_library": lib}))
     text = Path(sch.path).read_text(encoding="utf-8")
     assert '(lib_id "MCU_Microchip_ATmega:ATmega128-16A")' in text and text.count('(global_label "PE0"') == 4
     # B12: the fixture library has no power.kicad_sym, so no PWR_FLAG is placed and the note names the nets ERC will report
@@ -281,7 +284,7 @@ def test_recompute_inputs_check_validators_and_compiled_views_of_the_confirmed_b
     wiring = next(n for n in sch.notes if n.startswith("wiring: "))
     assert wiring.endswith(" of 64 net(s) drawn as wires (labels kept on every pin)") and int(wiring.split()[1]) >= 32, wiring
     assert any(n.startswith("gutters widened: ") and n.endswith(f"{wiring.split()[1]} now)") for n in sch.notes), sch.notes
-    again = SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path / "sch_again", tools={"kicad_library": lib}))
+    again = SchematicCompiler("legacy").compile(ir, CompileContext(workdir=tmp_path / "sch_again", tools={"kicad_library": lib}))
     assert Path(again.path).read_text(encoding="utf-8") == text
     bom = BOMCompiler().compile(ir, CompileContext(workdir=tmp_path / "bom", tools={"kicad_library": lib}))
     bom_text = Path(bom.path).read_text(encoding="utf-8")
@@ -295,13 +298,14 @@ def test_recompute_inputs_check_validators_and_compiled_views_of_the_confirmed_b
 def test_stacked_power_pins_of_the_real_symbol_share_one_stub_and_label_and_other_nets_are_refused(tmp_path: Path):
     """The real KiCad 10.0.6 symbol stacks hidden 52 VCC on 21 and 53 / 63 GND on 22: KiCad connects every pin at one point, so the
     compiler accepts the stack because the IR puts the pins in one net, and draws one stub + one label per point (none stacked on
-    another). A stack the IR splits over two nets is the ``coincides with`` refusal, never a silent merge."""
+    another). A stack the IR splits over two nets is the ``coincides with`` refusal, never a silent merge. The stubs are the
+    legacy table's (layout="legacy" since textbook 1.0 became the default); the refusals hold under every policy."""
     lib = atmega_library(tmp_path / "kicad", stacked_power_pins=True)
     ir = _ir(tmp_path, "atm")
     _present(ir, tmp_path, lib, ATMEGA)
     _confirm(ir, tmp_path, lib)
     assert len(ir.components) == 31
-    art = SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path / "sch", tools={"kicad_library": lib}))
+    art = SchematicCompiler("legacy").compile(ir, CompileContext(workdir=tmp_path / "sch", tools={"kicad_library": lib}))
     node = sexpr.parse_file(art.path)
     u1 = next(s for s in sexpr.find_all(node, "symbol") if sexpr.get(s, "lib_id") == "MCU_Microchip_ATmega:ATmega128-16A")
     at = sexpr.find(u1, "at")
@@ -338,12 +342,13 @@ def test_stacked_power_pins_of_the_real_symbol_share_one_stub_and_label_and_othe
 def test_reference_and_value_fields_sit_where_the_library_puts_them_clear_of_the_pins(tmp_path: Path):
     """Each Reference / Value field is written at the library symbol's own position (turned by the instance's transform) with the
     library's justification: the ATmega128-16A's reference above the body's top-left corner and its value below the body, clear of every
-    pin and its number - never at a fixed offset from the origin, which put the value inside the 64-pin body across PC0 / pin 35."""
+    pin and its number - never at a fixed offset from the origin, which put the value inside the 64-pin body across PC0 / pin 35.
+    The legacy table's rule (layout="legacy" since textbook 1.0 became the default, which places fields by its own sides)."""
     lib = atmega_library(tmp_path / "kicad", stacked_power_pins=True)
     ir = _ir(tmp_path, "atm")
     _present(ir, tmp_path, lib, ATMEGA)
     _confirm(ir, tmp_path, lib)
-    node = sexpr.parse_file(SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path / "sch", tools={"kicad_library": lib})).path)
+    node = sexpr.parse_file(SchematicCompiler("legacy").compile(ir, CompileContext(workdir=tmp_path / "sch", tools={"kicad_library": lib})).path)
     lib_syms = {str(s[1]): s for s in sexpr.find_all(sexpr.find(node, "lib_symbols"), "symbol")}
     for inst in sexpr.find_all(node, "symbol"):
         at = sexpr.find(inst, "at")
@@ -370,6 +375,46 @@ def test_reference_and_value_fields_sit_where_the_library_puts_them_clear_of_the
         pin_box = (min(ax, bx) - 1.27, min(ay, by) - 1.27, max(ax, bx) + 1.27, max(ay, by) + 1.27)
         for box in (value_box, ref_box):
             assert not (box[0] < pin_box[2] and pin_box[0] < box[2] and box[1] < pin_box[3] and pin_box[1] < box[3]), (pin.number, pin.name, box)
+
+
+REAL = KicadLibrary()
+
+
+@pytest.fixture(scope="module")
+def textbook_board(tmp_path_factory):
+    """The board on the installed KiCad libraries, drawn by the default layout (textbook 1.0), with its gates."""
+    if REAL.symbol_file("Device") is None or REAL.symbol_file("MCU_Microchip_ATmega") is None:
+        pytest.skip("KiCad libraries not installed")
+    base = tmp_path_factory.mktemp("atmega_textbook")
+    ir = corpus_ir("atmega128", base / "ir", REAL)
+    art = SchematicCompiler().compile(ir, CompileContext(workdir=base / "sch", tools={"kicad_library": REAL}))
+    return ir, art, schematic_gates(art.path, ir)
+
+
+def test_the_default_draws_the_board_as_textbook_10_without_the_table(textbook_board):
+    ir, art, gates = textbook_board
+    assert art.generator_version == "1.0" and art.notes[0].startswith("layout: textbook 1.0;")
+    assert not any("whole-sheet table" in n for n in art.notes)
+    assert gates["paper"] in ("A3", "A2") and gates["crossings"] <= 9 and gates["near_symbol_hits"] == gates["parallel_hits"] == 0, gates
+
+
+@pytest.mark.xfail(strict=True, reason="open gate: the hub drawing (headers beside the IC pin sides, pin pockets, a decoupler bank) "
+                                       "is not built yet; the headers sit in a grid left of U1 and GND has 8 labels")
+def test_textbook_headers_sit_on_the_ic_pin_sides_with_at_most_two_labels_per_net(textbook_board):
+    ir, art, gates = textbook_board
+    assert max(gates["labels_per_net"].values()) <= 2, gates["labels_per_net"]
+    node = sexpr.parse_file(art.path)
+    at = {str(sexpr.get(s, "property", 2)): (float(sexpr.find(s, "at")[1]), float(sexpr.find(s, "at")[2])) for s in sexpr.find_all(node, "symbol")}
+    u1 = next(s for s in sexpr.find_all(node, "symbol") if sexpr.get(s, "property", 2) == "U1")
+    ux, uy = at["U1"]
+    symbol = REAL.load_symbol(ir.component("U1").symbol)
+    where = {p.number: pin_position(ux, uy, int(float(sexpr.find(u1, "at")[3])), sexpr.get(u1, "mirror"), p) for p in symbol.pins}
+    net_of = {(p.component_ref, p.pin_number): n.name for n in ir.nets for p in n.pins if n.kind is NetKind.SIGNAL}
+    for ref in ("J3", "J4", "J5", "J6", "J7", "J8", "J9"):  # the port and UART headers
+        nets = {net_of.get((ref, p.number)) for p in ir.component(ref).pins} - {None}
+        xs = [where[num][0] for (r, num), n in net_of.items() if r == "U1" and n in nets]
+        side = -1 if sum(xs) / len(xs) < ux else 1
+        assert (at[ref][0] - ux) * side > 0, (ref, at[ref], (ux, uy))
 
 
 def test_two_independent_builds_hash_the_same(tmp_path: Path):
@@ -556,14 +601,15 @@ def test_led_current_reset_delay_and_avcc_level_are_verified_by_ngspice(tmp_path
 # --------------------------------------------------------------------------- the whole pipeline, the reports and the GUI previews
 
 
-def _release(tmp_path: Path, *, spice: bool):
+def _release(tmp_path: Path, *, spice: bool, layout: str | None = None):
     """Present, confirm (with ``pcb.routing=skip``) and run to RELEASE on the synthetic library whose MCU stacks its hidden power pins
     as the real KiCad 10.0.6 symbol does. Routing is skipped here: the maze router's full attempt on this 64-pin board takes minutes
     and leaves nets unrouted (the deliverable run records it), so the IR gets the placement only either way."""
     lib = atmega_library(tmp_path / "kicad", stacked_power_pins=True)
     ir = _ir(tmp_path, "atm")
     _present(ir, tmp_path, lib, ATMEGA)
-    state, ctx = _run(ir, tmp_path, lib, {CONFIRM_DESIGN_KEY: "yes", ROUTING_KEY: "skip"}, None, spice=spice)
+    answers = {CONFIRM_DESIGN_KEY: "yes", ROUTING_KEY: "skip", **({SCHEMATIC_LAYOUT_KEY: layout} if layout else {})}
+    state, ctx = _run(ir, tmp_path, lib, answers, None, spice=spice)
     assert not state.blocked and state.outcomes[-1].stage is Stage.RELEASE
     return ir, lib, state
 
@@ -615,8 +661,9 @@ def test_the_circuit_report_compares_track_capacity_with_the_rails_load_budget(t
 
 def test_stage_reports_and_gui_previews_render_the_64_pin_board(tmp_path: Path):
     """The four stage reports carry the board's figures and the core-ring rule; the GUI draws the compiled schematic's 64-pin symbol
-    (the three stacked hidden pins dashed) and the board with every TQFP pad and legible labels. Views only: nothing is saved."""
-    ir, lib, state = _release(tmp_path, spice=False)
+    (the three stacked hidden pins dashed) and the board with every TQFP pad and legible labels. Views only: nothing is saved.
+    The schematic is the legacy table (a label on every pin, counted below), chosen explicitly since textbook 1.0 became the default."""
+    ir, lib, state = _release(tmp_path, spice=False, layout="legacy")
     before = ir.content_hash()
     theory = build_stage_document(Stage.ARCHITECTURE, ir, lib, state)
     assert theory.figures.slots["theory"] == ["theory_p_reg", "theory_reset_rc", "theory_avcc_lc", "theory_crystal_cl"]

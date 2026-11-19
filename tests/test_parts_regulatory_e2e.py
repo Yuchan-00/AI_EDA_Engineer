@@ -202,10 +202,11 @@ def test_offline_run_fetches_nothing_and_is_honestly_not_verified(fake, tmp_path
     assert review_rp.status is S.NOT_VERIFIED and "compliance not assessed" in review_rp.message and set(review_rp.details["incomplete"]) == {LVD_ID, EMC_ID, ROHS_ID, RED_ID}
     assert "retrieved_at" in review_rp.details["incomplete"][LVD_ID] and "verification_status" in review_rp.details["incomplete"][LVD_ID]
     assert not [r for r in latest.values() if r.status is S.FAIL]
-    # the BOM prints the tagged MPNs (unchanged rule) but their DatasheetHash is NOT_VERIFIED: the evidence pointer is absent
+    # the BOM prints the tagged MPNs (unchanged rule) but their DatasheetHash is empty and named unverified: the evidence pointer is absent
     rows = _bom_rows(ir, tmp_path, ctx.tools)
     assert rows["R1"]["MPN"] == "RC0603FR-0710kL" and rows["J1"]["MPN"] == "PH1-03-UA"
-    assert {row["DatasheetHash"] for row in rows.values()} == {"NOT_VERIFIED"}
+    assert {row["DatasheetHash"] for row in rows.values()} == {""}
+    assert all("DatasheetHash (the MPN's source names no archived copy)" in row["Unverified"] for row in rows.values())
     release = state.outcomes[-1]
     assert release.status is S.NOT_VERIFIED
     blocking = set(_blocking(release.message))
@@ -363,8 +364,9 @@ def test_catalog_backs_sourcing_for_listed_parts_and_leaves_the_others_not_in_ca
     assert latest["ir.component_provenance"].status is S.PASS
     assert all(ir.component(ref).mpn_tagged_authoritative for ref in ("R1", "R2", "J1"))
     rows = _bom_rows(ir, tmp_path, ctx.tools)
-    assert rows["R1"]["Supplier"] == "JLCPCB" and rows["R1"]["SupplierPN"] == "C1" and rows["R2"]["Supplier"] == "NOT_VERIFIED" and rows["R2"]["MPN"] == "RC0603JR-0710kL"
-    assert rows["R2"]["DatasheetHash"] == rows["R1"]["DatasheetHash"] != "NOT_VERIFIED"
+    assert rows["R1"]["Supplier"] == "JLCPCB" and rows["R1"]["SupplierPN"] == "C1" and rows["R2"]["Supplier"] == "" and rows["R2"]["MPN"] == "RC0603JR-0710kL"
+    assert rows["R2"]["DatasheetHash"] == rows["R1"]["DatasheetHash"] != ""
+    assert rows["R2"]["Unverified"] == "Supplier (not stated); SupplierPN (not stated)" and "Supplier" not in rows["R1"]["Unverified"]
     # ... but the reviewer passes the existence check's worst sub-check through: mixed statuses, R2 named with the reason
     report = {r.check_id: r for r in IndependentReviewer(tools=ctx.tools).review(ir, tmp_path).results}
     cp = report[ReviewArea.COMPONENT_PROVENANCE]

@@ -328,3 +328,30 @@ def test_the_same_card_without_a_source_is_not_verified(tmp_path: Path):
     assert result.details["assumptions"] == [f"R1 model_card {MODEL_CARD_NO_SOURCE}"] and "R1 model_card (no model_source)" in result.message
     assert next(r for r in ir.validation.results if r.check_id == "spice").status is ValidationStatus.NOT_VERIFIED
     assert next(r for r in ir.validation.results if r.check_id == "ir.assumptions").status is ValidationStatus.PASS  # not stopped at IR_BUILD
+
+
+def test_a_parts_maker_and_part_number_reach_the_bom_columns_and_the_status_stays_its_own(tmp_path: Path):
+    """The 9 V piano board's BOM said NOT_VERIFIED under Manufacturer and MPN, its part numbers only in the description text. A part
+    may state ``manufacturer`` and ``mpn``: the table shows them as the file's word, the IR keeps them stamped user_requirement with
+    the file's hash, and the BOM prints them in their columns - while DatasheetHash stays empty and the verification status, in a
+    column of its own, names it (no datasheet grounds them). A cell a spreadsheet would execute is refused at load."""
+    from ai_eda.compilers import BOMCompiler, CompileContext
+
+    data = json.loads(json.dumps(RC))
+    data["components"][0].update(manufacturer="Yageo", mpn="RC0603FR-071KL")
+    ir, plan = _applied(tmp_path, data, {})
+    assert any("R1" in line and "manufacturer Yageo, part number RC0603FR-071KL (the file's word, not looked up)" in line for line in plan.parts)
+    r1 = ir.component("R1")
+    assert (r1.manufacturer.value, r1.mpn.value) == ("Yageo", "RC0603FR-071KL")
+    assert r1.mpn.provenance.kind is ProvenanceKind.USER_REQUIREMENT and plan.sha256 in r1.mpn.provenance.note
+    bom = BOMCompiler().compile(ir, CompileContext(workdir=tmp_path, tools={"kicad_library": template_library(tmp_path)}))
+    rows = {line.split(",")[0]: line for line in Path(bom.path).read_text(encoding="utf-8").splitlines()}
+    head = rows["Reference"].split(",")
+    cells = dict(zip(head, rows["R1"].split(",")))
+    assert (cells["Manufacturer"], cells["MPN"], cells["DatasheetHash"]) == ("Yageo", "RC0603FR-071KL", "")
+    assert "DatasheetHash (MPN not found in an archived datasheet)" in cells["Unverified"] and "MPN (" not in cells["Unverified"]
+    c1 = dict(zip(head, rows["C1"].split(",")))
+    assert c1["MPN"] == "" and "MPN (not stated)" in c1["Unverified"]  # a part without one: empty, and said so in its own column
+    data["components"][0]["mpn"] = "=HYPERLINK(1)"
+    with pytest.raises(DesignFileError, match=r"R1 mpn '=HYPERLINK\(1\)' starts with '='"):
+        load_design_file(_write(tmp_path, data), template_library(tmp_path))

@@ -64,6 +64,7 @@ from types import EllipsisType
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape
 
+from ai_eda.compilers.schematic import datasheet_field
 from ai_eda.ir import CircuitIR, Expectation, SilkKind, ValidationStatus, arc_geometry, arc_problem, track_length
 from ai_eda.tools.calc.si import parse_spice_number
 from ai_eda.tools.kicad import sexpr
@@ -1159,7 +1160,7 @@ def _board_silk(ir: CircuitIR, placed: Sequence[tuple[Any, Any, FootprintDef]], 
         out.by_layer[t.layer].append(_silk_text(t.text, ir_text_box(t), t.rotation_deg, t.size_mm, t.thickness_mm, t.layer, X, Y, scale, kind=str(t.kind), ref=t.component_ref))
         out.texts += 1
     for comp, placement, fp in placed:
-        values = {"Value": comp.value, "Datasheet": (comp.datasheet.url or "") if comp.datasheet is not None else ""}
+        values = {"Value": comp.value, "Datasheet": datasheet_field(comp)}  # the text the footprint carries (pcb.py)
         silk = footprint_silk(comp.ref, fp, placement, values)
         for item in silk.items:
             # a text item with a size (fp_text / a visible property); an fp_text_box has no single text size and is left out

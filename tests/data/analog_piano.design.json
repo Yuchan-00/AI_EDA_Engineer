@@ -1,0 +1,2057 @@
+{
+ "format": "ai-eda-design/1",
+ "title": "Analog piano C4-C5",
+ "topology": {
+  "name": "analog piano: keyed astable with Darlington speaker driver",
+  "domains": [
+   "analog",
+   "power"
+  ],
+  "rationale": "design.md (2026-11-18): tuning on the oscillator rail moves all notes together; a short fixed half keeps the scale; a light Darlington load keeps the timing node clean",
+  "blocks": [
+   {
+    "id": "power",
+    "function": "battery, power switch and the tuned oscillator rail (trimmer + follower)",
+    "domain": "power",
+    "component_refs": [
+     "J1",
+     "SW9",
+     "RV1",
+     "Q5"
+    ],
+    "input_nets": [
+     "VBATIN"
+    ],
+    "output_nets": [
+     "BAT",
+     "OSC"
+    ]
+   },
+   {
+    "id": "oscillator",
+    "function": "collector-coupled astable: fixed half RB1 x C2, key half chain x C1",
+    "domain": "analog",
+    "component_refs": [
+     "Q1",
+     "Q2",
+     "C1",
+     "C2",
+     "R9",
+     "R10",
+     "R11"
+    ],
+    "input_nets": [
+     "OSC",
+     "Q2B"
+    ],
+    "output_nets": [
+     "Q1C"
+    ]
+   },
+   {
+    "id": "keyboard",
+    "function": "eight keys tapping the base resistor chain of Q2 (C4 .. C5; the highest pressed key wins)",
+    "domain": "analog",
+    "component_refs": [
+     "R1",
+     "R2",
+     "R3",
+     "R4",
+     "R5",
+     "R6",
+     "R7",
+     "R8",
+     "SW1",
+     "SW2",
+     "SW3",
+     "SW4",
+     "SW5",
+     "SW6",
+     "SW7",
+     "SW8"
+    ],
+    "input_nets": [
+     "OSC"
+    ],
+    "output_nets": [
+     "Q2B"
+    ]
+   },
+   {
+    "id": "driver",
+    "function": "Darlington speaker switch with series resistor and coil clamp",
+    "domain": "analog",
+    "component_refs": [
+     "R12",
+     "Q3",
+     "R13",
+     "R14",
+     "Q4",
+     "R15",
+     "D1",
+     "J2"
+    ],
+    "input_nets": [
+     "Q1C",
+     "BAT"
+    ],
+    "output_nets": [
+     "SPKP",
+     "SPKN"
+    ]
+   }
+  ]
+ },
+ "components": [
+  {
+   "ref": "J1",
+   "value": "Battery_3xAA",
+   "description": "battery lead, 3 x AA cells (4.5 V nominal, design.md) on a JST PH 2-pin header; pin 1 +, pin 2 - (a stated choice: the connector has no polarity convention of its own)",
+   "symbol": "Connector_Generic:Conn_01x02",
+   "footprint": "Connector_JST:JST_PH_B2B-PH-K_1x02_P2.00mm_Vertical",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "battery connector: the simulation applies the battery as the DC stimulus VBAT on BAT"
+   }
+  },
+  {
+   "ref": "SW9",
+   "value": "SW_SPDT",
+   "description": "power slide switch C&K OS102011MS2Q: pole B (pin 2) from the battery, throw A (pin 1) to BAT; throw C (pin 3, the off position) is tied to the pole's own net (a design file cannot mark a pin no-connect). Pole = pin 2 is the KiCad symbol's geometry: not checked against the datasheet",
+   "symbol": "Switch:SW_SPDT",
+   "footprint": "Button_Switch_THT:SW_Slide_SPDT_Straight_CK_OS102011MS2Q",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "power switch without a model: its ON position is the DC stimulus VBAT on BAT"
+   }
+  },
+  {
+   "ref": "RV1",
+   "value": "10k",
+   "description": "tuning trimmer, Bourns 3386P 10 kohm (3386 REV. 12/24: pin 1 CCW, 2 wiper, 3 CW p.2; 0.5 W at 85 C p.1): pin 3 to BAT, pin 1 to GND; the wiper sets the oscillator rail - clockwise raises every note",
+   "symbol": "Device:R_Potentiometer_Trim",
+   "footprint": "Potentiometer_THT:Potentiometer_Bourns_3386P_Vertical",
+   "spice": {
+    "device": "X",
+    "model_name": "TRIM10K_7446",
+    "model_card": ".subckt TRIM10K_7446 1 2 3\nRA 1 2 7445.84\nRB 2 3 2554.16\n.ends",
+    "pin_order": [
+     "1",
+     "2",
+     "3"
+    ],
+    "model_source": "Bourns 3386 REV. 12/24 p.2 (pin 2 wiper): the 10 kohm track split at 0.7446 of it from pin 1, the setting measured to put OSC at 2.5 V (exp/trim_setting.json)"
+   },
+   "serves_requirements": [
+    "req.tuning"
+   ]
+  },
+  {
+   "ref": "Q5",
+   "value": "2N3904",
+   "description": "rail follower: OSC = wiper - V_BE (onsemi 2N3903/D Rev. 9)",
+   "symbol": "Transistor_BJT:2N3904",
+   "footprint": "Package_TO_SOT_THT:TO-92_Inline",
+   "spice": {
+    "device": "Q",
+    "model_name": "QNPN",
+    "model_card": ".model QNPN NPN (TR=200n)",
+    "model_source": "the generic NPN card of ai_eda's AstableTemplate (ai_eda/design/templates.py MODEL_CARD): ngspice default Gummel-Poon parameters plus TR=200n, not a 2N3904 vendor model",
+    "pin_order": [
+     "3",
+     "2",
+     "1"
+    ]
+   },
+   "serves_requirements": [
+    "req.tuning"
+   ]
+  },
+  {
+   "ref": "Q1",
+   "value": "2N3904",
+   "description": "astable; its collector drives the speaker stage (onsemi 2N3903/D Rev. 9)",
+   "symbol": "Transistor_BJT:2N3904",
+   "footprint": "Package_TO_SOT_THT:TO-92_Inline",
+   "spice": {
+    "device": "Q",
+    "model_name": "QNPN",
+    "model_card": ".model QNPN NPN (TR=200n)",
+    "model_source": "the generic NPN card of ai_eda's AstableTemplate (ai_eda/design/templates.py MODEL_CARD): ngspice default Gummel-Poon parameters plus TR=200n, not a 2N3904 vendor model",
+    "pin_order": [
+     "3",
+     "2",
+     "1"
+    ]
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "Q2",
+   "value": "2N3904",
+   "description": "astable; its base is fed by the key chain (onsemi 2N3903/D Rev. 9)",
+   "symbol": "Transistor_BJT:2N3904",
+   "footprint": "Package_TO_SOT_THT:TO-92_Inline",
+   "spice": {
+    "device": "Q",
+    "model_name": "QNPN",
+    "model_card": ".model QNPN NPN (TR=200n)",
+    "model_source": "the generic NPN card of ai_eda's AstableTemplate (ai_eda/design/templates.py MODEL_CARD): ngspice default Gummel-Poon parameters plus TR=200n, not a 2N3904 vendor model",
+    "pin_order": [
+     "3",
+     "2",
+     "1"
+    ]
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "C1",
+   "value": "100n",
+   "description": "timing capacitor Q1 collector -> Q2 base (the key half), film",
+   "symbol": "Device:C",
+   "footprint": "Capacitor_THT:C_Rect_L7.2mm_W2.5mm_P5.00mm_FKS2_FKP2_MKS2_MKP2",
+   "spice": {
+    "device": "C",
+    "value": {
+     "value": 1e-07,
+     "unit": "F"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "C2",
+   "value": "100n",
+   "description": "timing capacitor Q2 collector -> Q1 base (the fixed half), film",
+   "symbol": "Device:C",
+   "footprint": "Capacitor_THT:C_Rect_L7.2mm_W2.5mm_P5.00mm_FKS2_FKP2_MKS2_MKP2",
+   "spice": {
+    "device": "C",
+    "value": {
+     "value": 1e-07,
+     "unit": "F"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R9",
+   "value": "6k65",
+   "description": "RB1: Q1 base resistor, the fixed half 0.5484 ms",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 6650.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R10",
+   "value": "1k",
+   "description": "RC1: Q1 collector load",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 1000.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R11",
+   "value": "1k",
+   "description": "RC2: Q2 collector load",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 1000.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R1",
+   "value": "4k99",
+   "description": "key chain segment R(1) between tap T2 and tap T1",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 4990.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R2",
+   "value": "4k53",
+   "description": "key chain segment R(2) between tap T3 and tap T2",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 4530.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R3",
+   "value": "2k1",
+   "description": "key chain segment R(3) between tap T4 and tap T3",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 2100.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R4",
+   "value": "3k74",
+   "description": "key chain segment R(4) between tap T5 and tap T4",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 3740.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R5",
+   "value": "3k4",
+   "description": "key chain segment R(5) between tap T6 and tap T5",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 3400.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R6",
+   "value": "3k01",
+   "description": "key chain segment R(6) between tap T7 and tap T6",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 3010.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R7",
+   "value": "1k4",
+   "description": "key chain segment R(7) between tap T8 and tap T7",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 1400.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "R8",
+   "value": "16k5",
+   "description": "key chain segment R(8) between Q2's base and tap T8",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 16500.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "ref": "SW1",
+   "value": "SW_Push",
+   "description": "key C4: joins tap T1 to OSC. Omron B3F-1000 series tactile key (A070-E1-08: 6.5 x 4.5 mm hole grid p.4; rated load 1-50 mA silver, 100 uA-50 mA gold B3F-G, 10 uA reference minimum p.3); this key carries 44 uA (computed): below the silver contacts' rated load and the gold B3F-G's 100 uA, above the 10 uA reference minimum",
+   "symbol": "Switch:SW_Push",
+   "footprint": "Button_Switch_THT:SW_PUSH_6mm",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "push button: the simulation-only switch K1 across its nets presses it"
+   }
+  },
+  {
+   "ref": "SW2",
+   "value": "SW_Push",
+   "description": "key D4: joins tap T2 to OSC. Omron B3F-1000 series tactile key (A070-E1-08: 6.5 x 4.5 mm hole grid p.4; rated load 1-50 mA silver, 100 uA-50 mA gold B3F-G, 10 uA reference minimum p.3); this key carries 50 uA (computed): below the silver contacts' rated load and the gold B3F-G's 100 uA, above the 10 uA reference minimum",
+   "symbol": "Switch:SW_Push",
+   "footprint": "Button_Switch_THT:SW_PUSH_6mm",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "push button: the simulation-only switch K2 across its nets presses it"
+   }
+  },
+  {
+   "ref": "SW3",
+   "value": "SW_Push",
+   "description": "key E4: joins tap T3 to OSC. Omron B3F-1000 series tactile key (A070-E1-08: 6.5 x 4.5 mm hole grid p.4; rated load 1-50 mA silver, 100 uA-50 mA gold B3F-G, 10 uA reference minimum p.3); this key carries 58 uA (computed): below the silver contacts' rated load and the gold B3F-G's 100 uA, above the 10 uA reference minimum",
+   "symbol": "Switch:SW_Push",
+   "footprint": "Button_Switch_THT:SW_PUSH_6mm",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "push button: the simulation-only switch K3 across its nets presses it"
+   }
+  },
+  {
+   "ref": "SW4",
+   "value": "SW_Push",
+   "description": "key F4: joins tap T4 to OSC. Omron B3F-1000 series tactile key (A070-E1-08: 6.5 x 4.5 mm hole grid p.4; rated load 1-50 mA silver, 100 uA-50 mA gold B3F-G, 10 uA reference minimum p.3); this key carries 62 uA (computed): below the silver contacts' rated load and the gold B3F-G's 100 uA, above the 10 uA reference minimum",
+   "symbol": "Switch:SW_Push",
+   "footprint": "Button_Switch_THT:SW_PUSH_6mm",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "push button: the simulation-only switch K4 across its nets presses it"
+   }
+  },
+  {
+   "ref": "SW5",
+   "value": "SW_Push",
+   "description": "key G4: joins tap T5 to OSC. Omron B3F-1000 series tactile key (A070-E1-08: 6.5 x 4.5 mm hole grid p.4; rated load 1-50 mA silver, 100 uA-50 mA gold B3F-G, 10 uA reference minimum p.3); this key carries 72 uA (computed): below the silver contacts' rated load and the gold B3F-G's 100 uA, above the 10 uA reference minimum",
+   "symbol": "Switch:SW_Push",
+   "footprint": "Button_Switch_THT:SW_PUSH_6mm",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "push button: the simulation-only switch K5 across its nets presses it"
+   }
+  },
+  {
+   "ref": "SW6",
+   "value": "SW_Push",
+   "description": "key A4: joins tap T6 to OSC. Omron B3F-1000 series tactile key (A070-E1-08: 6.5 x 4.5 mm hole grid p.4; rated load 1-50 mA silver, 100 uA-50 mA gold B3F-G, 10 uA reference minimum p.3); this key carries 84 uA (computed): below the silver contacts' rated load and the gold B3F-G's 100 uA, above the 10 uA reference minimum",
+   "symbol": "Switch:SW_Push",
+   "footprint": "Button_Switch_THT:SW_PUSH_6mm",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "push button: the simulation-only switch K6 across its nets presses it"
+   }
+  },
+  {
+   "ref": "SW7",
+   "value": "SW_Push",
+   "description": "key B4: joins tap T7 to OSC. Omron B3F-1000 series tactile key (A070-E1-08: 6.5 x 4.5 mm hole grid p.4; rated load 1-50 mA silver, 100 uA-50 mA gold B3F-G, 10 uA reference minimum p.3); this key carries 98 uA (computed): below the silver contacts' rated load and the gold B3F-G's 100 uA, above the 10 uA reference minimum",
+   "symbol": "Switch:SW_Push",
+   "footprint": "Button_Switch_THT:SW_PUSH_6mm",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "push button: the simulation-only switch K7 across its nets presses it"
+   }
+  },
+  {
+   "ref": "SW8",
+   "value": "SW_Push",
+   "description": "key C5: joins tap T8 to OSC. Omron B3F-1000 series tactile key (A070-E1-08: 6.5 x 4.5 mm hole grid p.4; rated load 1-50 mA silver, 100 uA-50 mA gold B3F-G, 10 uA reference minimum p.3); this key carries 106 uA (computed): below the silver contacts' rated load and the gold B3F-G's 100 uA, above the 10 uA reference minimum",
+   "symbol": "Switch:SW_Push",
+   "footprint": "Button_Switch_THT:SW_PUSH_6mm",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "push button: the simulation-only switch K8 across its nets presses it"
+   }
+  },
+  {
+   "ref": "R12",
+   "value": "100k",
+   "description": "RBD: a light load on Q1's collector into the Darlington",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 100000.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.speaker"
+   ]
+  },
+  {
+   "ref": "Q3",
+   "value": "2N3904",
+   "description": "Darlington input (emitter follower, collector on BAT)",
+   "symbol": "Transistor_BJT:2N3904",
+   "footprint": "Package_TO_SOT_THT:TO-92_Inline",
+   "spice": {
+    "device": "Q",
+    "model_name": "QNPN",
+    "model_card": ".model QNPN NPN (TR=200n)",
+    "model_source": "the generic NPN card of ai_eda's AstableTemplate (ai_eda/design/templates.py MODEL_CARD): ngspice default Gummel-Poon parameters plus TR=200n, not a 2N3904 vendor model",
+    "pin_order": [
+     "3",
+     "2",
+     "1"
+    ]
+   },
+   "serves_requirements": [
+    "req.speaker"
+   ]
+  },
+  {
+   "ref": "R13",
+   "value": "100",
+   "description": "RE3: Q3 emitter into Q4's base",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 100.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.speaker"
+   ]
+  },
+  {
+   "ref": "R14",
+   "value": "10k",
+   "description": "RPD: Q4 base pull-down",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 10000.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.speaker"
+   ]
+  },
+  {
+   "ref": "Q4",
+   "value": "2N3904",
+   "description": "speaker switch (onsemi 2N3903/D Rev. 9: I_C 200 mA max p.1, h_FE min 30 at 100 mA p.2)",
+   "symbol": "Transistor_BJT:2N3904",
+   "footprint": "Package_TO_SOT_THT:TO-92_Inline",
+   "spice": {
+    "device": "Q",
+    "model_name": "QNPN",
+    "model_card": ".model QNPN NPN (TR=200n)",
+    "model_source": "the generic NPN card of ai_eda's AstableTemplate (ai_eda/design/templates.py MODEL_CARD): ngspice default Gummel-Poon parameters plus TR=200n, not a 2N3904 vendor model",
+    "pin_order": [
+     "3",
+     "2",
+     "1"
+    ]
+   },
+   "serves_requirements": [
+    "req.speaker"
+   ]
+  },
+  {
+   "ref": "R15",
+   "value": "39",
+   "description": "RSER: the speaker's peak current <= 100 mA at 4.5 V with the speaker's minimum 6.8 ohm",
+   "symbol": "Device:R",
+   "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+   "spice": {
+    "device": "R",
+    "value": {
+     "value": 39.0,
+     "unit": "ohm"
+    }
+   },
+   "serves_requirements": [
+    "req.speaker"
+   ]
+  },
+  {
+   "ref": "D1",
+   "value": "1N4148",
+   "description": "speaker coil clamp, cathode to the RSER side. Vishay 1N4148 doc. 81857 Rev. 1.6 (07-Nov-2024) p.1: V_RRM 100 V, V_R 75 V, I_F 300 mA, I_FRM 500 mA; p.2: V_F <= 1 V at 10 mA, t_rr 4 ns",
+   "symbol": "Diode:1N4148",
+   "footprint": "Diode_THT:D_DO-35_SOD27_P7.62mm_Horizontal",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "coil clamp: the speaker is simulated as a resistor (no coil inductance), so D1 is reverse biased by at most the speaker voltage and never conducts; no 1N4148 card"
+   }
+  },
+  {
+   "ref": "J2",
+   "value": "Speaker_8R",
+   "description": "speaker lead, Same Sky CLS0201MA 8 ohm 0.5 W (rev 1.05 p.1); pin 1 to RSER, pin 2 to Q4",
+   "symbol": "Connector_Generic:Conn_01x02",
+   "footprint": "Connector_JST:JST_PH_B2B-PH-K_1x02_P2.00mm_Vertical",
+   "spice": {
+    "exclude": true,
+    "exclude_reason": "speaker connector: the speaker is the simulation-only 8 ohm element SPK across its nets"
+   }
+  }
+ ],
+ "nets": [
+  {
+   "name": "VBATIN",
+   "kind": "power",
+   "pins": [
+    "J1.1",
+    "SW9.2",
+    "SW9.3"
+   ]
+  },
+  {
+   "name": "BAT",
+   "kind": "power",
+   "pins": [
+    "SW9.1",
+    "RV1.3",
+    "Q5.3",
+    "Q3.3",
+    "R15.1"
+   ],
+   "serves_requirements": [
+    "req.power"
+   ]
+  },
+  {
+   "name": "GND",
+   "kind": "ground",
+   "pins": [
+    "J1.2",
+    "RV1.1",
+    "Q1.1",
+    "Q2.1",
+    "Q4.1",
+    "R14.2"
+   ]
+  },
+  {
+   "name": "TUNE",
+   "pins": [
+    "RV1.2",
+    "Q5.2"
+   ]
+  },
+  {
+   "name": "OSC",
+   "kind": "power",
+   "pins": [
+    "Q5.1",
+    "R9.1",
+    "R10.1",
+    "R11.1",
+    "SW1.2",
+    "SW2.2",
+    "SW3.2",
+    "SW4.2",
+    "SW5.2",
+    "SW6.2",
+    "SW7.2",
+    "SW8.2"
+   ],
+   "serves_requirements": [
+    "req.tuning"
+   ]
+  },
+  {
+   "name": "Q1C",
+   "pins": [
+    "R10.2",
+    "Q1.3",
+    "C1.1",
+    "R12.2"
+   ]
+  },
+  {
+   "name": "Q1B",
+   "pins": [
+    "R9.2",
+    "Q1.2",
+    "C2.2"
+   ]
+  },
+  {
+   "name": "Q2C",
+   "pins": [
+    "R11.2",
+    "Q2.3",
+    "C2.1"
+   ]
+  },
+  {
+   "name": "Q2B",
+   "pins": [
+    "Q2.2",
+    "C1.2",
+    "R8.2"
+   ]
+  },
+  {
+   "name": "T1",
+   "pins": [
+    "R1.1",
+    "SW1.1"
+   ],
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "name": "T2",
+   "pins": [
+    "R2.1",
+    "R1.2",
+    "SW2.1"
+   ],
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "name": "T3",
+   "pins": [
+    "R3.1",
+    "R2.2",
+    "SW3.1"
+   ],
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "name": "T4",
+   "pins": [
+    "R4.1",
+    "R3.2",
+    "SW4.1"
+   ],
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "name": "T5",
+   "pins": [
+    "R5.1",
+    "R4.2",
+    "SW5.1"
+   ],
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "name": "T6",
+   "pins": [
+    "R6.1",
+    "R5.2",
+    "SW6.1"
+   ],
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "name": "T7",
+   "pins": [
+    "R7.1",
+    "R6.2",
+    "SW7.1"
+   ],
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "name": "T8",
+   "pins": [
+    "R8.1",
+    "R7.2",
+    "SW8.1"
+   ],
+   "serves_requirements": [
+    "req.notes"
+   ]
+  },
+  {
+   "name": "DRVB",
+   "pins": [
+    "R12.1",
+    "Q3.2"
+   ]
+  },
+  {
+   "name": "DRVE",
+   "pins": [
+    "Q3.1",
+    "R13.2"
+   ]
+  },
+  {
+   "name": "Q4B",
+   "pins": [
+    "R13.1",
+    "R14.1",
+    "Q4.2"
+   ]
+  },
+  {
+   "name": "SPKP",
+   "pins": [
+    "R15.2",
+    "J2.1",
+    "D1.1"
+   ],
+   "serves_requirements": [
+    "req.speaker"
+   ]
+  },
+  {
+   "name": "SPKN",
+   "pins": [
+    "J2.2",
+    "D1.2",
+    "Q4.3"
+   ],
+   "serves_requirements": [
+    "req.speaker"
+   ]
+  }
+ ],
+ "simulation": {
+  "nodes": [
+   "PRESS1",
+   "PRESS2",
+   "PRESS3",
+   "PRESS4",
+   "PRESS5",
+   "PRESS6",
+   "PRESS7",
+   "PRESS8",
+   "SPKS"
+  ],
+  "elements": [
+   {
+    "id": "K1",
+    "device": "S",
+    "net": "OSC",
+    "reference_net": "T1",
+    "control_net": "PRESS1",
+    "control_reference_net": "GND",
+    "model_name": "SWKEY",
+    "model_card": ".model SWKEY SW(RON=0.1 ROFF=1e+08 VT=0.5 VH=0.1)",
+    "model_source": "Omron B3F catalog A070-E1-08 p.3: contact resistance 100 mohm max (RON), insulation resistance 100 Mohm min (ROFF); VT and VH are the press schedule's thresholds (a stated choice)",
+    "reason": "SW1 (C4), pressed by the schedule on PRESS1"
+   },
+   {
+    "id": "K2",
+    "device": "S",
+    "net": "OSC",
+    "reference_net": "T2",
+    "control_net": "PRESS2",
+    "control_reference_net": "GND",
+    "model_name": "SWKEY",
+    "reason": "SW2 (D4), pressed by the schedule on PRESS2"
+   },
+   {
+    "id": "K3",
+    "device": "S",
+    "net": "OSC",
+    "reference_net": "T3",
+    "control_net": "PRESS3",
+    "control_reference_net": "GND",
+    "model_name": "SWKEY",
+    "reason": "SW3 (E4), pressed by the schedule on PRESS3"
+   },
+   {
+    "id": "K4",
+    "device": "S",
+    "net": "OSC",
+    "reference_net": "T4",
+    "control_net": "PRESS4",
+    "control_reference_net": "GND",
+    "model_name": "SWKEY",
+    "reason": "SW4 (F4), pressed by the schedule on PRESS4"
+   },
+   {
+    "id": "K5",
+    "device": "S",
+    "net": "OSC",
+    "reference_net": "T5",
+    "control_net": "PRESS5",
+    "control_reference_net": "GND",
+    "model_name": "SWKEY",
+    "reason": "SW5 (G4), pressed by the schedule on PRESS5"
+   },
+   {
+    "id": "K6",
+    "device": "S",
+    "net": "OSC",
+    "reference_net": "T6",
+    "control_net": "PRESS6",
+    "control_reference_net": "GND",
+    "model_name": "SWKEY",
+    "reason": "SW6 (A4), pressed by the schedule on PRESS6"
+   },
+   {
+    "id": "K7",
+    "device": "S",
+    "net": "OSC",
+    "reference_net": "T7",
+    "control_net": "PRESS7",
+    "control_reference_net": "GND",
+    "model_name": "SWKEY",
+    "reason": "SW7 (B4), pressed by the schedule on PRESS7"
+   },
+   {
+    "id": "K8",
+    "device": "S",
+    "net": "OSC",
+    "reference_net": "T8",
+    "control_net": "PRESS8",
+    "control_reference_net": "GND",
+    "model_name": "SWKEY",
+    "reason": "SW8 (C5), pressed by the schedule on PRESS8"
+   },
+   {
+    "id": "SPK",
+    "device": "R",
+    "net": "SPKP",
+    "reference_net": "SPKS",
+    "value": {
+     "value": 8.0,
+     "unit": "ohm"
+    },
+    "reason": "the 8 ohm speaker on J2 (Same Sky CLS0201MA rev 1.05 p.1, 8 ohm typ at 1 kHz), in series with the 0 V sense ISPK",
+    "serves_requirements": [
+     "req.speaker"
+    ]
+   }
+  ],
+  "stimuli": [
+   {
+    "id": "VBAT",
+    "source": "voltage",
+    "net": "BAT",
+    "reference_net": "GND",
+    "kind": "dc",
+    "value": {
+     "value": 4.5,
+     "unit": "V"
+    },
+    "serves_requirements": [
+     "req.power"
+    ]
+   },
+   {
+    "id": "ISPK",
+    "source": "voltage",
+    "net": "SPKS",
+    "reference_net": "SPKN",
+    "kind": "dc",
+    "value": {
+     "value": 0.0,
+     "unit": "V"
+    }
+   },
+   {
+    "id": "P1",
+    "source": "voltage",
+    "net": "PRESS1",
+    "reference_net": "GND",
+    "kind": "pwl",
+    "params": {
+     "points": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.005,
+       0.0
+      ],
+      [
+       0.005001,
+       1.0
+      ],
+      [
+       0.062333846494571445,
+       1.0
+      ],
+      [
+       0.062334846494571446,
+       0.0
+      ],
+      [
+       0.343281386130197,
+       0.0
+      ]
+     ]
+    }
+   },
+   {
+    "id": "P2",
+    "source": "voltage",
+    "net": "PRESS2",
+    "reference_net": "GND",
+    "kind": "pwl",
+    "params": {
+     "points": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.06233584649457145,
+       0.0
+      ],
+      [
+       0.06233684649457145,
+       1.0
+      ],
+      [
+       0.11341449684264013,
+       1.0
+      ],
+      [
+       0.11341549684264013,
+       0.0
+      ],
+      [
+       0.343281386130197,
+       0.0
+      ]
+     ]
+    }
+   },
+   {
+    "id": "P3",
+    "source": "voltage",
+    "net": "PRESS3",
+    "reference_net": "GND",
+    "kind": "pwl",
+    "params": {
+     "points": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.11341649684264013,
+       0.0
+      ],
+      [
+       0.11341749684264013,
+       1.0
+      ],
+      [
+       0.1589224009620731,
+       1.0
+      ],
+      [
+       0.1589234009620731,
+       0.0
+      ],
+      [
+       0.343281386130197,
+       0.0
+      ]
+     ]
+    }
+   },
+   {
+    "id": "P4",
+    "source": "voltage",
+    "net": "PRESS4",
+    "reference_net": "GND",
+    "kind": "pwl",
+    "params": {
+     "points": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.1589244009620731,
+       0.0
+      ],
+      [
+       0.1589254009620731,
+       1.0
+      ],
+      [
+       0.20187625493576197,
+       1.0
+      ],
+      [
+       0.20187725493576197,
+       0.0
+      ],
+      [
+       0.343281386130197,
+       0.0
+      ]
+     ]
+    }
+   },
+   {
+    "id": "P5",
+    "source": "voltage",
+    "net": "PRESS5",
+    "reference_net": "GND",
+    "kind": "pwl",
+    "params": {
+     "points": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.20187825493576197,
+       0.0
+      ],
+      [
+       0.20187925493576198,
+       1.0
+      ],
+      [
+       0.24014400658267243,
+       1.0
+      ],
+      [
+       0.24014500658267243,
+       0.0
+      ],
+      [
+       0.343281386130197,
+       0.0
+      ]
+     ]
+    }
+   },
+   {
+    "id": "P6",
+    "source": "voltage",
+    "net": "PRESS6",
+    "reference_net": "GND",
+    "kind": "pwl",
+    "params": {
+     "points": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.24014600658267243,
+       0.0
+      ],
+      [
+       0.24014700658267243,
+       1.0
+      ],
+      [
+       0.27423691567358155,
+       1.0
+      ],
+      [
+       0.2742379156735815,
+       0.0
+      ],
+      [
+       0.343281386130197,
+       0.0
+      ]
+     ]
+    }
+   },
+   {
+    "id": "P7",
+    "source": "voltage",
+    "net": "PRESS7",
+    "reference_net": "GND",
+    "kind": "pwl",
+    "params": {
+     "points": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.27423891567358155,
+       0.0
+      ],
+      [
+       0.2742399156735815,
+       1.0
+      ],
+      [
+       0.30461046288291127,
+       1.0
+      ],
+      [
+       0.30461146288291124,
+       0.0
+      ],
+      [
+       0.343281386130197,
+       0.0
+      ]
+     ]
+    }
+   },
+   {
+    "id": "P8",
+    "source": "voltage",
+    "net": "PRESS8",
+    "reference_net": "GND",
+    "kind": "pwl",
+    "params": {
+     "points": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.3046124628829113,
+       0.0
+      ],
+      [
+       0.30461346288291125,
+       1.0
+      ],
+      [
+       0.333279386130197,
+       1.0
+      ],
+      [
+       0.33328038613019695,
+       0.0
+      ],
+      [
+       0.343281386130197,
+       0.0
+      ]
+     ]
+    }
+   }
+  ],
+  "analyses": [
+   {
+    "id": "tran",
+    "kind": "tran",
+    "params": {
+     "step": {
+      "value": 2e-06,
+      "unit": "s"
+     },
+     "stop": {
+      "value": 0.343281386130197,
+      "unit": "s"
+     }
+    }
+   }
+  ],
+  "expectations": [
+   {
+    "id": "f_C4",
+    "analysis_id": "tran",
+    "vector": "v(Q1C)",
+    "reduce": "frequency",
+    "params": {
+     "t_start": {
+      "value": 0.02028902573188572,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.05851159006160002,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 261.6255653005986,
+     "unit": "Hz"
+    },
+    "tol_rel": 0.004610320896770936
+   },
+   {
+    "id": "spk_C4",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.02028902573188572,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.05851159006160002,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.011180339887498949,
+     "unit": "A"
+    },
+    "bound": "at_least"
+   },
+   {
+    "id": "f_D4",
+    "analysis_id": "tran",
+    "vector": "v(Q1C)",
+    "reduce": "frequency",
+    "params": {
+     "t_start": {
+      "value": 0.07595681992072309,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.11000925348610222,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 293.6647679174076,
+     "unit": "Hz"
+    },
+    "tol_rel": 0.004610320896770936
+   },
+   {
+    "id": "spk_D4",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.07595681992072309,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.11000925348610222,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.011180339887498949,
+     "unit": "A"
+    },
+    "bound": "at_least"
+   },
+   {
+    "id": "f_E4",
+    "analysis_id": "tran",
+    "vector": "v(Q1C)",
+    "reduce": "frequency",
+    "params": {
+     "t_start": {
+      "value": 0.12555140460782227,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.1558886740207776,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 329.6275569128699,
+     "unit": "Hz"
+    },
+    "tol_rel": 0.004610320896770936
+   },
+   {
+    "id": "spk_E4",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.12555140460782227,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.1558886740207776,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.011180339887498949,
+     "unit": "A"
+    },
+    "bound": "at_least"
+   },
+   {
+    "id": "f_F4",
+    "analysis_id": "tran",
+    "vector": "v(Q1C)",
+    "reduce": "frequency",
+    "params": {
+     "t_start": {
+      "value": 0.17037822868839014,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.1990127980041827,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 349.2282314330039,
+     "unit": "Hz"
+    },
+    "tol_rel": 0.004610320896770936
+   },
+   {
+    "id": "spk_F4",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.17037822868839014,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.1990127980041827,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.011180339887498949,
+     "unit": "A"
+    },
+    "bound": "at_least"
+   },
+   {
+    "id": "f_G4",
+    "analysis_id": "tran",
+    "vector": "v(Q1C)",
+    "reduce": "frequency",
+    "params": {
+     "t_start": {
+      "value": 0.21208245537493808,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.2375929564728784,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 391.99543598174927,
+     "unit": "Hz"
+    },
+    "tol_rel": 0.004610320896770936
+   },
+   {
+    "id": "spk_G4",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.21208245537493808,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.2375929564728784,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.011180339887498949,
+     "unit": "A"
+    },
+    "bound": "at_least"
+   },
+   {
+    "id": "f_A4",
+    "analysis_id": "tran",
+    "vector": "v(Q1C)",
+    "reduce": "frequency",
+    "params": {
+     "t_start": {
+      "value": 0.24923691567358153,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.27196418840085423,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 440.0,
+     "unit": "Hz"
+    },
+    "tol_rel": 0.004610320896770936
+   },
+   {
+    "id": "spk_A4",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.24923691567358153,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.27196418840085423,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.011180339887498949,
+     "unit": "A"
+    },
+    "bound": "at_least"
+   },
+   {
+    "id": "f_B4",
+    "analysis_id": "tran",
+    "vector": "v(Q1C)",
+    "reduce": "frequency",
+    "params": {
+     "t_start": {
+      "value": 0.2823379949294028,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.302585693068956,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 493.8833012561241,
+     "unit": "Hz"
+    },
+    "tol_rel": 0.004610320896770936
+   },
+   {
+    "id": "spk_B4",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.2823379949294028,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.302585693068956,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.011180339887498949,
+     "unit": "A"
+    },
+    "bound": "at_least"
+   },
+   {
+    "id": "f_C5",
+    "analysis_id": "tran",
+    "vector": "v(Q1C)",
+    "reduce": "frequency",
+    "params": {
+     "t_start": {
+      "value": 0.31225697574885414,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.3313682579137113,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 523.2511306011972,
+     "unit": "Hz"
+    },
+    "tol_rel": 0.004610320896770936
+   },
+   {
+    "id": "spk_C5",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.31225697574885414,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.3313682579137113,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.011180339887498949,
+     "unit": "A"
+    },
+    "bound": "at_least"
+   },
+   {
+    "id": "silent_before",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 1.9999999999999998e-05,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.005,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.0001,
+     "unit": "A"
+    },
+    "bound": "at_most"
+   },
+   {
+    "id": "silent_after",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "rms",
+    "params": {
+     "t_start": {
+      "value": 0.338281386130197,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.34326138613019697,
+      "unit": "s"
+     },
+     "f_max": {
+      "value": 20000.0,
+      "unit": "Hz"
+     }
+    },
+    "nominal": {
+     "value": 0.0001,
+     "unit": "A"
+    },
+    "bound": "at_most"
+   },
+   {
+    "id": "spk_peak",
+    "analysis_id": "tran",
+    "vector": "i(ISPK)",
+    "reduce": "max",
+    "nominal": {
+     "value": 0.1,
+     "unit": "A"
+    },
+    "bound": "at_most"
+   },
+   {
+    "id": "osc_rail",
+    "analysis_id": "tran",
+    "vector": "v(OSC)",
+    "reduce": "mean",
+    "params": {
+     "t_start": {
+      "value": 0.02028902573188572,
+      "unit": "s"
+     },
+     "t_stop": {
+      "value": 0.3313682579137113,
+      "unit": "s"
+     }
+    },
+    "nominal": {
+     "value": 2.5,
+     "unit": "V"
+    },
+    "tol_abs": {
+     "value": 0.025,
+     "unit": "V"
+    }
+   }
+  ]
+ },
+ "board": {
+  "outline": {
+   "width_mm": 103.0,
+   "height_mm": 46.5
+  },
+  "fixed": [
+   {
+    "ref": "SW1",
+    "x_mm": 4.5,
+    "y_mm": 36.0
+   },
+   {
+    "ref": "SW2",
+    "x_mm": 17.0,
+    "y_mm": 36.0
+   },
+   {
+    "ref": "SW3",
+    "x_mm": 29.5,
+    "y_mm": 36.0
+   },
+   {
+    "ref": "SW4",
+    "x_mm": 42.0,
+    "y_mm": 36.0
+   },
+   {
+    "ref": "SW5",
+    "x_mm": 54.5,
+    "y_mm": 36.0
+   },
+   {
+    "ref": "SW6",
+    "x_mm": 67.0,
+    "y_mm": 36.0
+   },
+   {
+    "ref": "SW7",
+    "x_mm": 79.5,
+    "y_mm": 36.0
+   },
+   {
+    "ref": "SW8",
+    "x_mm": 92.0,
+    "y_mm": 36.0
+   }
+  ],
+  "pack_regions": [
+   {
+    "id": "chain1",
+    "rect_mm": [
+     3.45,
+     30.0,
+     9.92,
+     3.2
+    ],
+    "refs": [
+     "R1"
+    ]
+   },
+   {
+    "id": "chain2",
+    "rect_mm": [
+     15.95,
+     30.0,
+     9.92,
+     3.2
+    ],
+    "refs": [
+     "R2"
+    ]
+   },
+   {
+    "id": "chain3",
+    "rect_mm": [
+     28.45,
+     30.0,
+     9.92,
+     3.2
+    ],
+    "refs": [
+     "R3"
+    ]
+   },
+   {
+    "id": "chain4",
+    "rect_mm": [
+     40.95,
+     30.0,
+     9.92,
+     3.2
+    ],
+    "refs": [
+     "R4"
+    ]
+   },
+   {
+    "id": "chain5",
+    "rect_mm": [
+     53.45,
+     30.0,
+     9.92,
+     3.2
+    ],
+    "refs": [
+     "R5"
+    ]
+   },
+   {
+    "id": "chain6",
+    "rect_mm": [
+     65.95,
+     30.0,
+     9.92,
+     3.2
+    ],
+    "refs": [
+     "R6"
+    ]
+   },
+   {
+    "id": "chain7",
+    "rect_mm": [
+     78.45,
+     30.0,
+     9.92,
+     3.2
+    ],
+    "refs": [
+     "R7"
+    ]
+   },
+   {
+    "id": "chain8",
+    "rect_mm": [
+     90.95,
+     30.0,
+     9.92,
+     3.2
+    ],
+    "refs": [
+     "R8"
+    ]
+   },
+   {
+    "id": "speaker",
+    "rect_mm": [
+     2.0,
+     2.0,
+     16.0,
+     11.0
+    ],
+    "refs": [
+     "J2"
+    ]
+   },
+   {
+    "id": "power",
+    "rect_mm": [
+     64.51,
+     2.0,
+     36.49,
+     11.0
+    ],
+    "refs": [
+     "Q5",
+     "RV1",
+     "SW9",
+     "J1"
+    ]
+   },
+   {
+    "id": "driver",
+    "rect_mm": [
+     2.0,
+     15.0,
+     38.12,
+     14.0
+    ],
+    "refs": [
+     "R15",
+     "D1",
+     "Q4",
+     "R14",
+     "R13",
+     "Q3",
+     "R12"
+    ]
+   },
+   {
+    "id": "oscillator",
+    "rect_mm": [
+     48.02,
+     15.0,
+     52.98,
+     4.94
+    ],
+    "refs": [
+     "R10",
+     "Q1",
+     "R9",
+     "C2",
+     "R11",
+     "Q2"
+    ]
+   },
+   {
+    "id": "timing",
+    "rect_mm": [
+     74.0,
+     21.74,
+     7.9,
+     3.2
+    ],
+    "refs": [
+     "C1"
+    ]
+   }
+  ],
+  "silk_texts": [
+   {
+    "text": "C4",
+    "x_mm": 7.75,
+    "y_mm": 43.75,
+    "size_mm": 1.5,
+    "ref": "SW1"
+   },
+   {
+    "text": "D4",
+    "x_mm": 20.25,
+    "y_mm": 43.75,
+    "size_mm": 1.5,
+    "ref": "SW2"
+   },
+   {
+    "text": "E4",
+    "x_mm": 32.75,
+    "y_mm": 43.75,
+    "size_mm": 1.5,
+    "ref": "SW3"
+   },
+   {
+    "text": "F4",
+    "x_mm": 45.25,
+    "y_mm": 43.75,
+    "size_mm": 1.5,
+    "ref": "SW4"
+   },
+   {
+    "text": "G4",
+    "x_mm": 57.75,
+    "y_mm": 43.75,
+    "size_mm": 1.5,
+    "ref": "SW5"
+   },
+   {
+    "text": "A4",
+    "x_mm": 70.25,
+    "y_mm": 43.75,
+    "size_mm": 1.5,
+    "ref": "SW6"
+   },
+   {
+    "text": "B4",
+    "x_mm": 82.75,
+    "y_mm": 43.75,
+    "size_mm": 1.5,
+    "ref": "SW7"
+   },
+   {
+    "text": "C5",
+    "x_mm": 95.25,
+    "y_mm": 43.75,
+    "size_mm": 1.5,
+    "ref": "SW8"
+   },
+   {
+    "text": "ANALOG PIANO",
+    "x_mm": 37.0,
+    "y_mm": 6.0,
+    "size_mm": 2.0,
+    "kind": "title"
+   }
+  ]
+ }
+}

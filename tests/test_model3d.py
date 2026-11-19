@@ -776,3 +776,20 @@ def test_a_fab_drawing_without_area_falls_back_to_the_courtyard(tmp_path: Path):
     scene = build_scene(_ir([("U9", "LINE", _place("U9"))]), KicadLibrary(roots=[root]), model_dir=tmp_path / "3d")
     (body,) = _only(scene, "body")
     assert scene.bodies[0].outline_source == "courtyard" and _xy_box(body) == pytest.approx((8.5, 9.0, 11.5, 11.0))
+
+
+def test_the_model_files_the_3d_library_lacks_are_named_with_their_parts(tmp_path: Path):
+    """KiCad 10.0.6's 3D library lacks Potentiometer_Bourns_3386P_Vertical.step, so the 9 V piano board's nine trimmers had no body in
+    any render and nothing said so. :func:`missing_models` names each model file a placed footprint names and the library lacks,
+    with its parts in the order met; a model that is there, and a hidden one, are not named; the note says no other model is put in
+    their place."""
+    from ai_eda.tools.model3d.models import missing_models, missing_models_note
+
+    lib = _library(tmp_path)
+    _box_step(tmp_path)
+    fps = [(ref, lib.load_footprint(LibraryRef(library="Test_Lib", name=name))) for ref, name in (("U1", "BOX"), ("J1", "THT"), ("J2", "THT"))]
+    missing = missing_models(fps, tmp_path)
+    assert missing == {"MISSING.step": ["J1", "J2"]}
+    note = missing_models_note(missing)
+    assert note.startswith("3D model file(s) not in the KiCad 3D library for 2 part(s): MISSING.step (J1, J2)") and "no other model is put in their place" in note
+    assert missing_models(fps[:1], tmp_path) == {} and missing_models_note({}) == ""

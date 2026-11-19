@@ -13,23 +13,84 @@ The one IR-side statement that is allowed to differ is
 deliberately left open"), not a claim about the library. KiCad records it the
 same way on the board - ``(pintype "passive+no_connect")`` - which is what
 :func:`pad_pin_types` returns for such pins.
+
+Multi-unit symbols (a dual op-amp's units A, B and the power unit C) are one
+component with one pin list: the IR names every pin of every unit, and the
+schematic draws one instance per unit, each with its own pins
+(:func:`unit_pins`). A multi-unit symbol with common (unit 0) pins is refused:
+those pins would belong to every unit instance at once.
+
+Pads pair with pins by number (:func:`match_pads`, the one rule the PCB
+compiler, the design file and the RF parts table apply): every pin needs a
+pad, and every numbered plated pad must be a pin - except a mounting pad
+``MP`` (:data:`MOUNTING_PAD`) on a symbol without an ``MP`` pin, which is
+mechanical copper and compiled without a net, as an unnumbered pad always
+was. ``Device:R_Potentiometer_MountingPin`` has the pin (``MP``,
+"MountPin"), so its mounting pads keep the net of that pin.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import dataclass
+
 from ai_eda.compilers.schematic_layout import natural_ref_key as natural_pin_key
 from ai_eda.errors import CompileError
 from ai_eda.ir import Component, PinElectricalType
-from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError, SymbolDef
+from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError, Pad, SymbolDef, SymbolPin
 
-__all__ = ["load_verified_symbol", "pad_pin_types", "NO_CONNECT_SUFFIX"]
+__all__ = ["load_verified_symbol", "match_pads", "pad_pin_types", "unit_pins", "MOUNTING_PAD", "NO_CONNECT_SUFFIX", "PadMatch"]
 
 #: suffix KiCad appends to a pad's pintype when the schematic pin carries a no-connect flag
 NO_CONNECT_SUFFIX = "+no_connect"
 
+#: the KiCad library's pad and pin number of a part's mechanical mounting pins (``Device:R_Potentiometer_MountingPin``'s pin
+#: "MountPin", the ``Connector_Generic_MountingPin`` connectors' pin "MountPin"; the potentiometer footprints' two pads)
+MOUNTING_PAD = "MP"
 
-def load_verified_symbol(c: Component, library: KicadLibrary) -> SymbolDef:
-    """The library symbol of ``c``, or CompileError (no symbol, unverified, not on disk, multi-unit)."""
+
+@dataclass(frozen=True, slots=True)
+class PadMatch:
+    """How a footprint's pads pair with a symbol's pin numbers (:func:`match_pads`)."""
+
+    #: pin numbers no pad carries: refused
+    without_pad: frozenset[str]
+    #: numbered plated pads that are no pin and no mechanical mounting pad: refused
+    extra: frozenset[str]
+    #: plated :data:`MOUNTING_PAD` pads of a symbol without that pin: mechanical, compiled without a net
+    mounting: int
+    #: unnumbered copper pads (a slide switch's mounting lugs): no pin can name them, compiled without a net
+    unnumbered: int
+
+    def note(self, ref: str) -> str | None:
+        """The one note naming ``ref``'s pads that are left without a net, or ``None`` when every copper pad is a pin."""
+        parts = ([f"mounting pad(s) {MOUNTING_PAD}"] if self.mounting else []) + ([f"{self.unnumbered} unnumbered pad(s)"] if self.unnumbered else [])
+        return f"{ref}: {' and '.join(parts)} left without a net (mechanical)" if parts else None
+
+
+def match_pads(pins: Iterable[str], pads: Iterable[Pad]) -> PadMatch:
+    """Pair the pin numbers of a symbol (or an IR component) with the pads of its footprint (module docstring).
+
+    A pad with a number is a pin's pad when the numbers are equal; a numbered NPTH hole counts as a pad but is never
+    copper, so it need not be a pin. A plated :data:`MOUNTING_PAD` pad is a pin's pad only when the pins have that
+    number; otherwise it is mechanical (``mounting``). A pad without a number is never a pin's: it is counted when it is
+    copper (``unnumbered``), not when it is a paste-only aperture.
+    """
+    pins = set(pins)
+    pads = list(pads)
+    plated = [p for p in pads if p.pad_type != "np_thru_hole"]
+    numbered = {p.number for p in plated if p.number}
+    return PadMatch(
+        without_pad=frozenset(pins - {p.number for p in pads if p.number}),
+        extra=frozenset(numbered - pins - {MOUNTING_PAD}),
+        mounting=0 if MOUNTING_PAD in pins else sum(1 for p in plated if p.number == MOUNTING_PAD),
+        unnumbered=sum(1 for p in plated if not p.number and any(layer.endswith(".Cu") for layer in p.layers)),
+    )
+
+
+def load_verified_symbol(c: Component, library: KicadLibrary, *, multi_unit: bool = False) -> SymbolDef:
+    """The library symbol of ``c``, or CompileError (no symbol, unverified, not on disk; multi-unit unless ``multi_unit``,
+    and with ``multi_unit`` a multi-unit symbol with common (unit 0) pins)."""
     if c.symbol is None:
         raise CompileError(f"{c.ref}: no KiCad symbol assigned")
     lib_id = f"{c.symbol.library}:{c.symbol.name}"
@@ -40,8 +101,18 @@ def load_verified_symbol(c: Component, library: KicadLibrary) -> SymbolDef:
     except LibraryLookupError as exc:
         raise CompileError(f"{c.ref}: symbol {lib_id!r} not found in the installed KiCad libraries: {exc}") from exc
     if symbol.units != [1]:
-        raise CompileError(f"{c.ref}: symbol {lib_id!r} has units {symbol.units}; multi-unit symbols are not supported yet")
+        if not multi_unit:
+            raise CompileError(f"{c.ref}: symbol {lib_id!r} has units {symbol.units}; multi-unit symbols are not supported yet")
+        common = sorted({p.number for p in symbol.pins if p.unit == 0}, key=natural_pin_key)
+        if common:
+            raise CompileError(f"{c.ref}: {lib_id} has common (unit 0) pins {common}; multi-unit symbols with common pins are not supported")
     return symbol
+
+
+def unit_pins(symbol: SymbolDef, unit: int) -> list[SymbolPin]:
+    """The library pins one instance of unit ``unit`` carries: its own and the common (unit 0) ones, in library order.
+    For a single-unit symbol (unit 1) that is every pin."""
+    return [p for p in symbol.pins if p.unit in (0, unit)]
 
 
 def pad_pin_types(c: Component, symbol: SymbolDef) -> dict[str, str]:

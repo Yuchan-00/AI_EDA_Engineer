@@ -55,6 +55,8 @@ class Topology(BaseModel):
     blocks: list[Block] = Field(default_factory=list)
     # Empty intent preserves both the serialized legacy topology and its design hash.
     pin_associations: list[PinAssociation] = Field(default_factory=list, exclude_if=lambda value: not value)
+    # Schematic layout policy; None (left out of the design hash) means the compiler's argument, then the
+    # schematic.layout answer, else the textbook layout (1.0). "legacy" selects the 0.8 symbol table.
     schematic_layout: Literal["legacy", "textbook"] | None = Field(default=None, exclude_if=lambda value: value is None)
     rationale: str = ""
     provenance: Provenance

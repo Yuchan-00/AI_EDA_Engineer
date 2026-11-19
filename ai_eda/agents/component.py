@@ -97,6 +97,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
 from ai_eda.agents.keys import CONFIRM_FACTS_KEY, CONFIRM_PARTS_KEY, EXTRACT_FACTS_KEY, FACTS_FILE_KEY
+from ai_eda.compilers.schematic import datasheet_field, stated
 from ai_eda.ir import (
     CircuitIR,
     Component,
@@ -479,7 +480,11 @@ class ComponentAgent(Agent):
                 notes.append(f"{c.ref}: datasheet reference set to the archived copy {doc.sha256} ({doc.path.name})")
         elif pointer is not None and c.datasheet is None and pointer.origin != "ir":
             c.datasheet = pointer.ref
-            notes.append(f"{c.ref}: datasheet pointer recorded from {pointer.origin} ({pointer.ref.url}); not archived")
+            # a link the schematic and the board leave out (the library symbol's own link, not checked for a stated MPN) says so here too
+            family = ""
+            if pointer.origin == "kicad_symbol" and pointer.ref.url and datasheet_field(c) != pointer.ref.url:
+                family = f"; the library symbol's own link, not checked for MPN {stated(c.mpn)!r} (left out of the schematic and the board)"
+            notes.append(f"{c.ref}: datasheet pointer recorded from {pointer.origin} ({pointer.ref.url}); not archived{family}")
         hit = report.mpn_hit
         if hit is not None and doc is not None and c.mpn is not None:
             old = c.mpn.provenance

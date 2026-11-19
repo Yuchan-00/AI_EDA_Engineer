@@ -83,6 +83,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ai_eda.compilers.schematic import LIBRARY_AUTHORITY, datasheet_field, stated
 from ai_eda.design import all_templates
 from ai_eda.design.base import CHOICE_NOTE_PREFIX, NO_RECORD, TOOL_ID, PartNote, Template, TheorySection, design_file_hash, parameter_value, quantity
 from ai_eda.design.board import design_file_silk_text, template_silk_text
@@ -777,6 +778,11 @@ def _library_facts(component: Component, library: KicadLibrary | None) -> list[s
     for prop in LIBRARY_PROPERTIES:
         value = sym.properties.get(prop)
         shown = "(속성 없음)" if value is None else ("(비어 있음)" if value.strip() in ("", "~") else _cell(value))
+        mpn = stated(component.mpn)
+        if prop == "Datasheet" and value is not None and value.strip() not in ("", "~") and mpn is not None and datasheet_field(component) != value.strip():
+            # the symbol's own link is not checked for the stated part (compilers.schematic.datasheet_field leaves it out of the files);
+            # it may or may not be that part's document, so the line says only that it was not checked
+            shown += f" - 심볼에 적힌 링크이며 MPN `{_cell(mpn)}` 의 문서인지 확인되지 않았습니다"
         out.append(f"- {prop} (KiCad 라이브러리 기재): {shown}")
     out.append(f"- 라이브러리 핀: {' '.join(f'{p.number}={p.name}' for p in sym.pins) or NO_RECORD}")
     if component.footprint is not None:
@@ -785,22 +791,40 @@ def _library_facts(component: Component, library: KicadLibrary | None) -> list[s
     return out
 
 
+def _datasheet_lines(component: Component) -> list[str]:
+    """The part's datasheet as the schematic and the board state it (:func:`~ai_eda.compilers.schematic.datasheet_field`): a link the
+    IR keeps from the library symbol that is not shown to belong to the stated MPN is never printed as the part's datasheet - the line
+    says it is the link the symbol states and that it was not checked for that MPN (it may be that part's document or another one)."""
+    ds = component.datasheet
+    url = (ds.url if ds is not None and ds.url else "") or ""
+    shown = datasheet_field(component)
+    mpn = stated(component.mpn)
+    if ds is None:
+        if shown:  # the document an authoritative MPN was found in (its own URL)
+            return [f"- 데이터시트: {_cell(shown)} (MPN `{_cell(mpn or '')}` 을 찾은 문서)"]
+        return [f"- 데이터시트: {NO_RECORD}"]
+    parts = [ds.title]
+    if url:
+        parts.append(url)
+    if ds.authority:
+        parts.append(f"출처 {ds.authority}")
+    if ds.content_hash:
+        parts.append(f"보관본 해시 {ds.content_hash}")
+    recorded = ", ".join(_cell(x) for x in parts)
+    if shown == url:
+        return ["- 데이터시트: " + recorded]
+    kept = f"IR에 남은 링크({recorded})는 KiCad 라이브러리 심볼에 적힌 링크이며 MPN `{_cell(mpn or '')}` 의 문서인지 확인되지 않았습니다"
+    if shown:
+        return [f"- 데이터시트: {_cell(shown)} (MPN `{_cell(mpn or '')}` 을 찾은 문서; 회로도·기판의 Datasheet 칸)",
+                f"- {kept}" if (ds.authority or "").startswith(LIBRARY_AUTHORITY) else f"- IR에 남은 다른 링크: {recorded}"]
+    return [f"- 데이터시트: 없음 - {kept}; 회로도·기판의 Datasheet 칸은 비어 있습니다"]
+
+
 def _ir_facts(component: Component) -> list[str]:
     out = ["### IR 기재", ""]
     for label, t in (("제조사", component.manufacturer), ("MPN", component.mpn), ("패키지", component.package)):
         out.append(f"- {label}: " + (f"{t.value} [{_provenance_text(t.provenance)}]" if t is not None else NO_RECORD))
-    ds = component.datasheet
-    if ds is None:
-        out.append(f"- 데이터시트: {NO_RECORD}")
-    else:
-        parts = [ds.title]
-        if ds.url:
-            parts.append(ds.url)
-        if ds.authority:
-            parts.append(f"출처 {ds.authority}")
-        if ds.content_hash:
-            parts.append(f"보관본 해시 {ds.content_hash}")
-        out.append("- 데이터시트: " + ", ".join(_cell(x) for x in parts))
+    out += _datasheet_lines(component)
     if component.electrical:
         out.append("- 전기 특성: " + "; ".join(f"{k} = {_traced_text(v)} [{_provenance_text(v.provenance)}]" for k, v in component.electrical.items()))
     else:
@@ -1230,7 +1254,7 @@ def _corner_lines(tracks: list, c: float, g: float) -> list[str]:
             f"이 보드의 구리에서 `{CORNERS_ID}` {CORNERS_ARC_VERSION} 는 모서리를 둥글리기 전에 라우터가 남긴 옆걸음(sidestep: 두 직각 모서리 사이의 짧은 트랙) "
             f"{len(steps)} 곳을 곧게 폈습니다 ({spread}; 트랙 provenance 의 `{CORNER_ENTRY_PREFIX}` 항목 중 `{STRAIGHTEN}`; "
             "프로젝트 소유자의 모서리 규칙 — 전기적 요구가 아닌 기하 관례). 옆걸음은 의도한 패턴이나 길이 맞춤이 아니라 격자 탐색이 남긴 것입니다. "
-            "그 짧은 트랙을 이웃 트랙을 따라 다음 모서리까지 밀어 거기서 나가는 트랙과 하나로 합쳤고, 패드·비아·접합점은 그대로이며 넷의 길이는 늘지 않습니다. "
+            "그 짧은 트랙을 이웃 트랙을 따라 다음 모서리까지 밀어 거기서 나가는 트랙과 하나로 합쳤고, 패드·비아는 그대로이고 접합점은 제 직선 위에서만 움직이며, 넷의 길이는 라우터가 놓은 직선 구리보다 늘지 않습니다(없앤 모서리의 둥글리기 몫만큼은 줄지 않으므로, 펴지 않고 둥글린 구리보다는 조금 길 수 있습니다). "
             f"새로 놓인 구리는 격자 여유 g/2 없이 정확한 기하로 검사했습니다: {margins}. 그래서 그 구리는 위 반경보다 "
             "가까울 수 있으며, 그 판정도 kicad-cli DRC 가 합니다. 곧게 펴지 못한 옆걸음은 트랙에 항목을 남기지 않아 여기서 세지 않습니다 "
             "(라우터의 배선 메모가 그 수를 적었다면 아래 단계 기록에 있습니다).", "",

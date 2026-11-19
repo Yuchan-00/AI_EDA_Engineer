@@ -18,6 +18,8 @@ What is proved
 
 from __future__ import annotations
 
+import hashlib
+
 import math
 import re
 import shutil
@@ -106,6 +108,9 @@ CHAMFER_NODE = (
 )
 #: sha256 of the board of ``_l_board(.., "chamfer")`` as compiler.kicad_pcb 0.2 wrote it before a track could be an arc
 PLAIN_BOARD_SHA256 = "16bd67e5f569894d53d832dfc619f4f4bde42e4fe5fb48c54fd459efac9d3a6e"
+#: the same board since its saved plot params ask for no drill marks (``(drillshape 0)``, compilers/pcb.py ``DRILL_MARKS``): that one
+#: byte is the only change - the test checks the old digest on the text with it set back
+PLAIN_BOARD_SHA256_NO_DRILL_MARKS = "7390689bc62b50817e0546ffdb7573603805e89c591a4193ed33739b57c34537"
 
 
 def test_a_track_with_mid_is_written_as_kicads_arc_between_its_neighbours(tmp_path: Path, lib: KicadLibrary):
@@ -130,7 +135,9 @@ def test_a_board_without_an_arc_compiles_to_the_bytes_it_had_before_arcs(tmp_pat
     every other byte of the board (the neighbours, every uuid, the rule areas cut around the three tracks) stays."""
     ref, text = _compile(_l_board(tmp_path, lib, "chamfer"), tmp_path / "plain", lib)
     assert "(arc" not in text and text.count("(segment") == 3
-    assert ref.content_hash == "sha256:" + PLAIN_BOARD_SHA256
+    assert ref.content_hash == "sha256:" + PLAIN_BOARD_SHA256_NO_DRILL_MARKS
+    assert text.count("(drillshape 0)") == 1
+    assert hashlib.sha256(text.replace("(drillshape 0)", "(drillshape 1)").encode("utf-8")).hexdigest() == PLAIN_BOARD_SHA256
     _, rounded = _compile(_l_board(tmp_path, lib, "arc"), tmp_path / "arc", lib)
     assert text.count(CHAMFER_NODE) == 1 and rounded == text.replace(CHAMFER_NODE, ARC_NODE)
 

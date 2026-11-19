@@ -44,6 +44,11 @@ status is the worst of six sub-checks, each listed in ``details.checks``:
    brand or in another package is NOT_VERIFIED with both values named and
    backs no sourcing.
 
+No part to buy: a component with no MPN whose library footprint keeps itself out of the BOM
+(:func:`~ai_eda.tools.kicad.library.fabrication_exclusions`: ``exclude_from_bom``, a test point's pad, a mounting hole)
+has sub-checks 3 - 6 NOT_APPLICABLE with that reason; its symbol and footprint are still checked. With an MPN it is
+checked as any other part.
+
 Evidence: the archived datasheet (path, final URL, sha256) and the catalog
 file (path, sha256). ``artifact_hash`` is the datasheet's sha256 - the
 document the tool actually read.
@@ -61,11 +66,11 @@ from ai_eda.ir import Component, Evidence, LibraryRef, SourcingInfo, ValidationR
 from ai_eda.parts.catalog import CatalogRow, CatalogSource
 from ai_eda.parts.datasheet_facts import searchable_document
 from ai_eda.parts.pointers import DatasheetPointer, PointerSearch, locate_datasheet
-from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError
+from ai_eda.tools.kicad.library import EXCLUDE_FROM_BOM, KicadLibrary, LibraryFormatError, fabrication_exclusions
 from ai_eda.tools.sources import ArchiveError, ArchivedDocument, DocumentArchive, FetchOutcome, QuoteHit
 
 TOOL = "parts.existence"
-TOOL_VERSION = "0.2"
+TOOL_VERSION = "0.3"
 CHECK_PREFIX = "component.existence."
 
 S = ValidationStatus
@@ -311,6 +316,14 @@ def examine_component(
     report = ExistenceReport(ref=component.ref, mpn=mpn)
     report.checks.append(_resolve(component.symbol, "symbol", library))
     report.checks.append(_resolve(component.footprint, "footprint", library))
+    if mpn is None and library is not None and EXCLUDE_FROM_BOM in fabrication_exclusions(library, component.footprint):
+        # a footprint the BOM leaves out (a test point's pad, a mounting hole) with no MPN: nothing is bought, so there is no
+        # datasheet, MPN or catalog row to check (module docstring: no part to buy)
+        why = (f"footprint {component.footprint.library}:{component.footprint.name} keeps itself out of the BOM ({EXCLUDE_FROM_BOM}) "
+               "and the IR names no MPN: no part to buy, no datasheet or catalog row to check")
+        report.checks += [SubCheck(name=name, status=S.NOT_APPLICABLE, message=why)
+                          for name in ("datasheet_pointer", "datasheet_archived", "mpn_in_datasheet", "catalog")]
+        return report
     search = locate_datasheet(component, library, user_urls)
     report.pointer_search = search
     report.pointer = search.pointer

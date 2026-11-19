@@ -12,7 +12,12 @@ Invariants:
   ``user_requirement`` with a note naming the file's hash.
 * A file cannot state pins: symbols and footprints are given by name and
   resolved on disk (:func:`~ai_eda.design.library_parts.library_component`),
-  and a net naming a pin the symbol does not have refuses the file.
+  and a net naming a pin the symbol does not have refuses the file. So does
+  a footprint whose pads do not pair with the symbol's pins by the PCB
+  compiler's rule (:func:`~ai_eda.compilers.pins.match_pads`: a pin without
+  a pad, a numbered plated pad that is no pin), before anything is confirmed
+  or simulated; a mounting pad ``MP`` of a symbol without an ``MP`` pin and
+  an unnumbered pad are mechanical and pass.
 * Every part the simulation sees names the requirements it serves
   (``serves_requirements``), so the reviewer can trace them; a part excluded
   from SPICE with a reason (a connector) may name none.
@@ -38,6 +43,16 @@ Invariants:
   confirmation table and never opened; the IR keeps the count as
   ``Component.min_pcb_layers`` with the source in its provenance, and the PCB
   agent's layer escalation starts at it.
+* A part may state its ``manufacturer`` and ``mpn`` (the maker's part
+  number), each one line of printable text a spreadsheet would not execute.
+  They are the file's word like every value: shown in the confirmation
+  table, stamped ``user_requirement``, never opened or looked up - the IR
+  keeps them as ``Component.manufacturer`` / ``Component.mpn`` and the BOM
+  prints them in its ``Manufacturer`` / ``MPN`` columns, while its
+  ``DatasheetHash`` cell stays empty and its ``Unverified`` column (the
+  verification status, in a column of its own) names it until a datasheet
+  grounds the part number. Without
+  them the plan, its table and hash and the IR are as before they existed.
 * An optional ``si`` block (``"si": {}`` is enough; the format stays
   ``ai-eda-design/1``) gives the board the signal-integrity classes a
   template's board gets (:func:`~ai_eda.design.board.si_choices` /
@@ -121,7 +136,9 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 
+from ai_eda.compilers.pins import match_pads
 from ai_eda.compilers.schematic import _REF_RE
+from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.compilers.spice import (
     _BAD_NODE_CHARS,
     _NAME,
@@ -187,6 +204,7 @@ from ai_eda.ir.simulation import CONTROLLED_DEVICES, ELECTRICAL_KEYS, MODEL_CARD
 from ai_eda.tools.calc.e_series import is_standard, nearest
 from ai_eda.tools.calc.quantity import parse_answer, parse_unit, unit_key
 from ai_eda.tools.kicad.library import KicadLibrary
+from ai_eda.tools.manufacturing.csv_cells import unsafe_cell
 from ai_eda.tools.functional_intent import validate_intent
 from ai_eda.tools.silkscreen.geometry import silk_text_problems
 from ai_eda.tools.silkscreen.place import stroke_for
@@ -247,6 +265,9 @@ class DesignPart(_Strict):
     #: required with the count)
     min_pcb_layers: int | None = None
     min_pcb_layers_source: str | None = None
+    #: the maker and its part number as the file states them (one line each; module docstring): the BOM's Manufacturer / MPN
+    manufacturer: str | None = None
+    mpn: str | None = None
     spice: DesignSpice
 
 
@@ -281,6 +302,7 @@ class DesignTopology(_Strict):
     rationale: str = ""
     blocks: list[DesignBlock] = Field(default_factory=list)
     pin_associations: list[DesignPinAssociation] = Field(default_factory=list)
+    #: None: the textbook schematic layout (1.0) unless the run says otherwise; "legacy" selects the 0.8 symbol table
     schematic_layout: Literal["legacy", "textbook"] | None = None
 
 
@@ -590,7 +612,23 @@ def _part_extras(p: DesignPart) -> str:
     source = f"; value outside the E series, stated part: {p.value_source.strip()}" if (p.value_source or "").strip() else ""
     layers = (f"; needs at least {p.min_pcb_layers} copper layers per {p.min_pcb_layers_source.strip()} (the file's word, not opened)"
               if p.min_pcb_layers is not None and p.min_pcb_layers_source else "")
-    return electrical + serves + source + layers
+    named = [f"{what} {text.strip()}" for what, text in (("manufacturer", p.manufacturer), ("part number", p.mpn)) if text is not None]
+    identity = f"; {', '.join(named)} (the file's word, not looked up)" if named else ""
+    return electrical + serves + source + layers + identity
+
+
+def _identity_problem(p: DesignPart) -> str | None:
+    """Why ``p``'s ``manufacturer`` / ``mpn`` cannot be taken (one line of printable text each, no cell a spreadsheet would execute -
+    the BOM's rule), or ``None``."""
+    for field_name, text in (("manufacturer", p.manufacturer), ("mpn", p.mpn)):
+        if text is None:
+            continue
+        if not text.strip() or len(text.splitlines()) != 1 or not text.strip().isprintable():
+            return f"{p.ref} {field_name} must be one line of printable text"
+        why = unsafe_cell(text.strip())
+        if why is not None:
+            return f"{p.ref} {field_name} {text.strip()!r} {why}: the BOM refuses a cell spreadsheet software would execute"
+    return None
 
 
 def _min_layers_problem(p: DesignPart) -> str | None:
@@ -631,6 +669,7 @@ class _Builder:
 
     def part(self, p: DesignPart) -> Component:
         c = library_component(self.library, p.ref, p.value, p.description, _lib_id(p.symbol, f"{p.ref} symbol"), _lib_id(p.footprint, f"{p.ref} footprint"), self.provenance, p.serves_requirements)
+        self.check_pads(c, p)
         c.electrical = self.params(p.electrical)
         s = p.spice
         value = self.optional(s.value)
@@ -647,12 +686,29 @@ class _Builder:
             device=s.device, exclude=s.exclude, exclude_reason=s.exclude_reason, value=value, model_name=s.model_name, model_card=card,
             pin_order=s.pin_order if s.pin_order is not None else [x.number for x in c.pins], ignored_pins=s.ignored_pins, params=self.params(s.params), provenance=self.provenance,
         )
+        for field_name, text in (("manufacturer", p.manufacturer), ("mpn", p.mpn)):  # checked by _identity_problem before any part is built
+            if text is not None:
+                setattr(c, field_name, user_requirement(text.strip(), None, f"{self.note}; as the file states it (not looked up)"))
         if p.min_pcb_layers is not None and p.min_pcb_layers_source is not None:  # checked by _min_layers_problem before any part is built
             source = p.min_pcb_layers_source.strip()
             c.min_pcb_layers = Traced(value=p.min_pcb_layers, unit=LAYER_UNIT, provenance=Provenance(
                 kind=ProvenanceKind.USER_REQUIREMENT, source=SourceRef(title=source),
                 note=f"{self.note}; the part needs at least {p.min_pcb_layers} copper layers per {source}, as the file states it (not opened)"))
         return c
+
+    def check_pads(self, c: Component, p: DesignPart) -> None:
+        """The PCB compiler's pad / pin rule for one part (module docstring), so the file is refused before it is confirmed."""
+        try:
+            fp = self.library.load_footprint(c.footprint)  # type: ignore[arg-type]
+        except CompileError as e:  # LibraryFormatError: a malformed .kicad_mod
+            raise DesignFileError(f"--design: {p.ref} footprint {p.footprint}: {e}") from e
+        match = match_pads([x.number for x in c.pins], fp.pads)
+        if match.without_pad:
+            raise DesignFileError(f"--design: {p.ref}: symbol pins {sorted(match.without_pad, key=natural_ref_key)} of {p.symbol!r} have no pad in footprint "
+                                  f"{p.footprint} (the PCB compiler refuses it)")
+        if match.extra:
+            raise DesignFileError(f"--design: {p.ref}: footprint {p.footprint} has pads {sorted(match.extra, key=natural_ref_key)} that are not pins of "
+                                  f"{p.symbol!r} (the PCB compiler refuses it)")
 
     def net(self, n: DesignNet, parts: dict[str, Component]) -> Net:
         pins = []
@@ -1039,6 +1095,9 @@ def _build(design: DesignFile, sha256: str, library: KicadLibrary) -> DesignFile
         layers = _min_layers_problem(p)
         if layers is not None:
             raise DesignFileError(f"--design: {layers}")
+        identity = _identity_problem(p)
+        if identity is not None:
+            raise DesignFileError(f"--design: {identity}")
     build = _Builder(sha256, library)
     try:
         parts = [build.part(p) for p in design.components]

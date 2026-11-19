@@ -1,0 +1,51 @@
+{
+ "about": "sha256 of the legacy 0.8 schematic (.kicad_sch bytes) of every tests/textbook_corpus.py design, recorded before textbook 1.0 existed; lib_symbols_sha256 fingerprints the embedded library text, so a different installed KiCad library is told apart from a layout change",
+ "kicad_cli": {
+  "10.0.6": {
+   "divider": {
+    "sha256": "757b7acbc0b88f17a90adb3a3cfd5524b736d801b916df845c4ad464ce3ee2a9",
+    "lib_symbols_sha256": "4bea1b1e6b1de08d6d77f39f7099ef67d50af4af817fedd33fd35a52cd46c62c"
+   },
+   "led": {
+    "sha256": "7ba9097a5e7d6d273ee329104dba8fc31bde970a0f7bc37d0d6f6ef741656acc",
+    "lib_symbols_sha256": "73d3fbb2043b13eb0deb0da59432bde4622fa702fef2ffe9b45775ee84d4d9c6"
+   },
+   "rc_lowpass": {
+    "sha256": "496d3bd94c770ae8bf03bd9a28a745d9cd45adec174eeab6d56b3e87f0fdba73",
+    "lib_symbols_sha256": "eb61e7818f6bb91d271edca51a54662a94c0caa219d6efc7c007d9f6856bc342"
+   },
+   "lc_lowpass": {
+    "sha256": "a2ab179d417ae2f45fbaa28050c8128a989abe67f7a20f0abfbfe4d9fd0e2d88",
+    "lib_symbols_sha256": "9b875bfcc6c4957696e01afc87f0764dcaa1e73b0d0e11ca37142fd30433093a"
+   },
+   "bjt_lowside_switch": {
+    "sha256": "9a5f8cd0c5f354807d00721fbca3c5c7e8e8ec007e98af1c607a92c1ef78e64d",
+    "lib_symbols_sha256": "5d99759d558840a163f9f88178ec5fd8d2bb777cf5c1051b69e535e4ec9f0b49"
+   },
+   "astable": {
+    "sha256": "cc0b4cf790088a74582036511a44c65d3ca533672a90239971e725514c871232",
+    "lib_symbols_sha256": "f3f0424de98bbcf963f64d6a94505fe09fc7cd300ad7f1efaf9e4b405f9cef00"
+   },
+   "i2c_pullup": {
+    "sha256": "8bb949bd71d77e43c5c83117b4a5c0a269d21fd74ef336d036ab71748a36f38e",
+    "lib_symbols_sha256": "4bea1b1e6b1de08d6d77f39f7099ef67d50af4af817fedd33fd35a52cd46c62c"
+   },
+   "amplifier": {
+    "sha256": "3c8f58a34ccdb26432d0474151e2ef0e74b88389af1917c36bd72bda59a1eb07",
+    "lib_symbols_sha256": "1da70b59f8adfe23abd1a6b31201e8bcc67978611c854f17845f3a7349fc93d0"
+   },
+   "analog_piano": {
+    "sha256": "6adde72997ce4c3ee50328a6957f07e28578adf4b0b0b56c2ef2175704fe56c9",
+    "lib_symbols_sha256": "1bced175ed05417654f6dfa77c7b1ca89c8f59497809440538fc2f09b39979b8"
+   },
+   "atmega128": {
+    "sha256": "4442046fc03d5a909e4c04cb2b0ea643b61a73987501e6e258c636f3ecae73b7",
+    "lib_symbols_sha256": "4a113f0996a7eb09dc8f3ebd7d4f5fd1c22941ef65e141df270715380c39543f"
+   },
+   "stm32f407": {
+    "sha256": "8e4d2f72d52f8c0a2e99af4870f0574ab87759c076e1e868bfaaae8cebece654",
+    "lib_symbols_sha256": "28ba6af85cc07dc5deb6eb6f1ca98daf0681babd9dc69cdad9ad5f636c5f2339"
+   }
+  }
+ }
+}

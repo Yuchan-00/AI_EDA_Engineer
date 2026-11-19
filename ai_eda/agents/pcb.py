@@ -287,7 +287,7 @@ import time
 from dataclasses import dataclass, field
 
 from ai_eda.agents.base import Agent, AgentContext, AgentResult, IRProposal
-from ai_eda.agents.keys import CORNERS_KEY, PLACEMENT_KEY, PLACEMENT_POLICY_KEY, ROUTING_KEY, SILKSCREEN_KEY
+from ai_eda.agents.keys import CORNERS_KEY, PACKING_KEY, PLACEMENT_KEY, PLACEMENT_POLICY_KEY, ROUTING_KEY, SILKSCREEN_KEY
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.design.base import TOOL_ID as TEMPLATE_TOOL_ID
 from ai_eda.design.base import leave_out_answer
@@ -471,8 +471,11 @@ class PCBAgent(Agent):
                     f"not placed: {PLACEMENT_POLICY_KEY}={policy!r} places by the grid / core-ring / RF placers, which do not read the "
                     f"{len(base.fixed)} fixed part(s) and {len(base.pack_regions)} pack region(s) in ir.pcb; {FIXED_PLACER_ID} places them - leave "
                     f"{PLACEMENT_POLICY_KEY} unanswered")])
+            packing = ctx.answers.get(PACKING_KEY, "left").strip().lower()
+            if packing not in ("left", "spread"):
+                notes.append(f"{PACKING_KEY}={packing!r} not understood (left or spread); packing from the left as usual")
             try:
-                fixed = fixed_placement(ir, library, spacing=self.spacing_mm, margin=self.margin_mm)
+                fixed = fixed_placement(ir, library, spacing=self.spacing_mm, margin=self.margin_mm, spread=packing == "spread")
             except (CompileError, LibraryLookupError) as e:  # LibraryFormatError is a CompileError
                 return self._result(notes=[*notes, f"not placed: {e}"])
             placed = base.model_copy(update={"outline": fixed.outline, "placements": list(fixed.placements)})

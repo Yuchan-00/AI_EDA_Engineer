@@ -63,6 +63,9 @@ __all__ = [
     "KICAD_PIN_TYPES",
     "kicad_pin_type_to_ir",
     "ir_pin_type_to_kicad",
+    "EXCLUDE_FROM_BOM",
+    "EXCLUDE_FROM_POS_FILES",
+    "fabrication_exclusions",
 ]
 
 
@@ -72,6 +75,32 @@ class LibraryLookupError(LookupError, AiEdaError):
 
 class LibraryFormatError(CompileError):
     """A library file exists but is malformed or uses a construct we refuse to guess about."""
+
+
+# --------------------------------------------------------------------------- fabrication attributes
+
+#: the ``(attr ...)`` token of a footprint that is no part to buy: a test point pad, a mounting hole, a fiducial (KiCad's own
+#: libraries set it on those; KiCad's BOM leaves such a footprint out and its schematic parity check wants the symbol's
+#: ``in_bom`` to agree)
+EXCLUDE_FROM_BOM = "exclude_from_bom"
+#: the ``(attr ...)`` token of a footprint that no machine places (the same footprints): KiCad's position file leaves it out
+EXCLUDE_FROM_POS_FILES = "exclude_from_pos_files"
+
+
+def fabrication_exclusions(library: "KicadLibrary", ref: LibraryRef | None) -> frozenset[str]:
+    """The fabrication outputs the library footprint ``ref`` keeps itself out of: the :data:`EXCLUDE_FROM_BOM` /
+    :data:`EXCLUDE_FROM_POS_FILES` tokens of its ``(attr ...)``, read from the file on disk. Empty for no footprint, one not
+    found or one without them - an unread footprint is never assumed to be excluded (it stays in the BOM and the CPL).
+
+    One reader for the BOM and CPL compilers, the schematic's ``in_bom`` / ``in_pos_files`` and the reviewer, so a part
+    leaves every output or none."""
+    if ref is None:
+        return frozenset()
+    try:
+        fp = library.load_footprint(ref)
+    except LibraryLookupError:
+        return frozenset()
+    return frozenset(a for a in fp.attributes if a in (EXCLUDE_FROM_BOM, EXCLUDE_FROM_POS_FILES))
 
 
 # --------------------------------------------------------------------------- pin type mapping

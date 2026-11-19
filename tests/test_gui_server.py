@@ -1024,7 +1024,7 @@ def test_tables_artifacts_and_the_ir_file(shared):
     assert bom["file"] == "bom.csv" and bom["columns"][:3] == ["Reference", "Value", "Description"]
     assert [row["Reference"] for row in bom["rows"]] == sorted(c.ref for c in ir.components)
     assert {row["Reference"]: row["Value"] for row in bom["rows"]} == {c.ref: c.value for c in ir.components}
-    assert len(bom["not_verified"]) == len(bom["rows"]) and all("MPN" in cols or row["MPN"] != "NOT_VERIFIED" for cols, row in zip(bom["not_verified"], bom["rows"]))
+    assert len(bom["not_verified"]) == len(bom["rows"]) and all("MPN" in cols or row["MPN"] not in ("", "NOT_VERIFIED") for cols, row in zip(bom["not_verified"], bom["rows"]))
     assert bom["notes"] == list(ir.artifacts["bom"].notes)
     cpl = get_json(running.port, "/preview/divider/cpl.json")
     assert cpl["columns"] == ["Designator", "Mid X", "Mid Y", "Rotation", "Layer"] and len(cpl["rows"]) == len(ir.pcb.placements)

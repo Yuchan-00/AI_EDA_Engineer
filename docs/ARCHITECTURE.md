@@ -423,7 +423,7 @@
   내부 넷·포트/프로브 넷·접합, 허용 네 종류 — 포트 모델·바이패스·정합 패드·DC 블록 — 마다 그 주장을 IR에서 확인, 쓰이지 않는 허용은 실패)
 - **9–10. KiCad / 회로도 생성** — `tools/kicad/sexpr.py` (파서/직렬화), `tools/kicad/library.py` (심볼·풋프린트 파싱, `extends`
   해석, 라이브러리 루트는 실제 실행되는 kicad-cli 설치본 우선·버전 숫자 정렬), `compilers/pins.py` (IR 핀 번호·전기 타입 ↔ 라이브러리 심볼 대조, 두 컴파일러
-  공용; `no_connect`는 `"<type>+no_connect"`), `compilers/schematic.py` (IR→`.kicad_sch` 0.5, 전역 라벨 연결, 라이브러리 심볼
+  공용; `no_connect`는 `"<type>+no_connect"`), `compilers/schematic.py` (IR→`.kicad_sch`; 기본 배치는 교과서식 1.0(`compilers/textbook/`, 크기 제한 없음, 마지막 대체 단계는 아래 표를 1.0 산출물 안에 그리고 메모를 남김 — `docs/SCHEMATIC_LAYOUT.md`), `layout="legacy"`로 고르는 0.8 심볼 표는 바이트 그대로; 0.8 표: 전역 라벨 연결, 라이브러리 심볼
   verbatim 임베드, Reference/Value 필드는 라이브러리 심볼 자신의 위치·각도·정렬(인스턴스 회전 적용 — KiCad가 심볼을 놓을 때와 같음; ATmega128의 값은 몸체
   아래), 연결점 일치·스텁 위 연결점·extent 겹침 거부; 한 심볼의 겹친 핀(stacked pin — 실제 ATmega128 심볼의 숨은 52 VCC / 53·63 GND)은 IR이 그
   점의 모든 핀을 같은 넷에 두고 방향이 같을 때만 받아 가장 낮은 번호의 핀에 스텁·라벨 하나(`_stacks`), 다른 넷이면 `coincides with` 거부; 용지는
@@ -617,8 +617,19 @@
   4·2·1배 순서로, 다음 고정점까지 길이의 절반이 허용하는 만큼 — 폭의 1배가 안 나오면 호 없음; 호는 현 사슬(`ai_eda.ir.arc`, 한계 1 µm)로 감사하고
   한계는 항상 거절하는 쪽에 두며, 자기 넷과 새 접촉을 만들지도 있던 접촉을 잃지도 않음; 호가 안 맞는 모서리는 45도 모따기, 그것도 안 되면
   그대로; 둥글리기 전에 라우터가 남긴 옆걸음 — 건너뛰지 않는 두 직각 모서리 사이의, 트랙 폭 8배(최대 반지름 호 두 개가 들어갈 자리)보다 짧은 트랙(넥다운 폭의 트랙은 제외) — 을
-  이웃 트랙을 따라 그 끝 모서리까지 밀어 거기서 나가는 트랙과 합쳐 곧게 폄(패드·비아·접합점·트랙 끝으로는 밀지 않고 넘지도 않음, 새로 놓이는 구리는 모따기와
-  같은 정확한 감사를 통과하고 자기 넷과 접촉을 만들지도 잃지도 않으며 넷의 길이는 늘지 않음; 못 편 옆걸음은 이유와 함께 그대로 — `straighten` 항목,
+  이웃 트랙을 따라 그 끝 모서리까지 밀어 거기서 나가는 트랙과 합쳐 곧게 폄(패드·비아·접합점·트랙 끝으로는 밀지 않고 넘지도 않음 — 단 런의 끝이
+  옆걸음 방향의 같은 넷 직선 트랙 위 접합점이고 그 트랙이 민 옆걸음을 통째로 덮으면 옆걸음은 그 트랙에 합쳐지고 접합점이 선을 따라 옮겨 가며, 끝이
+  스루홀 패드면 민 옆걸음이 패드 내접원 안일 때 사라지고 아니면 패드에 옆으로 들어감; SMD 패드와 비아는 그대로 고정점, 새로 놓이는 구리는 모따기와
+  같은 정확한 감사를 통과하고 자기 넷과 접촉을 만들지도 잃지도 않으며 넷의 길이는 늘지 않음(라우터가 놓은 직선 구리, 둥글리기
+  전 기준 — 둥글리기는 줄이기만 하므로 완성 구리는 라우터의 구리보다 길지 않지만, 편 이동이 없앤 모서리의 호·모따기만큼 줄지 않아 펴지 않고
+  둥글린 구리보다는 조금 길 수 있음: 9 V 피아노 rev 2·rev 3에서 넷·층 하나에 최대 1.01 mm); 2026-11-19부터 접합점(트랙 끝 셋 이상, 패드·비아 아님)에서
+  나가는 짧은 단차도 이웃을 따라 밀며, 그 접합점에 이웃의 선을 따라 들어오는 같은 넷 직선 트랙이 있을 때만 — 그 트랙이 접합점을 지나 곧게 이어지고
+  접합점은 제자리(T자, 행 `junction`); 런의 끝이나 꺾이는 점이 접합점이어도 그 선을 따라 나가는 직선 트랙이 있으면 새 방향으로 만나도 됨(곧게 통과);
+  차선이 접합점에서 바뀌는 곳도 펴서 — 스루홀 패드 상자 안의 접합점과 단차 모서리(비아·SMD 패드는 그대로 고정점), 트랙 안쪽에서 끝나는 직선
+  트랙의 T(그 트랙의 모서리까지 폭 8배 미만, 두 차선이 그 트랙 양쪽에서 Z)도 접합점 단차로 밀고(트랙은 T까지 짧아짐), 단차가 가지의 선을 따라
+  이어지면 단차는 가지의 구리로 남기고 접합점 쪽 차선을 모서리의 차선으로 옮김(넷이 길어지면 `length` 이유로 그대로); 접합점에서의 이동은 모서리를
+  둘 이상 없앨 때만;
+  비아를 옮겨 층이 바뀌는 런을 펴는 일은 하지 않음 — 그대로; 못 편 옆걸음은 이유와 함께 그대로 — `straighten` 항목,
   `stats["corners"]`의 `sidesteps`·`straightened`·`sidesteps_left`·`sidestep_reasons`); 같은 기하 관례이고 전기적·제조상 이점은 주장하지 않음; 2026-11-18부터
   에이전트의 기본값 — kicad-cli 10.0.6 DRC(schematic parity, zone 다시 채움)가 이 방식으로 배선한 분배기(호 3개)·ATmega128 2층(호 224·모따기 36·옆걸음 30)·STM32F407
   6층(호 211·모따기 139·옆걸음 24) 보드에서 오류 0·경고 0·미연결 0; 호가 있는 보드의 결과는 각 도구의 호 버전 — `pcb.routing`·`pcb.keepout` 0.3, `si` 0.3,
@@ -637,13 +648,23 @@
   풋프린트 실크 선·호·원·다각형·곡선·문자, 문자 상자 추정 폭 = 글자 수 × 크기 × 0.9 + 굵기·높이 = 크기 × 1.2 + 굵기, 컴파일러와 검사가 공유하는 거부 규칙
   `silk_text_problems`), `tools/silkscreen/place.py` `place_silkscreen`(`silkscreen.place` 0.1: 배치·배선 뒤 같은
   `pcb` 제안, 실크가 비어 있을 때만; 금지 영역 = 패드 구리 + `silk_to_pad` 0.15 mm·외곽 `silk_to_edge` 0.3 mm 안쪽·풋프린트 자신의 실크·먼저 놓은
-  문자 + `text_gap` 0.1 mm — 트랙은 아님, 비아도 아님(컴파일러 `_setup`이 비아를 텐팅); 참조는 코트야드 둘레 후보 10곳 × 1.0/0.8 mm, 없으면
-  F.Fab/B.Fab; `Connector*` 심볼의 넷 이름 핀 라벨 0.8 mm(충돌은 건너뛰고 이름을 남김); ASCII 제목 1.5 mm; 좌표는 시험 전에 0.001 mm로 반올림해 쓴
-  것이 시험한 것), `compilers/pcb.py`(reference 문자 → 그 풋프린트 `Reference` 속성의 `(at …)`·층·크기·정렬·`mirror`, 나머지 →
+  문자 + `text_gap` 0.1 mm, 비아 원판 + `text_gap`(텐팅돼도 드릴 구멍이라 실크가 찍히지 않음 — 라우터가 아니라 배선 뒤에 놓는 실크 배치기가
+  비아를 피함), 템플릿·설계 파일이 둔 문자는 그 문자 한 글자 폭(크기 × 0.9) — 트랙은 금지 영역이 아님; 참조는 코트야드 둘레 후보 10곳 × 1.0/0.8 mm를
+  다른 코트야드 밖 → 자기 부품의 것으로 읽히는 자리(다른 모든 코트야드가 자기 몸체보다 0.5 mm 이상 멀다; 두 트리머·두 저항 열 사이 틈처럼 이웃만큼
+  가까운 자리는 어느 쪽 이름인지 모름) → (2026-11-19부터) 보드 외곽에서 1 mm 이상(`PREFERRED_EDGE_MM`; 0.3 mm 규칙은 그대로) → 표준 크기 1.0 mm
+  (0.8 mm는 마지막 수단, 노트에 이유) → 다른 부품의 참조와 1 mm 이상(`CLUSTER_GAP_MM`; 더 가까우면 한 덩어리로 읽힘) → 가로 먼저(네 변, 각 변을 따라
+  0.25 mm씩 민 자리, 그다음 네 모서리), 가로 자리가 없거나 모두 이웃의 것으로 읽힐 때만 90도로 돌림(노트에 이유) → 트랙과 겹치지 않는 자리 먼저;
+  반복 셀(`ir.pcb.pack_regions` 중 같은 풋프린트·회전·면의 부품이 한 평행 이동으로 같은 배치인 영역들)은 셀 위치마다 모든 반복에서 비어 있는 한 자리를
+  같은 순서로 골라 모두에 씀(9 V 피아노 보드의 8개 음성 열; 모두에 빈 자리가 없으면 가장 많은 반복에 빈 자리를 쓰고 나머지는 하나씩 놓아 노트에 이름;
+  혼자라면 다른 자리를 골랐을 반복과 그 자리를 막은 것 — 설계 파일의 문자·비아·패드 — 을 노트가 밝힘; 커넥터는 셀에서 뺌); 어느 자리도 자기 것으로
+  읽히지 않으면 노트가 가까운 부품을 밝힘; 없으면 F.Fab/B.Fab; `Connector*` 심볼의 넷 이름 핀 라벨 0.8 mm(충돌은 건너뛰고 이름을 남김); 심볼 핀 이름이 A/K인
+  두 핀 부품(다이오드·LED)은 K 패드 옆에 `K`, +/-인 부품은 + 패드 옆에 `+`(풋프린트 패드 번호와 대조, 트랙과 겹치지 않는 자리 먼저, 자리가 없으면 노트);
+  ASCII 제목 1.5 mm; 좌표는 시험 전에 0.001 mm로 반올림해 쓴 것이 시험한 것), `compilers/pcb.py`(reference 문자 → 그 풋프린트 `Reference` 속성의 `(at …)`·층·크기·정렬·`mirror`, 나머지 →
   `gr_text`(`net_item_uuid(project, "silk", i)`), 거부 규칙에 걸리면 `CompileError`), `validation/layout.py`
   `SilkscreenValidator`(`pcb.silk.clearance`/`overlap`/`size`, tool `pcb.silk` 0.1 — IR 기하, DRC 아님; KiCad의
   `silk_over_copper`/`silk_overlap`/`text_height`는 `kicad.drc`의 몫이고 10.0.6에서 미측정). 3D:
-  `tools/model3d/`(`step_bbox.py` 근사 외곽, `models.py` `find_3dmodel_dir`·`footprint_models`·`model_transform`,
+  `tools/model3d/`(`step_bbox.py` 근사 외곽, `models.py` `find_3dmodel_dir`·`footprint_models`·`model_transform`·`missing_models`(3D 라이브러리에
+  없는 모델 파일과 그 부품 — PCB 단계와 제조 산출물 단계 메시지에 한 줄로 남기고 다른 모델로 대신하지 않음),
   `scene.py` `build_scene` — 부품 상자 = F.Fab 외곽(없으면 코트야드) × STEP 최대 높이, `BODY_CAPTION`, `glb.py` `write_glb`,
   `iso.py` `iso_svg`), `compilers/model3d.py` `Preview3DCompiler`(`compiler.preview_glb` 0.1, PCB 컴파일러가 거부하는
   것과 장면이 거부하는 것(`SceneError`)을 거부). keep-out과 RF 배치: `tools/keepout.py`(keep-out 영역·층·금지 항목·예외의 기하, 사각형 빼기
@@ -717,7 +738,15 @@
   `tools/model3d/scene.py` (내층 평면 판), `tools/si/measure.py`
   `plane_keepout`/`KEEPOUT_NO_PLANE`/`no_plane_reason` (zone 금지 keep-out 아래 구리는 기준면 없음 — 그 `si.impedance` 행은
   NOT_VERIFIED, 지연은 적층의 최대 εr로 잡은 무평면 상한(`keepout_bound`), 메시지는 그 keep-out을 이름 댐)
-- **14. 제조 산출물** — `compilers/bom.py` (BOM/CPL; 부재 identity는 `NOT_VERIFIED` 셀;
+- **14. 제조 산출물** — `compilers/bom.py` (BOM/CPL; 확인되지 않은 identity·풋프린트·sourcing·`DatasheetHash` 칸은 빈 칸이고 검증 상태는 자기 열
+  `Unverified`에 칸 이름과 이유로 둠(`compiler.bom` 0.3 — 0.2는 그 칸에 `NOT_VERIFIED`를 써서 업로드에서 품번으로 읽혔다; `unverified_columns`가
+  두 버전을 읽는 한 곳, GUI가 씀); 설계 파일 부품의 `manufacturer`·`mpn`은
+  `user_requirement`로 `Manufacturer`·`MPN` 열에 쓰고, 근거 데이터시트 전까지 `DatasheetHash`는 비고 `Unverified`가 그것을 말함;
+  CPL `compiler.cpl` 0.3의 `Mid X`/`Mid Y`는 부품 중심 = 패드 위치 상자의 중심을 거버의 좌표계로 씀 — KiCad 페이지 원점 (0, 0)(파이프라인이 배치하는
+  보드에서는 외곽의 왼쪽 위 모서리)에서 mm, X 오른쪽·**Y 위쪽**(보드 위 부품의 `Mid Y`는 음수; `kicad-cli pcb export gerbers`의 절대 좌표, `useauxorigin no`,
+  KiCad 위치 파일의 `PosY`와 같음 — JLCPCB CPL 문서는 원점·축 방향을 정하지 않으므로 같은 주문의 거버와 같은 좌표계; JLCPCB 열 이름은 그대로 두고 CSV에는
+  주석 줄이 없으므로 좌표계는 문서·리뷰어 메시지에 적음); 리뷰어도 보드 파일의 패드로 같은 중심을 재되 그 CPL 버전이 쓴 좌표계로 대조하고 메시지에
+  좌표계를 밝힘(0.1이 쓴 CPL은 풋프린트 anchor, 0.1/0.2는 KiCad 페이지 좌표계 Y 아래로 대조하고, 맞더라도 FAIL·`regenerate`);
   Reference·identity·Footprint·sourcing·DatasheetHash 셀과 CPL Designator는 formula 문자/제어문자면 `CompileError`,
   `Value`/`Description` 셀은 `=`/`+`/`-`/`@`로 시작하면 선행 `'`를 붙여 기록하고 `ArtifactRef.notes` → `compile.bom`
   `details.neutralised`/메시지로 보고 — 제어문자는 거부(제어문자 = Unicode 범주 Cc(C0/C1, NEL
@@ -1562,8 +1591,8 @@ power_in 핀이 생기면 즉시 FAIL — warning도 FAIL이므로), `.kicad_pro
 `domain.high_speed.si`는 그 행과 판정을 옮김)·손실·분산(`calc.tline.*`는 준정적·무손실).
 
 **알려진 한계 (문서화된 추정/미검증):** `extends` 자식 심볼의 `exclude_from_sim`/`in_bom`/`on_board`/`pin_names` 오버라이드는 flatten 시
-부모 값이 남는다(KiCad가 자식 값을 쓰는지는 실 ERC로 측정되지 않음 — `lib_symbol_mismatch`가 나면 이것을 의심할 것); CPL `Mid X/Y`는 풋프린트
-anchor(JLCPCB 중심점 아님); 하면 패드 `thermal_bridge_angle`은 KiCad 소스대로 유지하지만 DRC로 독립 검증되지 않음(양쪽 다 mismatch 없음); 회로도
+부모 값이 남는다(KiCad가 자식 값을 쓰는지는 실 ERC로 측정되지 않음 — `lib_symbol_mismatch`가 나면 이것을 의심할 것); CPL `Mid X/Y`는 0.1까지 풋프린트
+anchor(JLCPCB 중심점 아님)였고 0.2부터 패드 위치 상자의 중심; 하면 패드 `thermal_bridge_angle`은 KiCad 소스대로 유지하지만 DRC로 독립 검증되지 않음(양쪽 다 mismatch 없음); 회로도
 라벨 폭 추정(글자당 1.27 mm + 2.54 mm)은 보수적 추정이며 전기적 안전성은 별도의 연결점 일치 검사가 보장; warning-FAIL 정책상 사람이 warning을 수용할 방법은 설계
 변경뿐(KiCad exclusion도 카운트). SPICE: ngspice.dll은 프로세스 내 싱글턴이라 예기치 않은 access violation은 프로세스 재시작까지 엔진을
 죽인다(`validate_deck`가 실측된 crash/poison 덱을 미리 거부); 작업 폴더의 `.spiceinit`은 읽히지 않는다(ngspice가 그 `shell` 줄을 실행하므로 —
