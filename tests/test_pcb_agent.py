@@ -525,8 +525,10 @@ def test_routing_answer_is_a_control_key_and_skip_leaves_the_placement_without_c
     res = _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: " Skip "})
     [proposal] = res.proposals
     assert proposal.payload.tracks == [] and proposal.payload.vias == [] and len(proposal.payload.placements) == 5
-    assert len(res.notes) == 3 and res.notes[0].endswith(f"; {UNROUTED_NOTE}") and res.notes[1] == "routing skipped by answer"
+    assert len(res.notes) == 4 and res.notes[0].endswith(f"; {UNROUTED_NOTE}") and res.notes[1] == "routing skipped by answer"
     assert res.notes[2].startswith("silkscreen.place 0.1: ") and proposal.payload.silkscreen  # the silkscreen does not need copper
+    # the grid's 7.4 mm board leaves R1 / R10 no reference spot 1 mm from the edge: the placer names them (silkscreen.place, 2026-11-19)
+    assert res.notes[3].startswith("silkscreen: reference(s) nearer the board edge than 1 mm (no free spot farther in): R1: ")
     assert "unconnected_items" in res.notes[0]
     # any other value: noted as not understood, routing proceeds
     res = _run_agent(ir, tmp_path, lib, **{ROUTING_KEY: "yes"})

@@ -63,7 +63,8 @@ def main():
             res = PCBAgent().run(ir, AgentContext(workdir=workdir, tools={"kicad_library": library}, answers={"pcb.silkscreen": "skip", "pcb.corners": "miter45"}))
             Orchestrator.apply_proposals(ir, res.proposals)
             assert ir.pcb and ir.pcb.tracks, res.notes
-            schematic = SchematicCompiler().compile(ir, CompileContext(workdir=workdir, tools={"kicad_library": library}))
+            # the frozen baselines were measured on the legacy table: regenerate them with it (textbook 1.0 is the default)
+            schematic = SchematicCompiler("legacy").compile(ir, CompileContext(workdir=workdir, tools={"kicad_library": library}))
             record(name, ir, Path(schematic.path), {"template_inputs": answers, "placement_notes": res.notes})
     (DATA / "metrics.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 

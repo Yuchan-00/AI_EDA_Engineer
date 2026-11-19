@@ -22,6 +22,7 @@ from ai_eda.compilers.pcb import (
     design_rules,
     net_numbers,
 )
+from ai_eda.compilers.schematic import identity_fields
 from ai_eda.errors import CompileError
 from ai_eda.ir import (
     ArtifactKind,
@@ -322,7 +323,10 @@ def test_embedded_footprints_match_library_and_ir(board_ir: CircuitIR, ctx: Comp
     assert sexpr.args(sexpr.find(r1, "attr")) == ["smd"] and sexpr.args(sexpr.find(j1, "attr")) == ["through_hole"]
     assert sexpr.find(r1, "version") is None and sexpr.find(r1, "generator") is None
     props = {str(p[1]): p for p in sexpr.find_all(r1, "property")}
-    assert [str(p[1]) for p in sexpr.find_all(r1, "property")] == ["Reference", "Value", "Datasheet", "Description", "KiLib_Generator"]
+    assert [str(p[1]) for p in sexpr.find_all(r1, "property")] == ["Reference", "Value", "Datasheet", "Description", "KiLib_Generator", "Manufacturer", "MPN"]
+    # the identity the IR states, as the schematic symbol carries it (KiCad's parity compares the two), hidden
+    assert [(key, value) for key, value in identity_fields(board_ir.component("R1"))] == [(k, props[k][2]) for k in ("Manufacturer", "MPN")]
+    assert sexpr.get(props["Manufacturer"], "hide") == "yes" and sexpr.get(props["MPN"], "hide") == "yes"
     assert props["Value"][2] == "10k" and props["Description"][2] == board_ir.component("R1").description
     assert sexpr.args(sexpr.find(props["Reference"], "at")) == ["0", "-1.43", "270"]  # library position, rotated text
     assert sexpr.get(props["Reference"], "uuid") and sexpr.get(props["Datasheet"], "hide") == "yes"
@@ -615,6 +619,28 @@ def test_gerber_and_drill_export(board_ir: CircuitIR, ctx: CompileContext, tmp_p
     res = check_gerber_set(listed)
     assert res.status is ValidationStatus.PASS, res.message
     assert set(res.details["functions"]) >= {"Copper,L1", "Copper,L2", "Soldermask,Top", "Soldermask,Bot", "Profile,NP"}
+
+
+def test_the_boards_saved_plot_params_ask_for_no_drill_marks(board_ir: CircuitIR, ctx: CompileContext):
+    """The 9 V piano board's saved plot params had KiCad's default ``(drillshape 1)``: a re-export with them (the plot dialog,
+    ``--board-plot-params``) flashed a 0.35 mm drill mark at every pad and via of the copper and mask Gerbers. Every compiled board
+    asks for none."""
+    _, path = _compile(board_ir, ctx)
+    params = sexpr.find(sexpr.find(sexpr.parse_file(path), "setup"), "pcbplotparams")
+    assert sexpr.args(sexpr.find(params, "drillshape")) == ["0"]
+
+
+@needs_kicad
+def test_a_gerber_plotted_with_the_boards_own_params_is_the_pipelines_plot(board_ir: CircuitIR, ctx: CompileContext, tmp_path: Path):
+    """``kicad-cli pcb export gerbers --board-plot-params`` (what a re-export from the plot dialog uses) draws the copper and mask
+    layers exactly as the pipeline's export does: no drill-mark flash added (with ``drillshape 1`` every pad got one more ``D03``)."""
+    _, path = _compile(board_ir, ctx)
+    ours = {p.name: p for p in kicad.export_gerbers(path, tmp_path / "ours", ["F.Cu", "B.Cu", "F.Mask", "B.Mask"], check_zones=False)}
+    kicad._run(["pcb", "export", "gerbers", "--no-protel-ext", "--board-plot-params", "-o", str(tmp_path / "params") + "/", str(path)])
+    for name in (f"{PROJECT_ID}-F_Cu.gbr", f"{PROJECT_ID}-B_Cu.gbr", f"{PROJECT_ID}-F_Mask.gbr", f"{PROJECT_ID}-B_Mask.gbr"):
+        mine = ours[name].read_text(encoding="utf-8").count("D03*")
+        theirs = (tmp_path / "params" / name).read_text(encoding="utf-8").count("D03*")
+        assert mine > 0 and theirs == mine, (name, mine, theirs)
 
 
 @needs_kicad

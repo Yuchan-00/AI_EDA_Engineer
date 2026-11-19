@@ -88,8 +88,11 @@ from ai_eda.ir.provenance import design_data
 from ai_eda.llm.extraction import request_hash
 from ai_eda.tools.calc import recompute_parameters
 from ai_eda.tools.kicad.cli import KicadCli, run_drc_for, run_erc_for
-from ai_eda.tools.kicad.library import KicadLibrary
+from ai_eda.tools.kicad.library import KicadLibrary, LibraryLookupError
 from ai_eda.tools.manufacturing.outputs import check_output_artifact
+from ai_eda.compilers.bom import is_exclusion_note
+from ai_eda.compilers.model3d import MODEL_DIR_TOOL
+from ai_eda.tools.model3d.models import find_3dmodel_dir, missing_models, missing_models_note
 from ai_eda.validation import ValidationContext, default_registry
 from ai_eda.workflow.stages import STAGE_ORDER, Stage
 
@@ -103,8 +106,16 @@ def _stamp(results: list[ValidationResult], ir: CircuitIR) -> None:
 
 
 def _neutralised_summary(notes: list[str]) -> str:
-    """``'N cell(s) neutralised (R1.Value, ...)'`` from compiler notes of the form ``'<where>: <why>; ...'`` (one line per stage)."""
-    return f"{len(notes)} cell(s) neutralised ({', '.join(n.split(':', 1)[0] for n in notes)})"
+    """``'N cell(s) neutralised (R1.Value, ...)'`` from compiler notes of the form ``'<where>: <why>; ...'`` (one line per stage); the
+    parts a BOM / CPL left out (:func:`~ai_eda.compilers.bom.is_exclusion_note`) are counted apart: ``'N part(s) left out (TP1, ...)'``."""
+    left_out = [n for n in notes if is_exclusion_note(n)]
+    cells = [n for n in notes if not is_exclusion_note(n)]
+    parts = []
+    if cells:
+        parts.append(f"{len(cells)} cell(s) neutralised ({', '.join(n.split(':', 1)[0] for n in cells)})")
+    if left_out:
+        parts.append(f"{len(left_out)} part(s) left out, footprint excluded from this output ({', '.join(n.split(':', 1)[0] for n in left_out)})")
+    return "; ".join(parts)
 
 
 def _removed_previous(ir: CircuitIR, kind: ArtifactKind) -> str:
@@ -193,6 +204,21 @@ MANUFACTURING_EXPORTS: tuple[ArtifactKind, ...] = (ArtifactKind.GERBER, Artifact
 KICAD_3D_EXPORTS: tuple[ArtifactKind, ...] = (ArtifactKind.KICAD_STEP, ArtifactKind.KICAD_GLB, ArtifactKind.KICAD_RENDER)
 #: what the manufacturing-outputs stage says when there is no kicad-cli for the 3D exports
 NO_KICAD_3D = "3D export skipped: kicad-cli not found"
+
+
+def _missing_models_note(ir: CircuitIR, ctx: AgentContext) -> str:
+    """The line naming the 3D model files the placed footprints name and the 3D library lacks (:func:`~ai_eda.tools.model3d.models.missing_models_note`);
+    empty when none is missing or the footprints cannot be read (the board's own stage says why)."""
+    library = ctx.tools.get("kicad_library")
+    if ir.pcb is None or not isinstance(library, KicadLibrary):
+        return ""
+    placed = {p.component_ref for p in ir.pcb.placements}
+    try:
+        footprints = [(c.ref, library.load_footprint(c.footprint)) for c in ir.components if c.ref in placed and c.footprint is not None]
+        model_dir = ctx.tools[MODEL_DIR_TOOL] if MODEL_DIR_TOOL in ctx.tools else find_3dmodel_dir(library)
+        return missing_models_note(missing_models(footprints, Path(model_dir) if model_dir is not None else None))
+    except (CompileError, LibraryLookupError, ValueError):
+        return ""
 
 
 class Orchestrator:
@@ -485,7 +511,11 @@ class Orchestrator:
         art = ir.artifacts[kind]
         # a cell the compiler neutralised (BOM free text written with a leading apostrophe) is reported, never hidden:
         # the full notes in the details, a count + the cells in the message
-        details = {("neutralised" if kind in (ArtifactKind.BOM, ArtifactKind.CPL) else "notes"): list(art.notes)} if art.notes else {}
+        if kind in (ArtifactKind.BOM, ArtifactKind.CPL):
+            details = {key: kept for key, kept in (("neutralised", [n for n in art.notes if not is_exclusion_note(n)]),
+                                                   ("left_out", [n for n in art.notes if is_exclusion_note(n)])) if kept}
+        else:
+            details = {"notes": list(art.notes)} if art.notes else {}
         message = f"compiled {art.path}" + (f"; {_notes_summary(kind, art.notes)}" if art.notes else "")
         ir.validation.add(ValidationResult(status=ValidationStatus.PASS, message=message, artifact_hash=art.content_hash, details=details, **stamp))
         return ValidationStatus.PASS, str(art.path)
@@ -530,7 +560,8 @@ class Orchestrator:
         counts = ""
         if scene is not None:
             counts = f": {len(scene.bodies_with_step)} part box(es) with a STEP height, {len(scene.bodies_without_step)} flat outline(s) without"
-        return f"3D preview {Path(art.path).name}{counts} (a picture of the IR, not a check)"
+        missing = _missing_models_note(ir, ctx)
+        return f"3D preview {Path(art.path).name}{counts} (a picture of the IR, not a check)" + (f"; {missing}" if missing else "")
 
     def _kicad_check(self, check: str) -> StageFn:
         stage = Stage.ERC if check == "kicad.erc" else Stage.DRC
@@ -623,6 +654,10 @@ class Orchestrator:
                 continue
             ir.artifacts[kind] = art
             notes.append(f"{kind} exported {', '.join(Path(f).name for f in (art.files or [art.path]))} (3D, not a check)")
+        if any(kind in ir.artifacts for kind in KICAD_3D_EXPORTS):
+            missing = _missing_models_note(ir, ctx)
+            if missing:
+                notes.append(missing)
         return notes
 
     def _calculation(self, ir: CircuitIR, ctx: AgentContext) -> StageOutcome:

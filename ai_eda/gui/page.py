@@ -2198,12 +2198,15 @@ async function drawTable(box, file, isBom) {
   }
   const rows = t.rows.map((row, i) => {
     const nv = isBom && t.not_verified ? new Set(t.not_verified[i] || []) : new Set();
+    // an unverified cell is empty in the file (compiler.bom 0.3; a 0.2 file wrote NOT_VERIFIED there): the badge says so, the file is not changed
     return h('tr', {}, t.columns.map((c) => td(nv.has(c)
-      ? h('span', {title: '검증되지 않음: 이 칸의 값은 확인된 적이 없습니다'}, statusBadge(row[c]))
-      : row[c], c === 'Description' || c === 'Footprint' ? 'msg' : 'cell')));
+      ? h('span', {title: '검증되지 않음: 이 칸의 값은 확인된 적이 없습니다' + (row[c] ? '' : ' (파일에서는 빈 칸, 이유는 Unverified 칸)')},
+        statusBadge(row[c] || 'NOT_VERIFIED'))
+      : row[c], c === 'Description' || c === 'Footprint' || c === 'Unverified' ? 'msg' : 'cell')));
   });
   const caption = isBom
-    ? t.file + ' - Value / Description 칸은 CSV의 중화 표시(앞의 \')를 풀어 보여 주고, 나머지 칸은 쓰인 그대로입니다 (넓은 표는 옆으로 스크롤됩니다)'
+    ? t.file + ' - Value / Description 칸은 CSV의 중화 표시(앞의 \')를 풀어 보여 주고, 나머지 칸은 쓰인 그대로입니다. '
+      + 'Unverified 칸이 이름 댄 칸은 파일에서 비어 있고 여기서는 NOT_VERIFIED 표시로 보입니다 (넓은 표는 옆으로 스크롤됩니다)'
     : t.file + ' - 쓰인 그대로';
   fill(box, facts, table(t.columns, rows, caption), downloadLink(t.file, t.file + ' 내려받기'),
     (t.notes || []).map((n) => h('p', {class: 'hint'}, n)));

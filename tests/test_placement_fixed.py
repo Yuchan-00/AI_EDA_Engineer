@@ -667,3 +667,26 @@ def test_a_key_row_is_placed_routed_silk_placed_and_passes_real_drc(tmp_path: Pa
     report = json.loads((out / "drc.json").read_text(encoding="utf-8"))
     assert report["violations"] == [] and report["unconnected_items"] == [], (
         [(v["type"], v["description"]) for v in report["violations"]], len(report["unconnected_items"]))
+
+
+def test_spread_spreads_each_regions_rows_inside_it_and_left_packs_as_before(tmp_path: Path, lib: KicadLibrary):
+    """The 9 V piano board's op-amp regions held U1 and C3 at their left end and nothing in the other two thirds: the shelf packer
+    fills a region from its top-left corner. ``spread=True`` spreads each row with an even gap before, between and after its parts
+    across the region, then the rows across its height - the same parts, the same order, the same rows, every part still in its
+    region and clear of the fixed ones; the provenance names the shift. Without it the placement is the packer's, byte for byte."""
+    ir = keys_ir(tmp_path, lib)
+    packed = fixed_placement(ir, lib)
+    spread = fixed_placement(ir, lib, spread=True)
+    assert [design_data(p) for p in fixed_placement(ir, lib, spread=False).placements] == [design_data(p) for p in packed.placements]
+    assert packed.spread is None
+    by = {p.component_ref: p for p in spread.placements}
+    before = {p.component_ref: p for p in packed.placements}
+    chain = sorted(("R5", "R3", "R1", "R2", "R4"), key=lambda r: by[r].x_mm)
+    assert chain == ["R5", "R3", "R1", "R2", "R4"] and {_row(by[r]) for r in chain} == {_row(before[r]) for r in chain}
+    boxes = [spread.extents[r] for r in chain]  # region chain: x 2 .. 38 (inside the 2 mm margin), y 12 .. 20
+    gaps = [boxes[0].x1 - 2.0, *(b.x1 - a.x2 for a, b in zip(boxes, boxes[1:])), 38.0 - boxes[-1].x2]
+    assert max(gaps) - min(gaps) < 1e-5 and min(gaps) > SPACING_MM  # the anchors are rounded to 1e-6 mm
+    assert all(2.0 - 1e-9 <= b.x1 and b.x2 <= 38.0 + 1e-9 and 12.0 - 1e-9 <= b.y1 and b.y2 <= 20.0 + 1e-9 for b in boxes)
+    assert all(by[f"S{i}"] == before[f"S{i}"] for i in (1, 2, 3))
+    assert any(e.startswith("spread:") for e in by["R4"].provenance.derived_from) and spread.spread
+    assert "parts spread evenly inside their regions (pcb.packing=spread)" in spread.description("user", SPACING_MM, MARGIN_MM)

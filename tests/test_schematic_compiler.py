@@ -58,8 +58,8 @@ def ir(tmp_path: Path, lib: KicadLibrary) -> CircuitIR:
     return divider_with_connector_ir(tmp_path, lib)
 
 
-def compile_to(ir: CircuitIR, workdir: Path, lib: KicadLibrary):
-    ref = SchematicCompiler().compile(ir, CompileContext(workdir=workdir, tools={"kicad_library": lib}))
+def compile_to(ir: CircuitIR, workdir: Path, lib: KicadLibrary, layout: str | None = None):
+    ref = SchematicCompiler(layout).compile(ir, CompileContext(workdir=workdir, tools={"kicad_library": lib}))
     return ref, Path(ref.path)
 
 
@@ -128,9 +128,13 @@ def test_grid_positions_are_deterministic_and_on_grid():
 # --------------------------------------------------------------------------- compile against the real libraries
 
 
+# The legacy 0.8 table (a global label on every pin, gutter wires, the wiring note, flags) is tested with an explicit
+# layout="legacy" since textbook 1.0 became the default; the refusals below run on the default.
+
+
 @needs_libs
 def test_compile_writes_file_with_ir_hash(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary):
-    ref, path = compile_to(ir, tmp_path / "out", lib)
+    ref, path = compile_to(ir, tmp_path / "out", lib, "legacy")
     assert path.exists() and path.name == f"{PROJECT_ID}.kicad_sch"
     assert ref.generated_from_ir_hash == ir.content_hash()
     assert ref.generator == SchematicCompiler.id and ref.matches_disk()
@@ -141,14 +145,15 @@ def test_compile_writes_file_with_ir_hash(ir: CircuitIR, tmp_path: Path, lib: Ki
 
 @needs_libs
 def test_compile_is_byte_deterministic(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary):
-    _, a = compile_to(ir, tmp_path / "a", lib)
-    _, b = compile_to(divider_with_connector_ir(tmp_path, KicadLibrary()), tmp_path / "b", KicadLibrary())
-    assert a.read_bytes() == b.read_bytes()
+    for layout in ("legacy", None):
+        _, a = compile_to(ir, tmp_path / f"a{layout}", lib, layout)
+        _, b = compile_to(divider_with_connector_ir(tmp_path, KicadLibrary()), tmp_path / f"b{layout}", KicadLibrary(), layout)
+        assert a.read_bytes() == b.read_bytes()
 
 
 @needs_libs
 def test_structure_uuids_and_embedded_library_symbols(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary):
-    _, path = compile_to(ir, tmp_path, lib)
+    _, path = compile_to(ir, tmp_path, lib, "legacy")
     sch = sexpr.parse_file(path)
     assert sexpr.head(sch) == "kicad_sch" and sexpr.get(sch, "version") == "20260101"
     assert sexpr.get(sch, "uuid") == sheet_uuid(PROJECT_ID)
@@ -190,7 +195,7 @@ def test_structure_uuids_and_embedded_library_symbols(ir: CircuitIR, tmp_path: P
 def test_every_small_net_is_drawn_as_wires_with_a_junction_where_three_pins_meet(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary):
     """B11: VIN (2 pins), VOUT (3 pins) and GND (2 pins) each get a trunk + branches; VOUT's three branches meet at one junction.
     The note says so; the labels stay on every pin, so the netlist (tested below with kicad-cli) is unchanged."""
-    node, notes = SchematicCompiler().build_with_notes(ir, lib)
+    node, notes = SchematicCompiler("legacy").build_with_notes(ir, lib)
     wires = sexpr.find_all(node, "wire")
     junctions = sexpr.find_all(node, "junction")
     pin_count = sum(len(v) for v in EXPECTED_NETS.values())
@@ -204,7 +209,7 @@ def test_every_small_net_is_drawn_as_wires_with_a_junction_where_three_pins_meet
         for v in (ax, ay, bx, by):
             assert abs(v / 1.27 - round(v / 1.27)) < 1e-6, (ax, ay, bx, by)
     # the compile stage carries the note
-    ref, _ = compile_to(ir, tmp_path, lib)
+    ref, _ = compile_to(ir, tmp_path, lib, "legacy")
     assert ref.notes == notes
 
 
@@ -213,7 +218,7 @@ def test_no_connect_pin_emits_marker(ir: CircuitIR, tmp_path: Path, lib: KicadLi
     j1 = ir.component("J1")
     j1.pins[2] = j1.pins[2].model_copy(update={"electrical_type": PinElectricalType.NO_CONNECT})
     ir.net("GND").pins = [p for p in ir.net("GND").pins if p.component_ref != "J1"]
-    _, path = compile_to(ir, tmp_path, lib)
+    _, path = compile_to(ir, tmp_path, lib, "legacy")
     sch = sexpr.parse_file(path)
     ncs = sexpr.find_all(sch, "no_connect")
     assert len(ncs) == 1
@@ -241,8 +246,8 @@ def test_a_net_with_only_power_input_pins_gets_exactly_one_pwr_flag_and_a_driven
     for name, pins in more.items():
         ir.net(name).pins += [PinRef(component_ref=r, pin_number=p) for r, p in pins]
     ir.nets += [_fake_net("MID", ("U1", "3"), ("U2", "1"), ("U3", "8")), _fake_net("X", ("U3", "1"), ("U3", "3"))]
-    node, notes = SchematicCompiler().build_with_notes(ir, lib)
-    assert sexpr.dumps(node) == sexpr.dumps(SchematicCompiler().build(ir, KicadLibrary()))  # flags included: the same bytes again
+    node, notes = SchematicCompiler("legacy").build_with_notes(ir, lib)
+    assert sexpr.dumps(node) == sexpr.dumps(SchematicCompiler("legacy").build(ir, KicadLibrary()))  # flags included: the same bytes again
     flags = [s for s in sexpr.find_all(node, "symbol") if sexpr.get(s, "lib_id") == "power:PWR_FLAG"]
     assert [str(sexpr.get(s, "property", 2)) for s in flags] == ["#FLG01", "#FLG02"]  # net-name order: GND, VIN
     assert all(sexpr.get(sexpr.find(s, "property"), "hide") is True for s in flags)  # the library hides a flag's reference, so the instance does
@@ -255,7 +260,7 @@ def test_a_net_with_only_power_input_pins_gets_exactly_one_pwr_flag_and_a_driven
     assert notes[0].startswith("wiring: ") and " of 5 net(s)" in notes[0] and not any(n.startswith("not wired") and "GND" in n for n in notes)
     if not _kicad.available():
         return
-    _, path = compile_to(ir, tmp_path, lib)
+    _, path = compile_to(ir, tmp_path, lib, "legacy")
     result = _kicad.run_erc(path, tmp_path / "erc.json")
     errors = result.details["errors"]  # X only (U3's GND pin behind its own output): not driven, and no pin_to_pin from a flag
     assert [e["type"] for e in errors] == ["power_pin_not_driven"] and "U3" in errors[0]["items"][0]["description"], errors
@@ -350,7 +355,7 @@ def test_footprint_claimed_verified_but_missing_is_refused(ir: CircuitIR, tmp_pa
 
 @needs_kicad
 def test_real_erc_passes_with_zero_errors(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary):
-    _, path = compile_to(ir, tmp_path, lib)
+    _, path = compile_to(ir, tmp_path, lib, "legacy")
     result = _kicad.run_erc(path, tmp_path / "erc.json")
     warnings = result.details["warnings"]
     for w in warnings:
@@ -364,7 +369,7 @@ def test_real_erc_passes_with_zero_errors(ir: CircuitIR, tmp_path: Path, lib: Ki
 
 @needs_kicad
 def test_real_netlist_reproduces_ir_connectivity(ir: CircuitIR, tmp_path: Path, lib: KicadLibrary):
-    _, path = compile_to(ir, tmp_path, lib)
+    _, path = compile_to(ir, tmp_path, lib, "legacy")
     net_path = _kicad.export_netlist(path, tmp_path / "out.net", fmt="kicadsexpr")
     nets = netlist_nets(net_path)
     assert nets == ir_net_map(ir) == EXPECTED_NETS
@@ -383,10 +388,53 @@ def test_real_erc_on_no_connect_variant(ir: CircuitIR, tmp_path: Path, lib: Kica
     j1 = ir.component("J1")
     j1.pins[2] = j1.pins[2].model_copy(update={"electrical_type": PinElectricalType.NO_CONNECT})
     ir.net("GND").pins = [p for p in ir.net("GND").pins if p.component_ref != "J1"]
-    _, path = compile_to(ir, tmp_path, lib)
+    _, path = compile_to(ir, tmp_path, lib, "legacy")
     result = _kicad.run_erc(path, tmp_path / "erc.json")
     assert result.details["errors"] == [], result.details["errors"]
     nets = netlist_nets(_kicad.export_netlist(path, tmp_path / "nc.net", fmt="kicadsexpr"))
     assert nets["VIN"] == EXPECTED_NETS["VIN"] and nets["VOUT"] == EXPECTED_NETS["VOUT"]
     assert nets["GND"] == {("R2", "2")}
     assert any(name.startswith("unconnected-(J1-") and pins == {("J1", "3")} for name, pins in nets.items())
+
+
+def _instance_fields(path: Path) -> dict[str, dict[str, str]]:
+    """Reference -> the properties of its (first) placed symbol."""
+    out: dict[str, dict[str, str]] = {}
+    for item in sexpr.parse_file(path):
+        if sexpr.head(item) == "symbol":
+            props = {str(p[1]): str(p[2]) for p in sexpr.find_all(item, "property") if len(p) > 2}
+            out.setdefault(props["Reference"], props)
+    return out
+
+
+@needs_kicad
+@pytest.mark.parametrize("layout", ["textbook", "legacy"])
+def test_identity_fields_carry_what_the_ir_states_and_a_library_link_never_contradicts_a_stated_part(tmp_path: Path, lib: KicadLibrary, layout: str):
+    """Manufacturer / MPN are written when the IR states them (typed by the user or found in a datasheet), never for a
+    model's proposal. A Datasheet link that is only the library symbol's own property describes the symbol, not a part
+    number the IR states, so it is left empty for such a part; a part without a stated MPN keeps it, a URL of the IR's
+    own stays, and an MPN found in a datasheet brings that document's URL."""
+    from ai_eda.compilers.schematic import LIBRARY_AUTHORITY
+    from ai_eda.ir import SourceRef, authoritative, llm_generated, user_requirement
+    from ai_eda.parts.pointers import datasheet_pointer
+    from tests.textbook_corpus import corpus_ir
+
+    ir = corpus_ir("bjt_lowside_switch", tmp_path / "ir", lib)
+    q1, d1, r1, j1, j2 = (ir.component(r) for r in ("Q1", "D1", "R1", "J1", "J2"))
+    q1.datasheet, d1.datasheet = datasheet_pointer(q1, lib), datasheet_pointer(d1, lib)  # what the pipeline records: the library's link
+    assert q1.datasheet.url and q1.datasheet.authority.startswith(LIBRARY_AUTHORITY) and d1.datasheet.url
+    q1.manufacturer, q1.mpn = user_requirement("Example Maker"), user_requirement("EX3904-T")
+    r1.mpn = llm_generated("EX-R-1K", model="any")
+    j1.mpn = user_requirement("EX-HDR-2")
+    j1.datasheet = datasheet_pointer(j1, lib, user_urls={"J1": "https://example.com/ex-hdr-2.pdf"})
+    j2.mpn = authoritative("EX-HDR-3", SourceRef(title="EX-HDR-3 datasheet", url="https://example.com/ex-hdr-3.pdf", content_hash="sha256:" + "0" * 64))
+    _, path = compile_to(ir, tmp_path / layout, lib, layout)
+    fields = _instance_fields(path)
+    assert (fields["Q1"]["Manufacturer"], fields["Q1"]["MPN"], fields["Q1"]["Datasheet"]) == ("Example Maker", "EX3904-T", "")
+    assert fields["D1"]["Datasheet"] == d1.datasheet.url and "MPN" not in fields["D1"] and "Manufacturer" not in fields["D1"]
+    assert "MPN" not in fields["R1"]  # a model's proposal is not a statement
+    assert (fields["J1"]["MPN"], fields["J1"]["Datasheet"]) == ("EX-HDR-2", "https://example.com/ex-hdr-2.pdf")
+    assert (fields["J2"]["MPN"], fields["J2"]["Datasheet"]) == ("EX-HDR-3", "https://example.com/ex-hdr-3.pdf")
+    assert "Manufacturer" not in fields["J2"]
+    result = _kicad.run_erc(path, path.with_suffix(".erc.json"))
+    assert result.details["errors"] == [] and result.details["warnings"] == []

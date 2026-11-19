@@ -27,15 +27,21 @@ dangling pin); ``no_connect`` pins may stay unclaimed. The same rules the two
 compilers apply are checked here first, with their reasons, so a table row
 that cannot compile refuses at build time instead of at compile time:
 
-* a multi-unit symbol (``symbol.units != [1]``) - both compilers refuse it
-  (:func:`ai_eda.compilers.pins.load_verified_symbol`): the dual op-amp
-  ``MCP6002-xSN`` (units [1, 2, 3]) is therefore **not** in the table; every
-  op-amp is an ``MCP6001-OT`` single (kr447 design §2.1, critic2);
+* a multi-unit symbol with common (unit 0) pins - both compilers refuse it
+  (:func:`ai_eda.compilers.pins.load_verified_symbol`). The dual op-amp
+  ``MCP6002-xSN`` (units [1, 2, 3], no common pins) compiles, but it is
+  **not** in the table: every op-amp is an ``MCP6001-OT`` single (kr447
+  design §2.1, critic2) and :data:`REFUSED_PARTS` keeps the dual out;
 * a repeated pin number, a symbol pin without a pad, or an electrical pad
-  that is no symbol pin (the PCB compiler's pin/pad rule): the plain
-  ``Device:R_Potentiometer`` on the RK09K footprint (pad ``MP`` has no pin)
-  and ``RF_Switch:SKY13380-350LF`` (exposed pad 17 has no pin) are kept in
-  :data:`REFUSED_PARTS` with their reasons and refused by :func:`instantiate`;
+  that is no symbol pin (the PCB compiler's pin/pad rule,
+  :func:`ai_eda.compilers.pins.match_pads`; a mounting pad ``MP`` without an
+  ``MP`` pin is mechanical, not such a pad): ``RF_Switch:SKY13380-350LF``
+  (exposed pad 17 has no pin) is kept in :data:`REFUSED_PARTS` with its
+  reason and refused by :func:`instantiate`. The plain
+  ``Device:R_Potentiometer`` on the RK09K footprint compiles (its ``MP``
+  pads without a net) but stays there by its own recorded reason: the
+  boards ground the pot's mounting pin, which only
+  ``Device:R_Potentiometer_MountingPin`` has;
 * **stacked pins** - library pins at one symbol point, which KiCad connects -
   must share one net (the schematic compiler refuses stacked pins in two
   nets). A row names the functions whose pins the library stacks
@@ -62,7 +68,11 @@ on 2026-09-30 after the microphone row became the through-hole
 ``CUI_CMC-4013-SMT``, whose signal pad 2 lies inside its ring-shaped custom
 pad 1, so no track reaches it on F.Cu without a via in the pad): its pads
 ``1`` / ``2`` are the symbol's pins ``-`` / ``+``, and which terminal is the
-case is UNVERIFIED (the row says so).
+case is UNVERIFIED (the row says so). Since the compilers draw multi-unit
+symbols without common pins, the ``MCP6002-xSN`` row no longer refuses with a
+compiler reason (it stays out by its own recorded reason); since a mounting
+pad ``MP`` without a pin is mechanical, neither does the ``R_Potentiometer``
+row; the ``SKY13380-350LF`` row still does.
 """
 
 from __future__ import annotations
@@ -70,6 +80,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ai_eda.compilers.pins import match_pads
 from ai_eda.ir import Component, LibraryRef, PinElectricalType, Provenance
 from ai_eda.tools.kicad.library import KicadLibrary, LibraryFormatError, LibraryLookupError, SymbolDef
 
@@ -373,11 +384,13 @@ class RefusedPart:
 REFUSED_PARTS: dict[tuple[str, str], RefusedPart] = {
     ("Amplifier_Operational", "MCP6002-xSN"): RefusedPart(
         ("Amplifier_Operational", "MCP6002-xSN"), ("Package_SO", "SOIC-8_3.9x4.9mm_P1.27mm"),
-        "a multi-unit symbol (units [1, 2, 3]): both compilers refuse it (multi-unit symbols are not supported yet)",
+        "the kr447 stages are built on MCP6001-OT singles, one SOT-23-5 and one single-pole SPICE macro per stage (a multi-unit "
+        "symbol without common pins compiles; the table keeps the singles)",
         "two Amplifier_Operational:MCP6001-OT singles on SOT-23-5 (part 'opamp')"),
     ("Device", "R_Potentiometer"): RefusedPart(
         ("Device", "R_Potentiometer"), ("Potentiometer_THT", "Potentiometer_Alps_RK09K_Single_Vertical"),
-        "footprint pad MP is no symbol pin: the PCB compiler refuses an electrical pad without a pin",
+        "the plain symbol has no mounting pin: the footprint's MP pads would be left without a net, and the boards ground "
+        "the pot's mounting pin (rx_audio ties MOUNT to GND)",
         "Device:R_Potentiometer_MountingPin (part 'pot')"),
     ("RF_Switch", "SKY13380-350LF"): RefusedPart(
         ("RF_Switch", "SKY13380-350LF"), ("Package_DFN_QFN", "QFN-16-1EP_3x3mm_P0.5mm_EP1.7x1.7mm"),
@@ -551,19 +564,18 @@ def instantiate(
 
 def check_compilable(ref: str, symbol: SymbolDef, pads, footprint_id: str) -> None:
     """Refuse, with the compilers' own reasons, a symbol / footprint pair the schematic or PCB compiler would refuse."""
-    if symbol.units != [1]:
-        raise TemplateRefusal(f"{ref}: symbol {symbol.lib_id!r} has units {symbol.units}; multi-unit symbols are not supported yet (both compilers refuse it)")
+    if symbol.units != [1] and any(p.unit == 0 for p in symbol.pins):
+        raise TemplateRefusal(f"{ref}: symbol {symbol.lib_id!r} has units {symbol.units} and common (unit 0) pins; "
+                              "multi-unit symbols with common (unit 0) pins are not supported (both compilers refuse it)")
     numbers = [p.number for p in symbol.pins if p.body_style in (0, 1)]
     repeated = sorted({n for n in numbers if numbers.count(n) > 1}, key=_natural)
     if repeated:
         raise TemplateRefusal(f"{ref}: library symbol {symbol.lib_id!r} repeats pin number(s) {repeated} (stacked pins); unsupported - one physical pin per number")
-    pins = set(numbers)
-    pad_numbers = {p.number for p in pads if p.number}
-    electrical = {p.number for p in pads if p.number and p.pad_type != "np_thru_hole"}
-    without_pad = sorted(pins - pad_numbers, key=_natural)
+    match = match_pads(numbers, pads)
+    without_pad = sorted(match.without_pad, key=_natural)
     if without_pad:
         raise TemplateRefusal(f"{ref}: symbol pins {without_pad} of {symbol.lib_id!r} have no pad in footprint {footprint_id} (the PCB compiler refuses it)")
-    extra = sorted(electrical - pins, key=_natural)
+    extra = sorted(match.extra, key=_natural)
     if extra:
         raise TemplateRefusal(f"{ref}: footprint {footprint_id} has pads {extra} that are not pins of {symbol.lib_id!r} (the PCB compiler refuses it)")
 

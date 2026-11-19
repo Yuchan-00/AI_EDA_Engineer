@@ -134,7 +134,7 @@ def test_pcb_vs_bom_and_cpl_compare_rows_with_the_compiled_board(tmp_path: Path)
     Path(pcb.path).write_text(text.replace("(at 14 6 -90)", "(at 15 6 -90)", 1).replace('(property "Value" "10k"', '(property "Value" "47k"', 1), encoding="utf-8")
     pcb.content_hash = pcb.disk_hash()
     r = _review(ir, tmp_path, ReviewArea.PCB_VS_CPL)
-    assert r.status is S.FAIL and r.details["repair"] == "human" and any("position CPL (14.0, 6.0) vs board (15.0, 6.0)" in m for m in r.details["mismatches"])
+    assert r.status is S.FAIL and r.details["repair"] == "human" and any("position CPL (14.0, -6.0) vs board (15.0, -6.0)" in m for m in r.details["mismatches"])  # the Gerbers' frame: Y up
     r = _review(ir, tmp_path, ReviewArea.PCB_VS_BOM)
     assert r.status is S.FAIL and r.details["repair"] == "human" and any("value BOM '10k' vs board '47k'" in m for m in r.details["mismatches"])
 
@@ -238,7 +238,7 @@ def test_symbol_extent_covers_body_pins_stubs_and_labels():
 @needs_libs
 def test_tall_symbols_are_spaced_so_no_connection_points_coincide(tmp_path: Path):
     ir = _tall_headers_ir(tmp_path)
-    node = SchematicCompiler().build(ir, LIB)
+    node = SchematicCompiler("legacy").build(ir, LIB)  # the legacy table's rows on purpose (textbook 1.0 is the default)
     points: list[tuple[str, str]] = []
     for w in sexpr.find_all(node, "wire"):
         points += [(str(xy[1]), str(xy[2])) for xy in sexpr.find_all(sexpr.find(w, "pts"), "xy")]
@@ -664,7 +664,7 @@ def test_net_can_serve_a_requirement():
     assert _review(ir, Path("."), ReviewArea.REQUIREMENTS_VS_IR).status is S.PASS
 
 
-# --------------------------------------------------------------------------- finding 17: absent identity is NOT_VERIFIED, not blank
+# --------------------------------------------------------------------------- finding 17: absent identity is NOT_VERIFIED (its own column, the cell empty)
 
 
 def test_missing_identity_is_not_verified_in_bom_reviewer_and_validator(tmp_path: Path):
@@ -674,7 +674,10 @@ def test_missing_identity_is_not_verified_in_bom_reviewer_and_validator(tmp_path
     ir.components = [r1]
     art = BOMCompiler().compile(ir, CompileContext(workdir=tmp_path))
     row = next(iter(csv.DictReader(open(art.path, newline="", encoding="utf-8"))))
-    assert (row["Manufacturer"], row["MPN"], row["Package"], row["Supplier"], row["SupplierPN"]) == ("NOT_VERIFIED",) * 5
+    # compiler.bom 0.3: no part-number-shaped NOT_VERIFIED in the cells an upload reads; the status column names each one with why
+    assert (row["Manufacturer"], row["MPN"], row["Package"], row["Supplier"], row["SupplierPN"], row["DatasheetHash"]) == ("",) * 6
+    assert row["Unverified"] == ("Manufacturer (not stated); MPN (not stated); Package (not stated); Supplier (not stated); "
+                                 "SupplierPN (not stated); DatasheetHash (no MPN)")
     r = _review(ir, tmp_path, ReviewArea.COMPONENT_PROVENANCE)
     assert r.status is S.NOT_VERIFIED and "R1.mpn[missing]" in r.details["weak"] and r.details["repair"] == "human"
     v = default_registry.get("ir.component_provenance").validate(ir, ValidationContext(workdir=tmp_path))[0]

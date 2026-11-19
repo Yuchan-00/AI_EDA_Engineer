@@ -1,6 +1,9 @@
+import csv
+import io
 from pathlib import Path
 
 from ai_eda.compilers import BOMCompiler, CPLCompiler, CompileContext
+from ai_eda.compilers.bom import NOT_VERIFIED, UNVERIFIED_COLUMN, unverified_columns
 from ai_eda.ir import ArtifactKind, CircuitIR, ValidationResult, ValidationStatus, llm_generated
 from ai_eda.repair import NON_REPAIRABLE, RepairLoop, RepairStrategy, RepairAction, select_strategy
 from ai_eda.review import IndependentReviewer, ReviewArea
@@ -23,8 +26,12 @@ def test_review_covers_all_14_areas(divider_ir: CircuitIR, tmp_path: Path):
 def test_bom_marks_unverified_identity(divider_ir: CircuitIR, tmp_path: Path):
     divider_ir.components[1].mpn = llm_generated("GUESS", model="m")
     art = BOMCompiler().compile(divider_ir, CompileContext(workdir=tmp_path))
-    text = Path(art.path).read_text()
-    assert "MPN-10k" in text and "NOT_VERIFIED" in text
+    text = Path(art.path).read_text(encoding="utf-8")
+    rows = {r["Reference"]: r for r in csv.DictReader(io.StringIO(text))}
+    # the authoritative MPN prints; the model's guess is an empty cell, and the status column says why (never a placeholder in the cell)
+    assert rows["R1"]["MPN"] == "MPN-10k" and "MPN" not in unverified_columns(rows["R1"])
+    assert rows["R2"]["MPN"] == "" and "MPN (llm_generated)" in rows["R2"][UNVERIFIED_COLUMN]
+    assert "GUESS" not in text and NOT_VERIFIED not in text
     assert art.generated_from_ir_hash == divider_ir.content_hash()
 
 

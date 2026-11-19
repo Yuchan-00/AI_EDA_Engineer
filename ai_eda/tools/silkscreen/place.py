@@ -27,9 +27,18 @@ Keep-outs (board frame, mm, per silk side):
   lines, arcs, circles, polygons, texts - so a reference never covers a
   pin-1 or polarity mark) and every text placed before, each kept
   ``text_gap_mm`` (0.1) away;
-* **not** tracks: silk over mask-covered copper is normal; **not** vias: the
-  compiled board tents every via (``compilers/pcb.py`` ``_setup``: ``(tenting
-  (front yes) (back yes))``), so a via is under solder mask like a track.
+* **not** tracks: silk over mask-covered copper is normal - but a reference
+  prefers a spot clear of the tracks on its side's outer copper (step 1);
+* every via's disc + ``text_gap``, on each outer side its hole reaches (both
+  for a through via). The compiled board tents every via (``compilers/pcb.py``
+  ``_setup``: ``(tenting (front yes) (back yes))``), so the copper is under
+  mask like a track's - but a via is a drilled hole, no silk prints over a
+  hole, and a hole in a designator breaks its glyphs (the 9 V piano board of
+  2026-11-18 had via INM6 inside ``C16``). The silk placer keeps the texts
+  off the vias rather than the router keeping vias off the texts: the router
+  runs first and the texts go where the copper leaves room, so this is the
+  one place that knows both (a design file's kept texts are not moved either
+  way; the ``pcb.silk.*`` checks judge them).
 
 Placement, in this order (each text is a keep-out for the next):
 
@@ -40,16 +49,62 @@ Placement, in this order (each text is a keep-out for the next):
    custom pad with an unread primitive; the pads' box alone without a
    courtyard) - above, below, left at 0 then
    90 degrees, right at 0 then 90 degrees, then the four corners (the box
-   diagonally outside each courtyard corner) - at 1.0 mm (0.15 mm stroke,
-   KiCad's default silk text), then the same ten at 0.8 mm; the first
-   candidate whose estimated box touches no keep-out and stays ``text_gap``
-   clear of every *other* footprint's courtyard on its side (their pads' box
-   without one) wins - a designator inside a neighbour's courtyard reads as
-   the neighbour's. Only when none of the twenty is outside every other
-   courtyard, the first one that merely touches no keep-out wins and the
-   note names the courtyard. A connector that
-   will get pin labels tries the side(s) its labels use (step 2) last, so its
-   own reference does not take their place. None free: the reference goes to
+   diagonally outside each courtyard corner) at 1.0 mm (0.15 mm stroke,
+   KiCad's default silk text) and at 0.8 mm. They are tried horizontal
+   first: the four sides (above, below, left, right) at 1.0 mm, then each of
+   them slid along its side in :data:`OFFSET_STEP_MM` steps (the smaller
+   shift first, as long as the text's centre stays within the body's extent
+   along that side), then the same at 0.8 mm; then the four corners at 1.0
+   and 0.8 mm; and only then the two turned candidates (left and right at 90
+   degrees, also slid) at each size - a turned reference is named in the
+   notes with why no horizontal one was taken. A candidate is taken only
+   when its estimated box touches no keep-out; among those, in this order of
+   preference: (a) one that stays ``text_gap`` clear of every *other*
+   footprint's courtyard on its side (their pads' box without one) - a
+   designator inside a neighbour's courtyard reads as the neighbour's; only
+   when none is, the first one (in the same order) that merely touches no
+   keep-out wins and the note names the courtyard; (b) one not on a pin-label
+   side (below); (c) one that reads as its own part's: every other courtyard
+   at least :data:`OWN_MARGIN_MM` farther from the box than the part's own
+   body (a designator in the gap between two trimmers or two resistor columns,
+   as near the neighbour as its own part, names either - the 9 V piano board of
+   2026-11-18 had ``RV5`` off the corner of ``RV5`` beside ``RV6``); only when
+   none does, the first that does not (the note names the nearer courtyard);
+   (d) one at least :data:`PREFERRED_EDGE_MM` from the board edge (the hard
+   rule stays ``silk_to_edge``; the rev 3 piano board had R18 / R38 0.55 mm
+   from the edge; the note gives the gap of one nearer); (e) the standard
+   size before the smaller one - a turned 1 mm text before a horizontal
+   0.8 mm one: 0.8 mm is the last resort, and the note says why the standard
+   size was not free (the rev 3 board had eight 0.8 mm references where a
+   1 mm one fitted turned); (f) one at least :data:`CLUSTER_GAP_MM` from every
+   other part's reference (two designators closer read as one cluster - the
+   rev 3 board's 'C11' and 'C12' 0.93 mm apart with 'R11' 0.6 mm above them;
+   the note names the nearer one); (g) the horizontal tiers before the turned
+   one, as above - a turned reference says why (its free horizontal spots
+   read as another part's, sit near the edge or another reference, or are not
+   free in every repeat of its cell); (h) a spot whose box touches no track on
+   its side's outer copper before one over a track (the note says when none
+   was clear). **Repeated cells** (since 2026-11-19): pack regions
+   (``ir.pcb.pack_regions``) of two parts or more whose parts are the same
+   footprints at the same rotation and side, one region a translation of the
+   other (within 1 um), are repeats of one cell - the rev 3 board's eight voice
+   columns, whose references were placed differently in each (RV2/3/6/7/8
+   above, RV1/RV4 right, RV5 left; C11/C16 right and the other C1x left). The
+   parts at one cell position are placed together, at one candidate (the same
+   offset from every body): the first in the order above that is free in
+   every repeat - a repeat's preference counts as met when it is met in every
+   repeat (a candidate is ranked by how many repeats miss each preference),
+   and the texts of the repeats keep ``text_gap`` from each other. The notes
+   give the spot of every cell position and, where most repeats alone would
+   have taken another spot, which repeats it was not free at and what blocked
+   it (a design file's text, a via, a pad: what a designer may move). Where no
+   candidate is free in every repeat, the one free in the most repeats is
+   theirs and the others are placed one by one, named in the notes. A
+   connector with pin labels is in no cell. A connector that
+   will get pin labels tries the side(s) its labels use (step 2) last - after
+   every other spot, turned ones included -, so its own reference does not
+   take their place; a part that will get a polarity mark (step 2b) tries the
+   side its mark takes first last, for the same reason. None free: the reference goes to
    ``F.Fab`` / ``B.Fab`` at the courtyard centre (KiCad's convention for a
    reference that does not fit: on the fab drawing, not on the silk) and the
    note names it.
@@ -63,7 +118,26 @@ Placement, in this order (each text is a keep-out for the next):
    pads of a single row all on the one side where more labels fit (a tie: the
    side facing the board centre). A label that collides is skipped and named
    in the note - never overlapped. A net name that is not printable ASCII is
-   skipped too (the text-box estimate assumes Latin glyphs).
+   skipped too (the text-box estimate assumes Latin glyphs). A pad whose net
+   name a kept text (a template's or design file's, below) already prints for
+   that part - its ``component_ref`` is the part, its text the net name, as a
+   design file labels a test point - gets no second label: the pad is left
+   out of the part's labels (a part with none left places its reference as
+   any other part) and the note names it.
+2b. **Polarity marks**: a two-pin part whose symbol names its pins ``A`` and
+   ``K`` (a diode, an LED) gets a ``K`` beside the pad of its ``K`` pin, one
+   whose symbol names them ``+`` and ``-`` a ``+`` beside the ``+`` pad - the
+   pin names are the library symbol's, never a recollection, and the pin's
+   number must be a pad of the footprint (else the part is named in the
+   notes). A footprint whose own silk already carries the mark as a text gets
+   none. Its body's graphics are no evidence: a "flat" on an LED outline is a
+   KiCad drawing convention the part may lack (the TLLR4400's collar is a
+   full circle, Vishay doc. 83029 p.7). The mark is 0.8 mm, outside the pad's
+   keep-out, on the side away from the part's other pads first, then the two
+   sides across, then the side toward them, and outside every other
+   courtyard - the first such spot clear of the tracks on the side's outer
+   copper, else the first over a track (its note says so); a mark that finds
+   no free spot is left out and named in the notes, never overlapped. It is a ``pin_label`` text of its part.
 3. **Title**: ``ir.project.name`` (printable ASCII only; other characters
    dropped with a note - KiCad's stroke font is used and the estimate assumes
    Latin glyphs), 1.5 mm, in the board corner with the most room for it (the
@@ -81,8 +155,13 @@ Placement, in this order (each text is a keep-out for the next):
 placed (a keyboard's note names, a title: ``keep``, the ``user`` / ``title``
 texts the PCB agent recognises as a template's or a design file's; the notes
 name which, ``kept_by``). They stay exactly where they were put, ahead of
-the placed texts in :attr:`SilkPlacement.texts`, and each is a keep-out (its
-estimated box + ``text_gap``) for every text placed here, before step 1;
+the placed texts in :attr:`SilkPlacement.texts`, and each is a keep-out for
+every text placed here, before step 1: its estimated box grown by one
+character of it (:data:`KEPT_TEXT_GAP_CHARS` x its size x the estimate's
+width factor, at least ``text_gap``) - a placed text closer than that reads
+as one word with it (the 9 V piano board's pin label ``GND`` 0.35 mm after
+the design text ``SPK`` read ``SPKGND``), so such a label is skipped and
+named in the notes;
 when one of them is a ``title`` text, step 3 places no second title. A kept
 text the compiler would refuse (:func:`~ai_eda.tools.silkscreen.geometry.silk_text_problems`)
 or of another kind is refused (:class:`CompileError`). Whether the kept
@@ -107,13 +186,15 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from ai_eda.compilers.schematic import datasheet_field
 from ai_eda.compilers.schematic_layout import natural_ref_key
 from ai_eda.errors import CompileError
-from ai_eda.ir import BoardSide, CircuitIR, Component, Placement, Provenance, ProvenanceKind, SilkKind, SilkText
+from ai_eda.ir import BoardSide, CircuitIR, Component, Placement, Provenance, ProvenanceKind, SilkKind, SilkText, straight_pieces
 from ai_eda.tools.kicad.geometry import _q, courtyard_bbox, pad_copper_center, pads_bbox
 from ai_eda.tools.kicad.library import BBox, FootprintDef, KicadLibrary, LibraryLookupError
 from ai_eda.tools.silkscreen.geometry import (
     CONVEX_PAD_SHAPES,
+    TEXT_WIDTH_FACTOR,
     Box,
     Shape,
     footprint_silk,
@@ -155,6 +236,41 @@ REFERENCE_CANDIDATES: tuple[tuple[str, float], ...] = (
     ("above", 0.0), ("below", 0.0), ("left", 0.0), ("left", 90.0), ("right", 0.0), ("right", 90.0),
     ("top-left", 0.0), ("top-right", 0.0), ("bottom-left", 0.0), ("bottom-right", 0.0),
 )
+#: the horizontal reference candidates beside a side of the body - above, below, left, right (indices into
+#: :data:`REFERENCE_CANDIDATES`) -, each also slid along its side: tried first, at every size
+SIDE_CANDIDATES: tuple[int, ...] = tuple(i for i, (name, rot) in enumerate(REFERENCE_CANDIDATES) if rot == 0.0 and "-" not in name)
+#: the horizontal candidates diagonally off a corner of the body: next (a corner text sits as near another part's corner)
+CORNER_CANDIDATES: tuple[int, ...] = tuple(i for i, (name, rot) in enumerate(REFERENCE_CANDIDATES) if rot == 0.0 and "-" in name)
+#: the reference candidates turned by 90 degrees (each slid along its side too): only when no horizontal one is free
+ROTATED_CANDIDATES: tuple[int, ...] = tuple(i for i, (_name, rot) in enumerate(REFERENCE_CANDIDATES) if rot != 0.0)
+#: the step by which the above / below / left / right candidates are slid along the side they face (module docstring, step 1)
+OFFSET_STEP_MM = 0.25
+#: a reference reads as its own part's when every other footprint's courtyard is at least this much farther from its box than its
+#: own body is (module docstring, step 1): a designator as near a neighbour as its own part - in the gap between two trimmers, between
+#: two resistor columns - names either
+OWN_MARGIN_MM = 0.5
+#: how the notes say a reference was turned because its free horizontal spots read as another part's
+OWNED_TURN = "every free horizontal position reads as another part's"
+#: a reference prefers a box this far from the board edge (module docstring, step 1) - a preference over the hard ``silk_to_edge``
+#: (0.3 mm, the margin ``pcb.silk.clearance`` holds every silk item to): a designator printed at the very edge of the board reads
+#: badly and is the first thing a depanelled edge chips; where no free spot keeps it, the nearest one is taken and named in the notes
+PREFERRED_EDGE_MM = 1.0
+#: a reference prefers a box this far from every other part's reference (module docstring, step 1): two designators closer than
+#: about a character's width (1 mm text: 0.9 mm) read as one cluster ("C11 C12" between two bodies) and neither as its own part's
+CLUSTER_GAP_MM = 1.0
+#: how the notes say a reference was turned, or kept at a smaller size, for the other preferences of step 1
+EDGE_TURN = f"every free horizontal position at its size is within {PREFERRED_EDGE_MM:g} mm of the board edge"
+CLUSTER_TURN = f"every free horizontal position at its size is within {CLUSTER_GAP_MM:g} mm of another part's reference"
+COMMON_TURN = "no horizontal position is free in every repeat of its cell"
+OWNED_SMALL = "every free spot at the standard size reads as another part's"
+EDGE_SMALL = f"every free spot at the standard size is within {PREFERRED_EDGE_MM:g} mm of the board edge"
+COMMON_SMALL = "no spot at the standard size is free in every repeat of its cell"
+#: the gap a placed text keeps from a kept (template or design file) text, in characters of the kept text: one character's width of
+#: the text-box estimate (size x :data:`~ai_eda.tools.silkscreen.geometry.TEXT_WIDTH_FACTOR`), so the two never read as one word
+KEPT_TEXT_GAP_CHARS = 1.0
+#: the polarity mark a two-pin part gets: a diode / LED (symbol pins named ``A`` and ``K``) a ``K`` beside its cathode pad, a polarized
+#: part whose symbol names its pins ``+`` and ``-`` a ``+`` beside its positive pad - ``(the two pin names, the marked pin, the mark)``
+POLARITY_MARKS: tuple[tuple[frozenset[str], str, str], ...] = ((frozenset({"A", "K"}), "K", "K"), (frozenset({"+", "-"}), "+", "+"))
 #: the title corners, in the order that breaks a tie
 CORNERS: tuple[str, ...] = ("top-left", "top-right", "bottom-left", "bottom-right")
 #: symbol libraries whose parts get pin labels
@@ -165,6 +281,14 @@ KEEPOUT_NOTE = (
     "keep-outs: pad copper + silk_to_pad, the outline inset by silk_to_edge, footprint silk graphics / texts and placed texts + gap; "
     "tracks are not keep-outs (silk over mask-covered copper is normal), vias are tented; estimated text box "
     "(characters x size x 0.9 + stroke by size x 1.2 + stroke), not KiCad's font metrics; KiCad DRC decides silk_over_copper / silk_overlap"
+)
+#: what every text placed on a board with copper (tracks or vias) adds to :data:`KEEPOUT_NOTE`
+COPPER_NOTE = (
+    "every via's disc + gap is a keep-out too (a tented via is still a drilled hole, and a hole inside a designator breaks its glyphs); a "
+    "reference prefers a spot that reads as its own part's (every other courtyard at least 0.5 mm farther than its own body), then one "
+    "1 mm from the board edge, then the 1 mm size to 0.8 mm, then one 1 mm from every other part's reference, then a "
+    "horizontal spot (each side, slid along it, then the corners) to a turned one, and a spot clear of the tracks to one over a track; "
+    "the repeats of a cell take one spot"
 )
 
 
@@ -197,8 +321,25 @@ class SilkPlacement:
     references_on_fab: list[str] = field(default_factory=list)
     #: references on the silk only beside another footprint's courtyard (no candidate outside every other courtyard): "J2: within ..."
     references_in_courtyard: list[str] = field(default_factory=list)
+    #: references turned by 90 degrees because no horizontal position was free: "RV4 (why the first horizontal one was not taken)"
+    references_rotated: list[str] = field(default_factory=list)
+    #: references placed as near another part's courtyard as their own (no free spot read as their own part's): "R1: as near ..."
+    references_ambiguous: list[str] = field(default_factory=list)
+    #: references nearer the board edge than PREFERRED_EDGE_MM (no free spot kept it): "R38: 0.48 mm"
+    references_near_edge: list[str] = field(default_factory=list)
+    #: references within CLUSTER_GAP_MM of another part's reference (no free spot kept clear): "C12: the reference of C11"
+    references_clustered: list[str] = field(default_factory=list)
+    #: references below the standard (first) size, with why: "R23 (no position is free at 1 mm ...)"
+    references_reduced: list[str] = field(default_factory=list)
+    #: one line per repeated cell position (module docstring, step 1): its references, the common spot, what kept another one
+    cells: list[str] = field(default_factory=list)
+    #: polarity marks placed beside a part's cathode / positive pad ("D1.1 K"), and the ones left out with why
+    marks_placed: list[str] = field(default_factory=list)
+    marks_skipped: list[tuple[str, str]] = field(default_factory=list)
     labels_placed: list[str] = field(default_factory=list)  # "J1.1 VIN"
     labels_skipped: list[tuple[str, str]] = field(default_factory=list)  # ("J1.3 VOUT", why)
+    #: pads whose net name a kept text already prints for the part (step 2): "TP1.1 VOUT"
+    labels_on_kept: list[str] = field(default_factory=list)
     title: str | None = None
     title_corner: str | None = None  # "at the top-left corner" / "on the bottom edge, 5 mm from the bottom-left corner"
     notes: list[str] = field(default_factory=list)
@@ -242,6 +383,10 @@ def is_named_net(name: str) -> bool:
 
 def _r(v: float) -> float:
     return _q(round(v, COORD_DECIMALS))
+
+
+def _r_xy(xy: tuple[float, float]) -> tuple[float, float]:
+    return _r(xy[0]), _r(xy[1])
 
 
 def _r_toward(v: float, *, up: bool) -> float:
@@ -297,6 +442,11 @@ class _Board:
         self.outline: Box = (o.origin_x_mm, o.origin_y_mm, o.origin_x_mm + o.width_mm, o.origin_y_mm + o.height_mm)
         e = params.silk_to_edge_mm
         self.inset: Box = (self.outline[0] + e, self.outline[1] + e, self.outline[2] - e, self.outline[3] - e)
+        f = max(PREFERRED_EDGE_MM, e)
+        #: what a reference prefers to stay inside (PREFERRED_EDGE_MM)
+        self.preferred: Box = (self.outline[0] + f, self.outline[1] + f, self.outline[2] - f, self.outline[3] - f)
+        #: per side, the references placed so far: ``(ref, box shape, bbox)`` (a reference prefers to keep CLUSTER_GAP_MM from them)
+        self.references: dict[str, list[tuple[str, Shape, Box]]] = {"F": [], "B": []}
         self.params = params
         self.obstacles: dict[str, list[_Obstacle]] = {"F": [], "B": []}
         self.parts: list[tuple[Component, FootprintDef, Placement, BBox]] = []
@@ -334,30 +484,81 @@ class _Board:
                     shape, label = pad.shape, f"pad {pad.label}"
                 for side in sorted(pad.sides):
                     self._add(side, label, shape, params.silk_to_pad_mm)
-            values = {"Value": comp.value, "Datasheet": (comp.datasheet.url or "") if comp.datasheet is not None else ""}
+            values = {"Value": comp.value, "Datasheet": datasheet_field(comp)}  # the text the footprint carries (pcb.py)
             for item in footprint_silk(comp.ref, fp, placement, values).items:
                 if item.shape is None:
                     raise CompileError(f"{item.label} of footprint {fp.lib_id}: {item.why}; its silk cannot be kept clear")
                 self._add("B" if item.layer.startswith("B.") else "F", f"silk {item.label}", item.shape, params.text_gap_mm)
+        # the routed copper (module docstring): every via's disc is a keep-out on each outer side it reaches, every
+        # track on an outer layer is what a reference prefers to stay clear of
+        self.copper = bool(pcb.vias or pcb.tracks)
+        for via in pcb.vias:
+            disc = Shape(((via.x_mm, via.y_mm),), via.diameter_mm / 2.0)
+            for side in _via_sides(via):
+                self._add(side, f"the via of {via.net} at ({via.x_mm:g}, {via.y_mm:g})", disc, params.text_gap_mm)
+        #: per side, the tracks on that side's outer copper as capsules (a reference prefers a spot clear of them)
+        self.tracks: dict[str, list[tuple[Shape, Box, str]]] = {"F": [], "B": []}
+        for piece in straight_pieces(pcb.tracks):
+            side = {"F.Cu": "F", "B.Cu": "B"}.get(piece.layer)
+            if side is not None:
+                capsule = Shape((piece.start, piece.end), float(piece.width_mm) / 2.0)
+                self.tracks[side].append((capsule, capsule.bbox(), piece.net))
 
     def _add(self, side: str, label: str, shape: Shape, margin: float) -> None:
         self.obstacles[side].append(_Obstacle(label, shape, shape.bbox(), margin))
 
-    def add_text(self, side: str, label: str, shape: Shape) -> None:
-        self._add(side, f"text {label}", shape, self.params.text_gap_mm)
+    def add_text(self, side: str, label: str, shape: Shape, margin: float | None = None) -> None:
+        self._add(side, f"text {label}", shape, self.params.text_gap_mm if margin is None else margin)
 
-    def blocked(self, shape: Shape, side: str, extra: list[_Obstacle] | None = None) -> str | None:
-        """Why ``shape`` cannot go on ``side`` (the first collision, in a fixed order), or ``None`` when it is free."""
+    def on_track(self, shape: Shape, side: str, pool: list[tuple[Shape, Box, str]] | None = None) -> str | None:
+        """The net of the first track on ``side``'s outer copper that ``shape`` touches, or ``None``; ``pool``, when given, stands in for
+        the side's tracks (those near an area holding the shape)."""
+        x1, y1, x2, y2 = shape.bbox()
+        for capsule, b, net in (self.tracks[side] if pool is None else pool):
+            if x1 > b[2] or b[0] > x2 or y1 > b[3] or b[1] > y2:
+                continue
+            if shape_distance(shape, capsule) <= 0.0:
+                return net
+        return None
+
+    def near(self, side: str, area: Box) -> list[_Obstacle]:
+        """The keep-outs on ``side`` (in their order) whose box, grown by their margin, meets ``area``: all that a shape inside ``area``
+        can touch."""
+        return [ob for ob in self.obstacles[side]
+                if not (ob.box[0] - ob.margin > area[2] or area[0] > ob.box[2] + ob.margin or ob.box[1] - ob.margin > area[3] or area[1] > ob.box[3] + ob.margin)]
+
+    def clustered(self, shape: Shape, side: str, ref: str) -> str | None:
+        """``the reference of X`` for the first placed reference of another part within CLUSTER_GAP_MM of ``shape``, or ``None``."""
+        x1, y1, x2, y2 = shape.bbox()
+        g = CLUSTER_GAP_MM
+        for other, other_shape, b in self.references[side]:
+            if other == ref or x1 - g > b[2] or b[0] - g > x2 or y1 - g > b[3] or b[1] - g > y2:
+                continue
+            if shape_distance(shape, other_shape) < g - 1e-9:
+                return f"the reference of {other}"
+        return None
+
+    def blocked(self, shape: Shape, side: str, extra: list[_Obstacle] | None = None, pool: list[_Obstacle] | None = None) -> str | None:
+        """Why ``shape`` cannot go on ``side`` (the first collision, in a fixed order), or ``None`` when it is free; ``pool``, when
+        given, stands in for the side's keep-outs (those of :meth:`near` an area holding the shape)."""
         if not inside_box(shape, self.inset):
             return f"within {self.params.silk_to_edge_mm:g} mm of the board edge"
         x1, y1, x2, y2 = shape.bbox()
-        for ob in [*self.obstacles[side], *(extra or [])]:
+        for ob in [*(self.obstacles[side] if pool is None else pool), *(extra or [])]:
             b, m = ob.box, ob.margin
             if x1 - m > b[2] or b[0] - m > x2 or y1 - m > b[3] or b[1] - m > y2:
                 continue
             if shape_distance(shape, ob.shape) < _q(m):
                 return f"within {m:g} mm of {ob.label}"
         return None
+
+
+def _via_sides(via) -> list[str]:
+    """The silk sides a via's hole reaches: both for a through via, the outer side(s) of a typed via's span."""
+    if via.kind is None:
+        return ["F", "B"]
+    top, bottom = via.layers[0], via.layers[-1]
+    return [side for side, layer in (("F", "F.Cu"), ("B", "B.Cu")) if layer in (top, bottom)]
 
 
 # --------------------------------------------------------------------------- the placer
@@ -438,68 +639,433 @@ def _connector_pads(comp: Component, fp: FootprintDef, placement: Placement, bod
     return _ConnectorPads(pads, vertical_row, toward_centre, fixed, centre_line)
 
 
-def _place_references(board: _Board, out: SilkPlacement, connectors: dict[str, _ConnectorPads]) -> None:
-    p = board.params
-    for comp, fp, placement, body in board.parts:
-        side = "B" if placement.side == BoardSide.BOTTOM else "F"
-        mirrored = side == "B"
-        label_sides = connectors[comp.ref].label_sides() if comp.ref in connectors else set()
-        others = [ob for ref, ob in board.courtyards[side] if ref != comp.ref]
-        tried = 0
-        found: tuple[int, str, float, float, float, float, float, Shape, str | None] | None = None
-        # first a spot outside every other footprint's courtyard (a designator there reads as that part's); only when none of the
-        # candidates at any size has one, the first spot that is merely free of the keep-outs
-        for strict in (True, False):
-            tried = 0
-            for size in p.reference_sizes_mm:
-                thickness = stroke_for(size)
-                w, h = text_extent(comp.ref, size, thickness)
-                candidates = _reference_candidates(body, w, h, p.text_gap_mm)
-                candidates = [c for c in candidates if c[1] not in label_sides] + [c for c in candidates if c[1] in label_sides]
-                for index, name, x, y, rot in candidates:
-                    tried += 1
-                    shape = text_box(comp.ref, x, y, rot, size, thickness, "center", mirrored=mirrored)
-                    if board.blocked(shape, side) is not None:
-                        continue
-                    crowded = board.blocked(shape, side, others) if others else None
-                    if strict and crowded is not None:
-                        continue
-                    found = (index, name, x, y, rot, size, thickness, shape, crowded)
-                    break
-                if found is not None:
-                    break
-            if found is not None:
-                break
-        if found is not None:
-            index, name, x, y, rot, size, thickness, shape, crowded = found
-            where = f"reference beside the courtyard of {comp.ref} ({name}, candidate {index} of {len(REFERENCE_CANDIDATES)} at {size:g} mm)"
-            if crowded is not None:
-                where += f"; {crowded}: no candidate outside every other footprint's courtyard"
-                out.references_in_courtyard.append(f"{comp.ref}: {crowded}")
-            out.texts.append(SilkText(
-                text=comp.ref, x_mm=x, y_mm=y, rotation_deg=rot, layer=f"{side}.SilkS", size_mm=size, thickness_mm=thickness,
-                justify="center", kind=SilkKind.REFERENCE, component_ref=comp.ref,
-                provenance=_provenance(
-                    [f"component:{comp.ref}", f"footprint:{fp.lib_id}", f"placement:{placement.x_mm:g},{placement.y_mm:g},{placement.rotation_deg:g},{placement.side}",
-                     f"candidate:{index}:{name}@{rot:g}", f"size_mm:{size:g}"],
-                    where, p,
-                ),
-            ))
-            board.add_text(side, comp.ref, shape)
-            out.references_on_silk.append(comp.ref)
+def _nearer_part(shape: Shape, own: Shape, others: list[_Obstacle]) -> str | None:
+    """The label of the first other courtyard (in ``others``' order) less than :data:`OWN_MARGIN_MM` farther from ``shape`` than the
+    part's own body ``own`` - the text would read as that part's as much as its own -, or ``None`` when it reads as its own part's."""
+    reach = shape_distance(shape, own) + OWN_MARGIN_MM
+    x1, y1, x2, y2 = shape.bbox()
+    for ob in others:
+        b = ob.box
+        if x1 - reach > b[2] or b[0] - reach > x2 or y1 - reach > b[3] or b[1] - reach > y2:
             continue
+        if shape_distance(shape, ob.shape) < reach - 1e-9:
+            return ob.label
+    return None
+
+
+def _shifted(body: BBox, candidates: list[tuple[int, str, float, float, float]],
+             indices: tuple[int, ...]) -> list[tuple[int, str, float, float, float, float, float]]:
+    """``(index, name, x, y, rotation, dx, dy)``: first the candidates ``indices`` as they are, then each ``above`` / ``below`` one slid
+    along X and each ``left`` / ``right`` one slid along Y by :data:`OFFSET_STEP_MM` steps, the smaller shift first and the negative
+    one before the positive one, as long as the text still faces the side of the body it names (its centre within the body's extent
+    along that side); the corners are not slid."""
+    out = [(i, name, x, y, rot, 0.0, 0.0) for i, name, x, y, rot in candidates if i in indices]
+    slides: list[tuple[float, int, int, int, str, float, float, float, float, float]] = []
+    for i, name, x, y, rot in candidates:
+        if i not in indices or name not in ("above", "below", "left", "right"):
+            continue
+        along_x = name in ("above", "below")
+        reach = (body.x2 - body.x1) / 2.0 if along_x else (body.y2 - body.y1) / 2.0
+        k = 1
+        while k * OFFSET_STEP_MM <= reach + 1e-9:
+            for sign in (-1.0, 1.0):
+                d = sign * k * OFFSET_STEP_MM
+                dx, dy = (d, 0.0) if along_x else (0.0, d)
+                slides.append((k * OFFSET_STEP_MM, indices.index(i), 0 if sign < 0 else 1, i, name, _r(x + dx), _r(y + dy), rot, dx, dy))
+            k += 1
+    slides.sort(key=lambda t: t[:3])
+    out += [(i, name, x, y, rot, dx, dy) for _d, _o, _s, i, name, x, y, rot, dx, dy in slides]
+    return out
+
+
+@dataclass(slots=True)
+class _Verdict:
+    """What one candidate of one reference meets on the board as it stands (each measured once)."""
+
+    shape: Shape
+    blocked: str | None  # a keep-out it touches: not free
+    crowded: str | None  # another footprint's courtyard it comes within text_gap of
+    nearer: str | None  # another courtyard less than OWN_MARGIN_MM farther than its own body
+    edge: bool  # within PREFERRED_EDGE_MM of the board edge
+    cluster: str | None  # another part's reference within CLUSTER_GAP_MM
+    track: str | None  # the net of a track on its side's outer copper under it
+
+
+class _RefSearch:
+    """The reference candidates of one part, in a fixed order, each judged once against the board as it stands (module docstring,
+    step 1). A candidate's id - ``(on a pin-label side, tier, size index, position in its list)`` - is the same for every part with the
+    same footprint, rotation, side and pin-label sides, so the repeats of a cell are judged at the same relative spot."""
+
+    def __init__(self, board: _Board, comp: Component, fp: FootprintDef, placement: Placement, body: BBox, label_sides: set[str]) -> None:
+        p = board.params
+        self.board, self.comp, self.fp, self.placement, self.body = board, comp, fp, placement, body
+        self.side = "B" if placement.side == BoardSide.BOTTOM else "F"
+        self.mirrored = self.side == "B"
+        self.others = [ob for ref, ob in board.courtyards[self.side] if ref != comp.ref]
+        self.own = Shape(((body.x1, body.y1), (body.x2, body.y1), (body.x2, body.y2), (body.x1, body.y2)))
+        self.cands: list[tuple[tuple[bool, int, int, int], float, float, tuple]] = []
+        reach = 0.0
+        for on_labels in (False, True):
+            if on_labels and not label_sides:
+                break
+            for tier, indices in enumerate((SIDE_CANDIDATES, CORNER_CANDIDATES, ROTATED_CANDIDATES)):
+                for k, size in enumerate(p.reference_sizes_mm):
+                    thickness = stroke_for(size)
+                    w, h = text_extent(comp.ref, size, thickness)
+                    reach = max(reach, w, h)
+                    listed = [c for c in _shifted(body, _reference_candidates(body, w, h, p.text_gap_mm), indices) if (c[1] in label_sides) == on_labels]
+                    self.cands += [((on_labels, tier, k, pos), size, thickness, c) for pos, c in enumerate(listed)]
+        self.index = {cid: i for i, (cid, *_rest) in enumerate(self.cands)}
+        # what can touch a candidate: every candidate lies within the body grown by the widest text and the gap
+        grow = reach + 2.0 * p.text_gap_mm + max(p.silk_to_pad_mm, p.text_gap_mm, CLUSTER_GAP_MM) + 0.01
+        self.area: Box = (body.x1 - grow, body.y1 - grow, body.x2 + grow, body.y2 + grow)
+        self.pool = board.near(self.side, self.area)
+        a = self.area
+        self.tracks = [t for t in board.tracks[self.side] if not (t[1][0] > a[2] or a[0] > t[1][2] or t[1][1] > a[3] or a[1] > t[1][3])]
+        # a candidate's box is a gap from its body, so a courtyard that can be as near it as the body (+ OWN_MARGIN_MM) lies in the area
+        self.others = [ob for ob in self.others if not (ob.box[0] > a[2] or a[0] > ob.box[2] or ob.box[1] > a[3] or a[1] > ob.box[3])]
+        self._seen: dict[int, _Verdict] = {}
+
+    def judge(self, i: int) -> _Verdict:
+        if i not in self._seen:
+            _cid, size, thickness, cand = self.cands[i]
+            _index, _name, x, y, rot, _dx, _dy = cand
+            board, side = self.board, self.side
+            shape = text_box(self.comp.ref, x, y, rot, size, thickness, "center", mirrored=self.mirrored)
+            blocked = board.blocked(shape, side, pool=self.pool)
+            crowded = nearer = cluster = track = None
+            edge = False
+            if blocked is None:
+                crowded = board.blocked(shape, side, self.others, pool=[]) if self.others else None
+                nearer = _nearer_part(shape, self.own, self.others)
+                edge = not inside_box(shape, board.preferred)
+                cluster = board.clustered(shape, side, self.comp.ref)
+                track = board.on_track(shape, side, pool=self.tracks)
+            self._seen[i] = _Verdict(shape, blocked, crowded, nearer, edge, cluster, track)
+        return self._seen[i]
+
+
+def _joint(searches: list[_RefSearch], cid: tuple[bool, int, int, int], gap: float) -> tuple[tuple, list[_Verdict], list[str | None]] | None:
+    """``(key, verdicts, sibling clusters)`` of the candidate ``cid`` taken by every part of ``searches`` at once, or ``None`` when it is
+    not free for one of them (a keep-out, or the text of another of them). The key orders the candidates (module docstring, step 1):
+    the number of parts whose text is in another courtyard, on a pin-label side, as near another part as its own, near the edge, the
+    size, the number near another reference, the tier, the number over a track, the position."""
+    verdicts: list[_Verdict] = []
+    for s in searches:
+        i = s.index.get(cid)
+        if i is None:
+            return None
+        v = s.judge(i)
+        if v.blocked is not None:
+            return None
+        verdicts.append(v)
+    siblings: list[str | None] = [None] * len(searches)
+    for a in range(len(searches)):
+        ba = verdicts[a].shape.bbox()
+        for b in range(a + 1, len(searches)):
+            bb = verdicts[b].shape.bbox()
+            if ba[0] - CLUSTER_GAP_MM > bb[2] or bb[0] - CLUSTER_GAP_MM > ba[2] or ba[1] - CLUSTER_GAP_MM > bb[3] or bb[1] - CLUSTER_GAP_MM > ba[3]:
+                continue
+            d = shape_distance(verdicts[a].shape, verdicts[b].shape)
+            if d < _q(gap):
+                return None
+            if d < CLUSTER_GAP_MM - 1e-9:
+                siblings[a] = siblings[a] or f"the reference of {searches[b].comp.ref}"
+                siblings[b] = siblings[b] or f"the reference of {searches[a].comp.ref}"
+    on_labels, tier, k, pos = cid
+    key = (
+        sum(v.crowded is not None for v in verdicts), on_labels, sum(v.nearer is not None for v in verdicts), sum(v.edge for v in verdicts),
+        k, sum(v.cluster is not None or c is not None for v, c in zip(verdicts, siblings)), tier, sum(v.track is not None for v in verdicts), pos,
+    )
+    return key, verdicts, siblings
+
+
+def _best(searches: list[_RefSearch], gap: float) -> tuple[tuple, tuple, list[_Verdict], list[str | None]] | None:
+    """``(cid, key, verdicts, sibling clusters)`` of the candidate with the smallest key free for every part of ``searches``."""
+    best = None
+    for cid, *_rest in searches[0].cands:
+        got = _joint(searches, cid, gap)
+        if got is not None and (best is None or got[0] < best[1]):
+            best = (cid, *got)
+    return best
+
+
+def _why(s: _RefSearch, cid: tuple[bool, int, int, int], *, turned: bool, common: bool) -> str:
+    """Why ``s`` took the turned (``turned``) or reduced candidate ``cid`` instead of a horizontal one at its size / a 1 mm one: the
+    first such spot (not on a pin-label side) that was free, outside every other courtyard, and what it met."""
+    p = s.board.params
+    _on, _tier, k, _pos = cid
+    first: _Verdict | None = None
+    for i, (other, size, _thickness, cand) in enumerate(s.cands):
+        o_on, o_tier, o_k, _o_pos = other
+        if o_on or (turned and (o_tier == 2 or o_k != k)) or (not turned and o_k != 0):
+            continue
+        v = s.judge(i)
+        if first is None:
+            first = v
+        if v.blocked is not None or v.crowded is not None:
+            continue
+        spot = f"the first, {cand[1]} at {size:g} mm"
+        if v.nearer is not None:
+            what = OWNED_TURN if turned else OWNED_SMALL
+            return f"{what} ({spot}, is as near {v.nearer} as its own body)"
+        if v.edge:
+            return f"{EDGE_TURN if turned else EDGE_SMALL} ({spot})"
+        if turned and v.cluster is not None:
+            return f"{CLUSTER_TURN} ({spot}, is within {CLUSTER_GAP_MM:g} mm of {v.cluster})"
+        if common:
+            return COMMON_TURN if turned else COMMON_SMALL
+    size0 = p.reference_sizes_mm[k if turned else 0]
+    reason = (first.blocked or first.crowded) if first is not None else None
+    head = f"no horizontal position is free at {size0:g} mm" if turned else f"no position is free at {size0:g} mm"
+    return f"{head} (the first, above: {reason})" if reason else head
+
+
+def _repeated_cells(ir: CircuitIR, board: _Board, connectors: dict[str, _ConnectorPads]) -> dict[str, tuple[tuple[str, ...], str]]:
+    """``ref -> (the refs at its position in every repeat, natural order; the regions)``: the repeated cells of the board (module
+    docstring, step 1) - pack regions (``ir.pcb.pack_regions``) of two parts or more whose parts are the same footprints at the same
+    rotation and side in the same arrangement, one region a translation of the other (within 1 um); a connector that gets pin labels is
+    left out (its labels decide its reference's sides)."""
+    pcb = ir.pcb
+    parts = {comp.ref: (fp.lib_id, placement) for comp, fp, placement, _body in board.parts}
+
+    def sig(ref: str) -> tuple:
+        lib_id, pl = parts[ref]
+        return lib_id, round(pl.rotation_deg % 360.0, 6), pl.side.value
+
+    regions = [r for r in (pcb.pack_regions if pcb is not None else []) if len(r.refs) >= 2 and all(ref in parts for ref in r.refs)]
+    classes: list[tuple[list[str], list[tuple[str, dict[str, str]]]]] = []  # (representative's refs, [(region id, rep ref -> ref)])
+    for region in regions:
+        refs = sorted(region.refs, key=lambda ref: (sig(ref), parts[ref][1].x_mm, parts[ref][1].y_mm))
+        for rep, members in classes:
+            mapping = _translate(rep, refs, parts, sig)
+            if mapping is not None:
+                members.append((region.id, mapping))
+                break
+        else:
+            classes.append((refs, [(region.id, {ref: ref for ref in refs})]))
+    out: dict[str, tuple[tuple[str, ...], str]] = {}
+    for rep, members in classes:
+        if len(members) < 2:
+            continue
+        where = "pack regions " + ", ".join(rid for rid, _m in members)
+        for ref in rep:
+            group = tuple(sorted((m[ref] for _rid, m in members), key=natural_ref_key))
+            if any(r in connectors for r in group):
+                continue
+            for r in group:
+                out[r] = (group, where)
+    return out
+
+
+def _translate(rep: list[str], refs: list[str], parts: dict, sig) -> dict[str, str] | None:
+    """``rep ref -> ref`` when ``refs`` is ``rep`` moved by one translation (the same signatures, every part within 1 um), else ``None``."""
+    if len(rep) != len(refs) or sorted(sig(r) for r in rep) != sorted(sig(r) for r in refs):
+        return None
+    a = parts[rep[0]][1]
+    for anchor in refs:
+        if sig(anchor) != sig(rep[0]):
+            continue
+        b = parts[anchor][1]
+        tx, ty = b.x_mm - a.x_mm, b.y_mm - a.y_mm
+        mapping: dict[str, str] = {}
+        free = set(refs)
+        for r in rep:
+            pr = parts[r][1]
+            hit = next((q for q in refs if q in free and sig(q) == sig(r)
+                        and abs(parts[q][1].x_mm - pr.x_mm - tx) <= 1e-3 and abs(parts[q][1].y_mm - pr.y_mm - ty) <= 1e-3), None)
+            if hit is None:
+                break
+            mapping[r] = hit
+            free.discard(hit)
+        else:
+            return mapping
+    return None
+
+
+def _place_references(ir: CircuitIR, board: _Board, out: SilkPlacement, connectors: dict[str, _ConnectorPads]) -> None:
+    p = board.params
+    cells = _repeated_cells(ir, board, connectors)
+    by_ref = {part[0].ref: part for part in board.parts}
+    done: set[str] = set()
+
+    def search(ref: str) -> _RefSearch:
+        comp, fp, placement, body = by_ref[ref]
+        label_sides = connectors[ref].label_sides() if ref in connectors else _mark_sides(comp, fp, placement, body)
+        return _RefSearch(board, comp, fp, placement, body, label_sides)
+
+    for comp, _fp, _placement, _body in board.parts:
+        if comp.ref in done:
+            continue
+        group, where = cells.get(comp.ref, ((comp.ref,), ""))
+        done.update(group)
+        if len(group) == 1:
+            s = search(comp.ref)
+            _put(s, _best([s], p.text_gap_mm), out, cell=None)
+            continue
+        searches = [search(ref) for ref in group]
+        found = _best(searches, p.text_gap_mm)
+        alone: list[_RefSearch] = []
+        if found is None:
+            # no spot free in every repeat: the spot free in the most of them (the first such, in candidate order) is theirs, the
+            # others are placed one by one
+            counts = []
+            for cid, *_rest in searches[0].cands:
+                free = [s for s in searches if s.index.get(cid) is not None and s.judge(s.index[cid]).blocked is None]
+                counts.append((len(free), cid, free))
+            most = max((c[0] for c in counts), default=0)
+            subset = next((free for n, _cid, free in counts if n == most), []) if most >= 2 else []
+            found = _best(subset, p.text_gap_mm) if subset else None
+            while found is None and len(subset) > 2:  # their texts collide with each other at that spot: fewer of them
+                subset = subset[:-1]
+                found = _best(subset, p.text_gap_mm)
+            if found is None:
+                subset = []
+            alone = [s for s in searches if s not in subset]
+            searches = subset
+        refs = [s.comp.ref for s in searches]
+        if searches:
+            cid, _key, verdicts, siblings = found
+            name = searches[0].cands[searches[0].index[cid]][3][1]
+            line = (f"{_stem(refs)} ({', '.join(refs)}, {where}): {name}"
+                    f"{' turned' if cid[1] == 2 else ''} at {p.reference_sizes_mm[cid[2]]:g} mm in every repeat")
+            note = _blocked_spot(searches, cid)
+            if note:
+                line += f"; {note}"
+            if alone:
+                line += f"; placed one by one (no spot is free in every repeat): {', '.join(s.comp.ref for s in alone)}"
+            out.cells.append(line)
+            for s, v, sib in zip(searches, verdicts, siblings):
+                _put(s, (cid, None, [v], [sib]), out, cell=(refs, where))
+        elif alone:
+            out.cells.append(f"{_stem([s.comp.ref for s in alone])} ({', '.join(s.comp.ref for s in alone)}, {where}): no spot is free in "
+                             "two repeats or more: placed one by one")
+        for s in alone:
+            s = search(s.comp.ref)  # against the texts placed since
+            _put(s, _best([s], p.text_gap_mm), out, cell=None)
+
+
+def _stem(refs: list[str]) -> str:
+    """``R11`` ... ``R18`` -> ``R1x``: what the references of a cell position have in common, for naming it."""
+    head = refs[0]
+    for ref in refs[1:]:
+        while not ref.startswith(head):
+            head = head[:-1]
+    return f"{head}x"
+
+
+def _blocked_spot(searches: list[_RefSearch], cid: tuple) -> str:
+    """When the common spot is not the one most repeats would take alone, which repeats that one is not free at and why (a design's
+    text, a via, a pad), so a designer can free it."""
+    alone = []
+    for s in searches:
+        got = _best([s], s.board.params.text_gap_mm)
+        if got is not None:
+            alone.append(got[0])
+    if not alone:
+        return ""
+    preferred = max(set(alone), key=lambda c: (alone.count(c), [-x for x in (c[0], c[1], c[2], c[3])]))
+    if preferred == cid:
+        return ""
+    misses, worse = [], []
+    for s in searches:
+        i = s.index.get(preferred)
+        v = s.judge(i) if i is not None else None
+        if v is None or v.blocked is not None:
+            misses.append(f"{s.comp.ref} ({v.blocked if v is not None else 'no such spot'})")
+            continue
+        issues = [what for what, bad in (
+            (f"in {v.crowded}", v.crowded), (f"as near {v.nearer} as its own body", v.nearer),
+            (f"within {PREFERRED_EDGE_MM:g} mm of the board edge", v.edge), (f"within {CLUSTER_GAP_MM:g} mm of {v.cluster}", v.cluster),
+            (f"over a track of {v.track}", v.track)) if bad]
+        if issues:
+            worse.append(f"{s.comp.ref} ({', '.join(issues)})")
+    name = searches[0].cands[searches[0].index[preferred]][3][1] + (" turned" if preferred[1] == 2 else "")
+    size = searches[0].cands[searches[0].index[preferred]][1]
+    head = f"{name} at {size:g} mm, which {alone.count(preferred)} of {len(searches)} repeats would take alone,"
+    if misses:
+        return f"{head} is not free at " + "; ".join(misses)
+    if worse:
+        return f"{head} is " + "; ".join(worse)
+    return f"{head} is not free for all of them at once (their texts would meet)"
+
+
+def _put(s: _RefSearch, found: tuple | None, out: SilkPlacement, cell: tuple[list[str], str] | None) -> None:
+    """Write the reference of ``s`` at the candidate ``found`` (``(cid, key, [verdict], [sibling cluster])``), or on the fab layer when
+    ``found`` is ``None``, and record it (the notes, the lists of :class:`SilkPlacement`)."""
+    board, comp, fp, placement, body = s.board, s.comp, s.fp, s.placement, s.body
+    p, side = board.params, s.side
+    if found is None:
         cx, cy = _r((body.x1 + body.x2) / 2.0), _r((body.y1 + body.y2) / 2.0)
         size = p.reference_sizes_mm[0]
+        tried = len(REFERENCE_CANDIDATES) * len(p.reference_sizes_mm)
         out.texts.append(SilkText(
             text=comp.ref, x_mm=cx, y_mm=cy, rotation_deg=0.0, layer=f"{side}.Fab", size_mm=size, thickness_mm=stroke_for(size),
             justify="center", kind=SilkKind.REFERENCE, component_ref=comp.ref,
             provenance=_provenance(
                 [f"component:{comp.ref}", f"footprint:{fp.lib_id}", f"placement:{placement.x_mm:g},{placement.y_mm:g},{placement.rotation_deg:g},{placement.side}",
                  f"candidates_tried:{tried}"],
-                f"no free silk position for {comp.ref} among {tried} candidate(s): the reference is on the fab layer at the courtyard centre (hidden on the silk)", p,
+                f"no free silk position for {comp.ref} among {tried} candidate(s) (nor any of them slid along its side): the reference is "
+                "on the fab layer at the courtyard centre (hidden on the silk)", p,
             ),
         ))
         out.references_on_fab.append(comp.ref)
+        return
+    cid, _key, (v,), (sibling,) = found
+    _cid, size, thickness, cand = s.cands[s.index[cid]]
+    index, name, x, y, rot, dx, dy = cand
+    shape, crowded, nearer, track = v.shape, v.crowded, v.nearer, v.track
+    cluster = v.cluster or sibling
+    common = cell is not None
+    where = f"reference beside the courtyard of {comp.ref} ({name}, candidate {index} of {len(REFERENCE_CANDIDATES)} at {size:g} mm)"
+    derived = [f"component:{comp.ref}", f"footprint:{fp.lib_id}", f"placement:{placement.x_mm:g},{placement.y_mm:g},{placement.rotation_deg:g},{placement.side}",
+               f"candidate:{index}:{name}@{rot:g}", f"size_mm:{size:g}"]
+    if dx or dy:
+        where += f", slid by ({dx:g}, {dy:g}) mm along that side"
+        derived.append(f"offset_mm:{dx:g},{dy:g}")
+    if common:
+        refs, regions = cell
+        where += f"; the same spot as every repeat of its cell ({', '.join(refs)}: {regions})"
+        derived.append(f"repeated_cell:{','.join(refs)}")
+    if track is not None:
+        where += f"; over a track of {track} (no spot clear of the tracks among the spots preferred to it)"
+    if nearer is not None and crowded is None:
+        where += f"; as near {nearer} as its own body (no free spot reads as its own part's)"
+        out.references_ambiguous.append(f"{comp.ref}: as near {nearer}")
+    if v.edge:
+        gap = _edge_gap(shape, board)
+        where += f"; {gap:g} mm from the board edge (no free spot keeps {PREFERRED_EDGE_MM:g} mm)"
+        out.references_near_edge.append(f"{comp.ref}: {gap:g} mm")
+    if cluster is not None:
+        where += f"; within {CLUSTER_GAP_MM:g} mm of {cluster} (no free spot keeps clear of the other references)"
+        out.references_clustered.append(f"{comp.ref}: {cluster}")
+    if cid[2] > 0:
+        why_small = _why(s, cid, turned=False, common=common)
+        where += f"; at {size:g} mm, not {p.reference_sizes_mm[0]:g} mm: {why_small}"
+        out.references_reduced.append(f"{comp.ref} ({why_small})")
+    if rot:
+        why_turned = _why(s, cid, turned=True, common=common)
+        where += f"; turned by {rot:g} degrees: {why_turned}"
+        out.references_rotated.append(f"{comp.ref} ({why_turned})")
+    if crowded is not None:
+        where += f"; {crowded}: no candidate outside every other footprint's courtyard"
+        out.references_in_courtyard.append(f"{comp.ref}: {crowded}")
+    note = f"{where}; {COPPER_NOTE}" if board.copper else where
+    out.texts.append(SilkText(
+        text=comp.ref, x_mm=x, y_mm=y, rotation_deg=rot, layer=f"{side}.SilkS", size_mm=size, thickness_mm=thickness,
+        justify="center", kind=SilkKind.REFERENCE, component_ref=comp.ref,
+        provenance=_provenance(derived, note, p),
+    ))
+    board.add_text(side, comp.ref, shape)
+    board.references[side].append((comp.ref, shape, shape.bbox()))
+    out.references_on_silk.append(comp.ref)
+
+
+def _edge_gap(shape: Shape, board: _Board) -> float:
+    """The gap between a text's box and the board edge, mm (rounded to 0.01)."""
+    x1, y1, x2, y2 = shape.bbox()
+    o = board.outline
+    return round(min(x1 - o[0], y1 - o[1], o[2] - x2, o[3] - y2), 2)
 
 
 def _label_spot(body: BBox, pad_xy: tuple[float, float], vertical_row: bool, positive: bool, gap: float, mirrored: bool) -> tuple[float, float, float, str]:
@@ -515,12 +1081,19 @@ def _label_spot(body: BBox, pad_xy: tuple[float, float], vertical_row: bool, pos
     return _r(x), _r(y), rot, justify
 
 
-def _connectors(ir: CircuitIR, board: _Board) -> dict[str, _ConnectorPads]:
+def _connectors(ir: CircuitIR, board: _Board, keep: list[SilkText] | None = None, placement: SilkPlacement | None = None) -> dict[str, _ConnectorPads]:
     pin_net = {(pin.component_ref, pin.pin_number): net.name for net in ir.nets for pin in net.pins}
+    # a pad whose net name a kept text already prints for its part gets no second label (module docstring, step 2)
+    printed = {(t.component_ref, t.text) for t in keep or () if t.component_ref}
+    for (ref, number), net in sorted(pin_net.items()):
+        if (ref, net) in printed:
+            del pin_net[(ref, number)]
+            if placement is not None:
+                placement.labels_on_kept.append(f"{ref}.{number} {net}")
     centre = ((board.outline[0] + board.outline[2]) / 2.0, (board.outline[1] + board.outline[3]) / 2.0)
     out: dict[str, _ConnectorPads] = {}
-    for comp, fp, placement, body in board.parts:
-        found = _connector_pads(comp, fp, placement, body, pin_net, centre)
+    for comp, fp, part_placement, body in board.parts:
+        found = _connector_pads(comp, fp, part_placement, body, pin_net, centre)
         if found is not None:
             out[comp.ref] = found
     return out
@@ -582,6 +1155,123 @@ def _place_pin_labels(board: _Board, out: SilkPlacement, connectors: dict[str, _
             out.texts.append(silk)
             board.add_text(side, label, shape)
             out.labels_placed.append(label)
+
+
+def _polarity_pad(comp: Component, fp: FootprintDef) -> tuple[str, str, str] | str | None:
+    """``(mark, pad number, pin name)`` of a two-pin part whose symbol names its pins ``A`` / ``K`` or ``+`` / ``-`` (:data:`POLARITY_MARKS`),
+    checked against the footprint: the marked pin's number must be a pad of the footprint, and the footprint's own silk must not
+    already carry the mark as a text; ``None`` for any other part (or one with the mark already there), else why it gets none."""
+    names = sorted(pin.name for pin in comp.pins)
+    for pair, pin_name, mark in POLARITY_MARKS:
+        if names != sorted(pair):
+            continue
+        number = next(pin.number for pin in comp.pins if pin.name == pin_name)
+        if not any(pad.number == number for pad in fp.pads):
+            return f"its symbol's pin {pin_name!r} is number {number}, and footprint {fp.lib_id} has no pad {number}"
+        own = {str(node[2]).strip() for node in fp.node if isinstance(node, list) and node and node[0] == "fp_text" and len(node) > 2
+               and "SilkS" in str(next((c[1] for c in node if isinstance(c, list) and c and c[0] == "layer"), ""))}
+        if mark in own:
+            return None
+        return mark, number, pin_name
+    return None
+
+
+def _mark_order(comp: Component, fp: FootprintDef, placement: Placement, body: BBox) -> list[str]:
+    """The sides of the polarity mark's pad in the order step 2b tries them (away from the part's other pads first, then the two
+    across, then toward them); empty for a part that gets no mark or whose mark pad's copper is not known."""
+    got = _polarity_pad(comp, fp)
+    if got is None or isinstance(got, str):
+        return []
+    _mark, number, _pin_name = got
+    coppers = [c for c in pad_copper(comp.ref, fp, placement) if c.number == number and c.shape is not None]
+    rest = [c for c in pad_copper(comp.ref, fp, placement) if c.number != number and c.shape is not None]
+    if not coppers:
+        return []
+    cx = (min(c.shape.bbox()[0] for c in coppers) + max(c.shape.bbox()[2] for c in coppers)) / 2.0
+    cy = (min(c.shape.bbox()[1] for c in coppers) + max(c.shape.bbox()[3] for c in coppers)) / 2.0
+    if rest:
+        ox = sum((c.shape.bbox()[0] + c.shape.bbox()[2]) / 2.0 for c in rest) / len(rest)
+        oy = sum((c.shape.bbox()[1] + c.shape.bbox()[3]) / 2.0 for c in rest) / len(rest)
+    else:
+        ox, oy = (body.x1 + body.x2) / 2.0, (body.y1 + body.y2) / 2.0
+    away_x = "left" if ox >= cx else "right"
+    away_y = "above" if oy >= cy else "below"
+    toward = {"left": "right", "right": "left", "above": "below", "below": "above"}
+    if abs(ox - cx) >= abs(oy - cy):
+        return [away_x, away_y, toward[away_y], toward[away_x]]
+    return [away_y, away_x, toward[away_x], toward[away_y]]
+
+
+def _mark_sides(comp: Component, fp: FootprintDef, placement: Placement, body: BBox) -> set[str]:
+    """The reference candidate side the part's polarity mark (step 2b) takes first: its reference tries that side last, as a
+    connector's reference does its pin labels' sides, so the designator does not take the mark's place (a mark finds no spot
+    once a designator sits beside the pad: the 9 V piano board's D1 lost its K to its own reference, 2026-11-19)."""
+    order = _mark_order(comp, fp, placement, body)
+    return {order[0]} if order else set()
+
+
+def _place_polarity_marks(board: _Board, out: SilkPlacement) -> None:
+    """Step 2b (module docstring): a part whose symbol names its cathode (``K``) or positive (``+``) pin gets that mark beside the pad of
+    that number, outside the pad's keep-out - first on the side away from the part's other pads, then the two sides across, then the
+    side toward them -, at the pin label size, outside every other footprint's courtyard; a mark that finds no free spot is left out
+    and named in the notes, never overlapped."""
+    p = board.params
+    size = p.pin_label_size_mm
+    thickness = stroke_for(size)
+    for comp, fp, placement, body in board.parts:
+        got = _polarity_pad(comp, fp)
+        if got is None:
+            continue
+        if isinstance(got, str):
+            out.marks_skipped.append((comp.ref, got))
+            continue
+        mark, number, pin_name = got
+        side = "B" if placement.side == BoardSide.BOTTOM else "F"
+        mirrored = side == "B"
+        others = [ob for ref, ob in board.courtyards[side] if ref != comp.ref]
+        coppers = [c for c in pad_copper(comp.ref, fp, placement) if c.number == number and c.shape is not None]
+        label = f"{comp.ref}.{number} {mark}"
+        if not coppers:
+            out.marks_skipped.append((label, f"pad {number}'s copper is not known exactly"))
+            continue
+        x1 = min(c.shape.bbox()[0] for c in coppers)
+        y1 = min(c.shape.bbox()[1] for c in coppers)
+        x2 = max(c.shape.bbox()[2] for c in coppers)
+        y2 = max(c.shape.bbox()[3] for c in coppers)
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        w, h = text_extent(mark, size, thickness)
+        reach = p.silk_to_pad_mm + p.text_gap_mm
+        spots = {"left": (x1 - reach - w / 2.0, cy), "right": (x2 + reach + w / 2.0, cy),
+                 "above": (cx, y1 - reach - h / 2.0), "below": (cx, y2 + reach + h / 2.0)}
+        order = _mark_order(comp, fp, placement, body)
+        why = ""
+        placed = False
+        # a spot clear of the tracks on the side's outer copper first, in the same order; then the first free one over a track
+        tried = [(name, *_r_xy(spots[name])) for name in order]
+        free = []
+        for name, x, y in tried:
+            shape = text_box(mark, x, y, 0.0, size, thickness, "center", mirrored=mirrored)
+            why = board.blocked(shape, side) or (board.blocked(shape, side, others) if others else None) or ""
+            if not why:
+                free.append((board.on_track(shape, side) is not None, name, x, y, shape))
+        for over, name, x, y, shape in sorted(free, key=lambda f: f[0])[:1]:
+            out.texts.append(SilkText(
+                text=mark, x_mm=x, y_mm=y, rotation_deg=0.0, layer=f"{side}.SilkS", size_mm=size, thickness_mm=thickness, justify="center",
+                kind=SilkKind.PIN_LABEL, component_ref=comp.ref,
+                provenance=_provenance(
+                    [f"component:{comp.ref}", f"pad:{comp.ref}.{number}", f"pin_name:{pin_name}",
+                     f"symbol:{comp.symbol.library}:{comp.symbol.name}" if comp.symbol is not None else "symbol:-", f"footprint:{fp.lib_id}",
+                     f"side:{name}", f"size_mm:{size:g}"],
+                    f"polarity mark {mark!r} {name} pad {comp.ref}.{number}, the pin the symbol names {pin_name!r}: the part's polarity on the "
+                    "board whatever its body or the footprint's graphics show"
+                    + ("; over a track (no free spot beside the pad is clear of the tracks)" if over else ""), p,
+                ),
+            ))
+            board.add_text(side, label, shape)
+            out.marks_placed.append(label)
+            placed = True
+        if not placed:
+            out.marks_skipped.append((label, f"no free spot beside the pad (the last tried: {why})"))
 
 
 def _place_title(ir: CircuitIR, board: _Board, out: SilkPlacement) -> None:
@@ -676,7 +1366,9 @@ def _kept(ir: CircuitIR, board: _Board, keep: list[SilkText]) -> SilkText | None
                                "references and pin labels itself)")
         if i in problems:
             raise CompileError(f"kept silk text refused: {problems[i]}")
-        board.add_text(side_of_layer(t.layer), f"{t.kind} {t.text!r} (kept)", ir_text_box(t))
+        # a placed text keeps a character's width of this text from it (module docstring, kept texts): never read as one word with it
+        gap = max(board.params.text_gap_mm, KEPT_TEXT_GAP_CHARS * t.size_mm * TEXT_WIDTH_FACTOR)
+        board.add_text(side_of_layer(t.layer), f"{t.kind} {t.text!r} (kept)", ir_text_box(t), gap)
     return next((t for t in keep if t.kind == SilkKind.TITLE), None)
 
 
@@ -711,9 +1403,10 @@ def place_silkscreen(ir: CircuitIR, library: KicadLibrary, params: SilkParams | 
     board = _Board(ir, library, params)
     out = SilkPlacement(texts=[], params=params)
     kept_title = _kept(ir, board, list(keep)) if keep else None
-    connectors = _connectors(ir, board)
-    _place_references(board, out, connectors)
+    connectors = _connectors(ir, board, keep, out)
+    _place_references(ir, board, out, connectors)
     _place_pin_labels(board, out, connectors)
+    _place_polarity_marks(board, out)
     if kept_title is None:
         _place_title(ir, board, out)
     else:
@@ -722,10 +1415,42 @@ def place_silkscreen(ir: CircuitIR, library: KicadLibrary, params: SilkParams | 
     if keep:
         out.kept, out.kept_by = list(keep), kept_by
         out.texts = [*keep, *(_restamped(t, len(keep), kept_by) for t in out.texts)]
+    if out.cells:
+        out.notes.append("silkscreen: repeated cells (pack regions with the same parts in the same arrangement) - one reference spot per "
+                         "cell position, the same in every repeat: " + "; ".join(out.cells))
+    blocked_turns = [r for r in out.references_rotated if r.split(" (", 1)[1].startswith("no horizontal position is free at")]
+    owned_turns = [r for r in out.references_rotated if r.split(" (", 1)[1].startswith(OWNED_TURN)]
+    other_turns = [r for r in out.references_rotated if r not in blocked_turns and r not in owned_turns]
+    if blocked_turns:
+        out.notes.append("silkscreen: reference(s) turned by 90 degrees (no horizontal position free): " + "; ".join(blocked_turns))
+    if owned_turns:
+        out.notes.append("silkscreen: reference(s) turned by 90 degrees (every free horizontal position reads as another part's): "
+                         + "; ".join(owned_turns))
+    if other_turns:
+        out.notes.append("silkscreen: reference(s) turned by 90 degrees (every free horizontal position is near the board edge or another "
+                         "reference, or not free in every repeat of its cell): " + "; ".join(other_turns))
+    if out.references_reduced:
+        out.notes.append(f"silkscreen: reference(s) below {params.reference_sizes_mm[0]:g} mm (the last resort): " + "; ".join(out.references_reduced))
+    if out.references_near_edge:
+        out.notes.append(f"silkscreen: reference(s) nearer the board edge than {PREFERRED_EDGE_MM:g} mm (no free spot farther in): "
+                         + "; ".join(out.references_near_edge))
+    if out.references_clustered:
+        out.notes.append(f"silkscreen: reference(s) within {CLUSTER_GAP_MM:g} mm of another part's reference (no free spot clear of them): "
+                         + "; ".join(out.references_clustered))
+    if out.marks_placed:
+        out.notes.append("silkscreen: polarity mark(s) placed beside the pad the symbol's pin names: " + "; ".join(out.marks_placed))
+    if out.marks_skipped:
+        out.notes.append("silkscreen: polarity mark(s) left out (never overlapped): " + "; ".join(f"{label}: {why}" for label, why in out.marks_skipped))
+    if out.references_ambiguous:
+        out.notes.append("silkscreen: reference(s) as near another part as their own (no free spot reads as their own part's): "
+                         + "; ".join(out.references_ambiguous))
     if out.references_in_courtyard:
         out.notes.append("silkscreen: reference(s) at another footprint's courtyard (no candidate outside every other courtyard): " + "; ".join(out.references_in_courtyard))
     if out.references_on_fab:
         out.notes.append(f"silkscreen: reference(s) on the fab layer (no free silk position): {', '.join(out.references_on_fab)}")
+    if out.labels_on_kept:
+        out.notes.append(f"silkscreen: pin label(s) not placed, the {kept_by}'s text already prints the net name for the part: "
+                         + "; ".join(out.labels_on_kept))
     if out.labels_skipped:
         out.notes.append("silkscreen: pin label(s) skipped (never overlapped): " + "; ".join(f"{label}: {why}" for label, why in out.labels_skipped))
     return out

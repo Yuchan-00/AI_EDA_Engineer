@@ -26,7 +26,9 @@ from ai_eda.tools.manufacturing.csv_cells import TEXT_PREFIX, bom_cell_text, fre
 from ai_eda.workflow import Orchestrator, Stage
 from tests.conftest import AUTH, DS, make_component
 
-HEADER = "Reference,Value,Description,Manufacturer,MPN,Package,Footprint,Supplier,SupplierPN,DatasheetHash,Qty\n"
+HEADER = "Reference,Value,Description,Manufacturer,MPN,Package,Footprint,Supplier,SupplierPN,DatasheetHash,Qty,Unverified\n"
+#: the status of a make_component row (compiler.bom 0.3: those cells are empty): no maker, no supplier, an MPN whose source names no archived copy
+UNVERIFIED = "Manufacturer (not stated); Supplier (not stated); SupplierPN (not stated); DatasheetHash (the MPN's source names no archived copy)"
 ANSWERS = {"application": "test", "jurisdiction": "EU"}
 
 
@@ -65,11 +67,11 @@ def test_value_and_description_formula_cells_are_neutralised_with_exact_bytes(tm
     art = _compile(_ir(tmp_path, make_component("R1", "=1+1"), make_component("R2", "-5V"), r3), tmp_path)
     assert Path(art.path).read_bytes() == (
         HEADER
-        + "R1,'=1+1,resistor,NOT_VERIFIED,MPN-=1+1,0603,Resistor_SMD:R_0603_1608Metric,NOT_VERIFIED,NOT_VERIFIED,NOT_VERIFIED,1\n"
-        + "R2,'-5V,resistor,NOT_VERIFIED,MPN--5V,0603,Resistor_SMD:R_0603_1608Metric,NOT_VERIFIED,NOT_VERIFIED,NOT_VERIFIED,1\n"
-        + "R3,10k,'@cmd,NOT_VERIFIED,MPN-10k,0603,Resistor_SMD:R_0603_1608Metric,NOT_VERIFIED,NOT_VERIFIED,NOT_VERIFIED,1\n"
+        + f"R1,'=1+1,resistor,,MPN-=1+1,0603,Resistor_SMD:R_0603_1608Metric,,,,1,{UNVERIFIED}\n"
+        + f"R2,'-5V,resistor,,MPN--5V,0603,Resistor_SMD:R_0603_1608Metric,,,,1,{UNVERIFIED}\n"
+        + f"R3,10k,'@cmd,,MPN-10k,0603,Resistor_SMD:R_0603_1608Metric,,,,1,{UNVERIFIED}\n"
     ).encode("utf-8")
-    assert art.generator_version == BOMCompiler.version == "0.2" and art.generator == "compiler.bom"
+    assert art.generator_version == BOMCompiler.version == "0.4" and art.generator == "compiler.bom"
     assert len(art.notes) == 3 and [n.split(":", 1)[0] for n in art.notes] == ["R1.Value", "R2.Value", "R3.Description"]
     assert all("apostrophe" in n and "formula character" in n for n in art.notes)
     assert "spreadsheet software reads it as text" not in " ".join(art.notes)  # the note says only what is checked
@@ -102,7 +104,7 @@ def test_plain_cells_carry_no_note_and_bytes_are_unchanged(tmp_path: Path):
     art = _compile(_ir(tmp_path, make_component("R1", "10k")), tmp_path)
     assert art.notes == []
     row = Path(art.path).read_text(encoding="utf-8").splitlines()[1]
-    assert row == "R1,10k,resistor,NOT_VERIFIED,MPN-10k,0603,Resistor_SMD:R_0603_1608Metric,NOT_VERIFIED,NOT_VERIFIED,NOT_VERIFIED,1"
+    assert row == f"R1,10k,resistor,,MPN-10k,0603,Resistor_SMD:R_0603_1608Metric,,,,1,{UNVERIFIED}"
 
 
 def test_neutralisation_is_deterministic_and_hash_neutral(tmp_path: Path):

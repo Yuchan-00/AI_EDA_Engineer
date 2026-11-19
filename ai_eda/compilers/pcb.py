@@ -6,8 +6,12 @@ Invariants enforced here
   disk through :class:`~ai_eda.tools.kicad.library.KicadLibrary` and embedded
   *verbatim* (geometry, ``attr``, graphics, 3D model); pad geometry never comes
   from memory. A footprint that does not resolve, a component without a
-  placement, a net pin without a pad, a pad without an IR pin, an unknown
-  layer or net, or a missing outline is a :class:`~ai_eda.errors.CompileError`.
+  placement, a net pin without a pad, a numbered pad without an IR pin, an
+  unknown layer or net, or a missing outline is a
+  :class:`~ai_eda.errors.CompileError`. A mounting pad ``MP`` of a symbol
+  without an ``MP`` pin and an unnumbered pad are mechanical copper
+  (:func:`~ai_eda.compilers.pins.match_pads`): written without a net, and
+  named in the artifact's notes, one per component.
 * **Deterministic.** Every UUID is a uuid5 from :mod:`ai_eda.compilers.ids`;
   nets are numbered ``0 ""`` then IR nets sorted by name (:func:`net_numbers`);
   footprints follow IR order; the s-expression is written by
@@ -177,7 +181,8 @@ from pathlib import Path
 
 from ai_eda.compilers import ids
 from ai_eda.compilers.base import CompileContext, Compiler, check_finite
-from ai_eda.compilers.pins import load_verified_symbol, pad_pin_types
+from ai_eda.compilers.pins import load_verified_symbol, match_pads, pad_pin_types
+from ai_eda.compilers.schematic import datasheet_field, identity_fields
 from ai_eda.errors import CompileError, NothingToCompileError
 from ai_eda.ir import ArtifactKind, ArtifactRef, BoardSide, CircuitIR, Component, Placement, SilkKind, SilkText, Track, Via, Zone
 from ai_eda.ir.arc import arc_geometry, arc_problem
@@ -270,6 +275,10 @@ MANUFACTURING_RULE_KEYS: dict[str, str] = {
 }
 
 DEFAULT_BOARD_THICKNESS_MM = 1.6
+#: ``pcbplotparams`` ``drillshape`` of every compiled board: 0, no drill marks (KiCad's default is 1, small marks, which a plot with the
+#: board's own params - ``--board-plot-params`` or the plot dialog - flashes at every pad and via of the copper and mask Gerbers;
+#: :meth:`PCBCompiler._setup`)
+DRILL_MARKS = 0
 EDGE_LINE_WIDTH_MM = 0.05
 #: the clearance a zone without its own ``clearance_mm`` is written with, and every zone's minimum thickness (mm): KiCad's zone fill
 #: keeps this far from other nets' copper and drops any web narrower than the minimum thickness (the router's plane web check,
@@ -394,14 +403,18 @@ class PCBCompiler(Compiler):
             # python mode: a model with a wrap serializer (PCBDesign drops an empty silkscreen from the design view) turns
             # NaN / inf into None in JSON mode, which would hide exactly what this check looks for
             check_finite(ir.pcb.model_dump(), "ir.pcb")
-        node = self.build(ir, ctx)
+        node, notes = self.build_with_notes(ir, ctx)
         path = Path(ctx.workdir) / f"{ir.project.id}.kicad_pcb"
-        return self._write(ir, path, sexpr.dumps(node))
+        return self._write(ir, path, sexpr.dumps(node), notes)
 
     # --- tree construction (pure: same IR -> same tree) -------------------------
 
     def build(self, ir: CircuitIR, ctx: CompileContext) -> list:
         """The complete ``(kicad_pcb ...)`` tree for ``ir``; raises CompileError instead of guessing."""
+        return self.build_with_notes(ir, ctx)[0]
+
+    def build_with_notes(self, ir: CircuitIR, ctx: CompileContext) -> tuple[list, list[str]]:
+        """:meth:`build` plus the notes a human reads in ``compile.pcb``: each component's pads left without a net (mechanical)."""
         if ir.pcb is None:
             raise NothingToCompileError("ir.pcb is None: nothing to lay out (the PCB stage needs an outline and placements)")
         if not ir.components:
@@ -413,7 +426,7 @@ class PCBCompiler(Compiler):
             raise CompileError(f"project id {ir.project.id!r} is not usable as a KiCad file stem (it names the board and schematic files)")
         library = self._library(ctx)
         net_numbers(ir)  # validates net names
-        placed = self._resolve_components(ir, library)
+        placed, notes = self._resolve_components(ir, library)
         references = self._silk_references(ir)
         copper = self._copper_layers(ir)
         sheetfile = f"{ir.project.id}.kicad_sch"
@@ -448,7 +461,7 @@ class PCBCompiler(Compiler):
         for i, keepout in enumerate(keepouts_of(ir.pcb)):
             node.extend(self._rule_areas(ir, i, keepout, copper_names, placed))
         node.append(S("embedded_fonts", False))
-        return node
+        return node, notes
 
     # --- keep-outs ---------------------------------------------------------------------
 
@@ -568,7 +581,8 @@ class PCBCompiler(Compiler):
         return lib
 
     @staticmethod
-    def _resolve_components(ir: CircuitIR, library: KicadLibrary) -> list[_Placed]:
+    def _resolve_components(ir: CircuitIR, library: KicadLibrary) -> tuple[list[_Placed], list[str]]:
+        """The placed components in IR order, and the note of each one whose footprint has pads left without a net."""
         assert ir.pcb is not None
         refs = [c.ref for c in ir.components]
         dupes = sorted({r for r in refs if refs.count(r) > 1})
@@ -592,6 +606,7 @@ class PCBCompiler(Compiler):
                     raise CompileError(f"pin {comp.ref}.{pin.pin_number} is on two nets: {pin_nets[key]!r} and {net.name!r}")
                 pin_nets[key] = net.name
         placed: list[_Placed] = []
+        notes: list[str] = []
         for comp in ir.components:
             if comp.footprint is None:
                 raise CompileError(f"component {comp.ref!r} has no footprint; the PCB compiler never picks one")
@@ -605,25 +620,28 @@ class PCBCompiler(Compiler):
             placement = ir.pcb.placement(comp.ref)
             if placement is None:
                 raise CompileError(f"component {comp.ref!r} has no placement in ir.pcb.placements")
-            pad_nets = PCBCompiler._pad_nets(comp, fp, pin_nets)
+            pad_nets, note = PCBCompiler._pad_nets(comp, fp, pin_nets)
+            if note is not None:
+                notes.append(note)
             # pad pin types come from the verified library symbol - the same check the schematic compiler runs
-            symbol = load_verified_symbol(comp, library)
+            symbol = load_verified_symbol(comp, library, multi_unit=True)  # a multi-unit part is one footprint
             pin_types = pad_pin_types(comp, symbol)
             description = comp.description or symbol.properties.get("Description", "")
             placed.append(_Placed(comp, placement, fp, pad_nets, pin_types, description))
-        return placed
+        return placed, notes
 
     @staticmethod
-    def _pad_nets(comp: Component, fp: FootprintDef, pin_nets: dict[tuple[str, str], str]) -> dict[str, str]:
-        """IR pins vs library pads: a mismatch is an error, not a guess."""
+    def _pad_nets(comp: Component, fp: FootprintDef, pin_nets: dict[tuple[str, str], str]) -> tuple[dict[str, str], str | None]:
+        """IR pins vs library pads (:func:`~ai_eda.compilers.pins.match_pads`): a mismatch is an error, not a guess. The pad
+        nets, and the note naming the mechanical pads (mounting pads without a pin, unnumbered pads) left without a net."""
         pad_numbers = {p.number for p in fp.pads if p.number}
-        electrical = {p.number for p in fp.pads if p.number and p.pad_type != "np_thru_hole"}
         ir_pins = {p.number for p in comp.pins}
         fp_id = f"{fp.lib_id}"
-        without_pad = sorted(ir_pins - pad_numbers)
+        match = match_pads(ir_pins, fp.pads)
+        without_pad = sorted(match.without_pad)
         if without_pad:
             raise CompileError(f"{comp.ref!r}: IR pins {without_pad} have no pad in footprint {fp_id} (pads: {sorted(pad_numbers)})")
-        extra = sorted(electrical - ir_pins)
+        extra = sorted(match.extra)
         if extra:
             raise CompileError(f"{comp.ref!r}: footprint {fp_id} has pads {extra} that are not IR pins (pins: {sorted(ir_pins)})")
         pad_nets: dict[str, str] = {}
@@ -633,7 +651,7 @@ class PCBCompiler(Compiler):
             if pin_number not in pad_numbers:
                 raise CompileError(f"net {net_name!r} references {ref}.{pin_number} but footprint {fp_id} has no pad {pin_number!r}")
             pad_nets[pin_number] = net_name
-        return pad_nets
+        return pad_nets, match.note(comp.ref)
 
     @staticmethod
     def _silk_references(ir: CircuitIR) -> dict[str, SilkText]:
@@ -688,7 +706,13 @@ class PCBCompiler(Compiler):
 
         Design rules are *not* here (they live in ``.kicad_pro``, see :func:`design_rules`).
         Vias are tented (mask covers them) and neither filled nor capped; ``pcbplotparams``
-        is the GUI plot dialog state and only matters with ``--board-plot-params``.
+        is the GUI plot dialog state and only matters with ``--board-plot-params`` (or a
+        re-export from KiCad's plot dialog). One value differs from KiCad's default:
+        ``drillshape`` is 0 (no drill marks), not 1 (small marks) - with 1, ``kicad-cli pcb
+        export gerbers --board-plot-params`` flashes a 0.35 mm mark at every pad and via of the
+        copper and mask Gerbers (measured on the 9 V piano board of 2026-11-19: 307 extra lines
+        on F_Cu / B_Cu, 271 on F_Mask / B_Mask), which a fab would read as copper / openings.
+        The pipeline's own Gerbers never read these params (:data:`DRILL_MARKS`).
         """
         return S(
             "setup",
@@ -732,7 +756,7 @@ class PCBCompiler(Compiler):
                 S("subtractmaskfromsilk", False),
                 S("outputformat", 1),
                 S("mirror", False),
-                S("drillshape", 1),
+                S("drillshape", DRILL_MARKS),
                 S("scaleselection", 1),
                 S("outputdirectory", Q("")),
             ),
@@ -985,7 +1009,7 @@ class PCBCompiler(Compiler):
         values = {
             "Reference": comp.ref,
             "Value": comp.value,
-            "Datasheet": (comp.datasheet.url or "") if comp.datasheet is not None else "",
+            "Datasheet": datasheet_field(comp),
             "Description": description,
         }
         out: list[list] = []
@@ -997,10 +1021,13 @@ class PCBCompiler(Compiler):
                 out.append(cls._reference_property(project_id, comp.ref, template, placement, reference))
                 continue
             out.append(cls._property(project_id, comp.ref, key, values[key], template, placement))
+        identity = identity_fields(comp)
         for key, prop in lib_props.items():
-            if key in _STANDARD_PROPERTIES or key in _DROPPED_PROPERTIES:
+            if key in _STANDARD_PROPERTIES or key in _DROPPED_PROPERTIES or key in dict(identity):
                 continue
             out.append(cls._property(project_id, comp.ref, key, str(prop[2]), prop, placement))
+        for key, value in identity:  # the schematic symbol's fields, or KiCad's parity reports them missing
+            out.append(cls._property(project_id, comp.ref, key, value, cls._default_property(key), placement))
         return out
 
     @staticmethod

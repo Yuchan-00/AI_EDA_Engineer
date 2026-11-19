@@ -15,6 +15,17 @@ Invariants this module enforces (CLAUDE.md #1 and #2):
   names, and no timestamp or path is written. The same IR always compiles to
   the same bytes, so ``ArtifactRef.content_hash`` is meaningful and
   "regenerate" is a real repair.
+* **A field states only what the IR states.** ``Manufacturer`` and ``MPN``
+  (hidden) carry the IR's identity when it is authoritative or typed by the
+  user, and are left out otherwise. ``Datasheet`` is the IR's datasheet URL,
+  except where the IR names a part number that link is not shown to belong
+  to: a link that is only the library symbol's own ``Datasheet`` property
+  describes the symbol (one document, often of one maker), not the stated
+  part, so it is written empty unless the MPN was found in that very
+  document; the URL of the document an authoritative MPN was found in is
+  written instead when it has one, and a URL the IR holds from another
+  source (the user's, an archived copy) stays. Nothing is looked up and no
+  URL is made up (:func:`datasheet_field`).
 * **Library truth is embedded verbatim.** ``lib_symbols`` holds the library's
   own ``(symbol ...)`` tree renamed ``"Lib:Name"`` (what KiCad itself embeds);
   kicad-cli compares it with the global library and warns on any deviation.
@@ -79,13 +90,24 @@ a one-pin cell after the design's symbols with its own stub and global label
 and the board, and the artifact note names the nets, because a flag is the
 compiler's statement that the net is powered from outside the sheet.
 
-The opt-in textbook policy (compiler 0.9) is dispatched separately for small
-circuits; see :mod:`ai_eda.compilers.schematic_textbook`. The default legacy
-policy and its output remain version 0.8.
+Layout policy: the default is the textbook layout, version 1.0
+(:mod:`ai_eda.compilers.textbook`), for every design of any size; its last
+fallback rung is this module's table (``_table``) inside a 1.0 artifact, with
+a note. ``layout="legacy"`` (the IR's ``topology.schematic_layout``, then the
+constructor argument, then the ``schematic.layout`` answer) selects the table
+described above, version 0.8, with its bytes unchanged.
 
-What the legacy policy does *not* carry yet: multi-unit symbols, ``power:*`` rail
-symbols (``GND``, ``+5V``), and sheet hierarchy (each refused with
-:class:`CompileError` or simply absent).
+Multi-unit symbols (a dual op-amp): every unit is its own instance - its own
+cell of the table, its own UUID (:func:`~ai_eda.compilers.ids.unit_uuid` for
+all but the lowest unit), ``(unit n)`` and only that unit's pins
+(:func:`~ai_eda.compilers.pins.unit_pins`) - and every unit is always placed
+(KiCad reports a missing unit). The cells follow the part's place in the
+table order, in unit order. A multi-unit symbol with common (unit 0) pins is
+refused (:func:`~ai_eda.compilers.pins.load_verified_symbol`). The textbook
+layout places every unit too.
+
+What the legacy policy does *not* carry yet: ``power:*`` rail symbols (``GND``,
+``+5V``) and sheet hierarchy (simply absent).
 """
 
 from __future__ import annotations
@@ -95,8 +117,8 @@ import re
 from dataclasses import dataclass, replace
 
 from ai_eda.compilers.base import CompileContext, Compiler
-from ai_eda.compilers.ids import net_item_uuid, pin_uuid, sheet_uuid, symbol_uuid
-from ai_eda.compilers.pins import load_verified_symbol, pad_pin_types
+from ai_eda.compilers.ids import net_item_uuid, pin_uuid, sheet_uuid, symbol_uuid, unit_uuid
+from ai_eda.compilers.pins import load_verified_symbol, pad_pin_types, unit_pins
 from ai_eda.compilers.schematic_layout import (
     LAYOUT_MARGIN_CHANNEL_MM,
     LAYOUT_ORIGIN_MM,
@@ -120,9 +142,9 @@ from ai_eda.compilers.schematic_layout import (
 )
 from ai_eda.compilers.schematic_route import MAX_WIRED_PINS, Channels, RoutePin, channel_full, foreign_point_on_wire, route_net
 from ai_eda.errors import CompileError, NothingToCompileError
-from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, Component, LibraryRef, Pin, PinElectricalType, PinRef, Provenance, ProvenanceKind
+from ai_eda.ir import ArtifactKind, ArtifactRef, CircuitIR, Component, LibraryRef, Pin, PinElectricalType, PinRef, Provenance, ProvenanceKind, Traced
 from ai_eda.tools.kicad import sexpr
-from ai_eda.tools.kicad.library import KicadLibrary, SymbolDef, SymbolPin
+from ai_eda.tools.kicad.library import EXCLUDE_FROM_BOM, EXCLUDE_FROM_POS_FILES, KicadLibrary, SymbolDef, SymbolPin, fabrication_exclusions
 from ai_eda.tools.kicad.sexpr import Node, Q, S
 
 __all__ = ["SchematicCompiler", "SCH_FORMAT_VERSION", "GLOBAL_LABEL_SHAPE", "POWER_FLAG"]
@@ -145,6 +167,8 @@ POWER_FLAG = ("power", "PWR_FLAG")
 _FLAG_NEIGHBOURS = frozenset({PinElectricalType.POWER_IN, PinElectricalType.INPUT, PinElectricalType.PASSIVE})
 
 _REF_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*[0-9]+")
+#: a library unit sub-symbol name, ``<name>_<unit>_<body style>``
+_UNIT_NAME_RE = re.compile(r"_(\d+)_(\d+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +189,22 @@ class _PlacedSymbol:
     extent: Extent  # absolute schematic-frame box of body + pins + stubs + labels
     rotation: int = 0
     mirror: str | None = None
+    unit: int = 1  # the library unit this instance draws (1 for a single-unit symbol)
+
+
+def _cell_key(ref: str, unit: int, units: list[int]) -> str:
+    """The key of one placed instance: the ref, or ``ref:unit`` for a unit of a multi-unit symbol."""
+    return ref if len(units) == 1 else f"{ref}:{unit}"
+
+
+def _unit_view(symbol: SymbolDef, unit: int) -> SymbolDef:
+    """``symbol`` as one instance of ``unit`` shows it - that unit's (and the common) graphics and pins - for measuring its
+    cell; a single-unit symbol is returned as it is."""
+    if len(symbol.units) == 1:
+        return symbol
+    node = [item for item in symbol.node
+            if not (sexpr.head(item) == "symbol" and (m := _UNIT_NAME_RE.search(str(item[1]))) and int(m.group(1)) not in (0, unit))]
+    return replace(symbol, node=node, pins=unit_pins(symbol, unit))
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +256,45 @@ class _Sheet:
 def _effects(justify: str | tuple[str, ...] | None = None) -> Node:
     tokens = (justify,) if isinstance(justify, str) else tuple(justify or ())
     return S("effects", S("font", S("size", FONT_SIZE_MM, FONT_SIZE_MM)), S("justify", *tokens) if tokens else None)
+
+
+#: the authority a datasheet reference taken from a KiCad symbol's ``Datasheet`` property is recorded under (followed by
+#: the library's name)
+LIBRARY_AUTHORITY = "KiCad symbol library"
+
+
+def stated(t: Traced | None) -> str | None:
+    """The value of an identity the IR states (authoritative, or typed by the user), else ``None`` - the BOM's rule."""
+    if t is None or t.value in (None, "") or t.provenance.kind not in (ProvenanceKind.AUTHORITATIVE, ProvenanceKind.USER_REQUIREMENT):
+        return None
+    return str(t.value)
+
+
+def identity_fields(c: Component) -> list[tuple[str, str]]:
+    """``Manufacturer`` / ``MPN`` property values the IR states for ``c`` (none for a part it states neither of)."""
+    return [(key, value) for key, value in (("Manufacturer", stated(c.manufacturer)), ("MPN", stated(c.mpn))) if value is not None]
+
+
+def datasheet_field(c: Component) -> str:
+    """The ``Datasheet`` property of ``c`` (the PCB's footprint carries the same, or KiCad's schematic parity reports the
+    difference): its IR datasheet URL, unless the IR states a part number that URL is not shown to belong to (module
+    text). Shown to belong: the MPN is authoritative and was found in a document with a URL (that URL) or in the archived
+    copy of the IR's link, or the IR's link is a source of its own (a URL the user gave). A link recorded as the library
+    symbol's own ``Datasheet`` property (:data:`LIBRARY_AUTHORITY`, the authority :mod:`ai_eda.parts.pointers` records it
+    under) is not. A part without a stated MPN keeps the IR's URL as before."""
+    ds = c.datasheet
+    url = (ds.url if ds is not None and ds.url else "") or ""
+    if stated(c.mpn) is None:
+        return url
+    assert c.mpn is not None
+    source = c.mpn.provenance.source if c.mpn.provenance.kind is ProvenanceKind.AUTHORITATIVE else None
+    if source is not None and source.url:
+        return source.url
+    if ds is None or not url:
+        return url
+    if source is not None and source.content_hash and ds.content_hash == source.content_hash:
+        return url  # the archived copy of this link is the document the MPN was found in
+    return "" if (ds.authority or "").startswith(LIBRARY_AUTHORITY) else url
 
 
 def _property(key: str, value: str, x: float, y: float, rot: float = 0, hide: bool = False, justify: str | tuple[str, ...] | None = None) -> Node:
@@ -302,7 +381,7 @@ class SchematicCompiler(Compiler):
         self.answer_layout = answer_layout
 
     def layout_policy(self, ir: CircuitIR) -> str:
-        policy = (ir.topology.schematic_layout if ir.topology else None) or self.layout or self.answer_layout or "legacy"
+        policy = (ir.topology.schematic_layout if ir.topology else None) or self.layout or self.answer_layout or "textbook"
         if policy not in ("legacy", "textbook"):
             raise CompileError(f"unknown schematic layout {policy!r}; expected legacy or textbook")
         return policy
@@ -317,9 +396,9 @@ class SchematicCompiler(Compiler):
         path = ctx.workdir / f"{ir.project.id}.kicad_sch"
         artifact = self._write(ir, path, sexpr.dumps(node), notes)
         if self.layout_policy(ir) == "textbook":
-            from ai_eda.compilers.schematic_textbook import VERSION, eligible
-            if eligible(ir):
-                artifact.generator_version = VERSION
+            from ai_eda.compilers.textbook import VERSION
+
+            artifact.generator_version = VERSION  # the whole-sheet table rung too: it is a textbook 1.0 artifact with a note
         return artifact
 
     # --- pure tree construction (no I/O besides library reads) --------------------
@@ -330,22 +409,33 @@ class SchematicCompiler(Compiler):
 
     def build_with_notes(self, ir: CircuitIR, library: KicadLibrary) -> tuple[Node, list[str]]:
         """:meth:`build` plus the notes a human should read in ``compile.schematic`` (which nets stayed label-only, and why)."""
+        self._check_ir(ir)
+        if self.layout_policy(ir) == "textbook":
+            from ai_eda.compilers.textbook import build
+
+            result = build(self, ir, library)
+            return result.node, result.notes
+        return self._table(ir, library, f"generated by {self.id} {self.version} from IR project {ir.project.id}")
+
+    @staticmethod
+    def _check_ir(ir: CircuitIR) -> None:
         project_id = ir.project.id
         if not project_id or re.search(r'[\\/:*?"<>|\s]', project_id):
             raise CompileError(f"project id {project_id!r} is not usable as a KiCad file stem")
         if not ir.components:
             # an empty schematic passes ERC with zero violations - that would be evidence about nothing
             raise NothingToCompileError("IR has no components: nothing to draw (the schematic stage needs a component list)")
-        if self.layout_policy(ir) == "textbook":
-            from ai_eda.compilers.schematic_textbook import build, eligible
-            if eligible(ir):
-                return build(self, ir, library)
+
+    def _table(self, ir: CircuitIR, library: KicadLibrary, comment: str) -> tuple[Node, list[str]]:
+        """The legacy 0.8 symbol table (measured cells, stubs and a global label on every pin, gutter wires) with ``comment``
+        as the title block's first comment; also the textbook layout's last fallback rung."""
+        project_id = ir.project.id
         root_uuid = sheet_uuid(project_id)
         drawn, flags, flag_notes = self._power_flags(ir, library)
         components = [*self._ordered(ir, self._checked_components(ir)), *flags]
         pin_nets = self._pin_net_names(drawn)
         placed = self._place(components, library, pin_nets)
-        order = [c.ref for c in components]
+        order = list(placed)  # one cell per unit, in the components' order
         widened = _Widen()
         sheet = self._draw(ir, drawn, placed, order, pin_nets, widened)
         if sheet.blocked and sheet.full:
@@ -367,7 +457,7 @@ class SchematicCompiler(Compiler):
             "lib_symbols",
             *(sym.lib_symbols_entry() for sym in sorted({s.lib_id: s for s in lib_entries}.values(), key=lambda s: s.lib_id)),
         )
-        symbols = [self._symbol_node(project_id, root_uuid, ps) for ps in placed.values()]
+        symbols = [self._symbol_node(project_id, root_uuid, ps, fabrication_exclusions(library, ps.component.footprint)) for ps in placed.values()]
 
         return S(
             "kicad_sch",
@@ -379,7 +469,7 @@ class SchematicCompiler(Compiler):
             S(
                 "title_block",
                 S("title", Q(ir.project.name)),
-                S("comment", 1, Q(f"generated by {self.id} {self.version} from IR project {project_id}")),
+                S("comment", 1, Q(comment)),
                 S("comment", 2, Q(ir.project.description)) if ir.project.description else None,
             ),
             lib_symbols,
@@ -509,27 +599,37 @@ class SchematicCompiler(Compiler):
         self, components: list[Component], library: KicadLibrary, pin_nets: dict[tuple[str, str], str]
     ) -> dict[str, _PlacedSymbol]:
         """Resolve every symbol, measure it, and lay the symbols out on a grid the measurements dictate, in the order of
-        ``components`` (row-major; see ``_ordered``)."""
+        ``components`` (row-major; see ``_ordered``). A multi-unit symbol takes one cell per unit, keyed ``ref:unit``, in
+        unit order at the part's place in the order; each cell is measured on its own unit."""
         resolved: dict[str, SymbolDef] = {}
         extents: dict[str, Extent] = {}
+        cells: list[tuple[str, Component, int]] = []
         for c in components:
-            symbol = load_verified_symbol(c, library)
+            symbol = load_verified_symbol(c, library, multi_unit=True)
             pad_pin_types(c, symbol)  # pin numbers + electrical types must be the library's
-            label_lengths = {p.number: len(pin_nets[(c.ref, p.number)]) for p in symbol.pins if (c.ref, p.number) in pin_nets}
             resolved[c.ref] = symbol
-            extents[c.ref] = symbol_extent(symbol, label_lengths)
-        order = [c.ref for c in components]
+            for unit in symbol.units:
+                key = _cell_key(c.ref, unit, symbol.units)
+                shown = _unit_view(symbol, unit)
+                label_lengths = {p.number: len(pin_nets[(c.ref, p.number)]) for p in shown.pins if (c.ref, p.number) in pin_nets}
+                extents[key] = symbol_extent(shown, label_lengths)
+                cells.append((key, c, unit))
+        order = [key for key, _, _ in cells]
         positions = layout_positions(extents, columns=layout_columns(len(order)), order=order)
         placed: dict[str, _PlacedSymbol] = {}
-        for c in components:
-            x, y = positions[c.ref]
-            placed[c.ref] = _PlacedSymbol(
+        footprints: dict[str, str] = {}
+        for key, c, unit in cells:
+            x, y = positions[key]
+            if c.ref not in footprints:
+                footprints[c.ref] = "" if resolved[c.ref].is_power else self._footprint_id(c, library)  # a power symbol has no footprint
+            placed[key] = _PlacedSymbol(
                 component=c,
                 symbol=resolved[c.ref],
-                footprint_id="" if resolved[c.ref].is_power else self._footprint_id(c, library),  # a power symbol has no footprint
+                footprint_id=footprints[c.ref],
                 x=x,
                 y=y,
-                extent=extents[c.ref].shifted(x, y),
+                extent=extents[key].shifted(x, y),
+                unit=unit,
             )
         return placed
 
@@ -548,9 +648,11 @@ class SchematicCompiler(Compiler):
 
     @staticmethod
     def _pin_map(placed: dict[str, _PlacedSymbol]) -> dict[tuple[str, str], _PlacedPin]:
+        """``(ref, pin) -> placed pin`` over every instance's own pins (a unit instance carries only its unit's pins)."""
         out: dict[tuple[str, str], _PlacedPin] = {}
-        for ref, ps in placed.items():
-            for pin in ps.symbol.pins:
+        for ps in placed.values():
+            ref = ps.component.ref
+            for pin in unit_pins(ps.symbol, ps.unit):
                 if (ref, pin.number) in out:
                     raise CompileError(f"{ref}: library symbol {ps.symbol.lib_id!r} repeats pin number {pin.number!r} (stacked pins); unsupported - one physical pin per number")
                 pos = pin_position(ps.x, ps.y, ps.rotation, ps.mirror, pin)
@@ -577,9 +679,12 @@ class SchematicCompiler(Compiler):
         merge.
         """
         out: dict[tuple[str, str], tuple[str, str]] = {}
-        for ref in sorted(placed, key=natural_ref_key):
+        for name in sorted(placed, key=natural_ref_key):  # per instance: the pins of one unit
+            ps = placed[name]
+            ref = ps.component.ref
+            numbers = {p.number for p in unit_pins(ps.symbol, ps.unit)}
             at: dict[Vec, list[tuple[str, str]]] = {}
-            for key in sorted((k for k in pins if k[0] == ref), key=lambda k: natural_ref_key(k[1])):
+            for key in sorted((k for k in pins if k[0] == ref and k[1] in numbers), key=lambda k: natural_ref_key(k[1])):
                 at.setdefault(pins[key].position, []).append(key)
             for point, keys in at.items():
                 if len(keys) < 2:
@@ -590,11 +695,11 @@ class SchematicCompiler(Compiler):
                     if pin_nets.get(key) != pin_nets.get(first):
                         nets = (pin_nets.get(key), pin_nets.get(first))
                         raise CompileError(
-                            f"{what} (stacked pins of {placed[ref].symbol.lib_id!r}), but the IR puts them in "
+                            f"{what} (stacked pins of {ps.symbol.lib_id!r}), but the IR puts them in "
                             f"{'no net' if nets[0] is None else repr(nets[0])} and {'no net' if nets[1] is None else repr(nets[1])}"
                         )
                     if pins[key].body_dir != pins[first].body_dir:
-                        raise CompileError(f"{what} (stacked pins of {placed[ref].symbol.lib_id!r} pointing in different directions; unsupported)")
+                        raise CompileError(f"{what} (stacked pins of {ps.symbol.lib_id!r} pointing in different directions; unsupported)")
                     out[key] = first
         return out
 
@@ -643,6 +748,7 @@ class SchematicCompiler(Compiler):
     ) -> tuple[list[Node], list[Node], list[Node]]:
         stacked = stacked or {}
         project_id = ir.project.id
+        components = {ps.component.ref: ps.component for ps in placed.values()}  # a multi-unit part has one instance per unit
         names = [n.name for n in ir.nets]
         if len(set(names)) != len(names):
             raise CompileError(f"duplicate net names: {sorted(n for n in set(names) if names.count(n) > 1)}")
@@ -654,7 +760,7 @@ class SchematicCompiler(Compiler):
                 raise CompileError("a net has an empty name")
             for pref in sorted(net.pins, key=lambda p: (natural_ref_key(p.component_ref), natural_ref_key(p.pin_number))):
                 key = (pref.component_ref, pref.pin_number)
-                if pref.component_ref not in placed:
+                if pref.component_ref not in components:
                     raise CompileError(f"net {net.name!r}: unknown component {pref.component_ref!r}")
                 if key not in pins:
                     raise CompileError(f"net {net.name!r}: {pref.component_ref} has no pin {pref.pin_number!r}")
@@ -675,7 +781,7 @@ class SchematicCompiler(Compiler):
             if key in owner:
                 continue
             ref, number = key
-            ir_pin = placed[ref].component.pin(number)
+            ir_pin = components[ref].pin(number)
             if ir_pin is not None and ir_pin.electrical_type is PinElectricalType.NO_CONNECT:
                 if key not in stacked:  # one marker per point: a stacked pin shares its representative's
                     no_connects.append(_no_connect(pins[key].position, net_item_uuid(project_id, "no_connect", ref, number)))
@@ -701,6 +807,7 @@ class SchematicCompiler(Compiler):
         """
         project_id = ir.project.id
         extents = {ref: ps.extent for ref, ps in placed.items()}
+        cell_of = {(ps.component.ref, p.number): key for key, ps in placed.items() for p in unit_pins(ps.symbol, ps.unit)}
         all_points: dict[Vec, str] = {}
         stub_of: dict[tuple[str, str], tuple[Vec, Vec]] = {}  # key -> (stub end, away direction)
         for key, pp in pins.items():
@@ -734,7 +841,7 @@ class SchematicCompiler(Compiler):
             if len(keys) > MAX_WIRED_PINS:
                 skipped.append(f"{net.name} ({len(keys)} pins > {MAX_WIRED_PINS}: labels only)")
                 continue
-            route_pins = [RoutePin(ref=k[0], end=stub_of[k][0], away=stub_of[k][1]) for k in keys]
+            route_pins = [RoutePin(ref=cell_of[k], end=stub_of[k][0], away=stub_of[k][1]) for k in keys]
             own = {stub_of[k][0] for k in keys} | {pins[k].position for k in keys}
             points = {p: what for p, what in all_points.items() if p not in own}
             for seg in segments_so_far:
@@ -784,10 +891,19 @@ class SchematicCompiler(Compiler):
     # --- symbol instance ------------------------------------------------------------
 
     @staticmethod
-    def _symbol_node(project_id: str, root_uuid: str, ps: _PlacedSymbol) -> Node:
+    def _symbol_node(project_id: str, root_uuid: str, ps: _PlacedSymbol, exclusions: frozenset[str] = frozenset()) -> Node:
+        """One symbol instance: ``(unit n)``, the instance UUID (:func:`symbol_uuid` for the lowest unit, which the PCB
+        footprint path points at; :func:`unit_uuid` for the other units of a multi-unit symbol) and the unit's own pins.
+
+        ``exclusions`` (:func:`~ai_eda.tools.kicad.library.fabrication_exclusions` of the part's footprint) sets ``(in_bom no)`` for a
+        footprint excluded from the BOM - the board copies the footprint's ``exclude_from_bom`` and KiCad's schematic parity wants the
+        two to agree (``footprint_symbol_mismatch`` otherwise, kicad-cli 10.0.6) - and writes ``(in_pos_files no)`` for one excluded
+        from position files; every other part is written as before (``in_bom yes``, no ``in_pos_files`` token: KiCad's default yes)."""
         c = ps.component
         x, y = ps.x, ps.y
-        datasheet = (c.datasheet.url if c.datasheet and c.datasheet.url else "") or ""
+        unit = ps.unit
+        uuid = symbol_uuid(project_id, c.ref) if unit == min(ps.symbol.units) else unit_uuid(project_id, c.ref, unit)
+        datasheet = datasheet_field(c)
         description = c.description or ps.symbol.properties.get("Description", "")
         # A part with no SPICE binding (or one excluded from it) has no SPICE meaning in the IR; without
         # this flag kicad-cli's SPICE export writes a placeholder line (`J1 __J1`, exit 0, empty stderr)
@@ -799,17 +915,19 @@ class SchematicCompiler(Compiler):
             S("lib_id", Q(ps.symbol.lib_id)),
             S("at", x, y, ps.rotation),
             S("mirror", ps.mirror) if ps.mirror else None,
-            S("unit", 1),
+            S("unit", unit),
             S("exclude_from_sim", exclude_from_sim),
-            S("in_bom", True),
+            S("in_bom", EXCLUDE_FROM_BOM not in exclusions),
             S("on_board", True),
+            S("in_pos_files", False) if EXCLUDE_FROM_POS_FILES in exclusions else None,
             S("dnp", False),
-            S("uuid", Q(symbol_uuid(project_id, c.ref))),
+            S("uuid", Q(uuid)),
             _field("Reference", c.ref, ps),
             _field("Value", c.value, ps),
             _property("Footprint", ps.footprint_id, x, y, hide=True),
             _property("Datasheet", datasheet, x, y, hide=True),
             _property("Description", description, x, y, hide=True),
-            *(S("pin", Q(pin.number), S("uuid", Q(pin_uuid(project_id, c.ref, pin.number)))) for pin in ps.symbol.pins),
-            S("instances", S("project", Q(project_id), S("path", Q("/" + root_uuid), S("reference", Q(c.ref)), S("unit", 1)))),
+            *(_property(key, value, x, y, hide=True) for key, value in identity_fields(c)),
+            *(S("pin", Q(pin.number), S("uuid", Q(pin_uuid(project_id, c.ref, pin.number)))) for pin in unit_pins(ps.symbol, unit)),
+            S("instances", S("project", Q(project_id), S("path", Q("/" + root_uuid), S("reference", Q(c.ref)), S("unit", unit)))),
         )

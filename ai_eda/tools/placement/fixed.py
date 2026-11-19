@@ -53,6 +53,20 @@ pack regions:
    the extent fits at the cursor, else 90; a part that meets an obstacle
    moves right past it; a row that no part could use moves down past what
    blocked it), so both placers pack by one rule.
+6. **Spread** (opt-in: ``spread=True``, the PCB agent's ``--answer
+   pcb.packing=spread``; the default packs as above, byte for byte). The
+   shelf packer fills a region from its top-left corner and leaves the rest
+   of the rectangle empty. With ``spread`` each region's rows are then spread
+   inside the rectangle: the parts of a row with an even gap before, between
+   and after them across the region's width (one part: centred), then the
+   rows with an even gap above, between and below them across its height.
+   Order within a row and the rows' order are kept; a row that the packer
+   pushed past an obstacle (a gap wider than the spacing between two of its
+   parts) stays as packed, and so does a row or a set of rows whose spread
+   position would touch an obstacle (a fixed part, another region's part, a
+   kept silk text, a keep-out). Fixed parts never move and no part leaves
+   its region (the guard below checks both). A spread part's provenance
+   names the shift (``spread:dx,dy``).
 
 Before returning, the placed extents are re-measured with
 :func:`~ai_eda.tools.kicad.geometry.footprint_bbox` and checked by the RF
@@ -99,6 +113,7 @@ from ai_eda.tools.keepout import allowed_refs, area_bbox, area_points, box_area_
 from ai_eda.tools.kicad.geometry import finite_bbox, footprint_bbox, mirrored_layer
 from ai_eda.tools.kicad.library import BBox, KicadLibrary
 from ai_eda.tools.placement.grid import MARGIN_MM, SPACING_MM, _disjoint, _inside, _resolve, footprint_extent
+from ai_eda.tools.kicad.geometry import _q
 from ai_eda.tools.placement.rf_floorplan import Box, _clip, _grow, _guard, _Obstacles, _pad_layers, _shelf_pack, _touch, rf_blocks
 from ai_eda.tools.silkscreen.geometry import FAB_LAYERS, ir_text_box
 
@@ -138,6 +153,8 @@ class FixedPlacement:
     keepouts: list[str] = field(default_factory=list)
     #: how many silk texts already on the board the packed parts were kept clear of
     texts: int = 0
+    #: step 6 (``spread``): the parts the spreading moved; ``None`` when the regions were packed without it
+    spread: list[str] | None = None
 
     def description(self, origin: str, spacing: float, margin: float) -> str:
         o = self.outline
@@ -151,6 +168,8 @@ class FixedPlacement:
             + f" packed in their list order, {free} part(s) in the free board area in natural ref order; shelf packing by each part's own "
             f"extent around the fixed parts, spacing {spacing} mm, margin {margin} mm"
         )
+        if self.spread is not None:
+            text += f"; parts spread evenly inside their regions (pcb.packing=spread): {len(self.spread)} moved"
         if self.texts:
             text += f"; {self.texts} silk text(s) on the board kept clear"
         if self.keepouts:
@@ -191,11 +210,77 @@ def _keepout_ban(e: BBox, ref: str, side: BoardSide, pad_layers: frozenset[str],
     return None
 
 
-def fixed_placement(ir: CircuitIR, library: KicadLibrary, *, spacing: float = SPACING_MM, margin: float = MARGIN_MM) -> FixedPlacement:
+def _spread(region: list[str], anchors: dict[str, tuple[float, float, float, int]], obstacles: _Obstacles, target: Box, spacing: float,
+            fps: dict, board_layers: list[str]) -> dict[str, tuple[float, float]]:
+    """Step 6 (module docstring): spread one packed region inside ``target``; moves ``anchors`` and the region's boxes in ``obstacles``
+    in place and returns ``ref -> (dx, dy)`` of every part it moved."""
+    mine = {ref: next(i for i, (_b, what) in enumerate(obstacles.boxes) if what == ref) for ref in region}
+
+    def box(ref: str) -> Box:
+        b = obstacles.boxes[mine[ref]][0]
+        return (b[0] + spacing, b[1] + spacing, b[2] - spacing, b[3] - spacing)
+
+    def clear(moves: dict[str, tuple[float, float]]) -> bool:
+        moved = {ref: (box(ref)[0] + dx, box(ref)[1] + dy, box(ref)[2] + dx, box(ref)[3] + dy) for ref, (dx, dy) in moves.items()}
+        if any(b[0] < target[0] - _TOL or b[1] < target[1] - _TOL or b[2] > target[2] + _TOL or b[3] > target[3] + _TOL for b in moved.values()):
+            return False
+        rest = _Obstacles(boxes=[(b, what) for b, what in obstacles.boxes if what not in moves], areas=obstacles.areas)
+        for ref, b in moved.items():
+            if rest.hit(b, ref, _pad_layers(fps[ref], board_layers)) is not None:
+                return False
+            rest.boxes.append((_grow(b, spacing), ref))
+        return True
+
+    def commit(moves: dict[str, tuple[float, float]], shift: dict[str, tuple[float, float]]) -> None:
+        for ref, (dx, dy) in moves.items():
+            x, y, rot, row = anchors[ref]
+            anchors[ref] = (_q(x + dx), _q(y + dy), rot, row)
+            b, what = obstacles.boxes[mine[ref]]
+            obstacles.boxes[mine[ref]] = ((b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy), what)
+            sx, sy = shift.get(ref, (0.0, 0.0))
+            shift[ref] = (_q(sx + dx), _q(sy + dy))
+
+    shift: dict[str, tuple[float, float]] = {}
+    rows: dict[int, list[str]] = {}
+    for ref in region:
+        rows.setdefault(anchors[ref][3], []).append(ref)
+    for row in rows.values():
+        row.sort(key=lambda ref: box(ref)[0])
+        boxes = [box(ref) for ref in row]
+        if any(b[0] - a[2] > spacing + _TOL for a, b in zip(boxes, boxes[1:])):
+            continue  # pushed past an obstacle: stays as packed
+        free = (target[2] - target[0]) - sum(b[2] - b[0] for b in boxes)
+        gap = free / (len(row) + 1)
+        if gap < spacing - _TOL:
+            continue
+        x, moves = target[0] + gap, {}
+        for ref, b in zip(row, boxes):
+            moves[ref] = (x - b[0], 0.0)
+            x += (b[2] - b[0]) + gap
+        if clear(moves):
+            commit(moves, shift)
+    order = sorted(rows, key=lambda r: min(box(ref)[1] for ref in rows[r]))
+    spans = [(min(box(ref)[1] for ref in rows[r]), max(box(ref)[3] for ref in rows[r])) for r in order]
+    if all(b[0] - a[1] <= spacing + _TOL for a, b in zip(spans, spans[1:])):
+        free = (target[3] - target[1]) - sum(hi - lo for lo, hi in spans)
+        gap = free / (len(order) + 1)
+        if gap >= spacing - _TOL:
+            y, moves = target[1] + gap, {}
+            for r, (lo, hi) in zip(order, spans):
+                moves.update({ref: (0.0, y - lo) for ref in rows[r]})
+                y += (hi - lo) + gap
+            if clear(moves):
+                commit(moves, shift)
+    return {ref: d for ref, d in shift.items() if d != (0.0, 0.0)}
+
+
+def fixed_placement(ir: CircuitIR, library: KicadLibrary, *, spacing: float = SPACING_MM, margin: float = MARGIN_MM,
+                    spread: bool = False) -> FixedPlacement:
     """Place every component of ``ir`` around the board's fixed parts and in its pack regions (module docstring); pure.
 
     Reads ``ir.pcb`` (outline, fixed, pack_regions, keepouts, silkscreen);
-    ``ir`` is never modified. Raises :class:`CompileError` for every case the
+    ``ir`` is never modified. ``spread`` spreads each region's parts inside it
+    (module docstring, step 6); without it the parts are packed as before. Raises :class:`CompileError` for every case the
     module docstring lists, naming the parts / region.
     """
     if not spacing > 0 or not margin >= 0:
@@ -282,10 +367,13 @@ def fixed_placement(ir: CircuitIR, library: KicadLibrary, *, spacing: float = SP
     # each region's parts in its list order, around everything placed before (step 3; the shared obstacles keep the spacing between regions)
     anchors: dict[str, tuple[float, float, float, int]] = {}
     region_box: dict[str, Box] = {}
+    shifted: dict[str, tuple[float, float]] = {}
     for r in pcb.pack_regions:
         box = r.box()
         what = f"pack region {r.id} ({box[2] - box[0]:g} x {box[3] - box[1]:g} mm at ({box[0]:g}, {box[1]:g}))"
         anchors.update(_shelf_pack([(ref, fps[ref]) for ref in r.refs], _clip(box, inner_edge), obstacles, spacing, what, board_layers))
+        if spread:  # step 6 (module docstring)
+            shifted.update(_spread(list(r.refs), anchors, obstacles, _clip(box, inner_edge), spacing, fps, board_layers))
         for ref in r.refs:
             region_box[ref] = box
 
@@ -306,8 +394,11 @@ def fixed_placement(ir: CircuitIR, library: KicadLibrary, *, spacing: float = SP
             x, y, rot, row = anchors[ref]
             fp = fps[ref]
             box = region_box.get(ref)
-            p = Placement(component_ref=ref, x_mm=x, y_mm=y, rotation_deg=rot, side=BoardSide.TOP,
-                          provenance=_provenance(fp.lib_id, owner.get(ref, ""), box, row, rot, spacing, margin, fixed_refs))
+            prov = _provenance(fp.lib_id, owner.get(ref, ""), box, row, rot, spacing, margin, fixed_refs)
+            if ref in shifted:
+                prov = prov.model_copy(update={"derived_from": [*prov.derived_from, f"spread:{shifted[ref][0]:g},{shifted[ref][1]:g}"],
+                                               "note": f"{prov.note}; then spread evenly inside its region (pcb.packing=spread)"})
+            p = Placement(component_ref=ref, x_mm=x, y_mm=y, rotation_deg=rot, side=BoardSide.TOP, provenance=prov)
             got = footprint_bbox(p, fp)
             assert got is not None
             placed[ref] = got
@@ -329,4 +420,4 @@ def fixed_placement(ir: CircuitIR, library: KicadLibrary, *, spacing: float = SP
         if hit:
             raise CompileError(f"packed part(s) {hit} lie on the silk text {t.text!r}; refusing the placement")
     return FixedPlacement(outline=outline, placements=placements, extents={ref: placed[ref] for ref in order}, region_of=region_of,
-                          regions=[r.id for r in pcb.pack_regions], keepouts=honoured, texts=len(texts))
+                          regions=[r.id for r in pcb.pack_regions], keepouts=honoured, texts=len(texts), spread=sorted(shifted, key=natural_ref_key) if spread else None)

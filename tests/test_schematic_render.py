@@ -62,6 +62,7 @@ class _TransformedCompiler(SchematicCompiler):
     """The real compiler with every placed symbol given one rotation / mirror; keeps the placement it wrote."""
 
     def __init__(self, rotation: int, mirror: str | None) -> None:
+        super().__init__("legacy")  # the legacy table: ``_place`` is its placer (textbook 1.0, the default, does not call it)
         self.rotation = rotation
         self.mirror = mirror
         self.placed: dict[str, _PlacedSymbol] = {}

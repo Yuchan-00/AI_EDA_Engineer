@@ -58,7 +58,7 @@ from ai_eda.ir import (
     Traced,
 )
 from ai_eda.tools.calc import ngspice_reads, parse_spice_number
-from ai_eda.tools.kicad import KicadCli, KicadLibrary
+from ai_eda.tools.kicad import KicadCli, KicadLibrary, sexpr
 from ai_eda.tools.spice import SpiceAnalysis
 
 DS = SourceRef(title="Generic resistor datasheet", authority="Vendor", content_hash="sha256:abc")
@@ -693,6 +693,18 @@ def bind_fixture(ir: CircuitIR) -> CircuitIR:
     return ir
 
 
+def sim_flags(sch_text: str) -> dict[str, str]:
+    """``exclude_from_sim`` of every placed physical part, by reference. Changed with the default switch (textbook 1.0): the
+    sheet's own ``#PWR`` / ``#FLG`` glyphs and their embedded power symbols are not parts, so they are not counted."""
+    root = sexpr.parse(sch_text)
+    flags = {}
+    for sym in sexpr.find_all(root, "symbol"):
+        ref = next(str(p[2]) for p in sexpr.find_all(sym, "property") if str(p[1]) == "Reference")
+        if not ref.startswith("#"):
+            flags[ref] = str(sexpr.get(sym, "exclude_from_sim"))
+    return flags
+
+
 @needs_kicad
 def test_kicad_cli_spice_export_matches_our_passives(tmp_path: Path):
     from tests.fixtures_kicad import PROJECT_ID, divider_with_connector_ir
@@ -703,9 +715,8 @@ def test_kicad_cli_spice_export_matches_our_passives(tmp_path: Path):
     assert ours == f"{PROJECT_ID}\nR1 VIN VOUT 10k\nR2 VOUT 0 10k\nVVIN VIN 0 DC 12\n.end\n"
     sch = Path(SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path, tools={"kicad_library": lib})).path)
     sch_text = sch.read_text(encoding="utf-8")
-    # the schematic compiler marks the excluded header (and any part without a binding) exclude_from_sim;
-    # the two embedded library symbols (Device:R, Conn_01x03) carry their own `exclude_from_sim no`
-    assert sch_text.count("(exclude_from_sim yes)") == 1 and sch_text.count("(exclude_from_sim no)") == 2 + 2
+    # the schematic compiler marks the excluded header (and any part without a binding) exclude_from_sim
+    assert sim_flags(sch_text) == {"R1": "no", "R2": "no", "J1": "yes"}
     exported = _kicad.export_netlist(sch, tmp_path / "kicad.cir", fmt="spice").read_text(encoding="utf-8")
     got, problems = kicad_passives(exported)
     assert same_passives(got, our_passives(ours)), (got, ours)
@@ -724,7 +735,7 @@ def test_schematic_marks_unbound_parts_exclude_from_sim(tmp_path: Path):
     ir = divider_with_connector_ir(tmp_path, lib)
     ir.component("R2").spice = None
     sch_text = Path(SchematicCompiler().compile(ir, CompileContext(workdir=tmp_path, tools={"kicad_library": lib})).path).read_text(encoding="utf-8")
-    assert sch_text.count("(exclude_from_sim yes)") == 2 and sch_text.count("(exclude_from_sim no)") == 2 + 1  # 2 library symbols + R1
+    assert sim_flags(sch_text) == {"R1": "no", "R2": "yes", "J1": "yes"}
 
 
 def test_net_names_the_runner_would_reject_are_refused_by_the_compiler():

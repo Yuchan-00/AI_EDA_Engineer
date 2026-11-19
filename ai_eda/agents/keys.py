@@ -39,6 +39,9 @@ PROPOSE_REGS_KEY = "propose_regulations"
 #: placement alone: all or nothing)
 PLACEMENT_KEY = "pcb.placement"
 PLACEMENT_POLICY_KEY = "pcb.placement_policy"
+#: PCB agent, a board with pack regions (``placement.fixed``): ``--answer pcb.packing=spread`` spreads each region's parts evenly
+#: inside it; ``left`` (the default) packs them from the region's top-left corner as before
+PACKING_KEY = "pcb.packing"
 ROUTING_KEY = "pcb.routing"
 #: PCB agent: ``--answer pcb.silkscreen=skip`` proposes the board without designed silkscreen (the compiled board keeps
 #: the library's reference positions)
@@ -48,7 +51,7 @@ SILKSCREEN_KEY = "pcb.silkscreen"
 #: pcb.corners=miter45`` mitres them into 45-degree corners (routing.corners 0.1) and ``--answer pcb.corners=orthogonal`` keeps the
 #: router's right-angle grid corners
 CORNERS_KEY = "pcb.corners"
-#: Opt in to compiler 0.9's rail/column layout for small circuits.
+#: The schematic layout policy: "textbook" (the default, layout 1.0) or "legacy" (the 0.8 symbol table).
 SCHEMATIC_LAYOUT_KEY = "schematic.layout"
 
 #: requirement agent: ``--answer leave_out=k1,k2`` leaves the requirements under those keys out of the design (moved into

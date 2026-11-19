@@ -947,8 +947,12 @@ def test_the_microphone_is_the_through_hole_capsule_whose_pads_follow_the_symbol
 @needs_libs
 def test_refused_rows_refuse_with_the_compilers_reasons() -> None:
     reasons = {s[1]: check_refused(_REAL, s) for s in REFUSED_PARTS}
-    assert "multi-unit symbols are not supported" in reasons["MCP6002-xSN"]
-    assert "pads ['MP'] that are not pins" in reasons["R_Potentiometer"]
+    # deliberate change: the compilers draw multi-unit symbols without common (unit 0) pins one instance per unit, so the dual
+    # op-amp is no longer a compiler refusal; it stays out of the table by the table's own recorded reason
+    assert reasons["MCP6002-xSN"] == "" and "MCP6001-OT singles" in REFUSED_PARTS[("Amplifier_Operational", "MCP6002-xSN")].reason
+    # deliberate change: a mounting pad MP of a symbol without an MP pin is mechanical copper (compiled without a net), so the
+    # plain potentiometer is no longer a compiler refusal either; it stays out of the table by the table's own recorded reason
+    assert reasons["R_Potentiometer"] == "" and "ground the pot's mounting pin" in REFUSED_PARTS[("Device", "R_Potentiometer")].reason
     assert "pads ['17'] that are not pins" in reasons["SKY13380-350LF"]
 
 

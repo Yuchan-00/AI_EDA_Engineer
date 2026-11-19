@@ -1,0 +1,1383 @@
+{
+ "amplifier": {
+  "inferred.J1": [
+   {
+    "bridges": {
+     "R2": "U1"
+    },
+    "columns": [
+     [
+      "R2",
+      "U1"
+     ]
+    ],
+    "fields": {
+     "J1": "L",
+     "R1": "T",
+     "R2": "T",
+     "U1": "T"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ],
+     "R1": [
+      90,
+      null
+     ],
+     "R2": [
+      90,
+      null
+     ],
+     "U1": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "R1": 1,
+     "R2": 0,
+     "U1": 1
+    },
+    "slots": [
+     "j:J1",
+     "h:R1",
+     "col:R2"
+    ],
+    "variant": 0
+   }
+  ]
+ },
+ "analog_piano": {
+  "driver": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "Q3",
+      "R13",
+      "R14"
+     ],
+     [
+      "R15",
+      "D1",
+      "Q4"
+     ]
+    ],
+    "fields": {
+     "D1": "L",
+     "J2": "R",
+     "Q3": "R",
+     "Q4": "R",
+     "R12": "T",
+     "R13": "L",
+     "R14": "L",
+     "R15": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "D1": [
+      270,
+      null
+     ],
+     "J2": [
+      0,
+      null
+     ],
+     "Q3": [
+      0,
+      null
+     ],
+     "Q4": [
+      0,
+      null
+     ],
+     "R12": [
+      270,
+      null
+     ],
+     "R13": [
+      180,
+      null
+     ],
+     "R14": [
+      0,
+      null
+     ],
+     "R15": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "D1": 3,
+     "Q3": 2,
+     "Q4": 5,
+     "R12": 2,
+     "R13": 4,
+     "R14": 6,
+     "R15": 1
+    },
+    "slots": [
+     "h:R12",
+     "col:Q3",
+     "col:D1",
+     "j:J2"
+    ],
+    "variant": 1
+   }
+  ],
+  "keyboard": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "SW1"
+     ],
+     [
+      "SW2"
+     ],
+     [
+      "SW3"
+     ],
+     [
+      "SW4"
+     ],
+     [
+      "SW5"
+     ],
+     [
+      "SW6"
+     ],
+     [
+      "SW7"
+     ],
+     [
+      "SW8"
+     ]
+    ],
+    "fields": {
+     "R1": "T",
+     "R2": "T",
+     "R3": "T",
+     "R4": "T",
+     "R5": "T",
+     "R6": "T",
+     "R7": "T",
+     "R8": "T",
+     "SW1": "R",
+     "SW2": "R",
+     "SW3": "R",
+     "SW4": "R",
+     "SW5": "R",
+     "SW6": "R",
+     "SW7": "R",
+     "SW8": "R"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "R1": [
+      90,
+      null
+     ],
+     "R2": [
+      90,
+      null
+     ],
+     "R3": [
+      90,
+      null
+     ],
+     "R4": [
+      90,
+      null
+     ],
+     "R5": [
+      90,
+      null
+     ],
+     "R6": [
+      90,
+      null
+     ],
+     "R7": [
+      90,
+      null
+     ],
+     "R8": [
+      90,
+      null
+     ],
+     "SW1": [
+      90,
+      null
+     ],
+     "SW2": [
+      90,
+      null
+     ],
+     "SW3": [
+      90,
+      null
+     ],
+     "SW4": [
+      90,
+      null
+     ],
+     "SW5": [
+      90,
+      null
+     ],
+     "SW6": [
+      90,
+      null
+     ],
+     "SW7": [
+      90,
+      null
+     ],
+     "SW8": [
+      90,
+      null
+     ]
+    },
+    "rows": {
+     "R1": 2,
+     "R2": 2,
+     "R3": 2,
+     "R4": 2,
+     "R5": 2,
+     "R6": 2,
+     "R7": 2,
+     "R8": 2,
+     "SW1": 1,
+     "SW2": 1,
+     "SW3": 1,
+     "SW4": 1,
+     "SW5": 1,
+     "SW6": 1,
+     "SW7": 1,
+     "SW8": 1
+    },
+    "slots": [
+     "col:SW1",
+     "h:R1",
+     "col:SW2",
+     "h:R2",
+     "col:SW3",
+     "h:R3",
+     "col:SW4",
+     "h:R4",
+     "col:SW5",
+     "h:R5",
+     "col:SW6",
+     "h:R6",
+     "col:SW7",
+     "h:R7",
+     "col:SW8",
+     "h:R8"
+    ],
+    "variant": 0
+   }
+  ],
+  "oscillator": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "R11",
+      "Q2"
+     ],
+     [
+      "R9"
+     ],
+     [
+      "R10",
+      "Q1"
+     ]
+    ],
+    "fields": {
+     "C1": "T",
+     "C2": "T",
+     "Q1": "R",
+     "Q2": "L",
+     "R10": "R",
+     "R11": "L",
+     "R9": "R"
+    },
+    "jogs": [],
+    "mirror": {
+     "C1": "R",
+     "C2": "L",
+     "Q1": "R",
+     "Q2": "L",
+     "R10": "R",
+     "R11": "L"
+    },
+    "orient": {
+     "C1": [
+      270,
+      null
+     ],
+     "C2": [
+      90,
+      null
+     ],
+     "Q1": [
+      0,
+      null
+     ],
+     "Q2": [
+      0,
+      "y"
+     ],
+     "R10": [
+      0,
+      null
+     ],
+     "R11": [
+      0,
+      null
+     ],
+     "R9": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "C1": 2,
+     "C2": 2,
+     "Q1": 3,
+     "Q2": 3,
+     "R10": 1,
+     "R11": 1,
+     "R9": 1
+    },
+    "slots": [
+     "col:Q2",
+     "h:C2",
+     "col:R9",
+     "h:C1",
+     "col:Q1"
+    ],
+    "variant": 0
+   }
+  ],
+  "power": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "SW9"
+     ],
+     [
+      "Q5"
+     ],
+     [
+      "RV1"
+     ]
+    ],
+    "fields": {
+     "J1": "L",
+     "Q5": "L",
+     "RV1": "R",
+     "SW9": "T"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ],
+     "Q5": [
+      0,
+      "y"
+     ],
+     "RV1": [
+      180,
+      null
+     ],
+     "SW9": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "Q5": 1,
+     "RV1": 1,
+     "SW9": 0
+    },
+    "slots": [
+     "j:J1",
+     "col:SW9",
+     "col:Q5",
+     "col:RV1"
+    ],
+    "variant": 0
+   }
+  ]
+ },
+ "astable": {
+  "astable": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "R1",
+      "Q1"
+     ],
+     [
+      "R4"
+     ],
+     [
+      "R3"
+     ],
+     [
+      "R2",
+      "Q2"
+     ]
+    ],
+    "fields": {
+     "C1": "T",
+     "C2": "T",
+     "Q1": "L",
+     "Q2": "R",
+     "R1": "L",
+     "R2": "R",
+     "R3": "R",
+     "R4": "L"
+    },
+    "jogs": [],
+    "mirror": {
+     "C1": "L",
+     "C2": "R",
+     "Q1": "L",
+     "Q2": "R",
+     "R1": "L",
+     "R2": "R",
+     "R3": "R",
+     "R4": "L"
+    },
+    "orient": {
+     "C1": [
+      90,
+      null
+     ],
+     "C2": [
+      270,
+      null
+     ],
+     "Q1": [
+      0,
+      "y"
+     ],
+     "Q2": [
+      0,
+      null
+     ],
+     "R1": [
+      0,
+      null
+     ],
+     "R2": [
+      0,
+      null
+     ],
+     "R3": [
+      0,
+      null
+     ],
+     "R4": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "C1": 2,
+     "C2": 2,
+     "Q1": 3,
+     "Q2": 3,
+     "R1": 1,
+     "R2": 1,
+     "R3": 1,
+     "R4": 1
+    },
+    "slots": [
+     "col:Q1",
+     "h:C1",
+     "col:R4",
+     "col:R3",
+     "h:C2",
+     "col:Q2"
+    ],
+    "variant": 0
+   }
+  ],
+  "inferred.J1": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J1": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J1"
+    ],
+    "variant": 0
+   }
+  ]
+ },
+ "atmega128": {
+  "avcc_filter": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "C6"
+     ]
+    ],
+    "fields": {
+     "C6": "L",
+     "L1": "T"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "C6": [
+      0,
+      null
+     ],
+     "L1": [
+      90,
+      null
+     ]
+    },
+    "rows": {
+     "C6": 1,
+     "L1": 0
+    },
+    "slots": [
+     "h:L1",
+     "col:C6"
+    ],
+    "variant": 1
+   }
+  ],
+  "clock": [],
+  "headers": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J11": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J11": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J11"
+    ],
+    "variant": 0
+   }
+  ],
+  "mcu": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "C4"
+     ],
+     [
+      "C5"
+     ]
+    ],
+    "fields": {
+     "C4": "R",
+     "C5": "R"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "C4": [
+      0,
+      null
+     ],
+     "C5": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "C4": 1,
+     "C5": 1
+    },
+    "slots": [
+     "col:C4",
+     "col:C5"
+    ],
+    "variant": 0
+   }
+  ],
+  "pen": [],
+  "power_input": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "C1"
+     ],
+     [
+      "U2"
+     ],
+     [
+      "C2"
+     ],
+     [
+      "C3"
+     ]
+    ],
+    "fields": {
+     "C1": "L",
+     "C2": "L",
+     "C3": "L",
+     "D1": "T",
+     "J1": "L",
+     "U2": "T"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "C1": [
+      0,
+      null
+     ],
+     "C2": [
+      0,
+      null
+     ],
+     "C3": [
+      0,
+      null
+     ],
+     "D1": [
+      180,
+      null
+     ],
+     "J1": [
+      0,
+      null
+     ],
+     "U2": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "C1": 1,
+     "C2": 1,
+     "C3": 1,
+     "D1": 0,
+     "U2": 0
+    },
+    "slots": [
+     "j:J1",
+     "h:D1",
+     "col:C1",
+     "col:U2",
+     "col:C2",
+     "col:C3"
+    ],
+    "variant": 1
+   }
+  ],
+  "power_led": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "R1",
+      "D2"
+     ]
+    ],
+    "fields": {
+     "D2": "R",
+     "R1": "R"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "D2": [
+      90,
+      null
+     ],
+     "R1": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "D2": 3,
+     "R1": 1
+    },
+    "slots": [
+     "col:D2"
+    ],
+    "variant": 0
+   }
+  ],
+  "reset": []
+ },
+ "bjt_lowside_switch": {
+  "inferred.J1": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J1": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J1"
+    ],
+    "variant": 0
+   }
+  ],
+  "inferred.J2": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J2": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J2": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J2"
+    ],
+    "variant": 0
+   }
+  ],
+  "switch": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "D1",
+      "Q1"
+     ]
+    ],
+    "fields": {
+     "D1": "R",
+     "Q1": "R",
+     "R1": "T"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "D1": [
+      270,
+      null
+     ],
+     "Q1": [
+      0,
+      null
+     ],
+     "R1": [
+      90,
+      null
+     ]
+    },
+    "rows": {
+     "D1": 1,
+     "Q1": 3,
+     "R1": 3
+    },
+    "slots": [
+     "h:R1",
+     "col:D1"
+    ],
+    "variant": 0
+   }
+  ]
+ },
+ "divider": {
+  "divider": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "R1",
+      "R2"
+     ]
+    ],
+    "fields": {
+     "R1": "R",
+     "R2": "R"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "R1": [
+      0,
+      null
+     ],
+     "R2": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "R1": 1,
+     "R2": 3
+    },
+    "slots": [
+     "col:R1"
+    ],
+    "variant": 0
+   }
+  ],
+  "inferred.J1": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J1": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J1"
+    ],
+    "variant": 0
+   }
+  ]
+ },
+ "i2c_pullup": {
+  "inferred.J1": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J1": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J1"
+    ],
+    "variant": 0
+   }
+  ],
+  "pullups": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "R1"
+     ],
+     [
+      "R2"
+     ]
+    ],
+    "fields": {
+     "R1": "R",
+     "R2": "R"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "R1": [
+      0,
+      null
+     ],
+     "R2": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "R1": 1,
+     "R2": 1
+    },
+    "slots": [
+     "col:R1",
+     "col:R2"
+    ],
+    "variant": 0
+   }
+  ]
+ },
+ "lc_lowpass": {
+  "inferred.J1": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J1": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J1"
+    ],
+    "variant": 0
+   }
+  ],
+  "inferred.J2": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J2": "R"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J2": [
+      0,
+      null
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J2"
+    ],
+    "variant": 0
+   }
+  ],
+  "lowpass": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "C1"
+     ],
+     [
+      "R2"
+     ]
+    ],
+    "fields": {
+     "C1": "L",
+     "L1": "T",
+     "R1": "T",
+     "R2": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "C1": [
+      0,
+      null
+     ],
+     "L1": [
+      90,
+      null
+     ],
+     "R1": [
+      90,
+      null
+     ],
+     "R2": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "C1": 1,
+     "L1": 0,
+     "R1": 0,
+     "R2": 1
+    },
+    "slots": [
+     "h:R1",
+     "h:L1",
+     "col:C1",
+     "col:R2"
+    ],
+    "variant": 1
+   }
+  ]
+ },
+ "led": {
+  "inferred.J1": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J1": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J1"
+    ],
+    "variant": 0
+   }
+  ],
+  "led": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "R1",
+      "D1"
+     ]
+    ],
+    "fields": {
+     "D1": "R",
+     "R1": "R"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "D1": [
+      90,
+      null
+     ],
+     "R1": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "D1": 3,
+     "R1": 1
+    },
+    "slots": [
+     "col:D1"
+    ],
+    "variant": 0
+   }
+  ]
+ },
+ "rc_lowpass": {
+  "inferred.J1": [
+   {
+    "bridges": {},
+    "columns": [],
+    "fields": {
+     "J1": "L"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "J1": [
+      0,
+      "y"
+     ]
+    },
+    "rows": {},
+    "slots": [
+     "j:J1"
+    ],
+    "variant": 0
+   }
+  ],
+  "lowpass": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "C1"
+     ]
+    ],
+    "fields": {
+     "C1": "L",
+     "R1": "T"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "C1": [
+      0,
+      null
+     ],
+     "R1": [
+      90,
+      null
+     ]
+    },
+    "rows": {
+     "C1": 1,
+     "R1": 0
+    },
+    "slots": [
+     "h:R1",
+     "col:C1"
+    ],
+    "variant": 1
+   }
+  ]
+ },
+ "stm32f407": {
+  "boot": [],
+  "clock": [],
+  "debug": [],
+  "gpio_east": [],
+  "gpio_north": [],
+  "gpio_south": [],
+  "gpio_west": [],
+  "i2c_display": [],
+  "indicator": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "R4",
+      "D1"
+     ]
+    ],
+    "fields": {
+     "D1": "R",
+     "R4": "R"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "D1": [
+      90,
+      null
+     ],
+     "R4": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "D1": 3,
+     "R4": 1
+    },
+    "slots": [
+     "col:D1"
+    ],
+    "variant": 0
+   }
+  ],
+  "mcu": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "C5"
+     ],
+     [
+      "C6"
+     ],
+     [
+      "C7"
+     ],
+     [
+      "C8"
+     ],
+     [
+      "C9"
+     ],
+     [
+      "C10"
+     ],
+     [
+      "C3"
+     ],
+     [
+      "C4"
+     ]
+    ],
+    "fields": {
+     "C10": "R",
+     "C3": "R",
+     "C4": "R",
+     "C5": "R",
+     "C6": "R",
+     "C7": "R",
+     "C8": "R",
+     "C9": "R",
+     "L1": "T"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "C10": [
+      0,
+      null
+     ],
+     "C3": [
+      0,
+      null
+     ],
+     "C4": [
+      0,
+      null
+     ],
+     "C5": [
+      0,
+      null
+     ],
+     "C6": [
+      0,
+      null
+     ],
+     "C7": [
+      0,
+      null
+     ],
+     "C8": [
+      0,
+      null
+     ],
+     "C9": [
+      0,
+      null
+     ],
+     "L1": [
+      90,
+      null
+     ]
+    },
+    "rows": {
+     "C10": 1,
+     "C3": 1,
+     "C4": 1,
+     "C5": 1,
+     "C6": 1,
+     "C7": 1,
+     "C8": 1,
+     "C9": 1,
+     "L1": 0
+    },
+    "slots": [
+     "col:C5",
+     "col:C6",
+     "col:C7",
+     "col:C8",
+     "col:C9",
+     "col:C10",
+     "h:L1",
+     "col:C3",
+     "col:C4"
+    ],
+    "variant": 0
+   }
+  ],
+  "parallel_display": [],
+  "power": [
+   {
+    "bridges": {},
+    "columns": [
+     [
+      "C1"
+     ],
+     [
+      "U2"
+     ],
+     [
+      "C2"
+     ]
+    ],
+    "fields": {
+     "C1": "L",
+     "C2": "L",
+     "J1": "L",
+     "U2": "T"
+    },
+    "jogs": [],
+    "mirror": {},
+    "orient": {
+     "C1": [
+      0,
+      null
+     ],
+     "C2": [
+      0,
+      null
+     ],
+     "J1": [
+      0,
+      "y"
+     ],
+     "U2": [
+      0,
+      null
+     ]
+    },
+    "rows": {
+     "C1": 1,
+     "C2": 1,
+     "U2": 0
+    },
+    "slots": [
+     "j:J1",
+     "col:C1",
+     "col:U2",
+     "col:C2"
+    ],
+    "variant": 1
+   }
+  ],
+  "reset": [],
+  "spi_display": []
+ }
+}

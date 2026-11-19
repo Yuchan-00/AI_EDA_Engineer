@@ -22,6 +22,13 @@ body*, with the reason - never a guessed height.
   point, in KiCad's 3D frame (x right, **y up** = -board y, z up out of the
   footprint's side), offsets in millimetres, results rounded to 1e-6 mm. A legacy ``(at (xyz ..))`` is in
   inches and is converted (KiCad reads it that way).
+* :func:`missing_models`: the model files the placed footprints name that are
+  not in the 3D library (a footprint whose model KiCad's library does not
+  ship, as KiCad 10.0.6 lacks ``Potentiometer_Bourns_3386P_Vertical.step``):
+  the parts that show no body in the preview and in KiCad's own STEP / GLB /
+  render, and :func:`missing_models_note` says so in one line. No other model
+  is put in their place - a sibling of the same family (a horizontal 3386W
+  for a vertical 3386P) has another shape, and a body is never invented.
 """
 
 from __future__ import annotations
@@ -44,6 +51,8 @@ __all__ = [
     "resolve_model_path",
     "model_transform",
     "transformed_box",
+    "missing_models",
+    "missing_models_note",
 ]
 
 #: the path variable KiCad 10's footprint library writes in every ``(model ...)``
@@ -133,6 +142,32 @@ def resolve_model_path(path: str, model_dir: Path | None) -> tuple[Path | None, 
     if candidate.is_absolute():
         return (candidate, "") if candidate.is_file() else (None, "절대 경로의 모델 파일이 없음")
     return None, "경로 변수 없는 상대 경로 (기준 디렉터리를 알 수 없음)"
+
+
+def missing_models(footprints: list[tuple[str, FootprintDef]], model_dir: Path | None) -> dict[str, list[str]]:
+    """``{model file name: refs}`` (in the order met) of every visible model a footprint of ``footprints`` (``(ref, footprint)``) names
+    whose file is not in the 3D library ``model_dir`` - or every model, when there is no library (module docstring)."""
+    out: dict[str, list[str]] = {}
+    for ref, fp in footprints:
+        for m in footprint_models(fp):
+            if m.hidden:
+                continue
+            path, _why = resolve_model_path(m.path, model_dir)
+            if path is None:
+                refs = out.setdefault(re.split(r"[\\/]", m.path)[-1], [])
+                if ref not in refs:
+                    refs.append(ref)
+    return out
+
+
+def missing_models_note(missing: dict[str, list[str]]) -> str:
+    """One line naming the missing model files and their parts (module docstring); empty when none is missing."""
+    if not missing:
+        return ""
+    files = "; ".join(f"{name} ({', '.join(refs)})" for name, refs in missing.items())
+    count = sum(len(refs) for refs in missing.values())
+    return (f"3D model file(s) not in the KiCad 3D library for {count} part(s): {files} - these parts show no body in the 3D preview or in "
+            "KiCad's STEP / GLB / render; no other model is put in their place")
 
 
 def _q(v: float) -> float:

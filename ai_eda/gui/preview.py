@@ -51,7 +51,9 @@ verdict.
 * :func:`bom_table` / :func:`cpl_table` read the CSVs; a free-text BOM cell
   (``Value`` / ``Description``) is decoded with
   :func:`~ai_eda.tools.manufacturing.csv_cells.bom_cell_text`, every other
-  cell is shown exactly as written (``NOT_VERIFIED`` included).
+  cell is shown exactly as written; the cells a row's ``Unverified`` column
+  names (an empty cell, or ``NOT_VERIFIED`` in a ``compiler.bom`` 0.2 file:
+  :func:`~ai_eda.compilers.bom.unverified_columns`) are marked unverified.
 * :func:`artifact_rows` lists ``ir.artifacts`` with their disk state and
   whether they were generated from the current design hash;
   :func:`artifact_state` is that row, shown next to the preview of the same
@@ -87,6 +89,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ai_eda.compilers.bom import NOT_VERIFIED, unverified_columns
 from ai_eda.gui.projects import IR_FILE, safe_part
 from ai_eda.gui.schematic_render import render_kicad_sch_file
 from ai_eda.ir import ArtifactKind, CircuitIR
@@ -106,8 +109,8 @@ BOM_FILE = "bom.csv"
 CPL_FILE = "cpl.csv"
 #: the BOM columns written through ``free_text_cell`` (decoded with ``bom_cell_text``); every other cell is shown as written
 BOM_FREE_TEXT_COLUMNS: tuple[str, ...] = ("Value", "Description")
-#: the cell text the BOM writes for an identity / sourcing value nothing verified
-NOT_VERIFIED_CELL = "NOT_VERIFIED"
+#: the cell text ``compiler.bom`` 0.2 wrote for an identity / sourcing value nothing verified (0.3 leaves it empty and names it in ``Unverified``)
+NOT_VERIFIED_CELL = NOT_VERIFIED
 #: the analysis kinds drawn as waveforms (an ``op`` is one point: its values are listed, not drawn)
 WAVEFORM_KINDS: tuple[str, ...] = ("tran", "dc", "ac")
 #: a waveform id (and the analysis id it starts with): what a URL segment ``<id>.svg`` can carry
@@ -553,10 +556,11 @@ def _table(workdir: Path, name: str, free_text: Sequence[str]) -> dict[str, Any]
 
 
 def bom_table(workdir: Path) -> dict[str, Any] | None:
-    """``{file, columns, rows, not_verified}`` of ``<workdir>/bom.csv`` (free-text cells decoded; ``not_verified`` lists per row the columns whose cell reads ``NOT_VERIFIED``); ``None`` without the file."""
+    """``{file, columns, rows, not_verified}`` of ``<workdir>/bom.csv`` (free-text cells decoded; ``not_verified`` lists per row the columns
+    nothing verified: :func:`~ai_eda.compilers.bom.unverified_columns`); ``None`` without the file."""
     table = _table(workdir, BOM_FILE, BOM_FREE_TEXT_COLUMNS)
     if table is not None:
-        table["not_verified"] = [[c for c, v in row.items() if v == NOT_VERIFIED_CELL] for row in table["rows"]]
+        table["not_verified"] = [unverified_columns(row) for row in table["rows"]]
     return table
 
 
